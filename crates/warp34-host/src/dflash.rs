@@ -507,9 +507,14 @@ fn weight_arena_bytes(
     let coeff = product(&[2, cfg.taps, h / cfg.group])?;
     let rows = sum(&[capacity, cfg.block_size])?;
     let host_codebooks = use_host_selector_codebooks(cfg);
+    let use_inv_freq = rows > 8192;
     let mut bytes = vec![
         DFLASH2_WEIGHT_ARENA_SLACK_BYTES,
-        product(&[d / 2, 4])?,
+        if use_inv_freq {
+            product(&[d / 2, 4])?
+        } else {
+            product(&[rows, d, 4])?
+        },
         product(&[rows.div_ceil(16), 4])?,
     ];
     for name in ["hidden_norm.weight", "norm.weight"] {
@@ -769,6 +774,7 @@ pub struct DFlash2Rank {
     layers: Vec<Layer>,
     rope: u64,
     rope_rows: usize,
+    rope_uses_inv_freq: bool,
     hp: Linear,
     pred: u64,
     succ: u64,
@@ -1319,13 +1325,27 @@ impl DFlash2Rank {
             (p_ptr, s_ptr, None, None)
         };
         drop(upload_ring);
-        // Compute FP32 RoPE `inv_freq` [d / 2] once and evaluate `sincosf(pos * inv_freq[j])`
-        // on the fly in `warp34_dflash_qk_norm_rope_kv_write_bf16_inv_freq`, saving 64 MiB VRAM
-        // at 128K context while keeping exact FP32 rotation precision.
-        let inv_freq: Vec<f32> = (0..d / 2)
-            .map(|j| 1.0f32 / c.rope_theta.powf((2 * j) as f32 / d as f32))
-            .collect();
-        let rope = weights.upload_slice(&inv_freq, &t.stream)?;
+        // For compact contexts (`<= 8192` rows, `<= 4 MiB`), keep the exact host-computed FP32
+        // cos/sin table for 0-ULP SGLang donor parity; for long contexts (`> 8192` rows, e.g.
+        // 128K serving), store FP32 `inv_freq` [d / 2] and evaluate `sincosf` on the fly to save
+        // 64 MiB VRAM.
+        let rope_uses_inv_freq = rope_rows > 8192;
+        let rope = if rope_uses_inv_freq {
+            let inv_freq: Vec<f32> = (0..d / 2)
+                .map(|j| 1.0f32 / c.rope_theta.powf((2 * j) as f32 / d as f32))
+                .collect();
+            weights.upload_slice(&inv_freq, &t.stream)?
+        } else {
+            let mut table = vec![0f32; rope_rows * d];
+            for pos in 0..rope_rows {
+                for j in 0..d / 2 {
+                    let angle = pos as f32 * (1.0 / c.rope_theta.powf((2 * j) as f32 / d as f32));
+                    table[pos * d + j] = angle.cos();
+                    table[pos * d + d / 2 + j] = angle.sin();
+                }
+            }
+            weights.upload_slice(&table, &t.stream)?
+        };
         let layer_ids: Vec<usize> = (0..c.num_hidden_layers).collect();
         let logical_pages = rope_rows.div_ceil(DFLASH2_KV_PAGE_BLOCK_TOKENS);
         let (slot_count, ring_phys_per_slot) = dflash_ring_params(&cfg, tp);
@@ -1416,6 +1436,7 @@ impl DFlash2Rank {
             layers,
             rope,
             rope_rows,
+            rope_uses_inv_freq,
             hp,
             pred,
             succ,
@@ -1715,22 +1736,42 @@ impl DFlash2Rank {
         check_rc(
             // SAFETY: device pointers and write_slot_mapping are valid allocations for rows BF16 QKV entries according to kv_layout.
             unsafe {
-                ffi::warp34_dflash_qk_norm_rope_kv_write_bf16_inv_freq(
-                    &t.stream.exec(0, 0),
-                    qkv as *mut c_void,
-                    q_out as *mut c_void,
-                    pos as *const i32,
-                    layer.q_norm as *const c_void,
-                    layer.k_norm as *const c_void,
-                    self.rope as *const f32,
-                    kv_layout,
-                    write_slot_mapping,
-                    rows as i32,
-                    qheads as i32,
-                    (self.cfg.model.num_key_value_heads / self.tp) as i32,
-                    self.cfg.model.head_dim as i32,
-                    self.cfg.model.rms_norm_eps,
-                )
+                if self.rope_uses_inv_freq {
+                    ffi::warp34_dflash_qk_norm_rope_kv_write_bf16_inv_freq(
+                        &t.stream.exec(0, 0),
+                        qkv as *mut c_void,
+                        q_out as *mut c_void,
+                        pos as *const i32,
+                        layer.q_norm as *const c_void,
+                        layer.k_norm as *const c_void,
+                        self.rope as *const f32,
+                        kv_layout,
+                        write_slot_mapping,
+                        rows as i32,
+                        qheads as i32,
+                        (self.cfg.model.num_key_value_heads / self.tp) as i32,
+                        self.cfg.model.head_dim as i32,
+                        self.cfg.model.rms_norm_eps,
+                    )
+                } else {
+                    ffi::warp34_dflash_qk_norm_rope_kv_write_bf16_f32_table(
+                        &t.stream.exec(0, 0),
+                        qkv as *mut c_void,
+                        q_out as *mut c_void,
+                        pos as *const i32,
+                        layer.q_norm as *const c_void,
+                        layer.k_norm as *const c_void,
+                        self.rope as *const c_void,
+                        kv_layout,
+                        write_slot_mapping,
+                        rows as i32,
+                        qheads as i32,
+                        (self.cfg.model.num_key_value_heads / self.tp) as i32,
+                        self.cfg.model.head_dim as i32,
+                        self.rope_rows as i32,
+                        self.cfg.model.rms_norm_eps,
+                    )
+                }
             },
             "DFlash QK norm/RoPE + KV write",
         )
@@ -2719,7 +2760,9 @@ mod memory_tests {
                 c.block_size = block;
                 let weights = weight_arena_bytes(&c, &a, tp, 262144).unwrap();
                 let short = weight_arena_bytes(&c, &a, tp, 256).unwrap();
-                assert_eq!(weights - short, (262144 - 256) / 16 * 4);
+                // `262144` uses `inv_freq` (`d/2 * 4B`) while `256` keeps the compact table (`(256+block)*d*4B`).
+                let rope_delta = (256 + block) * 128 * 4 - (128 / 2) * 4;
+                assert_eq!(weights + rope_delta - short, (262144 - 256) / 16 * 4);
                 assert!(
                     mandatory_bytes(&c, &c.model, tp, 262144, weights).unwrap()
                         > weights + 64 * 1024 * 1024
@@ -2778,7 +2821,7 @@ mod memory_tests {
                     n * k / 2 + n * (k / 64) * 2 + 2 * DEVICE_SCRATCH_ALIGNMENT_BYTES
                 };
                 let expected = DFLASH2_WEIGHT_ARENA_SLACK_BYTES
-                    + (128 / 2) * 4
+                    + (256 + block) * 128 * 4
                     + (256 + block).div_ceil(16) * 4
                     + 2 * 256 * 2
                     + 2 * 1024 * 128 * 2
