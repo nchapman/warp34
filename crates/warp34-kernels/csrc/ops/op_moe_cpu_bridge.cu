@@ -126,6 +126,15 @@ __global__ void moe_hybrid_plan_and_submit_kernel(
     __shared__ uint64_t s_slot_ts[256];
     __shared__ int32_t s_slot_ge[256];
     __shared__ int16_t s_cold_idx[512];
+    __shared__ int s_cand_c[16];
+    __shared__ int s_n_cand;
+    __shared__ int s_n_cold_shared;
+    __shared__ int s_n_gpu_cold_shared;
+    __shared__ int s_stop_evict;
+    __shared__ int s_freq_ranked_shared;
+    __shared__ int s_use_tinylfu_shared;
+    __shared__ int s_async_bg_shared;
+    __shared__ uint64_t s_warp_min[8];
 
     const int total_pairs = num_tokens * top_k;
     if (threadIdx.x == 0) {
@@ -333,9 +342,10 @@ __global__ void moe_hybrid_plan_and_submit_kernel(
             cold_assigned_slot[c] = -1;
         }
 
-        int n_gpu_cold = 0;
         const bool freq_ranked_victims = (use_tinylfu || use_parallel_pcie_split);
-        for (int m = 0; m < want_gpu_cold; ++m) {
+        int n_cand = 0;
+        const int cand_cap = (want_gpu_cold < 16) ? want_gpu_cold : 16;
+        for (int m = 0; m < cand_cap; ++m) {
             int best_c = -1;
             int best_rank = -1;
             for (int c = 0; c < n_cold; ++c) {
@@ -350,24 +360,120 @@ __global__ void moe_hybrid_plan_and_submit_kernel(
                 }
             }
             if (best_c < 0) break;
+            // Mark temporarily as selected (`-3`) so we don't pick the same `best_c` twice.
+            cold_assigned_slot[best_c] = -3;
+            s_cand_c[n_cand++] = best_c;
+        }
+        for (int m = 0; m < n_cand; ++m) {
+            cold_assigned_slot[s_cand_c[m]] = -1;
+        }
+        s_n_cand = n_cand;
+        s_n_cold_shared = n_cold;
+        s_n_gpu_cold_shared = 0;
+        s_stop_evict = 0;
+        s_freq_ranked_shared = freq_ranked_victims ? 1 : 0;
+        s_use_tinylfu_shared = use_tinylfu ? 1 : 0;
+        s_async_bg_shared = async_bg_pull ? 1 : 0;
+    }
+    __syncthreads();
 
-            uint64_t best_ts = step;
-            uint32_t best_vfreq = 0xffffu;
-            int victim_slot = -1;
-            int victim_old_ge = -1;
-            if (cached_evict_table) {
-                for (int idx = 0; idx < n_evict; ++idx) {
-                    const uint64_t ts = s_slot_ts[idx];
-                    if (ts >= step) continue;
-                    const uint32_t vfreq = freq_ranked_victims ? s_slot_vfreq[idx] : 0u;
-                    if (vfreq < best_vfreq || (vfreq == best_vfreq && ts < best_ts)) {
-                        best_vfreq = vfreq;
-                        best_ts = ts;
-                        victim_slot = k_static + idx;
-                        victim_old_ge = s_slot_ge[idx];
+    // Phase 2b (parallel): select up to `s_n_cand` eviction victims using a 64-bit packed
+    // `(vfreq[8b] | ts[48b] | idx[8b])` block-wide min-reduction across all 256 threads.
+    if (s_n_cand > 0) {
+        const uint64_t step = next_step;
+        const bool freq_ranked_victims = (s_freq_ranked_shared != 0);
+        const bool use_tinylfu_p = (s_use_tinylfu_shared != 0);
+        const bool async_bg_p = (s_async_bg_shared != 0);
+        if (cached_evict_table) {
+            const int tid = (int)threadIdx.x;
+            const int warp_id = tid >> 5;
+            const int lane_id = tid & 31;
+            for (int m = 0; m < s_n_cand; ++m) {
+                uint64_t key = 0xFFFFFFFFFFFFFFFFULL;
+                if (tid < n_evict) {
+                    const uint64_t ts = s_slot_ts[tid];
+                    if (ts < step) {
+                        const uint32_t vf = freq_ranked_victims ? s_slot_vfreq[tid] : 0u;
+                        key = (((uint64_t)(vf & 0xffu)) << 56) |
+                              ((ts & 0x0000FFFFFFFFFFFFULL) << 8) |
+                              (uint64_t)tid;
                     }
                 }
-            } else {
+#pragma unroll
+                for (int off = 16; off > 0; off >>= 1) {
+                    const uint64_t other = __shfl_xor_sync(0xffffffffu, key, off);
+                    if (other < key) key = other;
+                }
+                if (lane_id == 0) {
+                    s_warp_min[warp_id] = key;
+                }
+                __syncthreads();
+                if (tid == 0) {
+                    uint64_t best_key = s_warp_min[0];
+#pragma unroll
+                    for (int w = 1; w < 8; ++w) {
+                        if (s_warp_min[w] < best_key) best_key = s_warp_min[w];
+                    }
+                    if (best_key == 0xFFFFFFFFFFFFFFFFULL) {
+                        s_stop_evict = 1;
+                    } else {
+                        const int victim_idx = (int)(best_key & 0xffu);
+                        const uint32_t best_vfreq = (uint32_t)(best_key >> 56);
+                        const uint64_t best_ts = s_slot_ts[victim_idx];
+                        const int victim_slot = k_static + victim_idx;
+                        const int victim_old_ge = s_slot_ge[victim_idx];
+                        const int best_c = s_cand_c[m];
+                        bool admit = true;
+                        if (use_tinylfu_p) {
+                            const uint32_t hyst = (best_ts + 32ULL < step) ? 1u : 2u;
+                            const uint32_t cand_eff =
+                                (cold_score[best_c] >= 5 && cold_freq[best_c] < 3)
+                                    ? 3u
+                                    : (uint32_t)cold_freq[best_c];
+                            if (cand_eff < best_vfreq + hyst) {
+                                admit = false;
+                            }
+                        }
+                        if (!admit) {
+                            s_stop_evict = 1;
+                        } else {
+                            const int le = distinct_cold[best_c];
+                            const int ge = distinct_ge[best_c];
+                            const int64_t old_le = (int64_t)victim_old_ge - global_expert_offset;
+                            if (old_le >= 0 && old_le < local_num_experts) {
+                                expert_to_slot[old_le] = -1;
+                            }
+                            expert_to_slot[le] = victim_slot;
+                            slot_to_expert[victim_slot] = ge;
+                            slot_last_used[victim_slot] = step;
+                            s_slot_ts[victim_idx] = step;
+                            s_slot_ge[victim_idx] = ge;
+                            if (freq_ranked_victims) {
+                                const uint32_t min_prom_freq =
+                                    (best_vfreq + 2u < 255u) ? (best_vfreq + 2u) : 255u;
+                                if ((uint32_t)expert_freq[le] < min_prom_freq) {
+                                    expert_freq[le] = (uint8_t)min_prom_freq;
+                                }
+                            }
+                            cold_assigned_slot[best_c] = async_bg_p ? -2 : victim_slot;
+                            const int gi = s_n_gpu_cold_shared;
+                            miss_local_experts[gi] = le;
+                            miss_victim_slots[gi] = victim_slot;
+                            s_n_gpu_cold_shared = gi + 1;
+                        }
+                    }
+                }
+                __syncthreads();
+                if (s_stop_evict) break;
+            }
+        } else if (threadIdx.x == 0) {
+            int n_gpu_cold = 0;
+            for (int m = 0; m < s_n_cand; ++m) {
+                const int best_c = s_cand_c[m];
+                uint64_t best_ts = step;
+                uint32_t best_vfreq = 0xffffu;
+                int victim_slot = -1;
+                int victim_old_ge = -1;
                 for (int s = k_static; s < k_hot; ++s) {
                     const uint64_t ts = slot_last_used[s];
                     if (ts >= step) continue;
@@ -389,44 +495,45 @@ __global__ void moe_hybrid_plan_and_submit_kernel(
                         victim_old_ge = v_ge;
                     }
                 }
-            }
-            if (victim_slot < 0) break;
-            if (use_tinylfu) {
-                const uint32_t hyst = (best_ts + 32ULL < step) ? 1u : 2u;
-                const uint32_t cand_eff = (cold_score[best_c] >= 5 && cold_freq[best_c] < 3)
-                    ? 3u
-                    : (uint32_t)cold_freq[best_c];
-                if (cand_eff < best_vfreq + hyst) break;
-            }
-
-            const int le = distinct_cold[best_c];
-            const int ge = distinct_ge[best_c];
-            const int64_t old_le = (int64_t)victim_old_ge - global_expert_offset;
-            if (old_le >= 0 && old_le < local_num_experts) {
-                expert_to_slot[old_le] = -1;
-            }
-            expert_to_slot[le] = victim_slot;
-            slot_to_expert[victim_slot] = ge;
-            slot_last_used[victim_slot] = step;
-            if (cached_evict_table) {
-                const int idx = victim_slot - k_static;
-                s_slot_ts[idx] = step;
-                s_slot_ge[idx] = ge;
-            }
-            if (freq_ranked_victims) {
-                const uint32_t min_prom_freq =
-                    (best_vfreq + 2u < 255u) ? (best_vfreq + 2u) : 255u;
-                if ((uint32_t)expert_freq[le] < min_prom_freq) {
-                    expert_freq[le] = (uint8_t)min_prom_freq;
+                if (victim_slot < 0) break;
+                if (use_tinylfu_p) {
+                    const uint32_t hyst = (best_ts + 32ULL < step) ? 1u : 2u;
+                    const uint32_t cand_eff = (cold_score[best_c] >= 5 && cold_freq[best_c] < 3)
+                        ? 3u
+                        : (uint32_t)cold_freq[best_c];
+                    if (cand_eff < best_vfreq + hyst) break;
                 }
+                const int le = distinct_cold[best_c];
+                const int ge = distinct_ge[best_c];
+                const int64_t old_le = (int64_t)victim_old_ge - global_expert_offset;
+                if (old_le >= 0 && old_le < local_num_experts) {
+                    expert_to_slot[old_le] = -1;
+                }
+                expert_to_slot[le] = victim_slot;
+                slot_to_expert[victim_slot] = ge;
+                slot_last_used[victim_slot] = step;
+                if (freq_ranked_victims) {
+                    const uint32_t min_prom_freq =
+                        (best_vfreq + 2u < 255u) ? (best_vfreq + 2u) : 255u;
+                    if ((uint32_t)expert_freq[le] < min_prom_freq) {
+                        expert_freq[le] = (uint8_t)min_prom_freq;
+                    }
+                }
+                cold_assigned_slot[best_c] = async_bg_p ? -2 : victim_slot;
+                miss_local_experts[n_gpu_cold] = le;
+                miss_victim_slots[n_gpu_cold] = victim_slot;
+                n_gpu_cold++;
             }
-            cold_assigned_slot[best_c] = async_bg_pull ? -2 : victim_slot;
-            miss_local_experts[n_gpu_cold] = le;
-            miss_victim_slots[n_gpu_cold] = victim_slot;
-            n_gpu_cold++;
+            s_n_gpu_cold_shared = n_gpu_cold;
         }
+        __syncthreads();
+    }
 
-        const int n_cpu_cold = async_bg_pull ? n_cold : (n_cold - n_gpu_cold);
+    if (threadIdx.x == 0) {
+        const int n_cold = s_n_cold_shared;
+        const int n_gpu_cold = s_n_gpu_cold_shared;
+        const bool async_bg_p = (s_async_bg_shared != 0);
+        const int n_cpu_cold = async_bg_p ? n_cold : (n_cold - n_gpu_cold);
         num_misses_out[0] = n_gpu_cold;
         num_misses_out[1] = n_cpu_cold;
         s_n_cpu_cold = n_cpu_cold;
