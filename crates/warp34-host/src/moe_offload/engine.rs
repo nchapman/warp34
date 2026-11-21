@@ -597,8 +597,12 @@ impl TieredMoeEngine {
                 let use_cpu_bridge = cache.bridge_runtime.is_some()
                     && num_tokens <= ws.max_tokens
                     && h_topk_weights.len() == num_tokens * top_k;
-                let dynamic_short_adapt =
-                    cache.k_static <= 1 && cache.slots.capacity >= 64 && num_tokens >= 64;
+                // Only run `dynamic_short_adapt` on short/medium prompts (`64 <= num_tokens < 1024`)
+                // so multi-chunk long-context prefills (`code-context-r64`, 2048-tok chunks) do not
+                // overwrite the hot decode cache with high-`expert_freq` prompt-only experts.
+                let dynamic_short_adapt = cache.k_static <= 1
+                    && cache.slots.capacity >= 64
+                    && (64..TIERED_MOE_LONG_PROMPT_ADAPT_MIN_TOKENS).contains(&num_tokens);
                 let want_freq_stats = use_cpu_bridge
                     || dynamic_short_adapt
                     || (num_tokens >= TIERED_MOE_LONG_PROMPT_ADAPT_MIN_TOKENS && adapt_end >= 64);

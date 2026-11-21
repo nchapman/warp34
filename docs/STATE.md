@@ -13,12 +13,13 @@
      - Vectorized `qsa_select_blocks_f16_kernel` (`q_reg[4][4]` register cache + coalesced 64-bit `uint2` loads), added Split-B (`kSelectSplits = 8`) decode stage+merge kernels for `total_tokens <= 16`, extended `qsa_sparse_paged_attn_mma_f16_kernel` to support Split-K (`num_splits >= 1`), and tuned overlapped `want_gpu_cold = (n_cold + 1) / 4`.
      - Borrowed the disjoint tail of `Rank`'s `512 MiB` `scratch_arena` (`ws.external_scratch`, advancing past `normed_buf` when prerotated inside scratch) in `execute_tiered` -> `TieredMoeEngine` so `2,048`-token prefill runs with `sparse_chunks = 1` instead of splitting into `7×` `293`-token chunks on the `16 MiB` `ws.d_scratch` (`0` extra VRAM).
      - Restored `moe_pull_mapped_experts_kernel` decode `grid_x` from `4 -> 12` (`48` CTAs, restoring full PCIe BW while leaving `36` SMs for `moe_hot`), set `fuse_h64 = false` in `moe_wxa16_pulled_add_f16` (restoring `40` X-blocks vs `10` for `n_interm = 640`, cutting `pulled_add` `gate_up` `~71.5 -> 20 µs`), and replaced the `O(total_pairs * n_cold)` serial dedup loop in `moe_hybrid_plan_and_submit_kernel` with an `O(1)` shared-memory `s_cold_idx[512]` map.
+     - Restricted `dynamic_short_adapt` in `TieredMoeEngine::execute_layer` to `64..1024` tokens so multi-chunk long-context prefills (`code-context-r64`, `2048`-token chunks) stop overwriting the warmed decode hot cache with `expert_freq = 24` prompt-only experts, lifting `prefix-primed-r16` by `+7.40 e2e / +9.27 dec tok/s`, `prefill-context-r16` by `+6.28 dec tok/s`, `code-context-r64` by `+4.56 dec tok/s`, and `coding-agent-replay` by `+3.07 e2e tok/s` (`-72 ms` TTFT).
 - **Verified 3-rep OOTB 1-GPU (`1× RTX 3090 Ti`, `TP=1`, `131K` auto-fit `TQ4` KV, zero manual flags) vs `Strata v0.2.17` (`3142b66`):**
-  - `short-chat`: **`73.77 tok/s`** e2e (**`85.78`** decode, rep 2 **`77.12`** e2e; `488 ms` TTFT vs Strata `587 ms`, Strata `81.15 / 99.38`).
-  - `prefill-context-r16`: **`30.17 tok/s`** e2e (**`79.33`** decode, rep 2 `30.58` e2e, **`+27.7%` faster than Strata `23.62`**, `1,317 ms` TTFT vs Strata `2,073 ms` `-36.5%`).
-  - `code-context-r64`: **`33.88 tok/s`** e2e (**`78.20`** decode, rep 2 `34.25` e2e; `4,283 ms` TTFT vs Strata `4,128 ms` / `37.93 tok/s`).
-  - `prefix-primed-r16`: **`68.50 tok/s`** e2e (rep 0 **`72.89`** e2e, **`79.95`** decode, `145 ms` TTFT vs Strata `161 ms` / `82.58 tok/s`).
-  - `coding-agent-replay`: **`57.16 tok/s`** e2e (**`90.55`** decode, rep 2 `59.03` e2e; `510 ms` TTFT vs Strata `623 ms`, Strata `61.86`).
+  - `short-chat`: **`73.91 tok/s`** e2e (**`86.04`** decode, rep 2 **`77.11`** e2e; `489 ms` TTFT vs Strata `587 ms`, Strata `81.15 / 99.38`).
+  - `prefill-context-r16`: **`31.34 tok/s`** e2e (**`85.61`** decode, rep 2 `31.65` e2e, **`+32.7%` faster than Strata `23.62`**, `1,296 ms` TTFT vs Strata `2,073 ms` `-37.5%`).
+  - `code-context-r64`: **`34.73 tok/s`** e2e (**`82.76`** decode, rep 1 `35.04` e2e; `4,278 ms` TTFT vs Strata `4,128 ms` / `37.93 tok/s`).
+  - `prefix-primed-r16`: **`75.90 tok/s`** e2e (rep 1 **`79.43`** e2e, **`89.22`** decode, `136 ms` TTFT vs Strata `161 ms` / `82.58 tok/s`).
+  - `coding-agent-replay`: **`60.23 tok/s`** e2e (**`89.08`** decode, rep 1 **`61.27`** e2e; `438 ms` TTFT vs Strata `623 ms` `-29.7%`, Strata `61.86`).
   - **Gates:** `mise run check-quick` PASS (`fmt-check`, `clippy` cuda & cpu, `doc-check`, `simd-check`, `cuda-bin-check` 1,773 kernels 0 violations, `dashboard-build`), unit tests (`moe_offload` `9/9`, `moe_cpu_bridge` `16/16`, `moe_sparse` `8/8`, `dflash` `15/15`, `model::tests` `26/26`, `qsa` `2/2`, `proposer` PASS), and `review` (`0` actionable findings).
 
 ## Fair 4-bit Tiered-MoE + `DFlash2` Optimizations & Specialized Engine Head-to-Head (`1–2× RTX 3090 Ti`)
