@@ -373,7 +373,7 @@ impl HotExpertRankings {
                         .and_then(|n| usize::try_from(n).ok())
                         .unwrap_or(512);
                     pts.push((num_exp, 1.0f64));
-                    pts.sort_by_key(|&(sz, _)| sz);
+                    pts.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| b.1.total_cmp(&a.1)));
                     pts.dedup_by_key(|p| p.0);
                     if pts.len() >= 3 {
                         hit_curves.insert(layer_id, pts);
