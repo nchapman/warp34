@@ -1629,6 +1629,9 @@ pub struct TieredMoeWorkspace {
     pub d_interm_buf: crate::cuda::DeviceBuffer,
     pub d_chunk_out: crate::cuda::DeviceBuffer,
     pub d_scratch: crate::cuda::DeviceBuffer,
+    /// Optional larger caller-owned scratch tail `(addr, len_bytes)` borrowed for the duration of
+    /// a single `execute_layer_auto` call so large prefill chunks avoid `sparse_chunks` splitting.
+    pub external_scratch: (u64, usize),
     pub d_miss_local_experts: crate::cuda::DeviceBuffer,
     pub d_miss_victim_slots: crate::cuda::DeviceBuffer,
     pub d_num_misses: crate::cuda::DeviceBuffer,
@@ -1781,6 +1784,7 @@ impl TieredMoeWorkspace {
             d_interm_buf,
             d_chunk_out,
             d_scratch,
+            external_scratch: (0, 0),
             d_miss_local_experts,
             d_miss_victim_slots,
             d_num_misses,

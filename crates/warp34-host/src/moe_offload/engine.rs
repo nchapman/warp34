@@ -467,7 +467,15 @@ impl TieredMoeEngine {
             }
         }
 
-        let ex = compute_stream.exec(ws.d_scratch.addr(), ws.d_scratch.len_bytes);
+        let (scratch_ptr, scratch_size) = if ws.external_scratch.0 != 0
+            && (ws.external_scratch.0 & 15) == 0
+            && ws.external_scratch.1 > ws.d_scratch.len_bytes
+        {
+            ws.external_scratch
+        } else {
+            (ws.d_scratch.addr(), ws.d_scratch.len_bytes)
+        };
+        let ex = compute_stream.exec(scratch_ptr, scratch_size);
 
         match effective_mode {
             MoeOffloadMode::GpuLru => {

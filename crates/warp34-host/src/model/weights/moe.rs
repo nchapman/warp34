@@ -770,6 +770,7 @@ impl FfnBlockWeights {
             )?;
             return self.execute_tiered(
                 tiered_moe,
+                ex,
                 stream,
                 is_capturing_graph,
                 if input_prerotated {
@@ -1026,9 +1027,11 @@ impl FfnBlockWeights {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn execute_tiered(
         &self,
         tiered_moe: Option<&mut crate::moe_offload::RankTieredMoe>,
+        ex: &ffi::Warp34Exec,
         stream: &CudaStream,
         is_capturing_graph: bool,
         normed_buf: u64,
@@ -1059,7 +1062,22 @@ impl FfnBlockWeights {
         } else {
             0
         };
-        tmoe_engine.execute_layer_auto(
+        let mut ext_ptr = ex.scratch_ptr;
+        let mut ext_size = ex.scratch_size;
+        let x_bytes = (num_tokens * tmoe_engine.stores[layer_id].layout().hidden * 2) as u64;
+        if normed_buf != 0 && normed_buf >= ext_ptr && normed_buf < ext_ptr + ext_size as u64 {
+            let after_x = (normed_buf + x_bytes + 255) & !255u64;
+            let end_cap = ext_ptr + ext_size as u64;
+            if after_x < end_cap {
+                ext_ptr = after_x;
+                ext_size = (end_cap - after_x) as usize;
+            } else {
+                ext_ptr = 0;
+                ext_size = 0;
+            }
+        }
+        tmoe_engine.ws.external_scratch = (ext_ptr, ext_size);
+        let res = tmoe_engine.execute_layer_auto(
             stream,
             is_capturing_graph,
             layer_id,
@@ -1071,7 +1089,9 @@ impl FfnBlockWeights {
             mlp_out_buf,
             num_tokens,
             moe.top_k,
-        )
+        );
+        tmoe_engine.ws.external_scratch = (0, 0);
+        res
     }
 }
 
