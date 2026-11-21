@@ -269,11 +269,12 @@ __global__ void moe_hybrid_plan_and_submit_kernel(
             } else if (use_parallel_pcie_split) {
                 // Parallel CPU DDR5 (~37 GB/s) + GPU PCIe (~12.6 GB/s) cold-expert split.
                 // When `pulled_topk_ids != nullptr`, `moe_hot` overlaps PCIe pull on `h2d_stream`,
-                // so GPU critical path is `max(k*200us, moe_hot) + 15us` vs CPU `(n_cold-k)*68us`
-                // -> `k = n_cold / 4` (1 for 4..7, 2 for 8..11, 3 for 12..15, 4 for >=16).
+                // so GPU critical path is `max(k*195us, moe_hot) + 30us` vs CPU `(n_cold-k)*68us + 25us`
+                // -> exact analytical optimum `k = (n_cold + 1) / 4` (0 for 1..2, 1 for 3..6,
+                // 2 for 7..10, 3 for 11..14, 4 for >=15).
                 // When serialized (`pulled_topk_ids == nullptr`), reserve 1 miss for `moe_hot`.
                 const int eff_cold = (pulled_topk_ids != nullptr)
-                    ? n_cold
+                    ? (n_cold + 1)
                     : ((n_cold > 1) ? (n_cold - 1) : 0);
                 want_gpu_cold = static_cast<int>(static_cast<float>(eff_cold) * gpu_share_frac);
             } else if (gpu_share_frac <= kAvx512RooflineGpuShareThreshold) {
