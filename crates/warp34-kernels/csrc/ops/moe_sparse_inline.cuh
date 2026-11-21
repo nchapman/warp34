@@ -23,10 +23,13 @@ __global__ __launch_bounds__(128, 4) void moe_sparse_vec4_kernel(
     const float * __restrict__ tw,
     __half * __restrict__ intermediate,
     __half * __restrict__ down,
-    int top_k, int N, int K) {
+    int top_k, int N, int K,
+    const int32_t * __restrict__ active_count = nullptr) {
     static_assert(BITS == 2 || BITS == 4, "BITS must be 2 or 4");
     static_assert(GROUP_SIZE == 64 || GROUP_SIZE == 128, "GROUP_SIZE must be 64 or 128");
     static_assert(!APPLY_HAD64 || GATE, "APPLY_HAD64 is only valid for GATE=true");
+    if (active_count != nullptr && __ldg(active_count) <= 0)
+        return;
     using w_vec_t = typename std::conditional<BITS == 2, uint2, uint4>::type;
     constexpr int W_COLS_PER_GROUP = GROUP_SIZE / 32;
     const int e = __ldg(&experts[blockIdx.y]);

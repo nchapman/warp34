@@ -649,7 +649,9 @@ __global__ void moe_align_block_size_kernel(
     int32_t* __restrict__ tile_expert_ids,
     int total_pairs,
     int num_experts,
-    int max_tiles) {
+    int max_tiles,
+    const int32_t* __restrict__ active_count = nullptr) {
+    if (active_count != nullptr && __ldg(active_count) <= 0) return;
     __shared__ int s_counts[1024];
     __shared__ int s_write_off[1024];
 
@@ -1133,7 +1135,9 @@ __global__ void moe_down_topk_reduce_f16_kernel(
     int num_tokens,
     int top_k,
     int num_experts,
-    int k_hidden) {
+    int k_hidden,
+    const int32_t* __restrict__ active_count = nullptr) {
+    if (active_count != nullptr && __ldg(active_count) <= 0) return;
     const int tok = (int)blockIdx.y;
     if (tok >= num_tokens) return;
     const int col4 = (int)blockIdx.x * 512 + (int)threadIdx.x * 4;
@@ -1915,6 +1919,155 @@ extern "C" int warp34_moe_w4a16_select_regime(
         return 3;
     }
     return 0;
+}
+
+template <int BITS>
+static int moe_wxa16_pulled_add_f16_impl(
+    const warp34_exec* ex,
+    const void* x,
+    const uint32_t* gate_up_packed,
+    const void* gate_up_scales,
+    const uint32_t* down_packed,
+    const void* down_scales,
+    const int32_t* pulled_topk_ids,
+    const float* topk_weights,
+    const int32_t* active_count,
+    void* interm_buf,
+    void* out,
+    int num_tokens,
+    int top_k,
+    int num_experts,
+    int n_interm,
+    int k_hidden,
+    int group_size,
+    int down_hadamard_block_size) {
+    using namespace warp34_moe;
+    if (ex == nullptr) return (int)cudaErrorInvalidValue;
+    if (num_tokens < 0 || top_k <= 0 || num_experts <= 0 || num_experts > 1024 ||
+        n_interm <= 0 || k_hidden <= 0 || (k_hidden % 4) != 0 ||
+        (group_size != 64 && group_size != 128) ||
+        (k_hidden % group_size) != 0 || (n_interm % group_size) != 0) {
+        return (int)cudaErrorInvalidValue;
+    }
+    if (num_tokens == 0) return 0;
+    if (x == nullptr || gate_up_packed == nullptr || gate_up_scales == nullptr ||
+        down_packed == nullptr || down_scales == nullptr || pulled_topk_ids == nullptr ||
+        topk_weights == nullptr || interm_buf == nullptr || out == nullptr) {
+        return (int)cudaErrorInvalidValue;
+    }
+    const int np = num_tokens * top_k;
+    const int nt = compute_moe_max_tiles<4>(np, num_experts);
+    const size_t pb = (size_t)nt * 4u * sizeof(int32_t);
+    const size_t eb = ((size_t)nt * sizeof(int32_t) + 15u) & ~size_t(15);
+    const size_t down_bytes = (size_t)np * (size_t)k_hidden * sizeof(__half);
+    const size_t needed_scratch = pb + eb + down_bytes;
+    if (ex->scratch_ptr == 0 || ex->scratch_size < needed_scratch) {
+        return (int)cudaErrorInvalidValue;
+    }
+    auto pairs = reinterpret_cast<int32_t*>((uintptr_t)ex->scratch_ptr);
+    auto experts = reinterpret_cast<int32_t*>((char*)pairs + pb);
+    auto down = reinterpret_cast<__half*>((char*)experts + eb);
+    cudaStream_t st = (cudaStream_t)ex->stream;
+    const bool fuse_h64 = (down_hadamard_block_size == 64 && (n_interm % 64) == 0);
+    const int lpr_gu = sparse_vec4_lpr(k_hidden);
+    const int base_rows_gu = 4 * 4 * (32 / lpr_gu);
+    const int cta_rows_gu = (fuse_h64 && base_rows_gu < 64) ? 64 : base_rows_gu;
+    const int lpr_dn = sparse_vec4_lpr(n_interm);
+    const int cta_rows_dn = 4 * 4 * (32 / lpr_dn);
+
+    moe_align_block_size_kernel<4><<<1, 256, 0, st>>>(
+        pulled_topk_ids, pairs, experts, np, num_experts, nt, active_count);
+    const dim3 g_gu((n_interm + cta_rows_gu - 1) / cta_rows_gu, nt);
+    const dim3 g_dn((k_hidden + cta_rows_dn - 1) / cta_rows_dn, nt);
+    if (fuse_h64) {
+        if (group_size == 64) {
+            moe_sparse_vec4_kernel<true, 64, true, BITS><<<g_gu, 128, 0, st>>>(
+                (const __half*)x, gate_up_packed, (const __half*)gate_up_scales, pairs, experts,
+                topk_weights, (__half*)interm_buf, down, top_k, n_interm, k_hidden, active_count);
+        } else {
+            moe_sparse_vec4_kernel<true, 128, true, BITS><<<g_gu, 128, 0, st>>>(
+                (const __half*)x, gate_up_packed, (const __half*)gate_up_scales, pairs, experts,
+                topk_weights, (__half*)interm_buf, down, top_k, n_interm, k_hidden, active_count);
+        }
+    } else {
+        if (group_size == 64) {
+            moe_sparse_vec4_kernel<true, 64, false, BITS><<<g_gu, 128, 0, st>>>(
+                (const __half*)x, gate_up_packed, (const __half*)gate_up_scales, pairs, experts,
+                topk_weights, (__half*)interm_buf, down, top_k, n_interm, k_hidden, active_count);
+        } else {
+            moe_sparse_vec4_kernel<true, 128, false, BITS><<<g_gu, 128, 0, st>>>(
+                (const __half*)x, gate_up_packed, (const __half*)gate_up_scales, pairs, experts,
+                topk_weights, (__half*)interm_buf, down, top_k, n_interm, k_hidden, active_count);
+        }
+        if (down_hadamard_block_size > 0) {
+            const int rc = warp34_block_hadamard_inplace_f16(
+                ex, interm_buf, np, n_interm, down_hadamard_block_size);
+            if (rc != 0) return rc;
+        }
+    }
+    if (group_size == 64) {
+        moe_sparse_vec4_kernel<false, 64, false, BITS><<<g_dn, 128, 0, st>>>(
+            (const __half*)interm_buf, down_packed, (const __half*)down_scales, pairs, experts,
+            topk_weights, (__half*)interm_buf, down, top_k, k_hidden, n_interm, active_count);
+    } else {
+        moe_sparse_vec4_kernel<false, 128, false, BITS><<<g_dn, 128, 0, st>>>(
+            (const __half*)interm_buf, down_packed, (const __half*)down_scales, pairs, experts,
+            topk_weights, (__half*)interm_buf, down, top_k, k_hidden, n_interm, active_count);
+    }
+    moe_down_topk_reduce_f16_kernel<<<dim3((k_hidden + 511) / 512, num_tokens), 128, 0, st>>>(
+        down, pulled_topk_ids, (const __half*)out, nullptr, (__half*)out, num_tokens, top_k,
+        num_experts, k_hidden, active_count);
+    return (int)cudaGetLastError();
+}
+
+extern "C" int warp34_moe_w4a16_pulled_add_f16(
+    const warp34_exec* ex,
+    const void* x,
+    const uint32_t* gate_up_packed,
+    const void* gate_up_scales,
+    const uint32_t* down_packed,
+    const void* down_scales,
+    const int32_t* pulled_topk_ids,
+    const float* topk_weights,
+    const int32_t* active_count,
+    void* interm_buf,
+    void* out,
+    int num_tokens,
+    int top_k,
+    int num_experts,
+    int n_interm,
+    int k_hidden,
+    int group_size,
+    int down_hadamard_block_size) {
+    return moe_wxa16_pulled_add_f16_impl<4>(
+        ex, x, gate_up_packed, gate_up_scales, down_packed, down_scales, pulled_topk_ids,
+        topk_weights, active_count, interm_buf, out, num_tokens, top_k, num_experts, n_interm,
+        k_hidden, group_size, down_hadamard_block_size);
+}
+
+extern "C" int warp34_moe_w2a16_pulled_add_f16(
+    const warp34_exec* ex,
+    const void* x,
+    const uint32_t* gate_up_packed,
+    const void* gate_up_scales,
+    const uint32_t* down_packed,
+    const void* down_scales,
+    const int32_t* pulled_topk_ids,
+    const float* topk_weights,
+    const int32_t* active_count,
+    void* interm_buf,
+    void* out,
+    int num_tokens,
+    int top_k,
+    int num_experts,
+    int n_interm,
+    int k_hidden,
+    int group_size,
+    int down_hadamard_block_size) {
+    return moe_wxa16_pulled_add_f16_impl<2>(
+        ex, x, gate_up_packed, gate_up_scales, down_packed, down_scales, pulled_topk_ids,
+        topk_weights, active_count, interm_buf, out, num_tokens, top_k, num_experts, n_interm,
+        k_hidden, group_size, down_hadamard_block_size);
 }
 
 extern "C" int warp34_moe_w4a16_mlp_ex_f16(

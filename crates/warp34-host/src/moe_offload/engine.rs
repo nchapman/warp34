@@ -150,7 +150,10 @@ impl TieredMoeEngine {
             } else {
                 0.0f32
             };
-            let use_forked_pull = false;
+            let use_overlapped_pull = cache.k_static < k_hot
+                && store.mapped_dev_ptr() != 0
+                && crate::moe_cpu_bridge::has_avx512()
+                && num_tokens >= 2;
             crate::cuda::check_rc(
                 // SAFETY: device pointers and capacities are owned and validated by `cache` and `ws`.
                 unsafe {
@@ -166,6 +169,11 @@ impl TieredMoeEngine {
                         cache.d_step_counter.addr() as *mut u64,
                         cache.d_expert_freq.addr() as *mut u8,
                         ws.d_remapped_topk_ids[0].addr() as *mut i32,
+                        if use_overlapped_pull {
+                            ws.d_remapped_topk_ids[1].addr() as *mut i32
+                        } else {
+                            core::ptr::null_mut()
+                        },
                         ws.d_miss_local_experts.addr() as *mut i32,
                         ws.d_miss_victim_slots.addr() as *mut i32,
                         ws.d_num_misses.addr() as *mut i32,
@@ -186,17 +194,17 @@ impl TieredMoeEngine {
                         store.layout().group_size as i32,
                         store.layout().bits as i32,
                         gpu_share,
-                        if use_forked_pull {
+                        if use_overlapped_pull {
                             ws.h2d_stream.handle as *mut core::ffi::c_void
                         } else {
                             core::ptr::null_mut()
                         },
-                        if use_forked_pull {
+                        if use_overlapped_pull {
                             ws.hybrid_plan_event.handle as *mut core::ffi::c_void
                         } else {
                             core::ptr::null_mut()
                         },
-                        if use_forked_pull {
+                        if use_overlapped_pull {
                             ws.hybrid_pull_done_event.handle as *mut core::ffi::c_void
                         } else {
                             core::ptr::null_mut()
@@ -220,6 +228,29 @@ impl TieredMoeEngine {
                 num_tokens,
                 top_k,
             )?;
+            if use_overlapped_pull {
+                crate::cuda::check_rc(
+                    // SAFETY: `compute_stream` and `ws.hybrid_pull_done_event` are live on this device.
+                    unsafe {
+                        warp34_kernels::ffi::warp34_stream_wait_event(
+                            compute_stream.handle,
+                            ws.hybrid_pull_done_event.handle,
+                        )
+                    },
+                    "warp34_stream_wait_event(hybrid_pull_done_event)",
+                )?;
+                cache.slots.launch_moe_w4a16_pulled_add(
+                    &ex,
+                    x_addr,
+                    ws.d_remapped_topk_ids[1].addr(),
+                    d_topk_weights_addr,
+                    ws.d_num_misses.addr(),
+                    ws.d_interm_buf.addr(),
+                    out_addr,
+                    num_tokens,
+                    top_k,
+                )?;
+            }
             return crate::cuda::check_rc(
                 // SAFETY: `out_addr` is a valid `[num_tokens, hidden]` FP16 buffer.
                 unsafe {
@@ -231,11 +262,7 @@ impl TieredMoeEngine {
                         ws.d_num_misses.addr() as *const i32,
                         num_tokens as i32,
                         store.layout().hidden as i32,
-                        if use_forked_pull {
-                            ws.hybrid_pull_done_event.handle as *mut core::ffi::c_void
-                        } else {
-                            core::ptr::null_mut()
-                        },
+                        core::ptr::null_mut(),
                     )
                 },
                 "warp34_moe_hybrid_wait_and_add_joined",

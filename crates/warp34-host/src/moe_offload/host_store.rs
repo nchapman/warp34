@@ -1065,6 +1065,77 @@ impl DeviceExpertSlotTable {
             label,
         )
     }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn launch_moe_w4a16_pulled_add(
+        &self,
+        ex: &warp34_kernels::ffi::Warp34Exec,
+        x_addr: u64,
+        pulled_topk_ids_addr: u64,
+        topk_weights_addr: u64,
+        active_count_addr: u64,
+        interm_buf_addr: u64,
+        out_addr: u64,
+        num_tokens: usize,
+        top_k: usize,
+    ) -> crate::cuda::Result<()> {
+        let (rc, label) = if self.layout.bits == 2 {
+            (
+                // SAFETY: all device addresses are valid for `num_tokens` and `top_k`.
+                unsafe {
+                    warp34_kernels::ffi::warp34_moe_w2a16_pulled_add_f16(
+                        ex,
+                        x_addr as *const core::ffi::c_void,
+                        self.gate_up_packed.addr() as *const u32,
+                        self.gate_up_scales.addr() as *const core::ffi::c_void,
+                        self.down_packed.addr() as *const u32,
+                        self.down_scales.addr() as *const core::ffi::c_void,
+                        pulled_topk_ids_addr as *const i32,
+                        topk_weights_addr as *const f32,
+                        active_count_addr as *const i32,
+                        interm_buf_addr as *mut core::ffi::c_void,
+                        out_addr as *mut core::ffi::c_void,
+                        num_tokens as i32,
+                        top_k as i32,
+                        self.capacity as i32,
+                        self.layout.intermediate as i32,
+                        self.layout.hidden as i32,
+                        self.layout.group_size as i32,
+                        self.layout.down_hadamard_block_size as i32,
+                    )
+                },
+                "warp34_moe_w2a16_pulled_add_f16",
+            )
+        } else {
+            (
+                // SAFETY: all device addresses are valid for `num_tokens` and `top_k`.
+                unsafe {
+                    warp34_kernels::ffi::warp34_moe_w4a16_pulled_add_f16(
+                        ex,
+                        x_addr as *const core::ffi::c_void,
+                        self.gate_up_packed.addr() as *const u32,
+                        self.gate_up_scales.addr() as *const core::ffi::c_void,
+                        self.down_packed.addr() as *const u32,
+                        self.down_scales.addr() as *const core::ffi::c_void,
+                        pulled_topk_ids_addr as *const i32,
+                        topk_weights_addr as *const f32,
+                        active_count_addr as *const i32,
+                        interm_buf_addr as *mut core::ffi::c_void,
+                        out_addr as *mut core::ffi::c_void,
+                        num_tokens as i32,
+                        top_k as i32,
+                        self.capacity as i32,
+                        self.layout.intermediate as i32,
+                        self.layout.hidden as i32,
+                        self.layout.group_size as i32,
+                        self.layout.down_hadamard_block_size as i32,
+                    )
+                },
+                "warp34_moe_w4a16_pulled_add_f16",
+            )
+        };
+        crate::cuda::check_rc(rc, label)
+    }
 }
 
 /// Per-layer VRAM hot expert cache (`K_hot` slots) with LRU eviction tracking and telemetry.

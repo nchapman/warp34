@@ -93,6 +93,7 @@ __global__ void moe_hybrid_plan_and_submit_kernel(
     uint64_t* __restrict__ step_counter,
     uint8_t* __restrict__ expert_freq,
     int32_t* __restrict__ remapped_topk_ids,
+    int32_t* __restrict__ pulled_topk_ids,
     int32_t* __restrict__ miss_local_experts,
     int32_t* __restrict__ miss_victim_slots,
     int32_t* __restrict__ num_misses_out,
@@ -266,11 +267,14 @@ __global__ void moe_hybrid_plan_and_submit_kernel(
                     }
                 }
             } else if (use_parallel_pcie_split) {
-                // Parallel CPU DDR5 (~37 GB/s) + GPU PCIe (~12.6 GB/s) cold-expert split:
-                // `(n_cold - 1) * 0.25` -> 0 for n_cold<=4, 1 for 5..8, 2 for 9..12,
-                // 3 for 13..16, 4 for >=17: balances `k*200us + moe_hot` against
-                // `(n_cold-k)*68us` so GPU PCIe pull never outruns CPU eval.
-                const int eff_cold = (n_cold > 1) ? (n_cold - 1) : 0;
+                // Parallel CPU DDR5 (~37 GB/s) + GPU PCIe (~12.6 GB/s) cold-expert split.
+                // When `pulled_topk_ids != nullptr`, `moe_hot` overlaps PCIe pull on `h2d_stream`,
+                // so GPU critical path is `max(k*200us, moe_hot) + 15us` vs CPU `(n_cold-k)*68us`
+                // -> `k = n_cold / 4` (1 for 4..7, 2 for 8..11, 3 for 12..15, 4 for >=16).
+                // When serialized (`pulled_topk_ids == nullptr`), reserve 1 miss for `moe_hot`.
+                const int eff_cold = (pulled_topk_ids != nullptr)
+                    ? n_cold
+                    : ((n_cold > 1) ? (n_cold - 1) : 0);
                 want_gpu_cold = static_cast<int>(static_cast<float>(eff_cold) * gpu_share_frac);
             } else if (gpu_share_frac <= kAvx512RooflineGpuShareThreshold) {
                 int worthy_promotes = 0;
@@ -420,7 +424,8 @@ __global__ void moe_hybrid_plan_and_submit_kernel(
     }
     __syncthreads();
 
-    // Phase 3 (parallel): write `remapped_topk_ids` and `s_cpu_le` across all `total_pairs` threads.
+    // Phase 3 (parallel): write `remapped_topk_ids`, optional `pulled_topk_ids`, and `s_cpu_le`
+    // across all `total_pairs` threads.
     if ((int)threadIdx.x < total_pairs) {
         const int p = (int)threadIdx.x;
         const int r = s_pair_remap[p];
@@ -428,14 +433,25 @@ __global__ void moe_hybrid_plan_and_submit_kernel(
             const int c_idx = -2 - r;
             const int v_slot = cold_assigned_slot[c_idx];
             if (v_slot >= 0) {
-                remapped_topk_ids[p] = v_slot;
+                if (pulled_topk_ids != nullptr) {
+                    remapped_topk_ids[p] = -1;
+                    pulled_topk_ids[p] = v_slot;
+                } else {
+                    remapped_topk_ids[p] = v_slot;
+                }
                 s_cpu_le[p] = -1;
             } else {
                 remapped_topk_ids[p] = -1;
+                if (pulled_topk_ids != nullptr) {
+                    pulled_topk_ids[p] = -1;
+                }
                 s_cpu_le[p] = distinct_cold[c_idx];
             }
         } else {
             remapped_topk_ids[p] = r;
+            if (pulled_topk_ids != nullptr) {
+                pulled_topk_ids[p] = -1;
+            }
         }
     }
     __syncthreads();
@@ -530,6 +546,7 @@ extern "C" int warp34_moe_hybrid_submit_and_pull_forked(
     uint64_t* step_counter,
     uint8_t* expert_freq,
     int32_t* remapped_topk_ids,
+    int32_t* pulled_topk_ids,
     int32_t* miss_local_experts,
     int32_t* miss_victim_slots,
     int32_t* num_misses_buf,
@@ -569,9 +586,12 @@ extern "C" int warp34_moe_hybrid_submit_and_pull_forked(
         k_static, k_hot, num_tokens, effective_gpu_share);
     const bool can_pull = (max_pull > 0 && mapped_host_packs != nullptr && effective_gpu_share > 0.0f);
     const bool use_async_fork =
-        (can_pull && pull_stream_raw != nullptr && plan_event_raw != nullptr &&
-         pull_done_event_raw != nullptr && expert_freq != nullptr &&
+        (can_pull && pulled_topk_ids == nullptr && pull_stream_raw != nullptr &&
+         plan_event_raw != nullptr && pull_done_event_raw != nullptr && expert_freq != nullptr &&
          effective_gpu_share <= warp34_moe_bridge::kAvx512RooflineGpuShareThreshold);
+    const bool use_overlapped_pull =
+        (can_pull && pulled_topk_ids != nullptr && pull_stream_raw != nullptr &&
+         plan_event_raw != nullptr && pull_done_event_raw != nullptr);
 
     if (can_pull) {
         const int pack_factor = (bits == 2) ? 16 : 8;
@@ -610,6 +630,7 @@ extern "C" int warp34_moe_hybrid_submit_and_pull_forked(
         step_counter,
         expert_freq,
         remapped_topk_ids,
+        use_overlapped_pull ? pulled_topk_ids : nullptr,
         miss_local_experts,
         miss_victim_slots,
         num_misses_buf,
@@ -628,7 +649,7 @@ extern "C" int warp34_moe_hybrid_submit_and_pull_forked(
     if (err != cudaSuccess) return (int)err;
 
     if (can_pull) {
-        if (use_async_fork) {
+        if (use_async_fork || use_overlapped_pull) {
             cudaStream_t pull_stream = (cudaStream_t)pull_stream_raw;
             cudaEvent_t plan_ev = (cudaEvent_t)plan_event_raw;
             cudaEvent_t pull_done_ev = (cudaEvent_t)pull_done_event_raw;
@@ -728,6 +749,7 @@ extern "C" int warp34_moe_hybrid_submit_and_pull(
         step_counter,
         expert_freq,
         remapped_topk_ids,
+        nullptr,
         miss_local_experts,
         miss_victim_slots,
         num_misses_buf,
