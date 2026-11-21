@@ -1173,7 +1173,7 @@ fn evaluate_into(
     let n_cpus = pool.cpus.len();
     let slices = if tokens <= MAX_DECODE_TOKENS && groups >= 2 && !jobs.is_empty() {
         let g_cap = groups.min(8);
-        if jobs.len() * g_cap <= n_cpus * 2 {
+        if jobs.len() * g_cap <= n_cpus * 4 {
             g_cap
         } else if jobs.len() < n_cpus || n_cpus <= 2 {
             2

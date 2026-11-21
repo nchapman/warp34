@@ -1876,7 +1876,7 @@ extern "C" int warp34_moe_w4a16_select_regime(
         n_interm <= 0 || k_hidden <= 0 || group_size <= 0) {
         return 0;
     }
-    constexpr int kVec4MinTokens = 4;
+    constexpr int kVec4MinTokens = 2;
     constexpr int kVec4MaxTokensDefault = 7;
     constexpr int kVec4MaxTokensWideTopK = 8;
     constexpr int kVec4WideTopKGroupSize = 64;

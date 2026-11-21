@@ -107,6 +107,10 @@ __global__ void moe_hybrid_plan_and_submit_kernel(
     int k_hot,
     float gpu_share_frac,
     int async_bg_pull) {
+    __shared__ int32_t s_ge[kMaxPairs];
+    __shared__ int32_t s_le[kMaxPairs];
+    __shared__ int32_t s_slot[kMaxPairs];
+    __shared__ int32_t s_pair_remap[kMaxPairs];
     __shared__ int32_t s_cpu_le[kMaxPairs];
     __shared__ int32_t distinct_cold[kMaxPairs];
     __shared__ int32_t distinct_ge[kMaxPairs];
@@ -117,13 +121,9 @@ __global__ void moe_hybrid_plan_and_submit_kernel(
     __shared__ int32_t cold_assigned_slot[kMaxPairs];
     __shared__ int32_t s_n_cpu_cold;
     __shared__ uint64_t s_next_step;
-    __shared__ int32_t s_n_cold;
-    __shared__ int32_t s_want_gpu_cold;
-    __shared__ int32_t s_use_tinylfu;
-    __shared__ int32_t s_best_c;
-    __shared__ uint32_t s_cand_vfreq[256];
-    __shared__ uint64_t s_cand_ts[256];
-    __shared__ int32_t s_cand_slot[256];
+    __shared__ uint32_t s_slot_vfreq[256];
+    __shared__ uint64_t s_slot_ts[256];
+    __shared__ int32_t s_slot_ge[256];
 
     const int total_pairs = num_tokens * top_k;
     if (threadIdx.x == 0) {
@@ -139,24 +139,67 @@ __global__ void moe_hybrid_plan_and_submit_kernel(
         }
         __syncthreads();
     }
+
+    // Phase 1 (parallel): issue all `total_pairs` global `global_topk_ids` + `expert_to_slot`
+    // lookups in a single memory wave instead of `O(T*k)` serial dependent loads in thread 0.
+    if ((int)threadIdx.x < total_pairs) {
+        const int p = (int)threadIdx.x;
+        const int ge = global_topk_ids[p];
+        const int64_t le64 = (int64_t)ge - global_expert_offset;
+        s_ge[p] = ge;
+        if (le64 < 0 || le64 >= local_num_experts) {
+            s_le[p] = -1;
+            s_slot[p] = -1;
+        } else {
+            const int le = (int)le64;
+            s_le[p] = le;
+            const int slot = expert_to_slot[le];
+            s_slot[p] = (slot >= 0 && slot < k_hot) ? slot : -1;
+        }
+    }
+
+    // Phase 1b (parallel): preload evictable slot metadata (`k_static..k_hot`) into shared memory
+    // so multi-victim selection (`want_gpu_cold = 1..4`) runs with zero global memory stalls.
+    const int n_evict = (k_hot > k_static) ? (k_hot - k_static) : 0;
+    const bool cached_evict_table = (n_evict > 0 && n_evict <= 256);
+    if (cached_evict_table && (int)threadIdx.x < n_evict) {
+        const int idx = (int)threadIdx.x;
+        const int s = k_static + idx;
+        const uint64_t ts = slot_last_used[s];
+        const int v_ge = slot_to_expert[s];
+        uint32_t vfreq = 0u;
+        if (expert_freq != nullptr) {
+            const int64_t v_le = (int64_t)v_ge - global_expert_offset;
+            if (v_le >= 0 && v_le < local_num_experts) {
+                vfreq = (uint32_t)expert_freq[v_le];
+                if (ts + 32ULL < next_step) {
+                    vfreq >>= 1;
+                }
+            }
+        }
+        s_slot_ts[idx] = ts;
+        s_slot_ge[idx] = v_ge;
+        s_slot_vfreq[idx] = vfreq;
+    }
+    __syncthreads();
+
     if (threadIdx.x == 0) {
         const uint64_t step = next_step;
-
         int n_cold = 0;
 
         for (int p = 0; p < total_pairs; ++p) {
-            const int ge = global_topk_ids[p];
-            const int64_t le64 = (int64_t)ge - global_expert_offset;
-            if (le64 < 0 || le64 >= local_num_experts) {
-                remapped_topk_ids[p] = -1;
+            const int le = s_le[p];
+            if (le < 0) {
+                s_pair_remap[p] = -1;
                 s_cpu_le[p] = -1;
                 continue;
             }
-            const int le = (int)le64;
-            const int slot = expert_to_slot[le];
-            if (slot >= 0 && slot < k_hot) {
-                remapped_topk_ids[p] = slot;
-                const uint64_t prev_ts = slot_last_used[slot];
+            const int slot = s_slot[p];
+            if (slot >= 0) {
+                s_pair_remap[p] = slot;
+                const uint64_t prev_ts = (cached_evict_table && slot >= k_static)
+                    ? s_slot_ts[slot - k_static]
+                    : slot_last_used[slot];
                 if (expert_freq != nullptr && prev_ts != step) {
                     const int inc = (p < top_k) ? 2 : 1;
                     const int nf = (int)expert_freq[le] + inc;
@@ -164,6 +207,9 @@ __global__ void moe_hybrid_plan_and_submit_kernel(
                 }
                 if (slot >= k_static || expert_freq != nullptr) {
                     slot_last_used[slot] = step;
+                    if (cached_evict_table && slot >= k_static) {
+                        s_slot_ts[slot - k_static] = step;
+                    }
                 }
                 s_cpu_le[p] = -1;
             } else {
@@ -171,7 +217,7 @@ __global__ void moe_hybrid_plan_and_submit_kernel(
                 while (c_idx < n_cold && distinct_cold[c_idx] != le) ++c_idx;
                 if (c_idx == n_cold) {
                     distinct_cold[n_cold] = le;
-                    distinct_ge[n_cold] = ge;
+                    distinct_ge[n_cold] = s_ge[p];
                     cold_hits[n_cold] = 0;
                     cold_score[n_cold] = 0;
                     cold_anchor[n_cold] = 0;
@@ -183,7 +229,7 @@ __global__ void moe_hybrid_plan_and_submit_kernel(
                     cold_anchor[c_idx] = 1;
                 }
                 // Temporarily store `-2 - c_idx` to mark the cold rank `c_idx`.
-                remapped_topk_ids[p] = -2 - c_idx;
+                s_pair_remap[p] = -2 - c_idx;
             }
         }
 
@@ -207,6 +253,8 @@ __global__ void moe_hybrid_plan_and_submit_kernel(
         const bool use_tinylfu =
             (gpu_share_frac > 0.0f && gpu_share_frac <= kAvx512RooflineGpuShareThreshold &&
              expert_freq != nullptr);
+        const bool use_parallel_pcie_split =
+            (gpu_share_frac >= 0.20f && gpu_share_frac <= 0.35f && expert_freq != nullptr);
         if (max_pull > 0 && gpu_share_frac > 0.0f) {
             if (use_tinylfu) {
                 if (n_cold >= 3) {
@@ -217,6 +265,12 @@ __global__ void moe_hybrid_plan_and_submit_kernel(
                         }
                     }
                 }
+            } else if (use_parallel_pcie_split) {
+                // Parallel CPU DDR5 (~37 GB/s) + GPU PCIe (~13.4 GB/s) cold-expert split:
+                // `(n_cold + 1) * 0.25` -> 0 for n_cold<=2, 1 for 3..6, 2 for 7..10,
+                // 3 for 11..14, 4 for >=15: matches 12.6 GB/s PCIe (~200 us/exp) against
+                // ~37 GB/s CPU (~68 us/exp) across both small-miss and high-miss regimes.
+                want_gpu_cold = static_cast<int>(static_cast<float>(n_cold + 1) * gpu_share_frac);
             } else if (gpu_share_frac <= kAvx512RooflineGpuShareThreshold) {
                 int worthy_promotes = 0;
                 for (int c = 0; c < n_cold; ++c) {
@@ -256,147 +310,47 @@ __global__ void moe_hybrid_plan_and_submit_kernel(
             cold_assigned_slot[c] = -1;
         }
 
-        s_n_cold = n_cold;
-        s_want_gpu_cold = want_gpu_cold;
-        s_use_tinylfu = use_tinylfu ? 1 : 0;
-        int fast_best_c = -1;
-        if (want_gpu_cold == 1) {
+        int n_gpu_cold = 0;
+        const bool freq_ranked_victims = (use_tinylfu || use_parallel_pcie_split);
+        for (int m = 0; m < want_gpu_cold; ++m) {
+            int best_c = -1;
             int best_rank = -1;
             for (int c = 0; c < n_cold; ++c) {
+                if (cold_assigned_slot[c] != -1) continue;
                 if (use_tinylfu && cold_freq[c] < 3 && cold_score[c] < 5) continue;
-                const int rank = use_tinylfu ? (cold_freq[c] * 8 + cold_score[c]) : cold_score[c];
+                const int rank = use_parallel_pcie_split
+                    ? (cold_hits[c] * 16 + cold_freq[c] * 4 + (int)cold_anchor[c] * 2)
+                    : (use_tinylfu ? (cold_freq[c] * 8 + cold_score[c]) : cold_score[c]);
                 if (rank > best_rank) {
                     best_rank = rank;
-                    fast_best_c = c;
+                    best_c = c;
                 }
             }
-        }
-        s_best_c = fast_best_c;
-    }
-    __syncthreads();
+            if (best_c < 0) break;
 
-    // Parallelize the `s = k_static..k_hot` victim scan across all 256 threads in the CTA
-    // when selecting a single victim (`want_gpu_cold == 1`, the AVX-512 TinyLFU hot path),
-    // eliminating the ~30 us single-threaded slot scan per layer (~1.4 ms/round across 48L).
-    if (s_want_gpu_cold == 1 && s_best_c >= 0) {
-        const uint64_t step = next_step;
-        const bool use_tinylfu = (s_use_tinylfu != 0);
-        uint32_t my_vfreq = 0xffffu;
-        uint64_t my_ts = step;
-        int32_t my_slot = -1;
-        for (int s = k_static + (int)threadIdx.x; s < k_hot; s += (int)blockDim.x) {
-            const uint64_t ts = slot_last_used[s];
-            if (ts >= step) continue;
-            uint32_t vfreq = 0u;
-            if (use_tinylfu) {
-                const int v_ge = slot_to_expert[s];
-                const int64_t v_le = (int64_t)v_ge - global_expert_offset;
-                if (v_le >= 0 && v_le < local_num_experts) {
-                    vfreq = (uint32_t)expert_freq[v_le];
-                    if (ts + 32ULL < step) {
-                        vfreq >>= 1;
+            uint64_t best_ts = step;
+            uint32_t best_vfreq = 0xffffu;
+            int victim_slot = -1;
+            int victim_old_ge = -1;
+            if (cached_evict_table) {
+                for (int idx = 0; idx < n_evict; ++idx) {
+                    const uint64_t ts = s_slot_ts[idx];
+                    if (ts >= step) continue;
+                    const uint32_t vfreq = freq_ranked_victims ? s_slot_vfreq[idx] : 0u;
+                    if (vfreq < best_vfreq || (vfreq == best_vfreq && ts < best_ts)) {
+                        best_vfreq = vfreq;
+                        best_ts = ts;
+                        victim_slot = k_static + idx;
+                        victim_old_ge = s_slot_ge[idx];
                     }
                 }
-            }
-            if (my_slot < 0 || vfreq < my_vfreq ||
-                (vfreq == my_vfreq && (ts < my_ts || (ts == my_ts && s < my_slot)))) {
-                my_vfreq = vfreq;
-                my_ts = ts;
-                my_slot = s;
-            }
-        }
-        s_cand_vfreq[threadIdx.x] = my_vfreq;
-        s_cand_ts[threadIdx.x] = my_ts;
-        s_cand_slot[threadIdx.x] = my_slot;
-        __syncthreads();
-        for (int stride = 128; stride > 0; stride >>= 1) {
-            if ((int)threadIdx.x < stride) {
-                const int o = (int)threadIdx.x + stride;
-                const int32_t os = s_cand_slot[o];
-                if (os >= 0) {
-                    const int32_t ms = s_cand_slot[threadIdx.x];
-                    const uint32_t ov = s_cand_vfreq[o];
-                    const uint64_t ot = s_cand_ts[o];
-                    const uint32_t mv = s_cand_vfreq[threadIdx.x];
-                    const uint64_t mt = s_cand_ts[threadIdx.x];
-                    if (ms < 0 || ov < mv ||
-                        (ov == mv && (ot < mt || (ot == mt && os < ms)))) {
-                        s_cand_vfreq[threadIdx.x] = ov;
-                        s_cand_ts[threadIdx.x] = ot;
-                        s_cand_slot[threadIdx.x] = os;
-                    }
-                }
-            }
-            __syncthreads();
-        }
-    }
-
-    if (threadIdx.x == 0) {
-        const uint64_t step = next_step;
-        const int n_cold = s_n_cold;
-        const int want_gpu_cold = s_want_gpu_cold;
-        const bool use_tinylfu = (s_use_tinylfu != 0);
-
-        int n_gpu_cold = 0;
-        if (want_gpu_cold == 1) {
-            const int best_c = s_best_c;
-            const int victim_slot = (best_c >= 0) ? s_cand_slot[0] : -1;
-            if (best_c >= 0 && victim_slot >= 0) {
-                const uint32_t best_vfreq = s_cand_vfreq[0];
-                const uint64_t best_ts = s_cand_ts[0];
-                const uint32_t hyst = (best_ts + 32ULL < step) ? 1u : 2u;
-                const uint32_t cand_eff = (cold_score[best_c] >= 5 && cold_freq[best_c] < 3)
-                    ? 3u
-                    : (uint32_t)cold_freq[best_c];
-                if (!use_tinylfu || cand_eff >= best_vfreq + hyst) {
-                    const int le = distinct_cold[best_c];
-                    const int ge = distinct_ge[best_c];
-                    const int old_ge = slot_to_expert[victim_slot];
-                    const int64_t old_le = (int64_t)old_ge - global_expert_offset;
-                    if (old_le >= 0 && old_le < local_num_experts) {
-                        expert_to_slot[old_le] = -1;
-                    }
-                    expert_to_slot[le] = victim_slot;
-                    slot_to_expert[victim_slot] = ge;
-                    slot_last_used[victim_slot] = step;
-                    if (use_tinylfu) {
-                        const uint32_t min_prom_freq =
-                            (best_vfreq + 2u < 255u) ? (best_vfreq + 2u) : 255u;
-                        if ((uint32_t)expert_freq[le] < min_prom_freq) {
-                            expert_freq[le] = (uint8_t)min_prom_freq;
-                        }
-                    }
-                    cold_assigned_slot[best_c] = async_bg_pull ? -2 : victim_slot;
-                    miss_local_experts[0] = le;
-                    miss_victim_slots[0] = victim_slot;
-                    n_gpu_cold = 1;
-                }
-            }
-        } else {
-            for (int m = 0; m < want_gpu_cold; ++m) {
-                int best_c = -1;
-                int best_rank = -1;
-                for (int c = 0; c < n_cold; ++c) {
-                    if (cold_assigned_slot[c] != -1) continue;
-                    if (use_tinylfu && cold_freq[c] < 2 && cold_score[c] < 5) continue;
-                    const int rank =
-                        use_tinylfu ? (cold_freq[c] * 8 + cold_score[c]) : cold_score[c];
-                    if (rank > best_rank) {
-                        best_rank = rank;
-                        best_c = c;
-                    }
-                }
-                if (best_c < 0) break;
-
-                uint64_t best_ts = step;
-                uint32_t best_vfreq = 0xffffu;
-                int victim_slot = -1;
+            } else {
                 for (int s = k_static; s < k_hot; ++s) {
                     const uint64_t ts = slot_last_used[s];
                     if (ts >= step) continue;
                     uint32_t vfreq = 0u;
-                    if (use_tinylfu) {
-                        const int v_ge = slot_to_expert[s];
+                    const int v_ge = slot_to_expert[s];
+                    if (freq_ranked_victims) {
                         const int64_t v_le = (int64_t)v_ge - global_expert_offset;
                         if (v_le >= 0 && v_le < local_num_experts) {
                             vfreq = (uint32_t)expert_freq[v_le];
@@ -409,58 +363,50 @@ __global__ void moe_hybrid_plan_and_submit_kernel(
                         best_vfreq = vfreq;
                         best_ts = ts;
                         victim_slot = s;
+                        victim_old_ge = v_ge;
                     }
                 }
-                if (victim_slot < 0) break;
-                const uint32_t hyst = (best_ts + 32ULL < step) ? 2u : 3u;
+            }
+            if (victim_slot < 0) break;
+            if (use_tinylfu) {
+                const uint32_t hyst = (best_ts + 32ULL < step) ? 1u : 2u;
                 const uint32_t cand_eff = (cold_score[best_c] >= 5 && cold_freq[best_c] < 3)
                     ? 3u
                     : (uint32_t)cold_freq[best_c];
-                if (use_tinylfu && cand_eff < best_vfreq + hyst) break;
-
-                const int le = distinct_cold[best_c];
-                const int ge = distinct_ge[best_c];
-                const int old_ge = slot_to_expert[victim_slot];
-                const int64_t old_le = (int64_t)old_ge - global_expert_offset;
-                if (old_le >= 0 && old_le < local_num_experts) {
-                    expert_to_slot[old_le] = -1;
-                }
-                expert_to_slot[le] = victim_slot;
-                slot_to_expert[victim_slot] = ge;
-                slot_last_used[victim_slot] = step;
-                if (use_tinylfu) {
-                    const uint32_t min_prom_freq =
-                        (best_vfreq + 2u < 255u) ? (best_vfreq + 2u) : 255u;
-                    if ((uint32_t)expert_freq[le] < min_prom_freq) {
-                        expert_freq[le] = (uint8_t)min_prom_freq;
-                    }
-                }
-                cold_assigned_slot[best_c] = async_bg_pull ? -2 : victim_slot;
-                miss_local_experts[n_gpu_cold] = le;
-                miss_victim_slots[n_gpu_cold] = victim_slot;
-                n_gpu_cold++;
+                if (cand_eff < best_vfreq + hyst) break;
             }
+
+            const int le = distinct_cold[best_c];
+            const int ge = distinct_ge[best_c];
+            const int64_t old_le = (int64_t)victim_old_ge - global_expert_offset;
+            if (old_le >= 0 && old_le < local_num_experts) {
+                expert_to_slot[old_le] = -1;
+            }
+            expert_to_slot[le] = victim_slot;
+            slot_to_expert[victim_slot] = ge;
+            slot_last_used[victim_slot] = step;
+            if (cached_evict_table) {
+                const int idx = victim_slot - k_static;
+                s_slot_ts[idx] = step;
+                s_slot_ge[idx] = ge;
+            }
+            if (freq_ranked_victims) {
+                const uint32_t min_prom_freq =
+                    (best_vfreq + 2u < 255u) ? (best_vfreq + 2u) : 255u;
+                if ((uint32_t)expert_freq[le] < min_prom_freq) {
+                    expert_freq[le] = (uint8_t)min_prom_freq;
+                }
+            }
+            cold_assigned_slot[best_c] = async_bg_pull ? -2 : victim_slot;
+            miss_local_experts[n_gpu_cold] = le;
+            miss_victim_slots[n_gpu_cold] = victim_slot;
+            n_gpu_cold++;
         }
 
         const int n_cpu_cold = async_bg_pull ? n_cold : (n_cold - n_gpu_cold);
         num_misses_out[0] = n_gpu_cold;
         num_misses_out[1] = n_cpu_cold;
         s_n_cpu_cold = n_cpu_cold;
-
-        for (int p = 0; p < total_pairs; ++p) {
-            const int r = remapped_topk_ids[p];
-            if (r <= -2) {
-                const int c_idx = -2 - r;
-                const int v_slot = cold_assigned_slot[c_idx];
-                if (v_slot >= 0) {
-                    remapped_topk_ids[p] = v_slot;
-                    s_cpu_le[p] = -1;
-                } else {
-                    remapped_topk_ids[p] = -1;
-                    s_cpu_le[p] = distinct_cold[c_idx];
-                }
-            }
-        }
 
         if (n_cpu_cold > 0) {
             req_slot->num_tokens = num_tokens;
@@ -469,6 +415,26 @@ __global__ void moe_hybrid_plan_and_submit_kernel(
             req_slot->hidden = hidden;
             req_slot->intermediate = intermediate;
             req_slot->local_num_experts = local_num_experts;
+        }
+    }
+    __syncthreads();
+
+    // Phase 3 (parallel): write `remapped_topk_ids` and `s_cpu_le` across all `total_pairs` threads.
+    if ((int)threadIdx.x < total_pairs) {
+        const int p = (int)threadIdx.x;
+        const int r = s_pair_remap[p];
+        if (r <= -2) {
+            const int c_idx = -2 - r;
+            const int v_slot = cold_assigned_slot[c_idx];
+            if (v_slot >= 0) {
+                remapped_topk_ids[p] = v_slot;
+                s_cpu_le[p] = -1;
+            } else {
+                remapped_topk_ids[p] = -1;
+                s_cpu_le[p] = distinct_cold[c_idx];
+            }
+        } else {
+            remapped_topk_ids[p] = r;
         }
     }
     __syncthreads();

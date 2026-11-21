@@ -53,14 +53,12 @@ fn sparse_moe_parity_and_partition() {
         expected_regime: 0,
         check_tp2_partition: true,
     };
-    for m in [1, 2, 3] {
-        check_sparse(SparseShape {
-            num_tokens: m,
-            expected_regime: 0,
-            ..base
-        });
-    }
-    for m in [4, 7] {
+    check_sparse(SparseShape {
+        num_tokens: 1,
+        expected_regime: 0,
+        ..base
+    });
+    for m in [2, 3, 4, 7] {
         check_sparse(SparseShape {
             num_tokens: m,
             expected_regime: 1,

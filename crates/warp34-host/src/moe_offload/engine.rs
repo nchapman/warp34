@@ -141,7 +141,7 @@ impl TieredMoeEngine {
             let resp_ptr = mailbox.response_ptr();
             let gpu_share = if cache.k_static < k_hot && store.mapped_dev_ptr() != 0 {
                 if crate::moe_cpu_bridge::has_avx512() && k_hot >= 64 {
-                    0.08f32
+                    0.25f32
                 } else if crate::moe_cpu_bridge::has_avx512() || (num_tokens == 1 && k_hot >= 64) {
                     TIERED_MOE_CPU_BRIDGE_COLD_WEIGHT_THRESHOLD
                 } else {
@@ -150,10 +150,7 @@ impl TieredMoeEngine {
             } else {
                 0.0f32
             };
-            let use_forked_pull = cache.k_static < k_hot
-                && store.mapped_dev_ptr() != 0
-                && crate::moe_cpu_bridge::has_avx512()
-                && k_hot >= 64;
+            let use_forked_pull = false;
             crate::cuda::check_rc(
                 // SAFETY: device pointers and capacities are owned and validated by `cache` and `ws`.
                 unsafe {
