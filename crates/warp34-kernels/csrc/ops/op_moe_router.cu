@@ -1058,7 +1058,8 @@ extern "C" int warp34_moe_pull_mapped_experts_with_count(
     const int grid_y = (max_staged < cap_y) ? max_staged : cap_y;
     int grid_x = (2 * sm_count + grid_y - 1) / grid_y;
     if (grid_x < 8) grid_x = 8;
-    if (grid_x > 64) grid_x = 64;
+    const int max_grid_x = (max_staged == 1 && num_staged_buf != nullptr) ? 24 : 64;
+    if (grid_x > max_grid_x) grid_x = max_grid_x;
     dim3 grid((unsigned)grid_x, (unsigned)grid_y);
     warp34_moe::moe_pull_mapped_experts_kernel<<<grid, 256, 0, (cudaStream_t)ex->stream>>>(
         static_cast<const uint8_t*>(mapped_host_packs),

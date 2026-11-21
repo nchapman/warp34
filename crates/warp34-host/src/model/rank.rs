@@ -671,7 +671,28 @@ impl Qwen3_5ModelRank {
                 || name.contains(".out_proj.")
                 || name.contains(".down_proj.");
             let raw_gpu_bytes = match info.dtype.as_str() {
-                "F16" | "BF16" => info.num_elems().saturating_mul(2),
+                "F16" | "BF16" => {
+                    // Online-quantize untied `lm_head.weight` (`N = 248320`) to `MarlinW8A16`
+                    // while keeping hyper-connection spine matrices in exact `DenseF16`.
+                    let online_u8 = cfg.uses_tiered_moe()
+                        && cfg.vocab_size >= 65_536
+                        && !matches!(cfg.quant, QuantScheme::Unquantized)
+                        && info.shape.len() == 2
+                        && !cfg.tie_word_embeddings
+                        && (name == "lm_head.weight" || name.ends_with(".lm_head.weight"))
+                        && (info.shape[1].is_multiple_of(64) || info.shape[1].is_multiple_of(128));
+                    if online_u8 {
+                        let gs = if info.shape[1].is_multiple_of(64) {
+                            64
+                        } else {
+                            128
+                        };
+                        info.num_elems()
+                            .saturating_add((info.num_elems() / gs).saturating_mul(2))
+                    } else {
+                        info.num_elems().saturating_mul(2)
+                    }
+                }
                 "F32" => {
                     if name.ends_with(".A_log") {
                         info.num_elems().saturating_mul(4)
@@ -1246,7 +1267,7 @@ impl Qwen3_5ModelRank {
             requested_kv_pages,
             capacity.lora_reserve,
         );
-        if cfg.uses_tiered_moe() && free_vram < TIERED_MOE_COMPACT_VRAM_THRESHOLD_BYTES {
+        if should_use_compact_tiered_moe_scratch(cfg, tp_size, free_vram, capacity.lora_reserve) {
             scratch_bytes = crate::scheduler::DEFAULT_SCRATCH_ARENA_BYTES;
         }
         let pages = requested_kv_pages.unwrap_or(DEFAULT_TARGET_KV_PAGES);
@@ -1426,7 +1447,7 @@ impl Qwen3_5ModelRank {
                 size_k: cfg.hidden_size,
             })
         } else if has_untied_lm_head {
-            let sharded = RawLinearHost::load_row_shard(
+            let mut sharded = RawLinearHost::load_row_shard(
                 archive,
                 "lm_head",
                 &cfg.quant,
@@ -1439,6 +1460,12 @@ impl Qwen3_5ModelRank {
                     sharded.dims(),
                     cfg.hidden_size
                 )));
+            }
+            if cfg.uses_tiered_moe()
+                && cfg.vocab_size >= 65_536
+                && !matches!(cfg.quant, QuantScheme::Unquantized)
+            {
+                sharded = sharded.into_u8b128_if_dense();
             }
             Some(sharded.upload_pipelined(&mut weight_arena, &stream, &mut upload_ring)?)
         } else {

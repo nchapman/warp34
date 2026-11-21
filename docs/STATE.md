@@ -1,5 +1,19 @@
 # warp34 — Session Orientation & Current State
 
+## `TP=1` Fair 4-bit `W4A16-HGPTQ` `DFlash2` + Tiered-MoE & QSA Optimizations (`1× RTX 3090 Ti`)
+
+- **Targeted `TP=1` `Qwen3.8-Flash-Next` (`48×512`) VRAM, CPU-Bridge, `DFlash2`, & QSA Improvements:**
+  1. **Uneven per-layer `k_hot` + `d_expert_freq` D2H sync & prefill promotion (`crates/warp34-host/src/moe_offload.rs`, `moe_offload/{engine,host_store}.rs`):** Wired `HotExpertRankings::plan_layer_capacities` from `runtime/expert_routing_profile.json` (`96..160`, mean `128`), fixed `sync_all_dirty_from_device` `d_expert_freq` D2H + `k_static <= 1` check, selected Chunk-0 `StreamedPrefill` promotions before CPU/GPU split, lifted multi-chunk AVX-512 CPU share (`70%`, `256` tok/job), and softened boot `expert_freq` / `step_clock = k_hot + 40`.
+  2. **VRAM reclamation & `DFlash2` zero-copy codebooks (`crates/warp34-host/src/{dflash.rs,dflash_tests.rs,scheduler.rs,cuda/warmup.rs,model/rank_capacity.rs}`, `crates/warp34-kernels/csrc/ops/op_dflash2.cu`):** Moved `DFlash2` `predecessor_codebook`/`successor_codebook` into zero-copy `MappedHostBuffer` (`-242.5 MiB` VRAM, 0-ULP BF16), replaced `DFlash2` `cos`/`sin` tables with on-the-fly FP32 `sincosf` `inv_freq` RoPE (`warp34_dflash_qk_norm_rope_kv_write_bf16_inv_freq`, `-64 MiB` VRAM), sized `TIERED_MOE_SCRATCH_ARENA_BYTES = 880 MiB` (`cpu_bridge_tp1` `dflash_meta_reserve = 512 MiB`, `12` GDN slots + `248 MiB` free VRAM), enabled `TP=1` chain-product `DFlash2` gate (`cum_conf >= 0.70`, `0..=7` drafts, `80.0%` accept rate), and fixed `proposer.rs` speculative state-slot cleanup after grammar truncation.
+  3. **CUDA kernel wins (`crates/warp34-kernels/csrc/ops/{op_moe_cpu_bridge.cu,op_qsa.cu}`):** Parallelized the `k_static..k_hot` victim scan across all 256 threads in `moe_hybrid_plan_and_submit_kernel`, overlapped `moe_hybrid_wait_and_add_kernel` with `pull_done_event` on the forked `async_bg_pull` path, and replaced warp-divergent `__constant__` `kTq4D256Centroids` lookups, `expf`, and integer `/` `%` in `qsa_sparse_paged_attn_gqa_f16_kernel` with `__shfl_sync`, `__expf`, and power-of-2 bitshift/mask (`-371 ms` TTFT on `5,964`-tok `code-context-r64`).
+- **Verified 3-rep OOTB 1-GPU (`1× RTX 3090 Ti`, `TP=1`, `131K` auto-fit `TQ4` KV, zero manual flags) vs `Strata v0.2.17` (`3142b66`):**
+  - `short-chat`: **`67.70 tok/s`** e2e (`77.47` decode, `469–481 ms` TTFT vs Strata `587 ms`, e2e `81.16`; up `+6.5%` from `63.59` baseline).
+  - `prefill-context-r16`: **`27.15 tok/s`** e2e (**`+14.9%` faster than Strata `23.62`**, `1,411 ms` TTFT vs Strata `2,073 ms` `-32%`).
+  - `code-context-r64`: **`27.72 tok/s`** e2e (`4,894 ms` TTFT, down **`-613 ms`** from `5,506 ms` baseline vs Strata `4,128 ms` / `37.94 tok/s`).
+  - `prefix-primed-r16`: **`43.26 tok/s`** e2e (**`+18.8%` faster than Strata `36.41`**, `577 ms` TTFT vs Strata `1,127 ms` `-49%`).
+  - `coding-agent-replay`: **`52.92 tok/s`** e2e (up **`+9.3%`** from `48.44` baseline, `445 ms` TTFT vs Strata `623 ms` `-29%`, Strata `61.59`).
+  - **Gates:** `mise run check-quick` PASS (`fmt-check`, `clippy` cuda & cpu, `doc-check`, `simd-check`, `cuda-bin-check`, `dashboard-build`), unit tests (`dflash` `15/15`, `moe_offload` `9/9`, `model::tests` `26/26`, `qsa` `2/2`, `proposer` PASS), and `review` findings resolved.
+
 ## Fair 4-bit Tiered-MoE + `DFlash2` Optimizations & Specialized Engine Head-to-Head (`1–2× RTX 3090 Ti`)
 
 - **Targeted optimizations on fair 4-bit `W4A16-HGPTQ` (`Qwen3.8-Flash-Next`) + `TP=1` `DFlash2` auto-planner & memo fixes:**

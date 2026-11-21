@@ -504,6 +504,84 @@ pub fn dequant_u8b128_n_major_to_f16(
     out
 }
 
+/// Quantizes an N-major `[N, K]` `FP16` matrix into symmetric `U8B128` (`[N, K/4]` `u32` words
+/// with `+128` zero-point bias + `[N, K/group_size]` `FP16` per-group scales).
+pub fn quantize_f16_n_major_to_u8b128(
+    weight_f16: &[u16],
+    size_n: usize,
+    size_k: usize,
+    group_size: usize,
+) -> (Vec<u32>, Vec<u16>) {
+    let eff_gs = if group_size == 0 { size_k } else { group_size };
+    assert!(
+        size_k >= 4
+            && size_k.is_multiple_of(4)
+            && size_k.is_multiple_of(eff_gs)
+            && eff_gs.is_multiple_of(4)
+    );
+    assert_eq!(weight_f16.len(), size_n * size_k);
+    let words_per_row = size_k / 4;
+    let groups_per_row = size_k / eff_gs;
+    let words_per_group = eff_gs / 4;
+    let mut packed = vec![0u32; size_n * words_per_row];
+    let mut scales = vec![0u16; size_n * groups_per_row];
+
+    let quant_rows = |src_rows: &[u16], dst_words: &mut [u32], dst_scales: &mut [u16]| {
+        for ((src_row, row_words), row_scales) in src_rows
+            .chunks_exact(size_k)
+            .zip(dst_words.chunks_exact_mut(words_per_row))
+            .zip(dst_scales.chunks_exact_mut(groups_per_row))
+        {
+            for g in 0..groups_per_row {
+                let g_src = &src_row[g * eff_gs..(g + 1) * eff_gs];
+                let mut max_abs = 0.0f32;
+                for &bits in g_src {
+                    let v = f16_to_f32(bits).abs();
+                    if v > max_abs {
+                        max_abs = v;
+                    }
+                }
+                let sc_bits = f32_to_f16(max_abs / 127.0);
+                row_scales[g] = sc_bits;
+                let sc = f16_to_f32(sc_bits);
+                let inv = if sc > 0.0 && sc.is_finite() {
+                    1.0 / sc
+                } else {
+                    0.0
+                };
+                let g_words = &mut row_words[g * words_per_group..(g + 1) * words_per_group];
+                for (w_idx, slot) in g_words.iter_mut().enumerate() {
+                    let base = w_idx * 4;
+                    let mut bytes = [128u8; 4];
+                    for b in 0..4 {
+                        let w = f16_to_f32(g_src[base + b]);
+                        let q = (w * inv).round_ties_even() as i32 + 128;
+                        bytes[b] = q.clamp(0, 255) as u8;
+                    }
+                    *slot = u32::from_le_bytes(bytes);
+                }
+            }
+        }
+    };
+
+    if size_n * size_k < 1_048_576 || size_n < 16 {
+        quant_rows(weight_f16, &mut packed, &mut scales);
+    } else {
+        let num_threads = std::thread::available_parallelism().map_or(4, |n| n.get().clamp(1, 16));
+        let rows_per_chunk = size_n.div_ceil(num_threads).max(1);
+        std::thread::scope(|s| {
+            for ((src_chunk, words_chunk), scales_chunk) in weight_f16
+                .chunks(rows_per_chunk * size_k)
+                .zip(packed.chunks_mut(rows_per_chunk * words_per_row))
+                .zip(scales.chunks_mut(rows_per_chunk * groups_per_row))
+            {
+                s.spawn(move || quant_rows(src_chunk, words_chunk, scales_chunk));
+            }
+        });
+    }
+    (packed, scales)
+}
+
 /// Validates that an optional GPTQ `.g_idx` tensor represents static sequential group assignment
 /// (`g_idx[k] == k / group_size`, or all `0` for channelwise) rather than an unapplied `desc_act`
 /// channel permutation.

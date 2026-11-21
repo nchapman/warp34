@@ -55,6 +55,17 @@ pub(crate) fn has_avx512() -> bool {
     }
 }
 
+pub(crate) fn has_vnni() -> bool {
+    #[cfg(target_arch = "x86_64")]
+    {
+        has_avx512() && std::is_x86_feature_detected!("avx512vnni")
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        false
+    }
+}
+
 fn prepare_x_perm_portable(x: &[f32], xp: &mut [f32], xg: &mut [f32]) -> Result<(), EvalError> {
     if !x.len().is_multiple_of(128) || xp.len() < x.len() || xg.len() < x.len() / 128 {
         return Err(EvalError::InvalidShape);
@@ -540,7 +551,7 @@ pub(super) fn eval_expert_slice(
                 weights,
                 out,
                 scratch,
-                weights.len() == 1,
+                weights.len() <= 2,
             );
         }
         return Ok(());
@@ -560,7 +571,7 @@ pub(super) fn eval_expert_prefill(
     scratch: &mut [f32],
 ) -> Result<(), EvalError> {
     let groups = 0..d.intermediate / 128;
-    validate(d, &groups, [xp, xg], weights, out, scratch, 96)?;
+    validate(d, &groups, [xp, xg], weights, out, scratch, 512)?;
     #[cfg(target_arch = "x86_64")]
     if supported() {
         // SAFETY: runtime ISA guard and all sizes/ranges checked above.
@@ -571,6 +582,122 @@ pub(super) fn eval_expert_prefill(
     }
     expert_portable(d, groups, xp, xg, weights, out, scratch);
     Ok(())
+}
+
+/// Quantize `x` (`f32`, multiple of 128) into VNNI `Q8_g64` `[x_even(64B), x_odd(64B)]` blocks
+/// stored in `xq_words` (`x.len() / 4` `f32` words = `x.len()` bytes) and `[xs_lo, xs_hi, xb_lo, xb_hi]`
+/// metadata stored in `xmeta` (`(x.len() / 128) * 4` floats).
+#[cfg_attr(not(test), allow(dead_code))]
+pub(super) fn prepare_x_vnni_f32(
+    x: &[f32],
+    xq_words: &mut [f32],
+    xmeta: &mut [f32],
+) -> Result<(), EvalError> {
+    if !x.len().is_multiple_of(128)
+        || xq_words.len() < x.len() / 4
+        || xmeta.len() < (x.len() / 128) * 4
+    {
+        return Err(EvalError::InvalidShape);
+    }
+    #[cfg(target_arch = "x86_64")]
+    if has_vnni() {
+        // SAFETY: `has_vnni()` verified AVX-512F/BW/VL/VNNI + F16C, and slice bounds are checked above.
+        unsafe {
+            simd::prepare_x_q8_f32_vnni(x, xq_words.as_mut_ptr().cast::<u8>(), xmeta);
+        }
+        return Ok(());
+    }
+    Err(EvalError::InvalidLayout)
+}
+
+/// Quantize FP16 `x` (`u16`, multiple of 128) directly into VNNI `Q8_g64` blocks.
+pub(super) fn prepare_x_vnni_f16(
+    x: &[u16],
+    xq_words: &mut [f32],
+    xmeta: &mut [f32],
+) -> Result<(), EvalError> {
+    if !x.len().is_multiple_of(128)
+        || xq_words.len() < x.len() / 4
+        || xmeta.len() < (x.len() / 128) * 4
+    {
+        return Err(EvalError::InvalidShape);
+    }
+    #[cfg(target_arch = "x86_64")]
+    if has_vnni() {
+        // SAFETY: `has_vnni()` verified AVX-512F/BW/VL/VNNI + F16C, and slice bounds are checked above.
+        unsafe {
+            simd::prepare_x_q8_f16_vnni(x, xq_words.as_mut_ptr().cast::<u8>(), xmeta);
+        }
+        return Ok(());
+    }
+    Err(EvalError::InvalidLayout)
+}
+
+/// Evaluate 4-bit expert slice (`1..=8` tokens) or prefill (`1..=512` tokens) using `AVX-512 VNNI` (`vpdpbusd`).
+#[allow(clippy::too_many_arguments)]
+pub(super) fn eval_expert_vnni_u4(
+    d: ExpertLayout<'_>,
+    groups: Range<usize>,
+    xq_words: &[f32],
+    xmeta: &[f32],
+    weights: &[f32],
+    out: &mut [f32],
+    scratch: &mut [f32],
+    max_tokens: usize,
+) -> Result<(), EvalError> {
+    let h = d.hidden;
+    let i = d.intermediate;
+    let gs = d.group_size;
+    if d.bits != 4
+        || h == 0
+        || i == 0
+        || !h.is_multiple_of(128)
+        || !i.is_multiple_of(128)
+        || !matches!(gs, 64 | 128)
+        || !matches!(d.down_hadamard, 0 | 64)
+    {
+        return Err(EvalError::InvalidLayout);
+    }
+    let words_per_group = gs / 8;
+    let gu = i
+        .checked_mul(2)
+        .and_then(|v| v.checked_mul(h / 8))
+        .ok_or(EvalError::InvalidLayout)?;
+    let dn = h.checked_mul(i / 8).ok_or(EvalError::InvalidLayout)?;
+    if d.gate_up_words.len() < gu
+        || d.gate_up_scales.len() < gu / words_per_group
+        || d.down_words.len() < dn
+        || d.down_scales.len() < dn / words_per_group
+    {
+        return Err(EvalError::InvalidLayout);
+    }
+    let t = weights.len();
+    if t == 0 || t > max_tokens || groups.start >= groups.end || groups.end > i / 128 {
+        return Err(EvalError::InvalidShape);
+    }
+    let nh = t.checked_mul(h).ok_or(EvalError::InvalidShape)?;
+    let ns = scratch_len(t, groups.end - groups.start).ok_or(EvalError::InvalidShape)?;
+    if xq_words.len() < nh / 4 || xmeta.len() < t * (h / 32) || out.len() < nh || scratch.len() < ns
+    {
+        return Err(EvalError::InvalidShape);
+    }
+    #[cfg(target_arch = "x86_64")]
+    if has_vnni() {
+        // SAFETY: runtime VNNI guard and all slice bounds checked above.
+        unsafe {
+            simd::expert_vnni_u4(
+                d,
+                groups,
+                xq_words.as_ptr().cast::<u8>(),
+                xmeta,
+                weights,
+                out,
+                scratch,
+            );
+        }
+        return Ok(());
+    }
+    Err(EvalError::InvalidLayout)
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -1746,6 +1873,365 @@ pub(crate) mod simd {
         }
         while r < h {
             rows::<1, BITS>([dw(r)], [ds(r)], ap, ag, sg, gs_len, n, |t, v| {
+                out[t * h + r] = wt[t] * v[0];
+            });
+            r += 1;
+        }
+    }
+
+    #[target_feature(enable = "avx2,fma,f16c,avx512f,avx512vl,avx512bw,avx512vnni")]
+    #[inline]
+    unsafe fn quantize_sub64_vnni(
+        v0: __m512,
+        v1: __m512,
+        v2: __m512,
+        v3: __m512,
+        dst_even32: *mut u8,
+        dst_odd32: *mut u8,
+    ) -> (f32, f32) {
+        let sign_mask = _mm512_set1_epi32(0x7fff_ffff);
+        let a0 = _mm512_castsi512_ps(_mm512_and_si512(_mm512_castps_si512(v0), sign_mask));
+        let a1 = _mm512_castsi512_ps(_mm512_and_si512(_mm512_castps_si512(v1), sign_mask));
+        let a2 = _mm512_castsi512_ps(_mm512_and_si512(_mm512_castps_si512(v2), sign_mask));
+        let a3 = _mm512_castsi512_ps(_mm512_and_si512(_mm512_castps_si512(v3), sign_mask));
+        let vmax = _mm512_max_ps(_mm512_max_ps(a0, a1), _mm512_max_ps(a2, a3));
+        let max_abs = _mm512_reduce_max_ps(vmax);
+        if max_abs <= 0.0 || !max_abs.is_finite() || !(127.0f32 / max_abs).is_finite() {
+            _mm256_storeu_si256(dst_even32.cast(), _mm256_setzero_si256());
+            _mm256_storeu_si256(dst_odd32.cast(), _mm256_setzero_si256());
+            return (0.0, 0.0);
+        }
+        let xs = max_abs * (1.0f32 / 127.0f32);
+        let vinv = _mm512_set1_ps(127.0f32 / max_abs);
+        let i0 = _mm512_cvtps_epi32(_mm512_mul_ps(v0, vinv));
+        let i1 = _mm512_cvtps_epi32(_mm512_mul_ps(v1, vinv));
+        let i2 = _mm512_cvtps_epi32(_mm512_mul_ps(v2, vinv));
+        let i3 = _mm512_cvtps_epi32(_mm512_mul_ps(v3, vinv));
+        let sum_i32 = _mm512_reduce_add_epi32(_mm512_add_epi32(
+            _mm512_add_epi32(i0, i1),
+            _mm512_add_epi32(i2, i3),
+        ));
+        let shuf = _mm_setr_epi8(0, 2, 4, 6, 8, 10, 12, 14, 1, 3, 5, 7, 9, 11, 13, 15);
+        for (pair, iv) in [i0, i1, i2, i3].into_iter().enumerate() {
+            let b16 = _mm512_cvtsepi32_epi8(iv);
+            let s16 = _mm_shuffle_epi8(b16, shuf);
+            let even64 = _mm_cvtsi128_si64(s16) as u64;
+            let odd64 = _mm_extract_epi64::<1>(s16) as u64;
+            dst_even32
+                .add(pair * 8)
+                .cast::<u64>()
+                .write_unaligned(even64);
+            dst_odd32.add(pair * 8).cast::<u64>().write_unaligned(odd64);
+        }
+        (xs, 8.0f32 * xs * (sum_i32 as f32))
+    }
+
+    #[target_feature(enable = "avx2,fma,f16c,avx512f,avx512vl,avx512bw,avx512vnni")]
+    pub(super) unsafe fn prepare_x_q8_f32_vnni(x: &[f32], xq: *mut u8, xmeta: &mut [f32]) {
+        let groups = x.len() / 128;
+        for g in 0..groups {
+            let src = x.as_ptr().add(g * 128);
+            let dst = xq.add(g * 128);
+            let (xs_lo, xb_lo) = quantize_sub64_vnni(
+                _mm512_loadu_ps(src),
+                _mm512_loadu_ps(src.add(16)),
+                _mm512_loadu_ps(src.add(32)),
+                _mm512_loadu_ps(src.add(48)),
+                dst,
+                dst.add(64),
+            );
+            let (xs_hi, xb_hi) = quantize_sub64_vnni(
+                _mm512_loadu_ps(src.add(64)),
+                _mm512_loadu_ps(src.add(80)),
+                _mm512_loadu_ps(src.add(96)),
+                _mm512_loadu_ps(src.add(112)),
+                dst.add(32),
+                dst.add(96),
+            );
+            let m = &mut xmeta[g * 4..g * 4 + 4];
+            m[0] = xs_lo;
+            m[1] = xs_hi;
+            m[2] = xb_lo;
+            m[3] = xb_hi;
+        }
+    }
+
+    #[target_feature(enable = "avx2,fma,f16c,avx512f,avx512vl,avx512bw,avx512vnni")]
+    pub(super) unsafe fn prepare_x_q8_f16_vnni(x: &[u16], xq: *mut u8, xmeta: &mut [f32]) {
+        let groups = x.len() / 128;
+        for g in 0..groups {
+            let src = x.as_ptr().add(g * 128);
+            let dst = xq.add(g * 128);
+            let (xs_lo, xb_lo) = quantize_sub64_vnni(
+                _mm512_cvtph_ps(_mm256_loadu_si256(src.cast())),
+                _mm512_cvtph_ps(_mm256_loadu_si256(src.add(16).cast())),
+                _mm512_cvtph_ps(_mm256_loadu_si256(src.add(32).cast())),
+                _mm512_cvtph_ps(_mm256_loadu_si256(src.add(48).cast())),
+                dst,
+                dst.add(64),
+            );
+            let (xs_hi, xb_hi) = quantize_sub64_vnni(
+                _mm512_cvtph_ps(_mm256_loadu_si256(src.add(64).cast())),
+                _mm512_cvtph_ps(_mm256_loadu_si256(src.add(80).cast())),
+                _mm512_cvtph_ps(_mm256_loadu_si256(src.add(96).cast())),
+                _mm512_cvtph_ps(_mm256_loadu_si256(src.add(112).cast())),
+                dst.add(32),
+                dst.add(96),
+            );
+            let m = &mut xmeta[g * 4..g * 4 + 4];
+            m[0] = xs_lo;
+            m[1] = xs_hi;
+            m[2] = xb_lo;
+            m[3] = xb_hi;
+        }
+    }
+
+    #[target_feature(enable = "avx2,fma,f16c,avx512f,avx512vl,avx512bw,avx512vnni")]
+    #[allow(clippy::needless_range_loop)]
+    unsafe fn row_tile_vnni_u4<const R: usize, const T: usize, const G64: bool>(
+        w: [&[u32]; R],
+        s: [&[u16]; R],
+        xq: *const u8,
+        xmeta: &[f32],
+        groups: usize,
+    ) -> [[f32; R]; T] {
+        let zf = _mm512_setzero_ps();
+        let zi = _mm512_setzero_si512();
+        let mask_0f = _mm512_set1_epi8(0x0f);
+        let perm_lohi = _mm512_setr_epi32(0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1);
+        let mut total = [[zf; R]; T];
+        let mut bias = [[0.0f32; R]; T];
+        for g in 0..groups {
+            let mut w_even = [zi; R];
+            let mut w_odd = [zi; R];
+            let mut ws_lo = [0.0f32; R];
+            let mut ws_hi = [0.0f32; R];
+            let mut vw_scale = [zf; R];
+            for r in 0..R {
+                let ptr = w[r].as_ptr().add(g * 16);
+                let q = _mm512_loadu_si512(ptr.cast());
+                if (g + 4) * 16 < w[r].len() {
+                    _mm_prefetch::<_MM_HINT_T0>(w[r].as_ptr().add((g + 4) * 16).cast());
+                }
+                w_even[r] = _mm512_and_si512(q, mask_0f);
+                w_odd[r] = _mm512_and_si512(_mm512_srli_epi16(q, 4), mask_0f);
+                if G64 {
+                    let spair = s[r].as_ptr().add(2 * g).cast::<u32>().read_unaligned() as i32;
+                    let s128 = _mm_cvtph_ps(_mm_cvtsi32_si128(spair));
+                    ws_lo[r] = _mm_cvtss_f32(s128);
+                    ws_hi[r] = _mm_cvtss_f32(_mm_shuffle_ps::<0x55>(s128, s128));
+                    vw_scale[r] = _mm512_permutexvar_ps(perm_lohi, _mm512_castps128_ps512(s128));
+                } else {
+                    ws_lo[r] = _mm_cvtss_f32(_mm_cvtph_ps(_mm_cvtsi32_si128(
+                        *s[r].get_unchecked(g) as i32,
+                    )));
+                    ws_hi[r] = ws_lo[r];
+                    vw_scale[r] = _mm512_set1_ps(ws_lo[r]);
+                }
+            }
+            for t in 0..T {
+                let x_ptr = xq.add(t * groups * 128 + g * 128);
+                let x_even = _mm512_loadu_si512(x_ptr.cast());
+                let x_odd = _mm512_loadu_si512(x_ptr.add(64).cast());
+                let m_ptr = xmeta.as_ptr().add(t * groups * 4 + g * 4);
+                let xm128 = _mm_loadu_ps(m_ptr);
+                let xb_lo = *m_ptr.add(2);
+                let xb_hi = *m_ptr.add(3);
+                let vx_scale = _mm512_permutexvar_ps(perm_lohi, _mm512_castps128_ps512(xm128));
+                for r in 0..R {
+                    let acc_i32 = _mm512_dpbusd_epi32(
+                        _mm512_dpbusd_epi32(zi, w_even[r], x_even),
+                        w_odd[r],
+                        x_odd,
+                    );
+                    let vcomb = _mm512_mul_ps(vw_scale[r], vx_scale);
+                    total[t][r] = _mm512_fmadd_ps(_mm512_cvtepi32_ps(acc_i32), vcomb, total[t][r]);
+                    bias[t][r] = ws_hi[r].mul_add(xb_hi, ws_lo[r].mul_add(xb_lo, bias[t][r]));
+                }
+            }
+        }
+        let mut out = [[0.0f32; R]; T];
+        for t in 0..T {
+            for r in 0..R {
+                out[t][r] = hsum(total[t][r]) - bias[t][r];
+            }
+        }
+        out
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    #[target_feature(enable = "avx2,fma,f16c,avx512f,avx512vl,avx512bw,avx512vnni")]
+    unsafe fn rows_vnni_u4<const R: usize>(
+        w: [&[u32]; R],
+        s: [&[u16]; R],
+        xq: *const u8,
+        xmeta: &[f32],
+        groups: usize,
+        group_size: usize,
+        n: usize,
+        mut emit: impl FnMut(usize, [f32; R]),
+    ) {
+        let xq_stride = groups * 128;
+        let xm_stride = groups * 4;
+        let mut t = 0;
+        while t + 4 <= n {
+            let v = if group_size == 64 {
+                row_tile_vnni_u4::<R, 4, true>(
+                    w,
+                    s,
+                    xq.add(t * xq_stride),
+                    &xmeta[t * xm_stride..],
+                    groups,
+                )
+            } else {
+                row_tile_vnni_u4::<R, 4, false>(
+                    w,
+                    s,
+                    xq.add(t * xq_stride),
+                    &xmeta[t * xm_stride..],
+                    groups,
+                )
+            };
+            for (dt, row) in v.into_iter().enumerate() {
+                emit(t + dt, row);
+            }
+            t += 4;
+        }
+        while t + 2 <= n {
+            let v = if group_size == 64 {
+                row_tile_vnni_u4::<R, 2, true>(
+                    w,
+                    s,
+                    xq.add(t * xq_stride),
+                    &xmeta[t * xm_stride..],
+                    groups,
+                )
+            } else {
+                row_tile_vnni_u4::<R, 2, false>(
+                    w,
+                    s,
+                    xq.add(t * xq_stride),
+                    &xmeta[t * xm_stride..],
+                    groups,
+                )
+            };
+            emit(t, v[0]);
+            emit(t + 1, v[1]);
+            t += 2;
+        }
+        if t < n {
+            let v = if group_size == 64 {
+                row_tile_vnni_u4::<R, 1, true>(
+                    w,
+                    s,
+                    xq.add(t * xq_stride),
+                    &xmeta[t * xm_stride..],
+                    groups,
+                )
+            } else {
+                row_tile_vnni_u4::<R, 1, false>(
+                    w,
+                    s,
+                    xq.add(t * xq_stride),
+                    &xmeta[t * xm_stride..],
+                    groups,
+                )
+            };
+            emit(t, v[0]);
+        }
+    }
+
+    #[target_feature(enable = "avx2,fma,f16c,avx512f,avx512vl,avx512bw,avx512vnni")]
+    pub(super) unsafe fn expert_vnni_u4(
+        d: ExpertLayout<'_>,
+        range: Range<usize>,
+        xq: *const u8,
+        xmeta: &[f32],
+        wt: &[f32],
+        out: &mut [f32],
+        scratch: &mut [f32],
+    ) {
+        let h = d.hidden;
+        let i = d.intermediate;
+        let gs_len = d.group_size;
+        let g_per_128 = 128 / gs_len;
+        let n = wt.len();
+        let sg = range.end - range.start;
+        let cols = sg * 128;
+        let (act, rest) = scratch.split_at_mut(n * cols);
+        let (ap_words, ag_meta) = rest.split_at_mut(n * (cols / 4));
+        let ap_q8 = ap_words.as_mut_ptr().cast::<u8>();
+        let gw = |r: usize| &d.gate_up_words[r * (h / 8)..];
+        let gs = |r: usize| &d.gate_up_scales[r * (h / gs_len)..];
+        let mut c = 0;
+        while c + 2 <= cols {
+            let r = range.start * 128 + c;
+            rows_vnni_u4::<4>(
+                [gw(r), gw(r + 1), gw(i + r), gw(i + r + 1)],
+                [gs(r), gs(r + 1), gs(i + r), gs(i + r + 1)],
+                xq,
+                xmeta,
+                h / 128,
+                gs_len,
+                n,
+                |t, v| {
+                    for j in 0..2 {
+                        let g = v[j];
+                        act[t * cols + c + j] = (g / (1.0f32 + (-g).exp())) * v[j + 2];
+                    }
+                },
+            );
+            c += 2;
+        }
+        if d.down_hadamard == 64 {
+            hadamard64_f32_avx2(act);
+        }
+        for t in 0..n {
+            prepare_x_q8_f32_vnni(
+                &act[t * cols..(t + 1) * cols],
+                ap_q8.add(t * cols),
+                &mut ag_meta[t * sg * 4..(t + 1) * sg * 4],
+            );
+        }
+        let dw = |r: usize| &d.down_words[r * (i / 8) + range.start * 16..];
+        let ds = |r: usize| &d.down_scales[r * (i / gs_len) + range.start * g_per_128..];
+        let mut r = 0;
+        while r + 4 <= h {
+            rows_vnni_u4::<4>(
+                [dw(r), dw(r + 1), dw(r + 2), dw(r + 3)],
+                [ds(r), ds(r + 1), ds(r + 2), ds(r + 3)],
+                ap_q8,
+                ag_meta,
+                sg,
+                gs_len,
+                n,
+                |t, v| {
+                    for j in 0..4 {
+                        out[t * h + r + j] = wt[t] * v[j];
+                    }
+                },
+            );
+            r += 4;
+        }
+        while r + 2 <= h {
+            rows_vnni_u4::<2>(
+                [dw(r), dw(r + 1)],
+                [ds(r), ds(r + 1)],
+                ap_q8,
+                ag_meta,
+                sg,
+                gs_len,
+                n,
+                |t, v| {
+                    for j in 0..2 {
+                        out[t * h + r + j] = wt[t] * v[j];
+                    }
+                },
+            );
+            r += 2;
+        }
+        while r < h {
+            rows_vnni_u4::<1>([dw(r)], [ds(r)], ap_q8, ag_meta, sg, gs_len, n, |t, v| {
                 out[t * h + r] = wt[t] * v[0];
             });
             r += 1;

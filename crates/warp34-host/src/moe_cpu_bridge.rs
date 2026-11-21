@@ -69,15 +69,60 @@ impl std::ops::Deref for Counter {
         &self.0
     }
 }
+
+const REDUCE_TILE_LEN: usize = 128;
+
+#[repr(align(64))]
+struct SlotBuf {
+    claimed: AtomicBool,
+    data: std::cell::UnsafeCell<Vec<f32>>,
+}
+impl Default for SlotBuf {
+    fn default() -> Self {
+        Self {
+            claimed: AtomicBool::new(false),
+            data: std::cell::UnsafeCell::new(Vec::new()),
+        }
+    }
+}
+// SAFETY: `SlotBuf` enforces exclusive Phase-1 write access via `claimed.swap(true)` and
+// happens-before synchronization via `eval_remaining` (`Release`/`Acquire`) prior to Phase-2 shared reads.
+unsafe impl Sync for SlotBuf {}
+
+#[repr(align(64))]
+struct ReduceTile {
+    claimed: AtomicBool,
+    data: std::cell::UnsafeCell<[f32; REDUCE_TILE_LEN]>,
+}
+impl Default for ReduceTile {
+    fn default() -> Self {
+        Self {
+            claimed: AtomicBool::new(false),
+            data: std::cell::UnsafeCell::new([0.0; REDUCE_TILE_LEN]),
+        }
+    }
+}
+// SAFETY: Each `ReduceTile` is claimed at most once via `claimed.swap(true)` during Phase 2,
+// and read on the caller thread only after `completion.remaining` reaches 0 (`Acquire`).
+unsafe impl Sync for ReduceTile {}
+
 struct Batch {
     store: HostExpertStore,
     xp: Vec<f32>,
     xg: Vec<f32>,
     jobs: Vec<Job>,
-    outputs: Vec<Mutex<Vec<f32>>>,
+    token_routes: Vec<Vec<(u32, u32)>>,
+    outputs: Vec<SlotBuf>,
+    reduce_tiles: Vec<ReduceTile>,
+    n_act: usize,
+    h: usize,
+    vnni: bool,
     slices: usize,
     tokens: usize,
     next: Counter,
+    eval_remaining: Counter,
+    next_reduce: Counter,
+    num_reduce_tiles: usize,
     failed: AtomicBool,
     completion: Arc<Completion>,
 }
@@ -121,10 +166,10 @@ impl Wake {
         }
     }
     fn wait(&self, seen: u32) {
-        // Spin across the ~8-10ms GPU lm_head + MTP-3 draft window between Target
+        // Spin across the ~5-12ms GPU lm_head + DFlash2/MTP-3 draft window between Target
         // Verify rounds so worker cores stay out of kernel futex / C-states during
         // active generation, then sleep at 0% CPU once idle.
-        for _ in 0..(1 << 18) {
+        for _ in 0..(1 << 22) {
             if self.epoch.load(Ordering::Acquire) != seen {
                 return;
             }
@@ -159,7 +204,7 @@ struct Dispatch {
 struct RoutingScratch {
     tok_to_compact: Vec<u32>,
     active_toks: Vec<usize>,
-    token_routes: Vec<Vec<usize>>,
+    token_routes: Vec<Vec<(u32, u32)>>,
     expert_to_job: Vec<u32>,
 }
 struct Pool {
@@ -169,7 +214,8 @@ struct Pool {
     // Serializes callers, but never grants workers borrowed caller buffers.
     submit: Mutex<()>,
     spare: Mutex<Vec<Job>>,
-    spare_outputs: Mutex<Vec<Mutex<Vec<f32>>>>,
+    spare_outputs: Mutex<Vec<SlotBuf>>,
+    spare_reduce_tiles: Mutex<Vec<ReduceTile>>,
     spare_inputs: Mutex<(Vec<f32>, Vec<f32>)>,
     spare_routing: Mutex<RoutingScratch>,
     caller_scratch: Mutex<Scratch>,
@@ -187,6 +233,7 @@ impl Pool {
             submit: Mutex::new(()),
             spare: Mutex::new(Vec::new()),
             spare_outputs: Mutex::new(Vec::new()),
+            spare_reduce_tiles: Mutex::new(Vec::new()),
             spare_inputs: Mutex::new((Vec::new(), Vec::new())),
             spare_routing: Mutex::new(RoutingScratch::default()),
             caller_scratch: Mutex::new(Scratch::default()),
@@ -261,22 +308,23 @@ impl Pool {
             }
             std::hint::spin_loop();
         }
-        let mut remaining = batch.completion.lock.lock().unwrap();
-        while batch.completion.remaining.load(Ordering::Acquire) != 0 {
-            let now = std::time::Instant::now();
-            if now >= deadline {
-                return Err(bridge_error(
-                    "30s worker deadline exceeded; batch buffers retained",
-                ));
+        if batch.completion.remaining.load(Ordering::Acquire) != 0 {
+            let mut remaining = batch.completion.lock.lock().unwrap();
+            while batch.completion.remaining.load(Ordering::Acquire) != 0 {
+                let now = std::time::Instant::now();
+                if now >= deadline {
+                    return Err(bridge_error(
+                        "30s worker deadline exceeded; batch buffers retained",
+                    ));
+                }
+                remaining = batch
+                    .completion
+                    .done
+                    .wait_timeout(remaining, deadline - now)
+                    .unwrap()
+                    .0;
             }
-            remaining = batch
-                .completion
-                .done
-                .wait_timeout(remaining, deadline - now)
-                .unwrap()
-                .0;
         }
-        drop(remaining);
         self.state
             .1
             .batch
@@ -768,25 +816,85 @@ fn pin_current_thread(cpu: usize) {
     let _ = cpu;
 }
 fn work_batch(batch: &Batch, scratch: &mut Scratch, deadline: Option<std::time::Instant>) {
+    let total_eval = batch.jobs.len() * batch.slices;
     loop {
         // Only the caller has a deadline. Workers retain and drain timed-out
         // batches. A claimed job is bounded CPU arithmetic and always finishes
         // before its scratch is reused; no caller-owned input is borrowed.
         if deadline.is_some_and(|limit| std::time::Instant::now() >= limit) {
-            break;
+            return;
         }
         let index = batch.next.fetch_add(1, Ordering::Relaxed);
-        if index >= batch.jobs.len() * batch.slices {
+        if index >= total_eval {
             break;
         }
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             run_job(batch, index, scratch);
         }));
         if result.is_err() {
-            batch.failed.store(true, Ordering::Relaxed);
+            batch.failed.store(true, Ordering::Release);
+        }
+        batch.eval_remaining.fetch_sub(1, Ordering::Release);
+    }
+    if batch.num_reduce_tiles == 0 {
+        return;
+    }
+    while batch.eval_remaining.load(Ordering::Acquire) != 0 {
+        if deadline.is_some_and(|limit| std::time::Instant::now() >= limit) {
+            return;
+        }
+        std::hint::spin_loop();
+    }
+    if batch.failed.load(Ordering::Acquire) {
+        return;
+    }
+    let h_tiles = batch.h / REDUCE_TILE_LEN;
+    loop {
+        if deadline.is_some_and(|limit| std::time::Instant::now() >= limit) {
+            return;
+        }
+        let tile_idx = batch.next_reduce.fetch_add(1, Ordering::Relaxed);
+        if tile_idx >= batch.num_reduce_tiles {
+            break;
+        }
+        reduce_tile(batch, tile_idx, h_tiles);
+    }
+}
+
+fn reduce_tile(batch: &Batch, tile_idx: usize, h_tiles: usize) {
+    let c = tile_idx / h_tiles;
+    let col_start = (tile_idx % h_tiles) * REDUCE_TILE_LEN;
+    let tile_slot = &batch.reduce_tiles[tile_idx];
+    assert!(
+        !tile_slot.claimed.swap(true, Ordering::Relaxed),
+        "duplicate reduce tile claim"
+    );
+    // SAFETY: `tile_slot.claimed.swap(true)` proves exclusive access to `tile_slot.data`,
+    // and `eval_remaining == 0` (`Acquire`) above guarantees all Phase-1 writes to
+    // `batch.outputs` have completed with no remaining mutable aliases.
+    unsafe {
+        let dst = &mut *tile_slot.data.get();
+        let mut first = true;
+        for &(job_u32, row_u32) in &batch.token_routes[c] {
+            let j = job_u32 as usize;
+            let start = row_u32 as usize * batch.h + col_start;
+            for slice in 0..batch.slices {
+                let src_vec = &*batch.outputs[j * batch.slices + slice].data.get();
+                let src = &src_vec[start..start + REDUCE_TILE_LEN];
+                if first {
+                    dst.copy_from_slice(src);
+                    first = false;
+                } else {
+                    eval::add_assign_slice(dst, src);
+                }
+            }
+        }
+        if first {
+            dst.fill(0.0);
         }
     }
 }
+
 fn run_job(batch: &Batch, index: usize, scratch: &mut Scratch) {
     let job = &batch.jobs[index / batch.slices];
     let store = &batch.store;
@@ -796,20 +904,31 @@ fn run_job(batch: &Batch, index: usize, scratch: &mut Scratch) {
     let gs = layout.group_size;
     let groups = layout.intermediate / 128;
     let n = job.rows.len();
+    let xp_stride = if batch.vnni { h / 4 } else { h };
+    let xg_stride = if batch.vnni { h / 32 } else { h / gs };
     scratch.xp.clear();
     scratch.xg.clear();
     scratch.weights.clear();
     for &(tok, weight) in &job.rows {
         scratch
             .xp
-            .extend_from_slice(&batch.xp[tok * h..(tok + 1) * h]);
+            .extend_from_slice(&batch.xp[tok * xp_stride..(tok + 1) * xp_stride]);
         scratch
             .xg
-            .extend_from_slice(&batch.xg[tok * (h / gs)..(tok + 1) * (h / gs)]);
+            .extend_from_slice(&batch.xg[tok * xg_stride..(tok + 1) * xg_stride]);
         scratch.weights.push(weight);
     }
-    let mut output = batch.outputs[index].lock().unwrap();
-    output.resize(n * h, 0.);
+    let slot_buf = &batch.outputs[index];
+    assert!(
+        !slot_buf.claimed.swap(true, Ordering::Relaxed),
+        "duplicate slice output claim"
+    );
+    // SAFETY: `slot_buf.claimed.swap(true)` proves exclusive Phase-1 ownership of `slot_buf.data`
+    // for this `index`; `eval_expert_*` overwrites all `0..n*h` elements before `eval_remaining` releases.
+    let output = unsafe { &mut *slot_buf.data.get() };
+    if output.len() < n * h {
+        output.resize(n * h, 0.);
+    }
     let pack = store
         .expert_pack(store.expert_ids().start + expert)
         .unwrap();
@@ -838,20 +957,35 @@ fn run_job(batch: &Batch, index: usize, scratch: &mut Scratch) {
     };
     {
         let slice = index % batch.slices;
-        let range = if batch.slices == 2 {
-            if slice == 0 {
-                0..groups / 2
-            } else {
-                groups / 2..groups
-            }
+        let range = if batch.slices > 1 {
+            let start = (slice * groups) / batch.slices;
+            let end = ((slice + 1) * groups) / batch.slices;
+            start..end
         } else {
             0..groups
         };
         scratch
             .eval
             .resize(eval::scratch_len(n, range.len()).unwrap(), 0.);
-        let y = &mut output[..];
-        if batch.tokens <= MAX_DECODE_TOKENS {
+        let y = &mut output[..n * h];
+        if batch.vnni {
+            let max_toks = if batch.tokens <= MAX_DECODE_TOKENS {
+                MAX_DECODE_TOKENS
+            } else {
+                512
+            };
+            eval::eval_expert_vnni_u4(
+                d,
+                range,
+                &scratch.xp,
+                &scratch.xg,
+                &scratch.weights,
+                y,
+                &mut scratch.eval,
+                max_toks,
+            )
+            .unwrap();
+        } else if batch.tokens <= MAX_DECODE_TOKENS {
             eval::eval_expert_slice(
                 d,
                 range,
@@ -901,6 +1035,20 @@ impl Input<'_> {
             #[cfg(test)]
             Self::F32(x) => eval::prepare_x_perm_grouped(&x[range], group_size, xp, xg),
             Self::F16(x) => eval::prepare_x_perm_f16_grouped(&x[range], group_size, xp, xg),
+        }
+    }
+    fn prepare_row_vnni(
+        &self,
+        tok: usize,
+        h: usize,
+        xq_words: &mut [f32],
+        xmeta: &mut [f32],
+    ) -> Result<(), eval::EvalError> {
+        let range = tok * h..(tok + 1) * h;
+        match self {
+            #[cfg(test)]
+            Self::F32(x) => eval::prepare_x_vnni_f32(&x[range], xq_words, xmeta),
+            Self::F16(x) => eval::prepare_x_vnni_f16(&x[range], xq_words, xmeta),
         }
     }
 }
@@ -988,14 +1136,13 @@ fn evaluate_into(
             routing.active_toks.push(tok);
             if c == routing.token_routes.len() {
                 routing.token_routes.push(Vec::with_capacity(10));
+            } else {
+                routing.token_routes[c].clear();
             }
             c
         } else {
             routing.tok_to_compact[tok] as usize
         };
-        if !routing.token_routes[compact_tok].contains(&expert) {
-            routing.token_routes[compact_tok].push(expert);
-        }
         let j = if routing.expert_to_job[expert] == u32::MAX {
             if used == jobs.len() {
                 jobs.push(Job::default());
@@ -1016,38 +1163,82 @@ fn evaluate_into(
     }
     jobs.truncate(used);
     jobs.sort_by_key(|j| std::cmp::Reverse(j.rows.len()));
+    let n_act = routing.active_toks.len();
     for (j, job) in jobs.iter().enumerate() {
-        routing.expert_to_job[job.expert] = j as u32;
+        for (row, &(c, _)) in job.rows.iter().enumerate() {
+            routing.token_routes[c].push((j as u32, row as u32));
+        }
     }
-    let slices = if tokens <= MAX_DECODE_TOKENS && store.layout().intermediate / 128 >= 2 {
-        2
+    let groups = store.layout().intermediate / 128;
+    let n_cpus = pool.cpus.len();
+    let slices = if tokens <= MAX_DECODE_TOKENS && groups >= 2 && !jobs.is_empty() {
+        let g_cap = groups.min(8);
+        if jobs.len() * g_cap <= n_cpus * 2 {
+            g_cap
+        } else if jobs.len() < n_cpus || n_cpus <= 2 {
+            2
+        } else {
+            1
+        }
     } else {
         1
     };
-    let n_act = routing.active_toks.len();
     let gs = store.layout().group_size;
-    let h_groups = h / gs;
+    let vnni = store.layout().bits == 4 && eval::has_vnni();
+    let xp_stride = if vnni { h / 4 } else { h };
+    let xg_stride = if vnni { h / 32 } else { h / gs };
     let (mut xp, mut xg) = std::mem::take(&mut *pool.spare_inputs.lock().unwrap());
-    xp.resize(n_act * h, 0.);
-    xg.resize(n_act * h_groups, 0.);
+    xp.resize(n_act * xp_stride, 0.);
+    xg.resize(n_act * xg_stride, 0.);
     for (c, &tok) in routing.active_toks.iter().enumerate() {
-        if let Err(e) = x.prepare_row(
-            tok,
-            h,
-            gs,
-            &mut xp[c * h..(c + 1) * h],
-            &mut xg[c * h_groups..(c + 1) * h_groups],
-        ) {
+        let prep_res = if vnni {
+            x.prepare_row_vnni(
+                tok,
+                h,
+                &mut xp[c * xp_stride..(c + 1) * xp_stride],
+                &mut xg[c * xg_stride..(c + 1) * xg_stride],
+            )
+        } else {
+            x.prepare_row(
+                tok,
+                h,
+                gs,
+                &mut xp[c * xp_stride..(c + 1) * xp_stride],
+                &mut xg[c * xg_stride..(c + 1) * xg_stride],
+            )
+        };
+        if let Err(e) = prep_res {
             *pool.spare.lock().unwrap() = jobs;
             *pool.spare_inputs.lock().unwrap() = (xp, xg);
             *pool.spare_routing.lock().unwrap() = routing;
             return Err(bridge_error(format!("{e:?}")));
         }
     }
+    let total_eval = jobs.len() * slices;
     let mut outputs = std::mem::take(&mut *pool.spare_outputs.lock().unwrap());
-    outputs.resize_with(jobs.len() * slices, || Mutex::new(Vec::new()));
+    outputs.resize_with(total_eval, SlotBuf::default);
+    for slot in &outputs[..total_eval] {
+        slot.claimed.store(false, Ordering::Relaxed);
+    }
+    let h_tiles = h / REDUCE_TILE_LEN;
+    let num_reduce_tiles = if tokens <= MAX_DECODE_TOKENS && h.is_multiple_of(REDUCE_TILE_LEN) {
+        n_act * h_tiles
+    } else {
+        0
+    };
+    let mut reduce_tiles = std::mem::take(&mut *pool.spare_reduce_tiles.lock().unwrap());
+    reduce_tiles.resize_with(num_reduce_tiles, ReduceTile::default);
+    for tile in &reduce_tiles[..num_reduce_tiles] {
+        tile.claimed.store(false, Ordering::Relaxed);
+    }
+    let token_routes = std::mem::take(&mut routing.token_routes);
     let batch = Arc::new(Batch {
         outputs,
+        reduce_tiles,
+        token_routes,
+        n_act,
+        h,
+        vnni,
         store: store.clone(),
         xp,
         xg,
@@ -1055,6 +1246,9 @@ fn evaluate_into(
         slices,
         tokens,
         next: Counter::new(0),
+        eval_remaining: Counter::new(total_eval),
+        next_reduce: Counter::new(0),
+        num_reduce_tiles,
         failed: AtomicBool::new(false),
         completion: Completion::new(pool.threads.len()),
     });
@@ -1063,11 +1257,15 @@ fn evaluate_into(
     if run_result.is_ok() {
         reduce_batch_outputs(&batch, &routing, h, slices, out);
     }
-    *pool.spare_routing.lock().unwrap() = routing;
-    if let Ok(batch) = Arc::try_unwrap(batch) {
+    if let Ok(mut batch) = Arc::try_unwrap(batch) {
+        routing.token_routes = std::mem::take(&mut batch.token_routes);
+        *pool.spare_routing.lock().unwrap() = routing;
         *pool.spare.lock().unwrap() = batch.jobs;
         *pool.spare_outputs.lock().unwrap() = batch.outputs;
+        *pool.spare_reduce_tiles.lock().unwrap() = batch.reduce_tiles;
         *pool.spare_inputs.lock().unwrap() = (batch.xp, batch.xg);
+    } else {
+        *pool.spare_routing.lock().unwrap() = routing;
     }
     run_result
 }
@@ -1078,6 +1276,8 @@ fn reduce_batch_outputs(
     slices: usize,
     out: Output<'_>,
 ) {
+    let h_tiles = h / REDUCE_TILE_LEN;
+    let parallel_reduced = batch.num_reduce_tiles == batch.n_act * h_tiles && h_tiles > 0;
     match out {
         Output::F32(y) => {
             for (tok, &compact) in routing.tok_to_compact.iter().enumerate() {
@@ -1085,15 +1285,28 @@ fn reduce_batch_outputs(
                     y[tok * h..(tok + 1) * h].fill(0.);
                 }
             }
+            if parallel_reduced {
+                for (c, &tok) in routing.active_toks.iter().enumerate() {
+                    let dst_row = &mut y[tok * h..(tok + 1) * h];
+                    let tile_base = c * h_tiles;
+                    for t in 0..h_tiles {
+                        // SAFETY: `Pool::run` synchronized all workers (`completion.remaining == 0` Acquire).
+                        let src = unsafe { &*batch.reduce_tiles[tile_base + t].data.get() };
+                        dst_row[t * REDUCE_TILE_LEN..(t + 1) * REDUCE_TILE_LEN]
+                            .copy_from_slice(src);
+                    }
+                }
+                return;
+            }
             for (c, &tok) in routing.active_toks.iter().enumerate() {
                 let dst = &mut y[tok * h..(tok + 1) * h];
                 let mut first = true;
-                for &expert in &routing.token_routes[c] {
-                    let j = routing.expert_to_job[expert] as usize;
-                    let row = batch.jobs[j].rows.iter().position(|r| r.0 == c).unwrap();
-                    let start = row * h;
+                for &(job_u32, row_u32) in &batch.token_routes[c] {
+                    let j = job_u32 as usize;
+                    let start = row_u32 as usize * h;
                     for slice in 0..slices {
-                        let output = batch.outputs[j * slices + slice].lock().unwrap();
+                        // SAFETY: `Pool::run` synchronized all workers (`completion.remaining == 0` Acquire).
+                        let output = unsafe { &*batch.outputs[j * slices + slice].data.get() };
                         let src = &output[start..start + h];
                         if first {
                             dst.copy_from_slice(src);
@@ -1111,16 +1324,31 @@ fn reduce_batch_outputs(
                     out_f16[tok * h..(tok + 1) * h].fill(0);
                 }
             }
+            if parallel_reduced {
+                for (c, &tok) in routing.active_toks.iter().enumerate() {
+                    let dst_row = &mut out_f16[tok * h..(tok + 1) * h];
+                    let tile_base = c * h_tiles;
+                    for t in 0..h_tiles {
+                        // SAFETY: `Pool::run` synchronized all workers (`completion.remaining == 0` Acquire).
+                        let src = unsafe { &*batch.reduce_tiles[tile_base + t].data.get() };
+                        eval::f32_to_f16_slice(
+                            src,
+                            &mut dst_row[t * REDUCE_TILE_LEN..(t + 1) * REDUCE_TILE_LEN],
+                        );
+                    }
+                }
+                return;
+            }
             let mut acc = [0.0f32; 4096];
             for (c, &tok) in routing.active_toks.iter().enumerate() {
                 let dst_f32 = &mut acc[..h];
                 let mut first = true;
-                for &expert in &routing.token_routes[c] {
-                    let j = routing.expert_to_job[expert] as usize;
-                    let row = batch.jobs[j].rows.iter().position(|r| r.0 == c).unwrap();
-                    let start = row * h;
+                for &(job_u32, row_u32) in &batch.token_routes[c] {
+                    let j = job_u32 as usize;
+                    let start = row_u32 as usize * h;
                     for slice in 0..slices {
-                        let output = batch.outputs[j * slices + slice].lock().unwrap();
+                        // SAFETY: `Pool::run` synchronized all workers (`completion.remaining == 0` Acquire).
+                        let output = unsafe { &*batch.outputs[j * slices + slice].data.get() };
                         let src = &output[start..start + h];
                         if first {
                             dst_f32.copy_from_slice(src);
@@ -1325,6 +1553,7 @@ mod tests {
             submit: Mutex::new(()),
             spare: Mutex::new(Vec::new()),
             spare_outputs: Mutex::new(Vec::new()),
+            spare_reduce_tiles: Mutex::new(Vec::new()),
             spare_inputs: Mutex::new((Vec::new(), Vec::new())),
             spare_routing: Mutex::new(RoutingScratch::default()),
             caller_scratch: Mutex::new(Scratch::default()),
@@ -1334,10 +1563,18 @@ mod tests {
             xp: vec![1.; 128],
             xg: vec![1.],
             jobs: Vec::new(),
+            token_routes: Vec::new(),
             outputs: Vec::new(),
+            reduce_tiles: Vec::new(),
+            n_act: 0,
+            h: 128,
+            vnni: false,
             slices: 1,
             tokens: 1,
             next: Counter::new(0),
+            eval_remaining: Counter::new(0),
+            next_reduce: Counter::new(0),
+            num_reduce_tiles: 0,
             failed: AtomicBool::new(false),
             completion: Completion::new(1),
         });
@@ -1362,10 +1599,18 @@ mod tests {
                 expert: 99,
                 rows: vec![(0, 1.)],
             }],
-            outputs: vec![Mutex::new(Vec::new())],
+            token_routes: Vec::new(),
+            outputs: vec![SlotBuf::default()],
+            reduce_tiles: Vec::new(),
+            n_act: 1,
+            h: 128,
+            vnni: false,
             slices: 1,
             tokens: 1,
             next: Counter::new(0),
+            eval_remaining: Counter::new(1),
+            next_reduce: Counter::new(0),
+            num_reduce_tiles: 0,
             failed: AtomicBool::new(false),
             completion: Completion::new(pool.threads.len()),
         });

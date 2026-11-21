@@ -292,6 +292,18 @@ impl Qwen3_5Engine {
                 resolved_draft.as_deref(),
                 lora_reserve,
             )?;
+        let (dflash_reserve_bytes, dflash_min_state_slots) = if let Some(ref draft) = resolved_draft
+        {
+            if let Ok(exact) =
+                crate::dflash::serving_reserve(draft, &cfg, tp_size, fit_plan.kv_pages * 16)
+            {
+                (exact.resident_bytes, exact.min_state_slots)
+            } else {
+                (dflash_reserve_bytes, dflash_min_state_slots)
+            }
+        } else {
+            (dflash_reserve_bytes, dflash_min_state_slots)
+        };
         capacity.kv_pages = Some(fit_plan.kv_pages);
         capacity.dflash_reserve_bytes = dflash_reserve_bytes;
         capacity.dflash_min_state_slots = dflash_min_state_slots;

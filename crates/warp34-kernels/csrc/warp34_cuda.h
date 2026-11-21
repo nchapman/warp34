@@ -626,12 +626,23 @@ int warp34_dflash_qk_norm_rope_kv_write_bf16_f32_table(const warp34_exec* ex, vo
     const int32_t* positions, const void* qw, const void* kw, const void* table,
     const warp34_kv_layer_layout* kv_layout, const int32_t* write_slot_mapping,
     int rows, int q_heads, int kv_heads, int dim, int table_rows, float eps);
+int warp34_dflash_qk_norm_rope_kv_write_bf16_inv_freq(const warp34_exec* ex, void* qkv, void* q_out,
+    const int32_t* positions, const void* qw, const void* kw, const float* inv_freq,
+    const warp34_kv_layer_layout* kv_layout, const int32_t* write_slot_mapping,
+    int rows, int q_heads, int kv_heads, int dim, float eps);
 int warp34_dflash_select_greedy_bf16(const warp34_exec* ex, const int32_t* ids, const float* unary,
     const void* hidden, const void* pred, const void* succ, int32_t* out_path,
     int anchor, int k, int topk, int rank, int vocab);
+int warp34_dflash_select_greedy_with_conf_bf16(const warp34_exec* ex, const int32_t* ids,
+    const float* unary, const void* hidden, const void* pred, const void* succ,
+    int32_t* out_path, float* out_confs, int anchor, int k, int topk, int rank, int vocab);
 int warp34_dflash_select_greedy_dev_anchor_bf16(const warp34_exec* ex, const int32_t* ids,
     const float* unary, const void* hidden, const void* pred, const void* succ,
     int32_t* out_path, const int32_t* anchor_dev, int k, int topk, int rank, int vocab);
+int warp34_dflash_select_greedy_dev_anchor_with_conf_bf16(const warp34_exec* ex,
+    const int32_t* ids, const float* unary, const void* hidden, const void* pred,
+    const void* succ, int32_t* out_path, float* out_confs, const int32_t* anchor_dev,
+    int k, int topk, int rank, int vocab);
 int warp34_dflash_qk_norm_rope_bf16(const warp34_exec*, void* qkv, const int32_t* positions,
     const void* qw, const void* kw, const void* table, int rows, int q_heads, int kv_heads,
     int dim, int table_rows, float eps);

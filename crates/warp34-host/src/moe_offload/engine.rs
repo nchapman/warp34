@@ -7,26 +7,29 @@ const TIERED_MOE_AUTO_GPU_LRU_MAX_TOKENS: usize = 32;
 const TIERED_MOE_PREFILL_SINGLE_CHUNK_MAX_TOKENS: usize = 384;
 /// Small-batch threshold (`<= 16` tokens) for `StreamedPrefill` CPU-bridge share tuning on AVX2 hosts.
 const TIERED_MOE_PREFILL_SMALL_BATCH_MAX_TOKENS: usize = 16;
-/// Percentage (`84%`) of cold misses delegated to the CPU bridge for `<= 384`-token batches on AVX-512 hosts
-/// (`~75 GB/s` 16-core AVX-512 DDR5 vs `~13.4 GB/s` PCIe 4.0 x8 => `75 / (75 + 13.4) = 84.8%`).
-const TIERED_MOE_PREFILL_AVX512_SINGLE_CHUNK_CPU_SHARE_PCT: usize = 84;
+/// Percentage (`74%`) of cold misses delegated to the CPU bridge for `<= 384`-token batches on AVX-512 hosts
+/// (`~38 GB/s` 16-core AVX-512 VNNI DDR5 vs `~13.4 GB/s` PCIe 4.0 x8 => `38 / (38 + 13.4) = 73.9%`).
+const TIERED_MOE_PREFILL_AVX512_SINGLE_CHUNK_CPU_SHARE_PCT: usize = 74;
 /// Percentage (`35%`) of cold misses delegated to the CPU bridge for `<= 16`-token batches on AVX2 hosts.
 const TIERED_MOE_PREFILL_AVX2_SMALL_CPU_SHARE_PCT: usize = 35;
 /// Percentage (`45%`) of cold misses delegated to the CPU bridge for `17..=384`-token batches on AVX2 hosts.
 const TIERED_MOE_PREFILL_AVX2_SINGLE_CHUNK_CPU_SHARE_PCT: usize = 45;
-/// Percentage (`78%`) of cold misses delegated to the CPU bridge for `> 384`-token batches on AVX-512 hosts.
-const TIERED_MOE_PREFILL_AVX512_MULTI_CHUNK_CPU_SHARE_PCT: usize = 78;
+/// Percentage (`70%`) of cold misses delegated to the CPU bridge for `> 384`-token batches on AVX-512 hosts
+/// (`~38 GB/s` 16-core AVX-512 VNNI DDR5 vs `~13.4 GB/s` PCIe 4.0 x8).
+const TIERED_MOE_PREFILL_AVX512_MULTI_CHUNK_CPU_SHARE_PCT: usize = 70;
 /// Percentage (`38%`) of cold misses delegated to the CPU bridge for `> 384`-token batches on AVX2 hosts.
 const TIERED_MOE_PREFILL_AVX2_MULTI_CHUNK_CPU_SHARE_PCT: usize = 38;
 /// Maximum routed tokens per cold expert eligible for CPU evaluation in `<= 384`-token prefill batches.
 const TIERED_MOE_PREFILL_SINGLE_CHUNK_MAX_TOK_PER_JOB: usize = 16;
 /// Maximum routed tokens per cold expert eligible for CPU evaluation in `> 384`-token prefill batches
-/// (must not exceed `moe_cpu_bridge::eval` prefill tile limit of `96`).
-const TIERED_MOE_PREFILL_MULTI_CHUNK_MAX_TOK_PER_JOB: usize = 96;
+/// (`prefill_tasks` / `eval_expert_vnni_u4` supports `1..=512` tokens per expert).
+const TIERED_MOE_PREFILL_MULTI_CHUNK_MAX_TOK_PER_JOB: usize = 256;
 
 /// Executes a tiered 512-expert MoE layer across `TP=1` or `TP=2 / EP=2` in `GpuLru`
 /// or double-buffered `StreamedPrefill` mode (with optional SIMD CPU bridge co-scheduling).
 pub struct TieredMoeEngine;
+
+pub type PreRoutedHook<'a> = &'a mut dyn FnMut(&crate::cuda::CudaStream) -> crate::cuda::Result<()>;
 
 impl TieredMoeEngine {
     /// Pure device-side CUDA-Graph-safe `GpuLru` execution for `num_tokens <= 16`.
@@ -48,6 +51,39 @@ impl TieredMoeEngine {
         num_tokens: usize,
         top_k: usize,
     ) -> crate::cuda::Result<()> {
+        Self::execute_layer_device_lru_with_hook(
+            store,
+            cache,
+            ws,
+            compute_stream,
+            x_addr,
+            d_topk_ids_addr,
+            d_topk_weights_addr,
+            shared_expert_out_addr,
+            shared_expert_gate_addr,
+            out_addr,
+            num_tokens,
+            top_k,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn execute_layer_device_lru_with_hook(
+        store: &HostExpertStore,
+        cache: &mut HotExpertCache,
+        ws: &TieredMoeWorkspace,
+        compute_stream: &crate::cuda::CudaStream,
+        x_addr: u64,
+        d_topk_ids_addr: u64,
+        d_topk_weights_addr: u64,
+        shared_expert_out_addr: u64,
+        shared_expert_gate_addr: u64,
+        out_addr: u64,
+        num_tokens: usize,
+        top_k: usize,
+        mut pre_routed_hook: Option<PreRoutedHook<'_>>,
+    ) -> crate::cuda::Result<()> {
         if num_tokens == 0 {
             return Ok(());
         }
@@ -60,6 +96,9 @@ impl TieredMoeEngine {
         let k_hot = cache.slots.capacity;
         let ex = compute_stream.exec(ws.d_scratch.addr(), ws.d_scratch.len_bytes);
         if k_hot >= cache.expert_ids.len() {
+            if let Some(hook) = pre_routed_hook.as_deref_mut() {
+                hook(compute_stream)?;
+            }
             let total_pairs = num_tokens * top_k;
             crate::cuda::check_rc(
                 // SAFETY: `d_topk_ids_addr`, `d_expert_to_slot`, and `d_remapped_topk_ids[0]` are
@@ -100,10 +139,25 @@ impl TieredMoeEngine {
             }
             let req_ptr = mailbox.request_ptr();
             let resp_ptr = mailbox.response_ptr();
+            let gpu_share = if cache.k_static < k_hot && store.mapped_dev_ptr() != 0 {
+                if crate::moe_cpu_bridge::has_avx512() && k_hot >= 64 {
+                    0.08f32
+                } else if crate::moe_cpu_bridge::has_avx512() || (num_tokens == 1 && k_hot >= 64) {
+                    TIERED_MOE_CPU_BRIDGE_COLD_WEIGHT_THRESHOLD
+                } else {
+                    TIERED_MOE_CPU_BRIDGE_AVX2_GPU_SHARE_FRAC
+                }
+            } else {
+                0.0f32
+            };
+            let use_forked_pull = cache.k_static < k_hot
+                && store.mapped_dev_ptr() != 0
+                && crate::moe_cpu_bridge::has_avx512()
+                && k_hot >= 64;
             crate::cuda::check_rc(
                 // SAFETY: device pointers and capacities are owned and validated by `cache` and `ws`.
                 unsafe {
-                    warp34_kernels::ffi::warp34_moe_hybrid_submit_and_pull(
+                    warp34_kernels::ffi::warp34_moe_hybrid_submit_and_pull_forked(
                         &ex,
                         req_ptr,
                         x_addr as *const core::ffi::c_void,
@@ -113,6 +167,7 @@ impl TieredMoeEngine {
                         cache.d_slot_to_expert.addr() as *mut i32,
                         cache.d_slot_last_used.addr() as *mut u64,
                         cache.d_step_counter.addr() as *mut u64,
+                        cache.d_expert_freq.addr() as *mut u8,
                         ws.d_remapped_topk_ids[0].addr() as *mut i32,
                         ws.d_miss_local_experts.addr() as *mut i32,
                         ws.d_miss_victim_slots.addr() as *mut i32,
@@ -133,23 +188,29 @@ impl TieredMoeEngine {
                         store.layout().hidden as i32,
                         store.layout().group_size as i32,
                         store.layout().bits as i32,
-                        if cache.k_static < k_hot && store.mapped_dev_ptr() != 0 {
-                            if crate::moe_cpu_bridge::has_avx512() && k_hot >= 64 {
-                                0.08f32
-                            } else if crate::moe_cpu_bridge::has_avx512()
-                                || (num_tokens == 1 && k_hot >= 64)
-                            {
-                                TIERED_MOE_CPU_BRIDGE_COLD_WEIGHT_THRESHOLD
-                            } else {
-                                TIERED_MOE_CPU_BRIDGE_AVX2_GPU_SHARE_FRAC
-                            }
+                        gpu_share,
+                        if use_forked_pull {
+                            ws.h2d_stream.handle as *mut core::ffi::c_void
                         } else {
-                            0.0f32
+                            core::ptr::null_mut()
+                        },
+                        if use_forked_pull {
+                            ws.hybrid_plan_event.handle as *mut core::ffi::c_void
+                        } else {
+                            core::ptr::null_mut()
+                        },
+                        if use_forked_pull {
+                            ws.hybrid_pull_done_event.handle as *mut core::ffi::c_void
+                        } else {
+                            core::ptr::null_mut()
                         },
                     )
                 },
-                "warp34_moe_hybrid_submit_and_pull",
+                "warp34_moe_hybrid_submit_and_pull_forked",
             )?;
+            if let Some(hook) = pre_routed_hook.as_deref_mut() {
+                hook(compute_stream)?;
+            }
             cache.slots.launch_moe_w4a16(
                 &ex,
                 x_addr,
@@ -165,7 +226,7 @@ impl TieredMoeEngine {
             return crate::cuda::check_rc(
                 // SAFETY: `out_addr` is a valid `[num_tokens, hidden]` FP16 buffer.
                 unsafe {
-                    warp34_kernels::ffi::warp34_moe_hybrid_wait_and_add(
+                    warp34_kernels::ffi::warp34_moe_hybrid_wait_and_add_joined(
                         &ex,
                         req_ptr,
                         resp_ptr,
@@ -173,10 +234,18 @@ impl TieredMoeEngine {
                         ws.d_num_misses.addr() as *const i32,
                         num_tokens as i32,
                         store.layout().hidden as i32,
+                        if use_forked_pull {
+                            ws.hybrid_pull_done_event.handle as *mut core::ffi::c_void
+                        } else {
+                            core::ptr::null_mut()
+                        },
                     )
                 },
-                "warp34_moe_hybrid_wait_and_add",
+                "warp34_moe_hybrid_wait_and_add_joined",
             );
+        }
+        if let Some(hook) = pre_routed_hook {
+            hook(compute_stream)?;
         }
         cache.device_lru_dirty = true;
         let total_pairs = num_tokens * top_k;
@@ -538,11 +607,74 @@ impl TieredMoeEngine {
                         }
                     }
 
+                    let mut is_promoted = vec![false; local_len];
+                    if dynamic_short_adapt && adapt_end >= 64 && !misses_in_step.is_empty() {
+                        // On `TP=1` dynamic TinyLFU (`k_static <= 1`), select prompt-hot cold experts
+                        // BEFORE partitioning `misses_in_step` into CPU `light_candidates` vs `gpu_misses`
+                        // so prompt-hot experts on `64..=6144`-token prompts always land in `gpu_misses`
+                        // Chunk 0 (`ws.d_stage_packs[0]`) and warm VRAM at zero extra PCIe DMA cost.
+                        let core_keep = (adapt_end / 4).clamp(16, 32);
+                        let mut victim_cands: Vec<(usize, u8, u64, usize)> = (core_keep..adapt_end)
+                            .map(|slot| {
+                                let ge_i32 = cache.slot_to_expert[slot];
+                                let (h_f, e_f) = if ge_i32 >= 0
+                                    && cache.expert_ids.contains(&(ge_i32 as usize))
+                                {
+                                    let le = ge_i32 as usize - local_start;
+                                    let ef = cache.expert_freq.get(le).copied().unwrap_or(0);
+                                    (hit_freq[le], ef)
+                                } else {
+                                    (0, 0)
+                                };
+                                (h_f, e_f, cache.slot_last_used[slot], slot)
+                            })
+                            .collect();
+                        victim_cands.sort_unstable();
+
+                        let mut heavy_cands: Vec<(usize, usize)> = misses_in_step
+                            .iter()
+                            .copied()
+                            .map(|ge| (miss_freq[ge - local_start], ge))
+                            .collect();
+                        heavy_cands.sort_unstable_by(|a, b| b.cmp(a));
+
+                        let min_freq = (num_tokens / 48).clamp(3, 14);
+                        let promote_cap = ws.stage_capacity.min(24);
+                        let max_promote =
+                            victim_cands.len().min(heavy_cands.len()).min(promote_cap);
+                        let mut pairs: Vec<(usize, i32, usize)> = Vec::new();
+                        for i in 0..max_promote {
+                            let (new_freq, new_ge) = heavy_cands[i];
+                            let (old_freq, old_ef, _, slot) = victim_cands[i];
+                            if new_freq >= min_freq
+                                && new_freq > old_freq * 2 + (usize::from(old_ef) / 4)
+                            {
+                                pairs.push((new_ge, slot as i32, new_freq));
+                            } else {
+                                break;
+                            }
+                        }
+                        if !pairs.is_empty() {
+                            pairs.sort_unstable_by_key(|&(ge, _, _)| ge);
+                            for &(ge, slot, new_freq) in &pairs {
+                                let new_le = ge - local_start;
+                                is_promoted[new_le] = true;
+                                promote_new_ges.push(ge);
+                                promote_victim_slots.push(slot);
+                                if !cache.expert_freq.is_empty() {
+                                    let boost = (4 + (new_freq / 2)).min(24) as u8;
+                                    cache.expert_freq[new_le] =
+                                        cache.expert_freq[new_le].max(boost);
+                                }
+                            }
+                        }
+                    }
+
                     if use_cpu_bridge {
                         // Rank cold experts with `1..=max_tok_per_job` routed tokens by token count ascending
                         // so the sparsest tail experts go to the CPU DDR5 pool (where row pairs are
                         // unpacked once and FMA-accumulated across all routed tokens) and the densest
-                        // cold experts fit in at most 1 GPU chunk (`<= 384` tokens) or 2 GPU chunks (`> 384` tokens).
+                        // cold experts (plus any Chunk-0 promotions) run on the GPU.
                         let (max_cpu_jobs, max_tok_per_job) = if cache.has_cpu_bridge() {
                             let avx512 = crate::moe_cpu_bridge::has_avx512();
                             let (target_gpu_misses, cpu_share_pct, max_tok_per_job) = if num_tokens
@@ -556,25 +688,43 @@ impl TieredMoeEngine {
                                     TIERED_MOE_PREFILL_AVX2_SINGLE_CHUNK_CPU_SHARE_PCT
                                 };
                                 (
-                                    ws.stage_capacity,
+                                    if avx512 {
+                                        ws.stage_capacity.max(32)
+                                    } else {
+                                        ws.stage_capacity
+                                    },
                                     pct,
                                     TIERED_MOE_PREFILL_SINGLE_CHUNK_MAX_TOK_PER_JOB,
                                 )
                             } else {
                                 (
-                                    2 * ws.stage_capacity,
+                                    if avx512 {
+                                        ws.stage_capacity.max(96)
+                                    } else {
+                                        ws.stage_capacity
+                                    },
                                     if avx512 {
                                         TIERED_MOE_PREFILL_AVX512_MULTI_CHUNK_CPU_SHARE_PCT
                                     } else {
                                         TIERED_MOE_PREFILL_AVX2_MULTI_CHUNK_CPU_SHARE_PCT
                                     },
-                                    TIERED_MOE_PREFILL_MULTI_CHUNK_MAX_TOK_PER_JOB,
+                                    if avx512 {
+                                        ((num_tokens * top_k * 2) / local_len.max(1) + 24).clamp(
+                                            40,
+                                            TIERED_MOE_PREFILL_MULTI_CHUNK_MAX_TOK_PER_JOB,
+                                        )
+                                    } else {
+                                        96
+                                    },
                                 )
                             };
-                            let jobs = misses_in_step
-                                .len()
-                                .saturating_sub(target_gpu_misses)
-                                .max((misses_in_step.len() * cpu_share_pct) / 100);
+                            let rem_misses =
+                                misses_in_step.len().saturating_sub(promote_new_ges.len());
+                            let jobs = rem_misses
+                                .saturating_sub(
+                                    target_gpu_misses.saturating_sub(promote_new_ges.len()),
+                                )
+                                .max((rem_misses * cpu_share_pct) / 100);
                             (jobs, max_tok_per_job)
                         } else if num_tokens <= 384 {
                             let jobs = misses_in_step
@@ -594,7 +744,11 @@ impl TieredMoeEngine {
                             .iter()
                             .copied()
                             .filter_map(|ge| {
-                                let cnt = exp_toks[ge - local_start].len();
+                                let le = ge - local_start;
+                                if is_promoted[le] {
+                                    return None;
+                                }
+                                let cnt = exp_toks[le].len();
                                 (1..=max_tok_per_job).contains(&cnt).then_some((cnt, ge))
                             })
                             .collect();
@@ -613,8 +767,10 @@ impl TieredMoeEngine {
                                 ws.cpu_tasks_scratch.push((tok as usize, le, wt));
                             }
                         }
+                        gpu_misses.extend_from_slice(&promote_new_ges);
                         for &ge in &misses_in_step {
-                            if !is_cpu_le[ge - local_start] {
+                            let le = ge - local_start;
+                            if !is_cpu_le[le] && !is_promoted[le] {
                                 gpu_misses.push(ge);
                             }
                         }
@@ -622,23 +778,17 @@ impl TieredMoeEngine {
                         gpu_misses.clone_from(&misses_in_step);
                     }
 
-                    // On long prompts (`num_tokens >= 1024`, both `TP=1` and `TP=2 / EP=2`), adapt
-                    // the bottom 20 slots of `0..adapt_end` by promoting up to 16 cold experts
+                    // On long prompts (`num_tokens >= 1024` when `!dynamic_short_adapt`, e.g. `TP=2 / EP=2`),
+                    // adapt the bottom 24 slots of `0..adapt_end` by promoting up to 16 cold experts
                     // from `gpu_misses` that are >= 3x more frequent in this prompt than the
                     // lowest-frequency resident tail slots, unpacking them directly from
                     // `ws.d_stage_packs[0]` during Chunk 0 at zero extra PCIe DMA cost.
-                    if (num_tokens >= TIERED_MOE_LONG_PROMPT_ADAPT_MIN_TOKENS
-                        || dynamic_short_adapt)
+                    if !dynamic_short_adapt
+                        && num_tokens >= TIERED_MOE_LONG_PROMPT_ADAPT_MIN_TOKENS
                         && adapt_end >= 64
                         && !gpu_misses.is_empty()
                     {
-                        let victim_range = if dynamic_short_adapt
-                            && num_tokens < TIERED_MOE_LONG_PROMPT_ADAPT_MIN_TOKENS
-                        {
-                            1..adapt_end
-                        } else {
-                            (adapt_end - 20)..adapt_end
-                        };
+                        let victim_range = (adapt_end - 24)..adapt_end;
                         let mut victim_cands: Vec<(usize, u64, usize)> = victim_range
                             .map(|slot| {
                                 let ge_i32 = cache.slot_to_expert[slot];
@@ -661,34 +811,15 @@ impl TieredMoeEngine {
                             .collect();
                         heavy_cands.sort_unstable_by(|a, b| b.cmp(a));
 
-                        let min_freq = if dynamic_short_adapt
-                            && num_tokens < TIERED_MOE_LONG_PROMPT_ADAPT_MIN_TOKENS
-                        {
-                            (num_tokens / 48).max(3)
-                        } else {
-                            (num_tokens / 64).max(16)
-                        };
-                        let promote_cap = if dynamic_short_adapt
-                            && num_tokens < TIERED_MOE_LONG_PROMPT_ADAPT_MIN_TOKENS
-                        {
-                            12
-                        } else {
-                            16
-                        };
+                        let min_freq = (num_tokens / 64).max(16);
+                        let promote_cap = 16usize;
                         let max_promote =
                             victim_cands.len().min(heavy_cands.len()).min(promote_cap);
                         let mut pairs: Vec<(usize, i32)> = Vec::new();
                         for i in 0..max_promote {
                             let (new_freq, new_ge) = heavy_cands[i];
                             let (old_freq, _, slot) = victim_cands[i];
-                            let ratio_ok = if dynamic_short_adapt
-                                && num_tokens < TIERED_MOE_LONG_PROMPT_ADAPT_MIN_TOKENS
-                            {
-                                new_freq > old_freq * 2
-                            } else {
-                                new_freq > old_freq * 3
-                            };
-                            if new_freq >= min_freq && ratio_ok {
+                            if new_freq >= min_freq && new_freq > old_freq * 3 {
                                 pairs.push((new_ge, slot as i32));
                             } else {
                                 break;
@@ -696,16 +827,16 @@ impl TieredMoeEngine {
                         }
                         if !pairs.is_empty() {
                             pairs.sort_unstable_by_key(|&(ge, _)| ge);
-                            let mut is_promoted = vec![false; local_len];
+                            let mut is_prom = vec![false; local_len];
                             for &(ge, slot) in &pairs {
-                                is_promoted[ge - local_start] = true;
+                                is_prom[ge - local_start] = true;
                                 promote_new_ges.push(ge);
                                 promote_victim_slots.push(slot);
                             }
                             let mut reordered = Vec::with_capacity(gpu_misses.len());
                             reordered.extend_from_slice(&promote_new_ges);
                             for &ge in &gpu_misses {
-                                if !is_promoted[ge - local_start] {
+                                if !is_prom[ge - local_start] {
                                     reordered.push(ge);
                                 }
                             }
@@ -816,16 +947,16 @@ impl TieredMoeEngine {
                     let local_len = cache.expert_ids.len();
 
                     compute_stream.wait_event(&ws.h2d_done_events[buf_idx])?;
-                    let stage_cap = ws.stage_tables[buf_idx].capacity;
+                    let stage_cap = ws.stage_table.capacity;
                     let sl = store.layout();
                     if ws.d_stage_packs[buf_idx].len_bytes < chunk.len().saturating_mul(sl.stride)
-                        || ws.stage_tables[buf_idx].gate_up_packed.len_bytes
+                        || ws.stage_table.gate_up_packed.len_bytes
                             < stage_cap.saturating_mul(sl.gate_up_packed.len())
-                        || ws.stage_tables[buf_idx].gate_up_scales.len_bytes
+                        || ws.stage_table.gate_up_scales.len_bytes
                             < stage_cap.saturating_mul(sl.gate_up_scales.len())
-                        || ws.stage_tables[buf_idx].down_packed.len_bytes
+                        || ws.stage_table.down_packed.len_bytes
                             < stage_cap.saturating_mul(sl.down_packed.len())
-                        || ws.stage_tables[buf_idx].down_scales.len_bytes
+                        || ws.stage_table.down_scales.len_bytes
                             < stage_cap.saturating_mul(sl.down_scales.len())
                     {
                         return Err(crate::cuda::CudaError::with_detail(
@@ -834,8 +965,8 @@ impl TieredMoeEngine {
                             "stage table buffer capacity smaller than layer ExpertPackLayout",
                         ));
                     }
-                    ws.stage_tables[buf_idx].layout = sl.clone();
-                    ws.stage_tables[buf_idx].unpack_staged(
+                    ws.stage_table.layout = sl.clone();
+                    ws.stage_table.unpack_staged(
                         compute_stream,
                         ws.d_stage_packs[buf_idx].addr(),
                         ws.d_stage_slots[buf_idx].addr(),
@@ -942,7 +1073,7 @@ impl TieredMoeEngine {
                         },
                         "warp34_moe_remap_topk_ids_i32 (StreamedPrefill chunk)",
                     )?;
-                    ws.stage_tables[buf_idx].launch_moe_w4a16(
+                    ws.stage_table.launch_moe_w4a16(
                         &ex,
                         x_addr,
                         ws.d_remapped_topk_ids[buf_idx].addr(),
@@ -1051,6 +1182,43 @@ impl TieredMoeEngine {
         num_tokens: usize,
         top_k: usize,
     ) -> crate::cuda::Result<()> {
+        Self::execute_auto_with_hook(
+            mode,
+            store,
+            cache,
+            ws,
+            compute_stream,
+            is_capturing_graph,
+            x_addr,
+            d_topk_ids_addr,
+            d_topk_weights_addr,
+            shared_expert_out_addr,
+            shared_expert_gate_addr,
+            out_addr,
+            num_tokens,
+            top_k,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn execute_auto_with_hook(
+        mode: MoeOffloadMode,
+        store: &HostExpertStore,
+        cache: &mut HotExpertCache,
+        ws: &mut TieredMoeWorkspace,
+        compute_stream: &crate::cuda::CudaStream,
+        is_capturing_graph: bool,
+        x_addr: u64,
+        d_topk_ids_addr: u64,
+        d_topk_weights_addr: u64,
+        shared_expert_out_addr: u64,
+        shared_expert_gate_addr: u64,
+        out_addr: u64,
+        num_tokens: usize,
+        top_k: usize,
+        pre_routed_hook: Option<PreRoutedHook<'_>>,
+    ) -> crate::cuda::Result<()> {
         if num_tokens == 0 {
             return Ok(());
         }
@@ -1062,7 +1230,7 @@ impl TieredMoeEngine {
             ));
         }
         if device_lru_safe {
-            return Self::execute_layer_device_lru(
+            return Self::execute_layer_device_lru_with_hook(
                 store,
                 cache,
                 ws,
@@ -1075,7 +1243,11 @@ impl TieredMoeEngine {
                 out_addr,
                 num_tokens,
                 top_k,
+                pre_routed_hook,
             );
+        }
+        if let Some(hook) = pre_routed_hook {
+            hook(compute_stream)?;
         }
         // For short warm-prefix tails and micro-batches (`9..=24` tokens, `<= 3` slices of `8`),
         // slice into `<= 8`-token device-bridge launches so we avoid 48-layer
@@ -1325,14 +1497,38 @@ impl RankTieredMoe {
         let mut caches = Vec::with_capacity(cfg.num_hidden_layers);
         let local_experts = cfg.num_experts / ep_size.max(1);
         let fully_resident = k_hot >= local_experts;
+        let uniform_stride = (0..cfg.num_hidden_layers)
+            .filter(|l| !cfg.mlp_only_layers.contains(l))
+            .all(|l| {
+                cfg.layer_moe_expert_pack_layout(l)
+                    .map_or(base_layout.stride, |lay| lay.stride)
+                    == base_layout.stride
+            });
+        let layer_k_hots = if !fully_resident && ep_size == 1 && uniform_stride {
+            rankings.as_ref().map_or_else(
+                || vec![k_hot; cfg.num_hidden_layers],
+                |r| {
+                    r.plan_layer_capacities(
+                        cfg.num_hidden_layers,
+                        k_hot,
+                        crate::model::TIERED_MOE_TP1_MIN_HOT_EXPERTS.min(local_experts),
+                        local_experts,
+                        2,
+                    )
+                },
+            )
+        } else {
+            vec![k_hot; cfg.num_hidden_layers]
+        };
         let mut slab_pool = host_store::PinnedSlabPool::new(cfg.num_hidden_layers.max(1));
-        for layer_id in 0..cfg.num_hidden_layers {
+        for (layer_id, &layer_k_hot) in layer_k_hots.iter().enumerate() {
+            let layer_fully_resident = layer_k_hot >= local_experts;
             let prefix = format!("model.layers.{layer_id}.mlp.experts");
             let layer_layout = cfg
                 .layer_moe_expert_pack_layout(layer_id)
                 .unwrap_or_else(|| base_layout.clone());
             let remaining_layers = cfg.num_hidden_layers - layer_id;
-            let preallocated = if fully_resident {
+            let preallocated = if layer_fully_resident {
                 None
             } else {
                 let bytes = layer_layout
@@ -1362,7 +1558,7 @@ impl RankTieredMoe {
                 ep_rank,
                 ep_size,
                 usize::MAX,
-                !fully_resident,
+                !layer_fully_resident,
                 preallocated,
             )
             .map_err(|e| {
@@ -1370,16 +1566,16 @@ impl RankTieredMoe {
             })?;
             let mut cache = HotExpertCache::new_on_stream(
                 device_id,
-                k_hot,
+                layer_k_hot,
                 store.expert_ids(),
                 store.layout().clone(),
                 stream,
             )?;
             let initial = rankings
                 .as_ref()
-                .and_then(|r| r.select_for_layer(layer_id, store.expert_ids(), k_hot));
+                .and_then(|r| r.select_for_layer(layer_id, store.expert_ids(), layer_k_hot));
             cache.populate_initial_async(&store, initial.as_deref(), &mut ws, stream)?;
-            if fully_resident {
+            if layer_fully_resident {
                 stream.synchronize()?;
                 store.release_host_storage();
             }
@@ -1396,15 +1592,16 @@ impl RankTieredMoe {
             && HotExpertCache::auto_cpu_bridge_preferred()
         {
             let mut bridge_runtime = None;
-            let k_static = if k_hot >= crate::model::TIERED_MOE_DYNAMIC_LRU_MIN_HOT_EXPERTS {
-                1
-            } else {
-                k_hot
-            };
             for (store, cache) in stores.iter().zip(&mut caches) {
-                if !store.layout().supports_cpu_bridge() {
+                let ck_hot = cache.slots.capacity;
+                if ck_hot >= store.expert_ids().len() || !store.layout().supports_cpu_bridge() {
                     continue;
                 }
+                let k_static = if ck_hot >= crate::model::TIERED_MOE_DYNAMIC_LRU_MIN_HOT_EXPERTS {
+                    1
+                } else {
+                    ck_hot
+                };
                 if bridge_runtime.is_none() {
                     bridge_runtime = Some(crate::moe_cpu_bridge::Runtime::new_for_ep(
                         stream, ep_rank, ep_size,
@@ -1455,7 +1652,7 @@ impl RankTieredMoe {
                 idx += 1;
                 continue;
             }
-            let mut batch_records: Vec<(usize, usize, usize, usize, usize)> = Vec::new();
+            let mut batch_records: Vec<(usize, usize, usize, usize, usize, usize)> = Vec::new();
             let mut off = 0usize;
             while idx < self.caches.len() {
                 let c = &self.caches[idx];
@@ -1466,7 +1663,8 @@ impl RankTieredMoe {
                 let e2s_b = c.expert_to_slot.len() * 4;
                 let s2e_b = c.slot_to_expert.len() * 4;
                 let slu_b = c.slot_last_used.len() * 8;
-                let need = (e2s_b + s2e_b + slu_b + 8 + 7) & !7;
+                let freq_b = c.expert_freq.len();
+                let need = (e2s_b + s2e_b + slu_b + 8 + freq_b + 15) & !7;
                 if need > pinned_cap {
                     break;
                 }
@@ -1477,8 +1675,9 @@ impl RankTieredMoe {
                 let s2e_off = base_off + e2s_b;
                 let slu_off = (s2e_off + s2e_b + 7) & !7;
                 let step_off = slu_off + slu_b;
-                off = step_off + 8;
-                // SAFETY: `step_off + 8 <= pinned_cap`, 8-byte aligned for `u64` slices,
+                let freq_off = step_off + 8;
+                off = (freq_off + freq_b + 7) & !7;
+                // SAFETY: `freq_off + freq_b <= pinned_cap`, 8-byte aligned for `u64` slices,
                 // and `stream.synchronize()` completes every D2H before reading.
                 unsafe {
                     crate::cuda::check_rc(
@@ -1517,8 +1716,19 @@ impl RankTieredMoe {
                         ),
                         "coalesced d_step_counter D2H",
                     )?;
+                    if freq_b > 0 {
+                        crate::cuda::check_rc(
+                            warp34_kernels::ffi::warp34_memcpy_d2h_async(
+                                pinned_base.add(freq_off).cast(),
+                                c.d_expert_freq.addr() as *const core::ffi::c_void,
+                                freq_b,
+                                stream.handle,
+                            ),
+                            "coalesced d_expert_freq D2H",
+                        )?;
+                    }
                 }
-                batch_records.push((idx, base_off, s2e_off, slu_off, step_off));
+                batch_records.push((idx, base_off, s2e_off, slu_off, step_off, freq_off));
                 idx += 1;
             }
             if batch_records.is_empty() {
@@ -1527,7 +1737,7 @@ impl RankTieredMoe {
                 continue;
             }
             stream.synchronize()?;
-            for (layer_idx, base_off, s2e_off, slu_off, step_off) in batch_records {
+            for (layer_idx, base_off, s2e_off, slu_off, step_off, freq_off) in batch_records {
                 let c = &mut self.caches[layer_idx];
                 // SAFETY: `stream.synchronize()` completed all D2H into aligned `pinned_base` offsets.
                 unsafe {
@@ -1546,11 +1756,18 @@ impl RankTieredMoe {
                         c.slot_last_used.as_mut_ptr(),
                         c.slot_last_used.len(),
                     );
+                    if !c.expert_freq.is_empty() {
+                        core::ptr::copy_nonoverlapping(
+                            pinned_base.add(freq_off),
+                            c.expert_freq.as_mut_ptr(),
+                            c.expert_freq.len(),
+                        );
+                    }
                     let step_val = core::ptr::read(pinned_base.add(step_off).cast::<u64>());
                     c.step_clock = step_val.saturating_add(1).max(1);
                 }
                 let check_limit = if c.has_cpu_bridge() {
-                    c.k_static
+                    if c.k_static <= 1 { 0 } else { c.k_static }
                 } else {
                     c.prefill_hot_limit()
                 }
@@ -1595,6 +1812,41 @@ impl RankTieredMoe {
             out_addr,
             num_tokens,
             top_k,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn execute_layer_auto_with_hook(
+        &mut self,
+        compute_stream: &crate::cuda::CudaStream,
+        is_capturing_graph: bool,
+        layer_idx: usize,
+        x_addr: u64,
+        d_topk_ids_addr: u64,
+        d_topk_weights_addr: u64,
+        shared_expert_out_addr: u64,
+        shared_expert_gate_addr: u64,
+        out_addr: u64,
+        num_tokens: usize,
+        top_k: usize,
+        pre_routed_hook: Option<PreRoutedHook<'_>>,
+    ) -> crate::cuda::Result<()> {
+        TieredMoeEngine::execute_auto_with_hook(
+            self.mode,
+            &self.stores[layer_idx],
+            &mut self.caches[layer_idx],
+            &mut self.ws,
+            compute_stream,
+            is_capturing_graph,
+            x_addr,
+            d_topk_ids_addr,
+            d_topk_weights_addr,
+            shared_expert_out_addr,
+            shared_expert_gate_addr,
+            out_addr,
+            num_tokens,
+            top_k,
+            pre_routed_hook,
         )
     }
 }

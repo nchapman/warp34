@@ -2586,6 +2586,14 @@ impl NativeProposer {
                 {
                     drafts.truncate(eos);
                 }
+                let mut extras = Vec::with_capacity(drafts.len());
+                for _ in 0..drafts.len() {
+                    let Some(s) = engine.alloc_state_slot() else {
+                        break;
+                    };
+                    extras.push(s);
+                }
+                drafts.truncate(extras.len());
                 let prepared_sampler = if processed_sampling {
                     Some(crate::model::PreparedSpecSamplerRows::prepare_drafts(
                         engine.cfg.vocab_size,
@@ -2596,17 +2604,13 @@ impl NativeProposer {
                 } else {
                     None
                 };
+                if extras.len() > drafts.len() {
+                    let surplus: Vec<_> = extras.drain(drafts.len()..).collect();
+                    engine.free_state_slots(&surplus);
+                }
                 let k = drafts.len();
                 let mut verify = vec![anchor];
                 verify.extend_from_slice(&drafts);
-                let mut extras = Vec::with_capacity(k);
-                for _ in 0..k {
-                    let Some(s) = engine.alloc_state_slot() else {
-                        engine.free_state_slots(&extras);
-                        return Err(loader_err("no speculative verification state slots"));
-                    };
-                    extras.push(s);
-                }
                 let schedule = if k > 0 {
                     tx.begin_spec_verify(extras);
                     tx.verify_slot_schedule()

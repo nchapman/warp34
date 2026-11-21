@@ -698,6 +698,334 @@ impl FfnBlockWeights {
 
     /// Executes the host/VRAM tiered MoE dispatch when `self` is a tiered `FfnBlockWeights::Moe`;
     /// no-op for `Dense` and VRAM-resident `Moe`.
+    /// Executes a tiered MoE FFN layer while overlapping `shared_expert` (`gate_up -> SiLU -> down`)
+    /// behind `warp34_moe_hybrid_submit_and_pull_forked` so CPU `eval_expert_vnni` wakes immediately
+    /// after `warp34_moe_topk_router_f16`. Falls back to sequential execution for non-tiered FFNs
+    /// or mixed-Hadamard layouts where `normed_buf` must be rotated after `shared_gate_up_proj`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_and_execute_tiered_overlapped(
+        &self,
+        tiered_moe: Option<&mut crate::moe_offload::RankTieredMoe>,
+        ex: &ffi::Warp34Exec,
+        stream: &CudaStream,
+        is_capturing_graph: bool,
+        cublas: &CublasHandle,
+        marlin_ws_ptr: u64,
+        marlin_ws_ints: usize,
+        normed_buf: u64,
+        mlp_out_buf: u64,
+        num_tokens: usize,
+        h_dim: usize,
+        interm: usize,
+        gate_up_buf: u64,
+        mlp_act_buf: u64,
+        moe_router_logits_buf: u64,
+        moe_topk_weights_buf: u64,
+        moe_topk_ids_buf: u64,
+        moe_interm_buf: u64,
+        moe_sh_gu_buf: u64,
+        moe_sh_act_buf: u64,
+        moe_sh_out_buf: u64,
+        moe_sh_gate_buf: u64,
+        prerotated_input_buf: u64,
+    ) -> Result<()> {
+        let input_prerotated = prerotated_input_buf != 0;
+        let can_defer_shared = num_tokens
+            <= crate::moe_offload::TIERED_MOE_CPU_BRIDGE_MAX_DECODE_TOKENS
+            && match self {
+                Self::Moe(moe) => {
+                    matches!(moe.experts, MoeExpertStorage::Tiered { .. })
+                        && (input_prerotated
+                            || moe.routed_input_hadamard == 0
+                            || (moe.routed_input_hadamard == HADAMARD_BLOCK_64
+                                && moe
+                                    .shared_gate_up_proj
+                                    .as_ref()
+                                    .is_some_and(LinearProj::can_fuse_h64_from_producer)))
+                }
+                Self::Dense { .. } => false,
+            };
+        if !can_defer_shared {
+            self.forward_with_prerotated_input(
+                ex,
+                cublas,
+                marlin_ws_ptr,
+                marlin_ws_ints,
+                normed_buf,
+                mlp_out_buf,
+                num_tokens,
+                h_dim,
+                interm,
+                gate_up_buf,
+                mlp_act_buf,
+                moe_router_logits_buf,
+                moe_topk_weights_buf,
+                moe_topk_ids_buf,
+                moe_interm_buf,
+                moe_sh_gu_buf,
+                moe_sh_act_buf,
+                moe_sh_out_buf,
+                moe_sh_gate_buf,
+                prerotated_input_buf,
+            )?;
+            return self.execute_tiered(
+                tiered_moe,
+                stream,
+                is_capturing_graph,
+                if input_prerotated {
+                    prerotated_input_buf
+                } else {
+                    normed_buf
+                },
+                [
+                    moe_topk_ids_buf,
+                    moe_topk_weights_buf,
+                    moe_sh_out_buf,
+                    moe_sh_gate_buf,
+                    mlp_out_buf,
+                ],
+                num_tokens,
+            );
+        }
+
+        let Self::Moe(moe) = self else {
+            unreachable!();
+        };
+        let MoeExpertStorage::Tiered { layer_id } = moe.experts else {
+            unreachable!();
+        };
+        let reserved_prerot = align_up_hadamard_workspace(
+            num_tokens
+                .saturating_mul(h_dim)
+                .saturating_mul(FP16_ELEM_BYTES),
+        );
+        let sub_ex = if input_prerotated
+            && prerotated_input_buf == ex.scratch_ptr
+            && ex.scratch_size >= reserved_prerot
+        {
+            Warp34Exec {
+                stream: ex.stream,
+                scratch_ptr: ex.scratch_ptr + reserved_prerot as u64,
+                scratch_size: ex.scratch_size - reserved_prerot,
+                flags: ex.flags,
+            }
+        } else {
+            *ex
+        };
+        let ex = &sub_ex;
+        let dual_router_sh_gate = match (
+            &moe.router_gate,
+            moe.shared_gate_up_proj
+                .as_ref()
+                .zip(moe.shared_down_proj.as_ref()),
+            &moe.shared_expert_gate,
+            num_tokens <= 16,
+        ) {
+            (
+                LinearProj::DenseF16 {
+                    weight_ptr: w0,
+                    size_n: n0,
+                    size_k: k0,
+                },
+                Some(_),
+                Some(LinearProj::DenseF16 {
+                    weight_ptr: w1,
+                    size_n: n1,
+                    size_k: k1,
+                }),
+                true,
+            ) if *n0 <= SMALL_N_GEMM_ROUTER_512_MAX_N
+                && *n1 <= SMALL_N_GEMM_ALWAYS_MAX_N
+                && *k0 == *k1
+                && k0.is_multiple_of(SMALL_N_GEMM_K_ALIGN) =>
+            {
+                Some((*w0, *n0, *w1, *n1, *k0))
+            }
+            _ => None,
+        };
+        if let Some((w0, n0, w1, n1, k)) = dual_router_sh_gate {
+            check_rc(
+                // SAFETY: `normed_buf` holds `[num_tokens, k]` FP16 inputs and scratch reserves
+                // disjoint `moe_router_logits_buf` / `moe_sh_gate_buf` outputs.
+                unsafe {
+                    ffi::warp34_small_n_gemm_dual_f16(
+                        ex,
+                        normed_buf as *const c_void,
+                        w0 as *const c_void,
+                        moe_router_logits_buf as *mut c_void,
+                        n0 as i32,
+                        w1 as *const c_void,
+                        moe_sh_gate_buf as *mut c_void,
+                        n1 as i32,
+                        num_tokens as i32,
+                        k as i32,
+                    )
+                },
+                "warp34_small_n_gemm_dual_f16",
+            )?;
+        } else {
+            moe.router_gate.forward(
+                ex,
+                cublas,
+                marlin_ws_ptr,
+                marlin_ws_ints,
+                normed_buf,
+                moe_router_logits_buf,
+                num_tokens,
+            )?;
+            if moe.shared_gate_up_proj.is_some()
+                && moe.shared_down_proj.is_some()
+                && let Some(sh_gate) = &moe.shared_expert_gate
+            {
+                sh_gate.forward(
+                    ex,
+                    cublas,
+                    marlin_ws_ptr,
+                    marlin_ws_ints,
+                    normed_buf,
+                    moe_sh_gate_buf,
+                    num_tokens,
+                )?;
+            }
+        }
+        check_rc(
+            // SAFETY: router projection precedes this on `ex.stream`.
+            unsafe {
+                ffi::warp34_moe_topk_router_f16(
+                    ex,
+                    moe_router_logits_buf as *const c_void,
+                    moe_topk_weights_buf as *mut f32,
+                    moe_topk_ids_buf as *mut i32,
+                    num_tokens as i32,
+                    moe.num_experts as i32,
+                    moe.top_k as i32,
+                    i32::from(moe.norm_topk_prob),
+                    moe.scoring_func,
+                )
+            },
+            "warp34_moe_topk_router_f16",
+        )?;
+        let fuse_shared_and_routed_in_h64 = !input_prerotated
+            && moe.routed_input_hadamard == HADAMARD_BLOCK_64
+            && moe
+                .shared_gate_up_proj
+                .as_ref()
+                .is_some_and(LinearProj::can_fuse_h64_from_producer);
+        if fuse_shared_and_routed_in_h64 {
+            check_rc(
+                // SAFETY: `normed_buf` holds `num_tokens * h_dim` FP16 elements.
+                unsafe {
+                    ffi::warp34_block_hadamard_inplace_f16(
+                        ex,
+                        normed_buf as *mut c_void,
+                        num_tokens as i32,
+                        h_dim as i32,
+                        HADAMARD_BLOCK_64 as i32,
+                    )
+                },
+                "warp34_block_hadamard_inplace_f16 (moe shared+routed input)",
+            )?;
+        }
+        let rotated_input_buf = if input_prerotated {
+            prerotated_input_buf
+        } else {
+            normed_buf
+        };
+        let sh_out_ptr = if moe.shared_down_proj.is_some() {
+            moe_sh_out_buf
+        } else {
+            0
+        };
+        let sh_gate_ptr = if moe.shared_expert_gate.is_some() {
+            moe_sh_gate_buf
+        } else {
+            0
+        };
+        let tmoe_engine =
+            tiered_moe.ok_or_else(|| loader_err("missing RankTieredMoe for tiered MoE layer"))?;
+        let mut run_shared = |_s: &CudaStream| -> Result<()> {
+            if let (Some(sh_gu), Some(sh_dn)) = (&moe.shared_gate_up_proj, &moe.shared_down_proj) {
+                if input_prerotated || fuse_shared_and_routed_in_h64 {
+                    sh_gu.forward_prerotated(
+                        ex,
+                        cublas,
+                        marlin_ws_ptr,
+                        marlin_ws_ints,
+                        rotated_input_buf,
+                        moe_sh_gu_buf,
+                        num_tokens,
+                    )?;
+                } else {
+                    sh_gu.forward(
+                        ex,
+                        cublas,
+                        marlin_ws_ptr,
+                        marlin_ws_ints,
+                        normed_buf,
+                        moe_sh_gu_buf,
+                        num_tokens,
+                    )?;
+                }
+                let fuse_sh_down_h64 = sh_dn.can_fuse_h64_from_producer();
+                let sh_silu_fn = if fuse_sh_down_h64 {
+                    ffi::warp34_silu_and_mul_hadamard_f16
+                } else {
+                    ffi::warp34_silu_and_mul_f16
+                };
+                check_rc(
+                    // SAFETY: `moe_sh_gu_buf` and `moe_sh_act_buf` are disjoint FFN scratch buffers.
+                    unsafe {
+                        sh_silu_fn(
+                            ex,
+                            moe_sh_gu_buf as *const c_void,
+                            moe_sh_act_buf as *mut c_void,
+                            core::ptr::null(),
+                            num_tokens as i32,
+                            moe.local_shared_interm as i32,
+                        )
+                    },
+                    "warp34_silu_and_mul_f16 (shared_expert)",
+                )?;
+                if fuse_sh_down_h64 {
+                    sh_dn.forward_prerotated(
+                        ex,
+                        cublas,
+                        marlin_ws_ptr,
+                        marlin_ws_ints,
+                        moe_sh_act_buf,
+                        moe_sh_out_buf,
+                        num_tokens,
+                    )?;
+                } else {
+                    sh_dn.forward(
+                        ex,
+                        cublas,
+                        marlin_ws_ptr,
+                        marlin_ws_ints,
+                        moe_sh_act_buf,
+                        moe_sh_out_buf,
+                        num_tokens,
+                    )?;
+                }
+            }
+            Ok(())
+        };
+        tmoe_engine.execute_layer_auto_with_hook(
+            stream,
+            is_capturing_graph,
+            layer_id,
+            rotated_input_buf,
+            moe_topk_ids_buf,
+            moe_topk_weights_buf,
+            sh_out_ptr,
+            sh_gate_ptr,
+            mlp_out_buf,
+            num_tokens,
+            moe.top_k,
+            Some(&mut run_shared),
+        )
+    }
+
     pub fn execute_tiered(
         &self,
         tiered_moe: Option<&mut crate::moe_offload::RankTieredMoe>,

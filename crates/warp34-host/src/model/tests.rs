@@ -1131,7 +1131,7 @@ mod serving_capacity_tests {
                 2_400 * mib,
                 11
             ),
-            super::rank_capacity::PLE_OR_LARGE_MODEL_DEFAULT_STATE_SLOTS
+            11
         );
         let (slots_tiered_tp1, _, _) = evaluate_serving_kv_candidate_budget(
             &tiered_cfg,
@@ -1690,9 +1690,11 @@ mod serving_capacity_tests {
         tied_cfg.tie_word_embeddings = true;
         let tp1_tied =
             Qwen3_5ModelRank::estimate_weight_arena_bytes(&tied_cfg, &archive, 1, Some(128));
-        assert_eq!(
-            tp1_bytes, tp1_tied,
-            "untied (host_embed_tokens + GPU lm_head.weight) and tied (GPU embed_tokens) must use identical weight_arena bytes"
+        // Untied quantized tiered-MoE online-quantizes `lm_head.weight` (`BF16 -> MarlinW8A16`,
+        // saving ~596 MiB vs FP16 `embed_tokens` in the tied configuration).
+        assert!(
+            tp1_tied > tp1_bytes && tp1_tied - tp1_bytes >= 580 * 1024 * 1024,
+            "expected untied MarlinW8A16 lm_head to save >=580 MiB vs tied FP16 embed_tokens (untied={tp1_bytes}, tied={tp1_tied})"
         );
     }
 

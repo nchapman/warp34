@@ -164,8 +164,8 @@ impl Qwen3_5ModelRank {
         lora_mode: GraphLoraMode,
         tp2: Option<&Tp2Collectives>,
     ) -> Result<()> {
-        const MAX_SPEC_VERIFY_CACHED_GRAPHS: usize = 8;
-        const MAX_LORA_SPEC_VERIFY_CACHED_GRAPHS: usize = 16;
+        const MAX_SPEC_VERIFY_CACHED_GRAPHS: usize = 16;
+        const MAX_LORA_SPEC_VERIFY_CACHED_GRAPHS: usize = 24;
         let long_ctx = !self.cfg.uses_qsa() && long_ctx;
         let key = (m_verify, long_ctx, sample_mode, lora_mode);
         if let Some(pos) = self

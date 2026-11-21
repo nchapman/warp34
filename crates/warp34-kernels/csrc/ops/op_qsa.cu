@@ -790,6 +790,10 @@ __global__ void qsa_sparse_paged_attn_gqa_f16_kernel(
     const int n_sel = num_selected_blocks[tok];
     const int seq_pos = token_seq_pos[tok];
     const int groups_per_page = kv_layout.block_size >> 2;
+    const bool gpp_pow2 = (groups_per_page > 0) && ((groups_per_page & (groups_per_page - 1)) == 0);
+    const int gpp_shift = gpp_pow2 ? (__ffs(groups_per_page) - 1) : 0;
+    const int gpp_mask = groups_per_page - 1;
+    const float tq4_lut = kTq4D256Centroids[lane & 15];
     const int groups_per_split = (n_sel + num_splits - 1) / num_splits;
     const int grp_start = split_id * groups_per_split;
     const int grp_end =
@@ -823,8 +827,10 @@ __global__ void qsa_sparse_paged_attn_gqa_f16_kernel(
         const int kv_pos = log_grp * 4 + grp_off;
         if (phys_grp < 0 || kv_pos > seq_pos) continue;
 
-        const int32_t phys_page = phys_grp / groups_per_page;
-        const int page_off = (phys_grp % groups_per_page) * 4 + grp_off;
+        const int32_t phys_page =
+            gpp_pow2 ? (phys_grp >> gpp_shift) : (phys_grp / groups_per_page);
+        const int page_off =
+            (gpp_pow2 ? (phys_grp & gpp_mask) : (phys_grp % groups_per_page)) * 4 + grp_off;
         const uint8_t* k_ptr =
             k_base + (size_t)phys_page * kv_layout.k_page_stride_bytes +
             (size_t)kv_head * kv_layout.k_head_stride_bytes +
@@ -846,8 +852,8 @@ __global__ void qsa_sparse_paged_attn_gqa_f16_kernel(
                 const uint8_t p1 = k_blks[1].qs[(lane + 32 * j) >> 1];
                 const uint8_t n0 = odd ? (p0 >> 4) : (p0 & 0x0Fu);
                 const uint8_t n1 = odd ? (p1 >> 4) : (p1 & 0x0Fu);
-                k_val[j] = kd0 * kTq4D256Centroids[n0];
-                k_val[j + 4] = kd1 * kTq4D256Centroids[n1];
+                k_val[j] = kd0 * __shfl_sync(0xffffffffu, tq4_lut, n0);
+                k_val[j + 4] = kd1 * __shfl_sync(0xffffffffu, tq4_lut, n1);
             }
         } else if (kv_layout.k_format == WARP34_KV_FORMAT_Q8_0) {
             const qsa_block_q8_0_64* k_blks = reinterpret_cast<const qsa_block_q8_0_64*>(k_ptr);
@@ -893,8 +899,8 @@ __global__ void qsa_sparse_paged_attn_gqa_f16_kernel(
                 }
                 const float score = qsa_warp_reduce_sum(dot);
                 const float m_new = fmaxf(m_i[h], score);
-                alpha[h] = expf(m_i[h] - m_new);
-                beta[h] = expf(score - m_new);
+                alpha[h] = __expf(m_i[h] - m_new);
+                beta[h] = __expf(score - m_new);
                 d_i[h] = d_i[h] * alpha[h] + beta[h];
                 m_i[h] = m_new;
             }
@@ -912,8 +918,8 @@ __global__ void qsa_sparse_paged_attn_gqa_f16_kernel(
                 const uint8_t p1 = v_blks[1].qs[(lane + 32 * j) >> 1];
                 const uint8_t n0 = odd ? (p0 >> 4) : (p0 & 0x0Fu);
                 const uint8_t n1 = odd ? (p1 >> 4) : (p1 & 0x0Fu);
-                v_val[j] = vd0 * kTq4D256Centroids[n0];
-                v_val[j + 4] = vd1 * kTq4D256Centroids[n1];
+                v_val[j] = vd0 * __shfl_sync(0xffffffffu, tq4_lut, n0);
+                v_val[j + 4] = vd1 * __shfl_sync(0xffffffffu, tq4_lut, n1);
             }
         } else if (kv_layout.v_format == WARP34_KV_FORMAT_Q8_0) {
             const qsa_block_q8_0_64* v_blks = reinterpret_cast<const qsa_block_q8_0_64*>(v_ptr);

@@ -1247,6 +1247,22 @@ unsafe extern "C" {
         table_rows: i32,
         eps: f32,
     ) -> i32;
+    pub fn warp34_dflash_qk_norm_rope_kv_write_bf16_inv_freq(
+        ex: *const Warp34Exec,
+        qkv: *mut c_void,
+        q_out: *mut c_void,
+        positions: *const i32,
+        qw: *const c_void,
+        kw: *const c_void,
+        inv_freq: *const f32,
+        kv_layout: *const Warp34KvLayerLayout,
+        write_slot_mapping: *const i32,
+        rows: i32,
+        q_heads: i32,
+        kv_heads: i32,
+        dim: i32,
+        eps: f32,
+    ) -> i32;
     pub fn warp34_dflash_select_greedy_bf16(
         ex: *const Warp34Exec,
         ids: *const i32,
@@ -1261,6 +1277,21 @@ unsafe extern "C" {
         rank: i32,
         vocab: i32,
     ) -> i32;
+    pub fn warp34_dflash_select_greedy_with_conf_bf16(
+        ex: *const Warp34Exec,
+        ids: *const i32,
+        unary: *const f32,
+        hidden: *const c_void,
+        pred: *const c_void,
+        succ: *const c_void,
+        out_path: *mut i32,
+        out_confs: *mut f32,
+        anchor: i32,
+        k: i32,
+        topk: i32,
+        rank: i32,
+        vocab: i32,
+    ) -> i32;
     pub fn warp34_dflash_select_greedy_dev_anchor_bf16(
         ex: *const Warp34Exec,
         ids: *const i32,
@@ -1269,6 +1300,21 @@ unsafe extern "C" {
         pred: *const c_void,
         succ: *const c_void,
         out_path: *mut i32,
+        anchor_dev: *const i32,
+        k: i32,
+        topk: i32,
+        rank: i32,
+        vocab: i32,
+    ) -> i32;
+    pub fn warp34_dflash_select_greedy_dev_anchor_with_conf_bf16(
+        ex: *const Warp34Exec,
+        ids: *const i32,
+        unary: *const f32,
+        hidden: *const c_void,
+        pred: *const c_void,
+        succ: *const c_void,
+        out_path: *mut i32,
+        out_confs: *mut f32,
         anchor_dev: *const i32,
         k: i32,
         topk: i32,

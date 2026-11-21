@@ -847,8 +847,11 @@ impl Qwen3_5ModelRank {
                     dump,
                 )?;
             }
-            layer.ffn.forward_with_prerotated_input(
+            layer.ffn.forward_and_execute_tiered_overlapped(
+                self.tiered_moe.as_mut(),
                 ex,
+                &self.stream,
+                self.is_capturing_graph,
                 &self.cublas,
                 mw,
                 mi,
@@ -868,18 +871,6 @@ impl Qwen3_5ModelRank {
                 shout,
                 shgate,
                 pre_mlp_targets[1],
-            )?;
-            layer.ffn.execute_tiered(
-                self.tiered_moe.as_mut(),
-                &self.stream,
-                self.is_capturing_graph,
-                if pre_mlp_targets[1] != 0 {
-                    pre_mlp_targets[1]
-                } else {
-                    s.normed
-                },
-                [topids, topw, shout, shgate, s.mlp],
-                rows,
             )?;
             let [next_weight, next_out, next_had64] =
                 if let Some(next) = self.layers.get(layer_idx + 1) {

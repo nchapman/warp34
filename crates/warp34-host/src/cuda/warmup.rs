@@ -1333,6 +1333,25 @@ pub fn prepare_execution_plan(device_id: i32) -> Result<()> {
         "warmup BF16 QK/RoPE + KV write"
     )?;
     warmup_ffi!(
+        ffi::warp34_dflash_qk_norm_rope_kv_write_bf16_inv_freq(
+            &ex,
+            buf_a as *mut c_void,
+            buf_d as *mut c_void,
+            candidate_ids as *const i32,
+            buf_b as *const c_void,
+            buf_b as *const c_void,
+            buf_c as *const f32,
+            &bf16_layout,
+            slot_map as *const i32,
+            1,
+            1,
+            1,
+            256,
+            1e-6,
+        ),
+        "warmup BF16 QK/RoPE inv_freq + KV write"
+    )?;
+    warmup_ffi!(
         ffi::warp34_dflash_select_greedy_bf16(
             &ex,
             candidate_ids as *const i32,
