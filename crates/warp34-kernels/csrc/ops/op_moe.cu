@@ -1968,7 +1968,10 @@ static int moe_wxa16_pulled_add_f16_impl(
     auto experts = reinterpret_cast<int32_t*>((char*)pairs + pb);
     auto down = reinterpret_cast<__half*>((char*)experts + eb);
     cudaStream_t st = (cudaStream_t)ex->stream;
-    const bool fuse_h64 = (down_hadamard_block_size == 64 && (n_interm % 64) == 0);
+    // Keep `fuse_h64 = false` so `moe_sparse_vec4_kernel` uses `cta_rows = 16` (`40` X-blocks
+    // instead of `10` for `n_interm = 640`), saturating all SMs even when only 1..4 experts are
+    // pulled (`~20 us` + `1.7 us` `block_hadamard_16bit` vs `71.5 us` fused).
+    const bool fuse_h64 = false;
     const int lpr_gu = sparse_vec4_lpr(k_hidden);
     const int base_rows_gu = 4 * 4 * (32 / lpr_gu);
     const int cta_rows_gu = (fuse_h64 && base_rows_gu < 64) ? 64 : base_rows_gu;

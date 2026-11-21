@@ -125,6 +125,7 @@ __global__ void moe_hybrid_plan_and_submit_kernel(
     __shared__ uint32_t s_slot_vfreq[256];
     __shared__ uint64_t s_slot_ts[256];
     __shared__ int32_t s_slot_ge[256];
+    __shared__ int16_t s_cold_idx[512];
 
     const int total_pairs = num_tokens * top_k;
     if (threadIdx.x == 0) {
@@ -160,6 +161,9 @@ __global__ void moe_hybrid_plan_and_submit_kernel(
     }
 
     // Phase 1b (parallel): preload evictable slot metadata (`k_static..k_hot`) into shared memory
+    // and clear O(1) cold-expert dedup map `s_cold_idx[0..512)`.
+    s_cold_idx[threadIdx.x] = -1;
+    s_cold_idx[threadIdx.x + 256] = -1;
     // so multi-victim selection (`want_gpu_cold = 1..4`) runs with zero global memory stalls.
     const int n_evict = (k_hot > k_static) ? (k_hot - k_static) : 0;
     const bool cached_evict_table = (n_evict > 0 && n_evict <= 256);
@@ -214,9 +218,22 @@ __global__ void moe_hybrid_plan_and_submit_kernel(
                 }
                 s_cpu_le[p] = -1;
             } else {
-                int c_idx = 0;
-                while (c_idx < n_cold && distinct_cold[c_idx] != le) ++c_idx;
-                if (c_idx == n_cold) {
+                int c_idx = -1;
+                if (le < 512) {
+                    c_idx = (int)s_cold_idx[le];
+                } else {
+                    for (int k = 0; k < n_cold; ++k) {
+                        if (distinct_cold[k] == le) {
+                            c_idx = k;
+                            break;
+                        }
+                    }
+                }
+                if (c_idx < 0) {
+                    c_idx = n_cold;
+                    if (le < 512) {
+                        s_cold_idx[le] = (int16_t)c_idx;
+                    }
                     distinct_cold[n_cold] = le;
                     distinct_ge[n_cold] = s_ge[p];
                     cold_hits[n_cold] = 0;
