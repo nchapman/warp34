@@ -296,7 +296,7 @@ mod serving_capacity_tests {
         assert!(hot_with_dflash < hot_without_dflash);
 
         // TP=2 at 12288 pages + MTP reserve and 1.2 GiB state pool:
-        // exact 8-aligned hot_per_layer = 96, fitting within 19_600 MiB.
+        // exact 2-aligned hot_per_layer = 102, fitting within 19_600 MiB.
         let base_plus_kv_12k = gib + 1536 * 1024 * 1024 + 1824 * 1024 * 1024;
         let min_state_12k = 1200 * 1024 * 1024;
         let (hot_tp2_12k, reserve_12k) = plan_tiered_moe_hot_per_layer(
@@ -306,7 +306,7 @@ mod serving_capacity_tests {
             base_plus_kv_12k,
             min_state_12k,
         );
-        assert_eq!(hot_tp2_12k, 96);
+        assert_eq!(hot_tp2_12k, 102);
         assert!(base_plus_kv_12k + min_state_12k + reserve_12k <= 19_600 * 1024 * 1024);
 
         // Insufficient VRAM falls back to min_hot (16 on TP=1, 32 on TP=2)
@@ -434,6 +434,32 @@ mod serving_capacity_tests {
         );
         assert!(hot_rco_tp2_8k >= 176);
         assert!(base_plus_kv_8k_tq4 + min_state_18 + reserve_rco_tp2_8k <= 16_400 * mib);
+    }
+
+    #[test]
+    fn tp2_tiered_moe_stage_capacity_and_compact_scratch() {
+        let cfg = sample_qwen4_exp_config();
+        let gib = 1024usize * 1024 * 1024;
+        assert_eq!(
+            super::super::rank_capacity::select_tiered_moe_stage_capacity_with_bridge(
+                &cfg, 2, 128, true
+            ),
+            super::super::rank_capacity::TIERED_MOE_STAGE_CAPACITY_TP4
+        );
+        assert_eq!(
+            super::super::rank_capacity::select_tiered_moe_stage_capacity_with_bridge(
+                &cfg, 2, 128, false
+            ),
+            super::super::rank_capacity::TIERED_MOE_STAGE_CAPACITY_DEFAULT
+        );
+        assert!(
+            super::super::rank_capacity::should_use_compact_tiered_moe_scratch(
+                &cfg,
+                2,
+                24 * gib,
+                crate::model::LoraCapacityReserve::default(),
+            )
+        );
     }
 
     #[test]

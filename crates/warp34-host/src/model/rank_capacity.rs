@@ -364,13 +364,29 @@ pub(super) fn select_tiered_moe_stage_capacity(
     tp_size: usize,
     hot_per_layer: usize,
 ) -> usize {
+    select_tiered_moe_stage_capacity_with_bridge(
+        cfg,
+        tp_size,
+        hot_per_layer,
+        crate::moe_offload::HotExpertCache::auto_cpu_bridge_preferred(),
+    )
+}
+
+pub(super) fn select_tiered_moe_stage_capacity_with_bridge(
+    cfg: &ModelConfig,
+    tp_size: usize,
+    hot_per_layer: usize,
+    cpu_bridge_preferred: bool,
+) -> usize {
     let local_experts = (cfg.num_experts / tp_size.max(1)).max(1);
-    let cpu_bridge_tp1 = tp_size == 1
-        && cfg.num_experts >= TIERED_MOE_MIN_MODEL_EXPERTS
-        && crate::moe_offload::HotExpertCache::auto_cpu_bridge_preferred();
+    let cpu_bridge_tp1 =
+        tp_size == 1 && cfg.num_experts >= TIERED_MOE_MIN_MODEL_EXPERTS && cpu_bridge_preferred;
+    let cpu_bridge_tp2 =
+        tp_size == 2 && cfg.num_experts >= TIERED_MOE_MIN_MODEL_EXPERTS && cpu_bridge_preferred;
     if cpu_bridge_tp1 && hot_per_layer > TIERED_MOE_COMPACT_MAX_HOT_EXPERTS {
         local_experts.clamp(1, TIERED_MOE_STAGE_CAPACITY_TP1_BRIDGE)
     } else if tp_size >= 4
+        || cpu_bridge_tp2
         || (cfg.num_experts >= TIERED_MOE_MIN_MODEL_EXPERTS
             && hot_per_layer <= TIERED_MOE_COMPACT_MAX_HOT_EXPERTS)
     {
@@ -562,8 +578,13 @@ pub fn plan_tiered_moe_hot_per_layer_with_options(
     let cpu_bridge_tp1 = tp_size == 1
         && cfg.num_experts >= TIERED_MOE_MIN_MODEL_EXPERTS
         && crate::moe_offload::HotExpertCache::auto_cpu_bridge_preferred();
+    let cpu_bridge_tp2 = tp_size == 2
+        && cfg.num_experts >= TIERED_MOE_MIN_MODEL_EXPERTS
+        && crate::moe_offload::HotExpertCache::auto_cpu_bridge_preferred();
     let stage_slots_default = if cpu_bridge_tp1 {
         TIERED_MOE_STAGE_CAPACITY_TP1_BRIDGE.saturating_mul(2)
+    } else if cpu_bridge_tp2 {
+        TIERED_MOE_STAGE_CAPACITY_TP4.saturating_mul(2)
     } else {
         TIERED_MOE_STAGE_CAPACITY_DEFAULT.saturating_mul(2)
     };
@@ -614,7 +635,7 @@ pub fn plan_tiered_moe_hot_per_layer_with_options(
             if max_affordable >= local_experts {
                 local_experts
             } else {
-                let align = if tp_size == 1 {
+                let align = if tp_size <= 2 {
                     2
                 } else {
                     TIERED_MOE_HOT_SLOT_ALIGNMENT
@@ -931,7 +952,7 @@ pub(super) fn should_use_compact_tiered_moe_scratch(
     if free_vram < TIERED_MOE_COMPACT_VRAM_THRESHOLD_BYTES {
         return true;
     }
-    tp_size == 1
+    tp_size <= 2
         && free_vram < 28 * 1024 * 1024 * 1024
         && !lora.has_midloop
         && !lora.requires_atomic_prefix
