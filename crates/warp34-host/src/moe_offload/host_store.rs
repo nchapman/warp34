@@ -1309,7 +1309,11 @@ impl HotExpertCache {
         if self.slots.capacity >= self.expert_ids.len() {
             self.slots.capacity
         } else if self.has_cpu_bridge() {
-            self.k_static
+            if self.k_static <= 1 {
+                self.slots.capacity
+            } else {
+                self.k_static
+            }
         } else if self.slots.capacity > TIERED_MOE_GPU_LRU_TAIL_SLOTS {
             self.slots.capacity - TIERED_MOE_GPU_LRU_TAIL_SLOTS
         } else {
@@ -1407,7 +1411,7 @@ impl HotExpertCache {
         stream.synchronize()?;
         self.step_clock = step_arr[0].saturating_add(1).max(1);
         let check_limit = if self.has_cpu_bridge() {
-            self.k_static
+            if self.k_static <= 1 { 0 } else { self.k_static }
         } else {
             self.prefill_hot_limit()
         }

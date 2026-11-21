@@ -1299,7 +1299,7 @@ impl Qwen3_5ModelRank {
             // Apply vision reserve symmetrically across TP ranks so all ranks make the same
             // host-embed offload decision and never leak unused slots on non-zero ranks.
             let vision = if archive_has_vision {
-                VISION_ENCODER_LAZY_RESERVE_BYTES
+                vision_lazy_reserve_bytes(cfg, tp_size)
                     .saturating_sub(target_base_headroom(cfg, tp_size, pages, free_vram))
             } else {
                 0
@@ -1892,6 +1892,8 @@ impl PrePoolModelRank {
             if cfg.uses_tiered_moe() {
                 let post_weight_available = device.mem_info()?.0;
                 let moe_vision_extra = vision_lazy_extra_headroom(
+                    &cfg,
+                    tp_size,
                     capacity.state_slots.is_some() && has_vision_weights(&cfg, archive),
                     base_headroom,
                 );
@@ -2019,8 +2021,12 @@ impl PrePoolModelRank {
                     MIN_ACTIVE_STATE_SLOTS
                 };
                 let min_state_bytes = bytes_per_state_slot.saturating_mul(min_state_floor);
-                let desired_vision_extra =
-                    vision_lazy_extra_headroom(has_vision_weights(&cfg, archive), base_headroom);
+                let desired_vision_extra = vision_lazy_extra_headroom(
+                    &cfg,
+                    tp_size,
+                    has_vision_weights(&cfg, archive),
+                    base_headroom,
+                );
                 let vision_reserve = available_for_pools
                     .saturating_sub(base_reserved.saturating_add(min_state_bytes))
                     .min(desired_vision_extra);

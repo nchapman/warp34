@@ -160,7 +160,7 @@ impl NativeProposer {
             0
         };
         let features = self.captured(engine)?;
-        self.ingest(engine, radix_tokens, &features)?;
+        self.ingest_for_prompt_len(engine, radix_tokens, &features, seq.prompt_tokens.len())?;
         seq.radix_state.commit_tokens(radix_tokens, &planned);
         seq.prefilled_tokens = end;
 

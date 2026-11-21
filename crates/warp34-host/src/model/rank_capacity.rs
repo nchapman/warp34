@@ -69,13 +69,33 @@ pub const LARGE_MODEL_WEIGHT_THRESHOLD_BYTES: usize = 15 * 1024 * 1024 * 1024;
 
 /// Dedicated VRAM reserve (`1.5 GiB`) set aside symmetrically across serving ranks for
 /// lazy `Qwen3VisionEncoder` loading when serving multimodal checkpoints.
-#[cfg(feature = "cuda")]
+#[cfg(any(test, feature = "cuda"))]
 pub(super) const VISION_ENCODER_LAZY_RESERVE_BYTES: usize = 1536 * 1024 * 1024;
 
+/// Compact lazy `Qwen3VisionEncoder` reserve (`768 MiB`) for tiered-MoE checkpoints (`qwen4_exp`),
+/// whose ViT weights are ~230 MiB and where `ensure_vision_encoder_loaded` clears CUDA graphs on demand.
+#[cfg(any(test, feature = "cuda"))]
+pub(super) const TIERED_MOE_VISION_LAZY_RESERVE_BYTES: usize = 768 * 1024 * 1024;
+
+#[cfg(any(test, feature = "cuda"))]
+#[inline]
+pub(super) fn vision_lazy_reserve_bytes(cfg: &ModelConfig, tp_size: usize) -> usize {
+    if cfg.uses_tiered_moe() && tp_size == 1 {
+        TIERED_MOE_VISION_LAZY_RESERVE_BYTES
+    } else {
+        VISION_ENCODER_LAZY_RESERVE_BYTES
+    }
+}
+
 #[cfg(feature = "cuda")]
-pub(super) fn vision_lazy_extra_headroom(has_vision: bool, base_headroom: usize) -> usize {
+pub(super) fn vision_lazy_extra_headroom(
+    cfg: &ModelConfig,
+    tp_size: usize,
+    has_vision: bool,
+    base_headroom: usize,
+) -> usize {
     if has_vision {
-        VISION_ENCODER_LAZY_RESERVE_BYTES.saturating_sub(base_headroom)
+        vision_lazy_reserve_bytes(cfg, tp_size).saturating_sub(base_headroom)
     } else {
         0
     }
@@ -871,7 +891,7 @@ pub(super) fn target_base_headroom(
     free: usize,
 ) -> usize {
     if (tp == 1
-        && cfg.num_hidden_layers >= EXTREME_LONGCTX_MIN_LAYERS
+        && (cfg.num_hidden_layers >= EXTREME_LONGCTX_MIN_LAYERS || cfg.uses_tiered_moe())
         && pages >= EXTREME_LONGCTX_MIN_PAGES)
         || (cfg.uses_tiered_moe() && free < TIERED_MOE_COMPACT_VRAM_THRESHOLD_BYTES)
     {
@@ -1057,7 +1077,7 @@ pub(super) fn evaluate_serving_kv_candidate_budget(
         resident_moe_mtp_serving_reserve(cfg, true, native_mtp, mtp_experts_w4);
     let desired_slots = requested_state_slots.max(min_state_floor);
     let vision_extra = if archive_has_vision {
-        VISION_ENCODER_LAZY_RESERVE_BYTES.saturating_sub(base_headroom)
+        vision_lazy_reserve_bytes(cfg, tp_size).saturating_sub(base_headroom)
     } else {
         0
     };
@@ -1133,7 +1153,7 @@ pub(super) fn evaluate_serving_kv_candidate_budget(
         };
     let available_for_pools = post_weight_available.checked_sub(allocated_moe_bytes)?;
     let vision_headroom = if archive_has_vision && auto_fit_mode {
-        VISION_ENCODER_LAZY_RESERVE_BYTES.saturating_sub(base_headroom)
+        vision_lazy_reserve_bytes(cfg, tp_size).saturating_sub(base_headroom)
     } else {
         0
     };

@@ -30,6 +30,7 @@ static constexpr int kMaxPairs = kMaxTokens * kMaxTopK; // 128
 static constexpr int kMaxHidden = 4096;
 static constexpr int kMaxGpuStagePull = 8;
 static constexpr int kDefaultSingleTokenMaxGpuPull = 2;
+static constexpr float kAvx512RooflineGpuShareThreshold = 0.10f;
 static constexpr float kHighGpuShareThreshold = 0.20f;
 static constexpr float kMultiTokenDefaultGpuShare = 0.36f;
 
@@ -140,7 +141,7 @@ __global__ void moe_hybrid_plan_and_submit_kernel(
                     n_cold++;
                 }
                 cold_hits[c_idx] += 1;
-                cold_score[c_idx] += (p < top_k) ? 4 : 2;
+                cold_score[c_idx] += (p < top_k) ? 5 : 2;
                 // Temporarily store `-2 - c_idx` to mark the cold rank `c_idx`.
                 remapped_topk_ids[p] = -2 - c_idx;
             }
@@ -149,24 +150,44 @@ __global__ void moe_hybrid_plan_and_submit_kernel(
         const int max_pull = hybrid_max_gpu_pull(k_static, k_hot, num_tokens, gpu_share_frac);
         int want_gpu_cold = 0;
         if (max_pull > 0 && gpu_share_frac > 0.0f) {
-            if (n_cold >= 7) {
-                want_gpu_cold = 2;
-            } else if (n_cold >= 4) {
-                want_gpu_cold = 1;
-            } else {
+            if (gpu_share_frac <= kAvx512RooflineGpuShareThreshold) {
+                // On AVX-512 hosts with full-cache dynamic LRU (`k_hot >= 64`), PCIe expert pulls
+                // (~0.20 ms/expert on PCIe 4.0 x8) are ~6x slower than parallel 16-core AVX-512 DDR5
+                // evaluation (~0.03 ms/expert). Promote at most 1..2 worthy cold experts (routed by
+                // committed anchor token 0 or >= 2 tokens in the batch) so PCIe + Marlin overlaps
+                // with CPU evaluation and rejected draft tail singletons never pollute the LRU cache.
+                int worthy_promotes = 0;
                 for (int c = 0; c < n_cold; ++c) {
-                    if (cold_hits[c] >= 2) {
-                        want_gpu_cold++;
+                    if (cold_score[c] >= 4) {
+                        worthy_promotes++;
                     }
                 }
-            }
-            if (gpu_share_frac > kHighGpuShareThreshold || num_tokens > 1) {
-                const float eff_frac = (gpu_share_frac > kHighGpuShareThreshold)
-                    ? gpu_share_frac
-                    : kMultiTokenDefaultGpuShare;
-                const int scaled = static_cast<int>(static_cast<float>(n_cold) * eff_frac + 0.5f);
-                if (scaled > want_gpu_cold) {
-                    want_gpu_cold = scaled;
+                const int pcie_cap = (n_cold >= 10) ? 2 : 1;
+                want_gpu_cold = (worthy_promotes < pcie_cap) ? worthy_promotes : pcie_cap;
+                if (want_gpu_cold == 0 && n_cold >= 12) {
+                    want_gpu_cold = 1;
+                }
+            } else {
+                if (n_cold >= 7) {
+                    want_gpu_cold = 2;
+                } else if (n_cold >= 4) {
+                    want_gpu_cold = 1;
+                } else {
+                    for (int c = 0; c < n_cold; ++c) {
+                        if (cold_hits[c] >= 2) {
+                            want_gpu_cold++;
+                        }
+                    }
+                }
+                if (gpu_share_frac > kHighGpuShareThreshold || num_tokens > 1) {
+                    const float eff_frac = (gpu_share_frac > kHighGpuShareThreshold)
+                        ? gpu_share_frac
+                        : kMultiTokenDefaultGpuShare;
+                    const int scaled =
+                        static_cast<int>(static_cast<float>(n_cold) * eff_frac + 0.5f);
+                    if (scaled > want_gpu_cold) {
+                        want_gpu_cold = scaled;
+                    }
                 }
             }
             if (want_gpu_cold > max_pull) want_gpu_cold = max_pull;

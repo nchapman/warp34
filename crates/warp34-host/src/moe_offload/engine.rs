@@ -7,19 +7,21 @@ const TIERED_MOE_AUTO_GPU_LRU_MAX_TOKENS: usize = 32;
 const TIERED_MOE_PREFILL_SINGLE_CHUNK_MAX_TOKENS: usize = 384;
 /// Small-batch threshold (`<= 16` tokens) for `StreamedPrefill` CPU-bridge share tuning on AVX2 hosts.
 const TIERED_MOE_PREFILL_SMALL_BATCH_MAX_TOKENS: usize = 16;
-/// Percentage (`70%`) of cold misses delegated to the CPU bridge for `<= 384`-token batches on AVX-512 hosts.
-const TIERED_MOE_PREFILL_AVX512_SINGLE_CHUNK_CPU_SHARE_PCT: usize = 70;
+/// Percentage (`84%`) of cold misses delegated to the CPU bridge for `<= 384`-token batches on AVX-512 hosts
+/// (`~75 GB/s` 16-core AVX-512 DDR5 vs `~13.4 GB/s` PCIe 4.0 x8 => `75 / (75 + 13.4) = 84.8%`).
+const TIERED_MOE_PREFILL_AVX512_SINGLE_CHUNK_CPU_SHARE_PCT: usize = 84;
 /// Percentage (`35%`) of cold misses delegated to the CPU bridge for `<= 16`-token batches on AVX2 hosts.
 const TIERED_MOE_PREFILL_AVX2_SMALL_CPU_SHARE_PCT: usize = 35;
 /// Percentage (`45%`) of cold misses delegated to the CPU bridge for `17..=384`-token batches on AVX2 hosts.
 const TIERED_MOE_PREFILL_AVX2_SINGLE_CHUNK_CPU_SHARE_PCT: usize = 45;
-/// Percentage (`58%`) of cold misses delegated to the CPU bridge for `> 384`-token batches on AVX-512 hosts.
-const TIERED_MOE_PREFILL_AVX512_MULTI_CHUNK_CPU_SHARE_PCT: usize = 58;
+/// Percentage (`78%`) of cold misses delegated to the CPU bridge for `> 384`-token batches on AVX-512 hosts.
+const TIERED_MOE_PREFILL_AVX512_MULTI_CHUNK_CPU_SHARE_PCT: usize = 78;
 /// Percentage (`38%`) of cold misses delegated to the CPU bridge for `> 384`-token batches on AVX2 hosts.
 const TIERED_MOE_PREFILL_AVX2_MULTI_CHUNK_CPU_SHARE_PCT: usize = 38;
 /// Maximum routed tokens per cold expert eligible for CPU evaluation in `<= 384`-token prefill batches.
-const TIERED_MOE_PREFILL_SINGLE_CHUNK_MAX_TOK_PER_JOB: usize = 8;
-/// Maximum routed tokens per cold expert eligible for CPU evaluation in `> 384`-token prefill batches.
+const TIERED_MOE_PREFILL_SINGLE_CHUNK_MAX_TOK_PER_JOB: usize = 16;
+/// Maximum routed tokens per cold expert eligible for CPU evaluation in `> 384`-token prefill batches
+/// (must not exceed `moe_cpu_bridge::eval` prefill tile limit of `96`).
 const TIERED_MOE_PREFILL_MULTI_CHUNK_MAX_TOK_PER_JOB: usize = 96;
 
 /// Executes a tiered 512-expert MoE layer across `TP=1` or `TP=2 / EP=2` in `GpuLru`
@@ -132,7 +134,9 @@ impl TieredMoeEngine {
                         store.layout().group_size as i32,
                         store.layout().bits as i32,
                         if cache.k_static < k_hot && store.mapped_dev_ptr() != 0 {
-                            if crate::moe_cpu_bridge::has_avx512()
+                            if crate::moe_cpu_bridge::has_avx512() && k_hot >= 64 {
+                                0.08f32
+                            } else if crate::moe_cpu_bridge::has_avx512()
                                 || (num_tokens == 1 && k_hot >= 64)
                             {
                                 TIERED_MOE_CPU_BRIDGE_COLD_WEIGHT_THRESHOLD
@@ -429,8 +433,9 @@ impl TieredMoeEngine {
                     let check_limit = cache
                         .prefill_hot_limit()
                         .min(cache.initial_slot_to_expert.len());
-                    if (0..check_limit)
-                        .any(|s| cache.slot_to_expert[s] != cache.initial_slot_to_expert[s])
+                    if cache.k_static > 1
+                        && (0..check_limit)
+                            .any(|s| cache.slot_to_expert[s] != cache.initial_slot_to_expert[s])
                     {
                         cache.adapted_slots_dirty = true;
                     }
@@ -483,7 +488,7 @@ impl TieredMoeEngine {
 
                 let local_start = cache.expert_ids.start;
                 let local_len = cache.expert_ids.len();
-                let adapt_end = if cache.has_cpu_bridge() {
+                let adapt_end = if cache.has_cpu_bridge() && cache.k_static > 1 {
                     cache.k_static
                 } else {
                     cache.slots.capacity
@@ -491,7 +496,10 @@ impl TieredMoeEngine {
                 let use_cpu_bridge = cache.bridge_runtime.is_some()
                     && num_tokens <= ws.max_tokens
                     && h_topk_weights.len() == num_tokens * top_k;
+                let dynamic_short_adapt =
+                    cache.k_static <= 1 && cache.slots.capacity >= 64 && num_tokens >= 64;
                 let want_freq_stats = use_cpu_bridge
+                    || dynamic_short_adapt
                     || (num_tokens >= TIERED_MOE_LONG_PROMPT_ADAPT_MIN_TOKENS && adapt_end >= 64);
 
                 if want_freq_stats && !misses_in_step.is_empty() {
@@ -619,12 +627,19 @@ impl TieredMoeEngine {
                     // from `gpu_misses` that are >= 3x more frequent in this prompt than the
                     // lowest-frequency resident tail slots, unpacking them directly from
                     // `ws.d_stage_packs[0]` during Chunk 0 at zero extra PCIe DMA cost.
-                    if num_tokens >= TIERED_MOE_LONG_PROMPT_ADAPT_MIN_TOKENS
+                    if (num_tokens >= TIERED_MOE_LONG_PROMPT_ADAPT_MIN_TOKENS
+                        || dynamic_short_adapt)
                         && adapt_end >= 64
                         && !gpu_misses.is_empty()
                     {
-                        let adapt_start = adapt_end - 20;
-                        let mut victim_cands: Vec<(usize, usize)> = (adapt_start..adapt_end)
+                        let victim_range = if dynamic_short_adapt
+                            && num_tokens < TIERED_MOE_LONG_PROMPT_ADAPT_MIN_TOKENS
+                        {
+                            1..adapt_end
+                        } else {
+                            (adapt_end - 20)..adapt_end
+                        };
+                        let mut victim_cands: Vec<(usize, u64, usize)> = victim_range
                             .map(|slot| {
                                 let ge_i32 = cache.slot_to_expert[slot];
                                 let freq = if ge_i32 >= 0
@@ -634,7 +649,7 @@ impl TieredMoeEngine {
                                 } else {
                                     0
                                 };
-                                (freq, slot)
+                                (freq, cache.slot_last_used[slot], slot)
                             })
                             .collect();
                         victim_cands.sort_unstable();
@@ -646,13 +661,34 @@ impl TieredMoeEngine {
                             .collect();
                         heavy_cands.sort_unstable_by(|a, b| b.cmp(a));
 
-                        let min_freq = (num_tokens / 64).max(16);
-                        let max_promote = victim_cands.len().min(heavy_cands.len()).min(16);
+                        let min_freq = if dynamic_short_adapt
+                            && num_tokens < TIERED_MOE_LONG_PROMPT_ADAPT_MIN_TOKENS
+                        {
+                            (num_tokens / 48).max(3)
+                        } else {
+                            (num_tokens / 64).max(16)
+                        };
+                        let promote_cap = if dynamic_short_adapt
+                            && num_tokens < TIERED_MOE_LONG_PROMPT_ADAPT_MIN_TOKENS
+                        {
+                            12
+                        } else {
+                            16
+                        };
+                        let max_promote =
+                            victim_cands.len().min(heavy_cands.len()).min(promote_cap);
                         let mut pairs: Vec<(usize, i32)> = Vec::new();
                         for i in 0..max_promote {
                             let (new_freq, new_ge) = heavy_cands[i];
-                            let (old_freq, slot) = victim_cands[i];
-                            if new_freq >= min_freq && new_freq > old_freq * 3 {
+                            let (old_freq, _, slot) = victim_cands[i];
+                            let ratio_ok = if dynamic_short_adapt
+                                && num_tokens < TIERED_MOE_LONG_PROMPT_ADAPT_MIN_TOKENS
+                            {
+                                new_freq > old_freq * 2
+                            } else {
+                                new_freq > old_freq * 3
+                            };
+                            if new_freq >= min_freq && ratio_ok {
                                 pairs.push((new_ge, slot as i32));
                             } else {
                                 break;
@@ -839,7 +875,9 @@ impl TieredMoeEngine {
                         cache.step_clock = cache.step_clock.saturating_add(7);
                         let promoted_ts = cache.step_clock;
                         cache.step_clock = cache.step_clock.saturating_add(1);
-                        cache.adapted_slots_dirty = true;
+                        if cache.k_static > 1 {
+                            cache.adapted_slots_dirty = true;
+                        }
                         for (&new_ge, &slot_i32) in
                             promote_new_ges.iter().zip(&promote_victim_slots)
                         {
@@ -1038,6 +1076,47 @@ impl TieredMoeEngine {
                 num_tokens,
                 top_k,
             );
+        }
+        // For short warm-prefix tails and micro-batches (`9..=24` tokens, `<= 3` slices of `8`),
+        // slice into `<= 8`-token device-bridge launches so we avoid 48-layer
+        // `sync_from_device_if_dirty` + routing D2H stalls without losing cross-token deduplication.
+        if !is_capturing_graph
+            && matches!(mode, MoeOffloadMode::Auto | MoeOffloadMode::GpuLru)
+            && num_tokens <= 24
+            && top_k <= TIERED_MOE_CPU_BRIDGE_MAX_TOP_K
+            && cache.has_cpu_bridge()
+            && cache.slots.capacity >= 64
+        {
+            let hidden_f16_bytes = (store.layout().hidden * core::mem::size_of::<u16>()) as u64;
+            let topk_i32_bytes = (top_k * core::mem::size_of::<i32>()) as u64;
+            let topk_f32_bytes = (top_k * core::mem::size_of::<f32>()) as u64;
+            for c0 in (0..num_tokens).step_by(TIERED_MOE_CPU_BRIDGE_MAX_DECODE_TOKENS) {
+                let m = (num_tokens - c0).min(TIERED_MOE_CPU_BRIDGE_MAX_DECODE_TOKENS);
+                let c0_u64 = c0 as u64;
+                Self::execute_layer_device_lru(
+                    store,
+                    cache,
+                    ws,
+                    compute_stream,
+                    x_addr + c0_u64 * hidden_f16_bytes,
+                    d_topk_ids_addr + c0_u64 * topk_i32_bytes,
+                    d_topk_weights_addr + c0_u64 * topk_f32_bytes,
+                    if shared_expert_out_addr != 0 {
+                        shared_expert_out_addr + c0_u64 * hidden_f16_bytes
+                    } else {
+                        0
+                    },
+                    if shared_expert_gate_addr != 0 {
+                        shared_expert_gate_addr + c0_u64 * (core::mem::size_of::<u16>() as u64)
+                    } else {
+                        0
+                    },
+                    out_addr + c0_u64 * hidden_f16_bytes,
+                    m,
+                    top_k,
+                )?;
+            }
+            return Ok(());
         }
         let pairs = num_tokens * top_k;
         let ids_bytes = pairs * 4;
