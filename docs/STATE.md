@@ -20,6 +20,15 @@
   - `code-context-r64`: **`34.73 tok/s`** e2e (**`82.76`** decode, rep 1 `35.04` e2e; `4,278 ms` TTFT vs Strata `4,128 ms` / `37.93 tok/s`).
   - `prefix-primed-r16`: **`75.90 tok/s`** e2e (rep 1 **`79.43`** e2e, **`89.22`** decode, `136 ms` TTFT vs Strata `161 ms` / `82.58 tok/s`).
   - `coding-agent-replay`: **`60.23 tok/s`** e2e (**`89.08`** decode, rep 1 **`61.27`** e2e; `438 ms` TTFT vs Strata `623 ms` `-29.7%`, Strata `61.86`).
+- **Verified 3-rep OOTB 1-GPU `W2.6A16-HGPTQ-RCO` (`75a95c0`, `1× RTX 3090 Ti`, `TP=1`, `131K` auto-fit `TQ4` KV, zero manual flags) vs `Strata v0.2.17` (`3142b66`):** **5-for-5 sweep across e2e, decode, and TTFT:**
+  - `short-chat`: **`100.20 tok/s`** e2e (**`113.08`** decode, rep 1 **`104.54`** e2e, **`+23.5%` e2e / `+13.8%` dec**, `290 ms` TTFT vs `587 ms` `2.02×`).
+  - `prefill-context-r16`: **`42.15 tok/s`** e2e (**`118.90`** decode, **`+78.4%` e2e / `+20.0%` dec**, `977 ms` TTFT vs `2,073 ms` `2.12×`).
+  - `code-context-r64`: **`41.28 tok/s`** e2e (**`108.55`** decode, **`+8.8%` e2e / `+11.4%` dec**, `3,841 ms` TTFT vs `4,128 ms`).
+  - `prefix-primed-r16`: **`108.66 tok/s`** e2e (**`124.39`** decode, rep 1 **`110.20`** e2e, **`+31.6%` e2e / `+21.0%` dec**, `81 ms` TTFT vs `161 ms` `1.99×`).
+  - `coding-agent-replay`: **`96.29 tok/s`** e2e (**`143.89`** decode, **`+55.7%` e2e / `+11.9%` dec**, `245 ms` TTFT vs `623 ms` `2.54×`).
+- **Verified 3-rep OOTB 2-GPU `TP=2` (`75a95c0`, `2× RTX 3090 Ti`, `131K` auto-fit `TQ4` KV, zero manual flags):**
+  - **`W4A16-HGPTQ` `TP=2`**: `short-chat` **`118.47 / 135.63`** (`268 ms` TTFT), `prefill-context-r16` **`48.36 / 141.12`** (`867 ms`), `code-context-r64` **`49.12 / 117.71`** (`3,032 ms`), `prefix-primed-r16` **`116.80 / 137.59`** (`88 ms`), `coding-agent-replay` **`111.45 / 175.75`** (`231 ms`).
+  - **`W2.6A16-HGPTQ-RCO` `TP=2`**: `short-chat` **`149.25 / 163.04`** (rep 1 **`154.80`** e2e, `141 ms` TTFT), `prefill-context-r16` **`65.43 / 161.40`** (`578 ms`), `code-context-r64` **`66.15 / 148.00`** (`2,135 ms`), `prefix-primed-r16` **`137.37 / 160.24`** (rep 1 **`145.48`** e2e, `71 ms`), `coding-agent-replay` **`153.45 / 234.05`** (rep 0 **`163.81`** e2e, `154 ms`).
   - **Gates:** `mise run check-quick` PASS (`fmt-check`, `clippy` cuda & cpu, `doc-check`, `simd-check`, `cuda-bin-check` 1,773 kernels 0 violations, `dashboard-build`), unit tests (`moe_offload` `9/9`, `moe_cpu_bridge` `16/16`, `moe_sparse` `8/8`, `dflash` `15/15`, `model::tests` `26/26`, `qsa` `2/2`, `proposer` PASS), and `review` (`0` actionable findings).
 
 ## Fair 4-bit Tiered-MoE + `DFlash2` Optimizations & Specialized Engine Head-to-Head (`1–2× RTX 3090 Ti`)
