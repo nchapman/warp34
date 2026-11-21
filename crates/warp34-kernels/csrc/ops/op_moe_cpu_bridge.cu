@@ -266,11 +266,12 @@ __global__ void moe_hybrid_plan_and_submit_kernel(
                     }
                 }
             } else if (use_parallel_pcie_split) {
-                // Parallel CPU DDR5 (~37 GB/s) + GPU PCIe (~13.4 GB/s) cold-expert split:
-                // `(n_cold + 1) * 0.25` -> 0 for n_cold<=2, 1 for 3..6, 2 for 7..10,
-                // 3 for 11..14, 4 for >=15: matches 12.6 GB/s PCIe (~200 us/exp) against
-                // ~37 GB/s CPU (~68 us/exp) across both small-miss and high-miss regimes.
-                want_gpu_cold = static_cast<int>(static_cast<float>(n_cold + 1) * gpu_share_frac);
+                // Parallel CPU DDR5 (~37 GB/s) + GPU PCIe (~12.6 GB/s) cold-expert split:
+                // `(n_cold - 1) * 0.25` -> 0 for n_cold<=4, 1 for 5..8, 2 for 9..12,
+                // 3 for 13..16, 4 for >=17: balances `k*200us + moe_hot` against
+                // `(n_cold-k)*68us` so GPU PCIe pull never outruns CPU eval.
+                const int eff_cold = (n_cold > 1) ? (n_cold - 1) : 0;
+                want_gpu_cold = static_cast<int>(static_cast<float>(eff_cold) * gpu_share_frac);
             } else if (gpu_share_frac <= kAvx512RooflineGpuShareThreshold) {
                 int worthy_promotes = 0;
                 for (int c = 0; c < n_cold; ++c) {

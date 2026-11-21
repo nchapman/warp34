@@ -209,20 +209,27 @@ __global__ __launch_bounds__(128, 4) void moe_sparse_vec4_kernel(
                     const uint32_t uw_v = GATE
                         ? ((BITS == 2) ? uw_words[word_i >> 1] : uw_words[word_i])
                         : 0u;
-                    const uint4 xv0 = __ldg(&x_u4[xm0 + x_col0 + word_i]);
-                    const __half2 *xh0 = reinterpret_cast<const __half2 *>(&xv0);
+                    __half2 gd_h2[4];
+                    __half2 ud_h2[4];
 #pragma unroll
                     for (int p = 0; p < 4; ++p) {
-                        const __half2 gd = (BITS == 2)
+                        gd_h2[p] = (BITS == 2)
                             ? unpack_u2b2_pair_scaled_h2(gw_v, ((word_i & 1) << 2) + p, gs_h2)
                             : unpack_u4b8_pair_scaled_h2(gw_v, p, gs_h2);
-                        const float x0_l = __low2float(xh0[p]), x0_h = __high2float(xh0[p]);
-                        gv0 += __low2float(gd) * x0_l + __high2float(gd) * x0_h;
                         if (GATE) {
-                            const __half2 ud = (BITS == 2)
+                            ud_h2[p] = (BITS == 2)
                                 ? unpack_u2b2_pair_scaled_h2(uw_v, ((word_i & 1) << 2) + p, us_h2)
                                 : unpack_u4b8_pair_scaled_h2(uw_v, p, us_h2);
-                            uv0 += __low2float(ud) * x0_l + __high2float(ud) * x0_h;
+                        }
+                    }
+                    {
+                        const uint4 xv0 = __ldg(&x_u4[xm0 + x_col0 + word_i]);
+                        const __half2 *xh0 = reinterpret_cast<const __half2 *>(&xv0);
+#pragma unroll
+                        for (int p = 0; p < 4; ++p) {
+                            const float x0_l = __low2float(xh0[p]), x0_h = __high2float(xh0[p]);
+                            gv0 += __low2float(gd_h2[p]) * x0_l + __high2float(gd_h2[p]) * x0_h;
+                            if (GATE) uv0 += __low2float(ud_h2[p]) * x0_l + __high2float(ud_h2[p]) * x0_h;
                         }
                     }
                     if (has1) {
@@ -230,17 +237,9 @@ __global__ __launch_bounds__(128, 4) void moe_sparse_vec4_kernel(
                         const __half2 *xh1 = reinterpret_cast<const __half2 *>(&xv1);
 #pragma unroll
                         for (int p = 0; p < 4; ++p) {
-                            const __half2 gd = (BITS == 2)
-                                ? unpack_u2b2_pair_scaled_h2(gw_v, ((word_i & 1) << 2) + p, gs_h2)
-                                : unpack_u4b8_pair_scaled_h2(gw_v, p, gs_h2);
                             const float x1_l = __low2float(xh1[p]), x1_h = __high2float(xh1[p]);
-                            gv1 += __low2float(gd) * x1_l + __high2float(gd) * x1_h;
-                            if (GATE) {
-                                const __half2 ud = (BITS == 2)
-                                    ? unpack_u2b2_pair_scaled_h2(uw_v, ((word_i & 1) << 2) + p, us_h2)
-                                    : unpack_u4b8_pair_scaled_h2(uw_v, p, us_h2);
-                                uv1 += __low2float(ud) * x1_l + __high2float(ud) * x1_h;
-                            }
+                            gv1 += __low2float(gd_h2[p]) * x1_l + __high2float(gd_h2[p]) * x1_h;
+                            if (GATE) uv1 += __low2float(ud_h2[p]) * x1_l + __high2float(ud_h2[p]) * x1_h;
                         }
                     }
                     if (has2) {
@@ -248,17 +247,9 @@ __global__ __launch_bounds__(128, 4) void moe_sparse_vec4_kernel(
                         const __half2 *xh2 = reinterpret_cast<const __half2 *>(&xv2);
 #pragma unroll
                         for (int p = 0; p < 4; ++p) {
-                            const __half2 gd = (BITS == 2)
-                                ? unpack_u2b2_pair_scaled_h2(gw_v, ((word_i & 1) << 2) + p, gs_h2)
-                                : unpack_u4b8_pair_scaled_h2(gw_v, p, gs_h2);
                             const float x2_l = __low2float(xh2[p]), x2_h = __high2float(xh2[p]);
-                            gv2 += __low2float(gd) * x2_l + __high2float(gd) * x2_h;
-                            if (GATE) {
-                                const __half2 ud = (BITS == 2)
-                                    ? unpack_u2b2_pair_scaled_h2(uw_v, ((word_i & 1) << 2) + p, us_h2)
-                                    : unpack_u4b8_pair_scaled_h2(uw_v, p, us_h2);
-                                uv2 += __low2float(ud) * x2_l + __high2float(ud) * x2_h;
-                            }
+                            gv2 += __low2float(gd_h2[p]) * x2_l + __high2float(gd_h2[p]) * x2_h;
+                            if (GATE) uv2 += __low2float(ud_h2[p]) * x2_l + __high2float(ud_h2[p]) * x2_h;
                         }
                     }
                     if (has3) {
@@ -266,17 +257,9 @@ __global__ __launch_bounds__(128, 4) void moe_sparse_vec4_kernel(
                         const __half2 *xh3 = reinterpret_cast<const __half2 *>(&xv3);
 #pragma unroll
                         for (int p = 0; p < 4; ++p) {
-                            const __half2 gd = (BITS == 2)
-                                ? unpack_u2b2_pair_scaled_h2(gw_v, ((word_i & 1) << 2) + p, gs_h2)
-                                : unpack_u4b8_pair_scaled_h2(gw_v, p, gs_h2);
                             const float x3_l = __low2float(xh3[p]), x3_h = __high2float(xh3[p]);
-                            gv3 += __low2float(gd) * x3_l + __high2float(gd) * x3_h;
-                            if (GATE) {
-                                const __half2 ud = (BITS == 2)
-                                    ? unpack_u2b2_pair_scaled_h2(uw_v, ((word_i & 1) << 2) + p, us_h2)
-                                    : unpack_u4b8_pair_scaled_h2(uw_v, p, us_h2);
-                                uv3 += __low2float(ud) * x3_l + __high2float(ud) * x3_h;
-                            }
+                            gv3 += __low2float(gd_h2[p]) * x3_l + __high2float(gd_h2[p]) * x3_h;
+                            if (GATE) uv3 += __low2float(ud_h2[p]) * x3_l + __high2float(ud_h2[p]) * x3_h;
                         }
                     }
                 }
