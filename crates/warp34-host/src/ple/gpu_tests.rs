@@ -1345,6 +1345,90 @@ fn test_gpu_hc_ple_qsa_kernels_parity() {
         "GQA-6 Split-K vs no-split mismatch: max_split_diff={max_split_diff}"
     );
 
+    // 6b. Verify Tensor-Core `qsa_sparse_paged_attn_mma_f16_kernel` (`num_splits == 1`) against
+    // Split-K `qsa_sparse_paged_attn_gqa_f16_kernel` (`num_splits > 1`) across `TQ4` and `Q8_0`
+    // KV caches (with Rademacher+WHT256 transform on `TQ4`).
+    for (label, kv_fmt, kv_xform, row_stride) in [
+        (
+            "TQ4",
+            WARP34_KV_FORMAT_TQ4,
+            WARP34_KV_TRANSFORM_RADEMACHER_WHT256,
+            132usize,
+        ),
+        (
+            "Q8_0",
+            WARP34_KV_FORMAT_Q8_0,
+            WARP34_KV_TRANSFORM_IDENTITY,
+            272usize,
+        ),
+    ] {
+        let q_bytes = nu_pages * block_size * row_stride;
+        let d_k_q = DeviceBuffer::alloc(0, q_bytes).unwrap();
+        let d_v_q = DeviceBuffer::alloc(0, q_bytes).unwrap();
+        let layout_q = Warp34KvLayerLayout {
+            k_base: d_k_q.addr(),
+            v_base: d_v_q.addr(),
+            k_page_stride_bytes: (block_size * row_stride) as u64,
+            v_page_stride_bytes: (block_size * row_stride) as u64,
+            k_head_stride_bytes: (block_size * row_stride) as u64,
+            v_head_stride_bytes: (block_size * row_stride) as u64,
+            k_token_stride_bytes: row_stride as u64,
+            v_token_stride_bytes: row_stride as u64,
+            k_format: kv_fmt,
+            v_format: kv_fmt,
+            k_transform: kv_xform,
+            v_transform: kv_xform,
+            ..layout6
+        };
+        // SAFETY: `d_nu_k_in`/`d_nu_v_in` and `d_k_q`/`d_v_q` are sized for `nu_seq_len` tokens.
+        unsafe {
+            assert_eq!(
+                warp34_kv_cache_write_strided(
+                    &ex,
+                    &layout_q,
+                    &write_batch,
+                    d_nu_k_in.addr() as *const c_void,
+                    d_nu_v_in.addr() as *const c_void,
+                    head_dim as i32,
+                    head_dim as i32,
+                ),
+                0
+            );
+        }
+        let d_out_q_mma = DeviceBuffer::alloc(0, gqa6_heads * head_dim * 2).unwrap();
+        let d_out_q_ref = DeviceBuffer::alloc(0, gqa6_heads * head_dim * 2).unwrap();
+        for (exec_ref, out_buf) in [(&ex_nosplit, &d_out_q_mma), (&ex_splitk, &d_out_q_ref)] {
+            gpu_ops::qsa_sparse_paged_attn_hadamard_f16(
+                exec_ref,
+                d_gqa6_q.addr(),
+                d_gqa6_gate.addr(),
+                &layout_q,
+                d_nu_sel_phys.addr(),
+                d_nu_sel_log.addr(),
+                d_nu_num_sel.addr(),
+                d_nu_seq_pos.addr(),
+                0,
+                out_buf.addr(),
+                1,
+                gqa6_heads,
+                nu_select_k,
+                nu_attn_batch.sm_scale,
+            )
+            .unwrap();
+        }
+        let h_mma: Vec<u16> = dev_to_vec(&d_out_q_mma, gqa6_heads * head_dim, &stream);
+        let h_ref: Vec<u16> = dev_to_vec(&d_out_q_ref, gqa6_heads * head_dim, &stream);
+        let max_diff = h_mma
+            .iter()
+            .zip(h_ref.iter())
+            .map(|(&a, &b)| (f16_to_f32(a) - f16_to_f32(b)).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            max_diff < 2e-3,
+            "GQA-6 MMA vs Split-K mismatch for {label}: max_diff={max_diff}"
+        );
+    }
+
     // 7. Verify 0-ULP bit-identity of all producer-fused H_64 and residual-add kernels:
     let had64_ref = |src: &DeviceBuffer, rows: usize, cols: usize| -> Vec<u16> {
         let dst = DeviceBuffer::alloc(0, rows * cols * 2).unwrap();
