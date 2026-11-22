@@ -1184,6 +1184,27 @@ __global__ void moe_down_topk_reduce_f16_kernel(
     *reinterpret_cast<uint2*>(&out[(size_t)tok * k_hidden + col4]) = out_u2;
 }
 
+// Sparse active-pair-only in-place H_64 transform for `moe_wxa16_pulled_add_f16_impl`.
+// Skips the entire grid when `*active_count <= 0` and skips every non-pulled `(tok, slot)` pair,
+// avoiding full `[np, n_interm]` RMW traffic while keeping Stage-1 `cta_rows = 16`.
+__global__ void moe_pulled_hadamard64_f16_kernel(
+    __half* __restrict__ interm,
+    const int32_t* __restrict__ pulled_topk_ids,
+    const int32_t* __restrict__ active_count,
+    int n_interm,
+    int num_experts) {
+    if (active_count != nullptr && __ldg(active_count) <= 0) return;
+    const int pair_idx = (int)blockIdx.y;
+    const int e = __ldg(&pulled_topk_ids[pair_idx]);
+    if (e < 0 || e >= num_experts) return;
+    const int tid = (int)threadIdx.x;
+    const int base_col = ((int)blockIdx.x * 2 + (tid >> 4)) * 64;
+    if (base_col >= n_interm) return;
+    uint2* row_u2 = reinterpret_cast<uint2*>(interm + (size_t)pair_idx * n_interm + base_col);
+    const int lane16 = tid & 15;
+    row_u2[lane16] = warp34::hadamard64_vec4_f16(row_u2[lane16], tid);
+}
+
 template <int BLOCK_M>
 static inline int compute_moe_max_tiles(int total_pairs, int num_experts) {
     const int e_star = (total_pairs < num_experts) ? total_pairs : num_experts;
@@ -1968,13 +1989,11 @@ static int moe_wxa16_pulled_add_f16_impl(
     auto experts = reinterpret_cast<int32_t*>((char*)pairs + pb);
     auto down = reinterpret_cast<__half*>((char*)experts + eb);
     cudaStream_t st = (cudaStream_t)ex->stream;
-    // Keep `fuse_h64 = false` so `moe_sparse_vec4_kernel` uses `cta_rows = 16` (`40` X-blocks
-    // instead of `10` for `n_interm = 640`), saturating all SMs even when only 1..4 experts are
-    // pulled (`~20 us` + `1.7 us` `block_hadamard_16bit` vs `71.5 us` fused).
-    const bool fuse_h64 = false;
+    // Keep Stage-1 `APPLY_HAD64 = false` so `moe_sparse_vec4_kernel` uses `cta_rows = 16`
+    // (`40` X-blocks instead of `10` for `n_interm = 640`), saturating all SMs even when only
+    // 1..4 experts are pulled, then run `moe_pulled_hadamard64_f16_kernel` only on active pairs.
     const int lpr_gu = sparse_vec4_lpr(k_hidden);
-    const int base_rows_gu = 4 * 4 * (32 / lpr_gu);
-    const int cta_rows_gu = (fuse_h64 && base_rows_gu < 64) ? 64 : base_rows_gu;
+    const int cta_rows_gu = 4 * 4 * (32 / lpr_gu);
     const int lpr_dn = sparse_vec4_lpr(n_interm);
     const int cta_rows_dn = 4 * 4 * (32 / lpr_dn);
 
@@ -1982,31 +2001,23 @@ static int moe_wxa16_pulled_add_f16_impl(
         pulled_topk_ids, pairs, experts, np, num_experts, nt, active_count);
     const dim3 g_gu((n_interm + cta_rows_gu - 1) / cta_rows_gu, nt);
     const dim3 g_dn((k_hidden + cta_rows_dn - 1) / cta_rows_dn, nt);
-    if (fuse_h64) {
-        if (group_size == 64) {
-            moe_sparse_vec4_kernel<true, 64, true, BITS><<<g_gu, 128, 0, st>>>(
-                (const __half*)x, gate_up_packed, (const __half*)gate_up_scales, pairs, experts,
-                topk_weights, (__half*)interm_buf, down, top_k, n_interm, k_hidden, active_count);
-        } else {
-            moe_sparse_vec4_kernel<true, 128, true, BITS><<<g_gu, 128, 0, st>>>(
-                (const __half*)x, gate_up_packed, (const __half*)gate_up_scales, pairs, experts,
-                topk_weights, (__half*)interm_buf, down, top_k, n_interm, k_hidden, active_count);
-        }
+    if (group_size == 64) {
+        moe_sparse_vec4_kernel<true, 64, false, BITS><<<g_gu, 128, 0, st>>>(
+            (const __half*)x, gate_up_packed, (const __half*)gate_up_scales, pairs, experts,
+            topk_weights, (__half*)interm_buf, down, top_k, n_interm, k_hidden, active_count);
     } else {
-        if (group_size == 64) {
-            moe_sparse_vec4_kernel<true, 64, false, BITS><<<g_gu, 128, 0, st>>>(
-                (const __half*)x, gate_up_packed, (const __half*)gate_up_scales, pairs, experts,
-                topk_weights, (__half*)interm_buf, down, top_k, n_interm, k_hidden, active_count);
-        } else {
-            moe_sparse_vec4_kernel<true, 128, false, BITS><<<g_gu, 128, 0, st>>>(
-                (const __half*)x, gate_up_packed, (const __half*)gate_up_scales, pairs, experts,
-                topk_weights, (__half*)interm_buf, down, top_k, n_interm, k_hidden, active_count);
-        }
-        if (down_hadamard_block_size > 0) {
-            const int rc = warp34_block_hadamard_inplace_f16(
-                ex, interm_buf, np, n_interm, down_hadamard_block_size);
-            if (rc != 0) return rc;
-        }
+        moe_sparse_vec4_kernel<true, 128, false, BITS><<<g_gu, 128, 0, st>>>(
+            (const __half*)x, gate_up_packed, (const __half*)gate_up_scales, pairs, experts,
+            topk_weights, (__half*)interm_buf, down, top_k, n_interm, k_hidden, active_count);
+    }
+    if (down_hadamard_block_size == 64 && (n_interm % 64) == 0 && ((uintptr_t)interm_buf & 7u) == 0u) {
+        const dim3 g_had(((n_interm / 64) + 1) / 2, np);
+        moe_pulled_hadamard64_f16_kernel<<<g_had, 32, 0, st>>>(
+            (__half*)interm_buf, pulled_topk_ids, active_count, n_interm, num_experts);
+    } else if (down_hadamard_block_size > 0) {
+        const int rc = warp34_block_hadamard_inplace_f16(
+            ex, interm_buf, np, n_interm, down_hadamard_block_size);
+        if (rc != 0) return rc;
     }
     if (group_size == 64) {
         moe_sparse_vec4_kernel<false, 64, false, BITS><<<g_dn, 128, 0, st>>>(

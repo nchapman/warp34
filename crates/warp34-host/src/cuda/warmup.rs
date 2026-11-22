@@ -460,6 +460,21 @@ pub fn prepare_execution_plan(device_id: i32) -> Result<()> {
             "warmup warp34_small_n_gemm_dual_f16"
         )?;
     }
+    warmup_ffi!(
+        ffi::warp34_small_n_gemm_dual_f16(
+            &ex,
+            buf_a as *const c_void,
+            buf_b as *const c_void,
+            buf_c as *mut c_void,
+            128,
+            buf_b as *const c_void,
+            buf_d as *mut c_void,
+            128,
+            8,
+            128,
+        ),
+        "warmup warp34_small_n_gemm_dual_f16 (8x4)"
+    )?;
     for hs in [128i32, 3072, 5120, 6144] {
         // SAFETY: Pure query returning constant signal struct byte size.
         let sig_bytes = unsafe { ffi::warp34_tp2_signal_bytes() };

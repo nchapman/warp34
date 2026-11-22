@@ -674,19 +674,18 @@ impl Qwen3_5ModelRank {
                 "F16" | "BF16" => {
                     // Online-quantize untied `lm_head.weight` (`N = 248320`) to `MarlinW8A16`
                     // while keeping hyper-connection spine matrices in exact `DenseF16`.
-                    let online_u8 = cfg.uses_tiered_moe()
-                        && cfg.vocab_size >= 65_536
-                        && !matches!(cfg.quant, QuantScheme::Unquantized)
-                        && info.shape.len() == 2
-                        && !cfg.tie_word_embeddings
+                    let online_u8_gs = if info.shape.len() == 2
                         && (name == "lm_head.weight" || name.ends_with(".lm_head.weight"))
-                        && (info.shape[1].is_multiple_of(64) || info.shape[1].is_multiple_of(128));
-                    if online_u8 {
-                        let gs = if info.shape[1].is_multiple_of(64) {
-                            64
-                        } else {
-                            128
-                        };
+                    {
+                        RawLinearHost::lm_head_online_u8_group_size(
+                            cfg,
+                            info.shape[0] / tp_size.max(1),
+                            info.shape[1],
+                        )
+                    } else {
+                        None
+                    };
+                    if let Some(gs) = online_u8_gs {
                         info.num_elems()
                             .saturating_add((info.num_elems() / gs).saturating_mul(2))
                     } else {
@@ -1461,12 +1460,7 @@ impl Qwen3_5ModelRank {
                     cfg.hidden_size
                 )));
             }
-            if cfg.uses_tiered_moe()
-                && cfg.vocab_size >= 65_536
-                && !matches!(cfg.quant, QuantScheme::Unquantized)
-            {
-                sharded = sharded.into_u8b128_if_dense();
-            }
+            sharded = sharded.into_lm_head_u8b128_if_eligible(cfg);
             Some(sharded.upload_pipelined(&mut weight_arena, &stream, &mut upload_ring)?)
         } else {
             None

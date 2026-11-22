@@ -166,14 +166,20 @@ impl Wake {
         }
     }
     fn wait(&self, seen: u32) {
-        // Spin across the ~5-12ms GPU lm_head + DFlash2/MTP-3 draft window between Target
+        // Spin across the ~5-15ms GPU lm_head + DFlash2/MTP-3 draft window between Target
         // Verify rounds so worker cores stay out of kernel futex / C-states during
         // active generation, then sleep at 0% CPU once idle.
-        for _ in 0..(1 << 22) {
-            if self.epoch.load(Ordering::Acquire) != seen {
-                return;
+        let spin_deadline = std::time::Instant::now() + std::time::Duration::from_millis(15);
+        loop {
+            for _ in 0..256 {
+                if self.epoch.load(Ordering::Acquire) != seen {
+                    return;
+                }
+                std::hint::spin_loop();
             }
-            std::hint::spin_loop();
+            if std::time::Instant::now() >= spin_deadline {
+                break;
+            }
         }
         self.sleeping.fetch_add(1, Ordering::SeqCst);
         if self.epoch.load(Ordering::SeqCst) == seen {
@@ -332,6 +338,13 @@ impl Pool {
         self.state.0.lock().unwrap().batch = None;
         if batch.failed.load(Ordering::Relaxed) {
             return Err(bridge_error("expert worker failed"));
+        }
+        if batch.eval_remaining.load(Ordering::Acquire) != 0
+            || batch.next_reduce.load(Ordering::Acquire) < batch.num_reduce_tiles
+        {
+            return Err(bridge_error(
+                "30s worker deadline exceeded; caller aborted incomplete single-worker batch",
+            ));
         }
         Ok(())
     }
@@ -1620,6 +1633,40 @@ mod tests {
                 std::time::Instant::now() + std::time::Duration::from_secs(5)
             )
             .is_err()
+        );
+        assert!(evaluate(&pool, &batch.store, &[0.; 128], 1, &[]).is_ok());
+    }
+    #[test]
+    fn single_core_pool_reports_expired_deadline() {
+        let pool = Pool::new_with_cpus(vec![0]).unwrap();
+        assert!(pool.threads.is_empty());
+        let batch = Arc::new(Batch {
+            store: zero_store(),
+            xp: vec![0.; 128],
+            xg: vec![0.],
+            jobs: vec![Job {
+                expert: 0,
+                rows: vec![(0, 1.)],
+            }],
+            token_routes: Vec::new(),
+            outputs: vec![SlotBuf::default()],
+            reduce_tiles: Vec::new(),
+            n_act: 1,
+            h: 128,
+            vnni: false,
+            slices: 1,
+            tokens: 1,
+            next: Counter::new(0),
+            eval_remaining: Counter::new(1),
+            next_reduce: Counter::new(0),
+            num_reduce_tiles: 0,
+            failed: AtomicBool::new(false),
+            completion: Completion::new(pool.threads.len()),
+        });
+        let past = std::time::Instant::now() - std::time::Duration::from_millis(1);
+        assert!(
+            pool.run(&batch, past).is_err(),
+            "1-core Pool::run must not return Ok(()) when caller deadline expired before batch completion"
         );
         assert!(evaluate(&pool, &batch.store, &[0.; 128], 1, &[]).is_ok());
     }

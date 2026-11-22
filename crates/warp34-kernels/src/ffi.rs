@@ -1,6 +1,5 @@
 //! FFI bindings to `csrc/warp34_cuda.h`.
 
-#[cfg(feature = "cuda")]
 use core::ffi::c_void;
 
 #[repr(C)]
@@ -88,6 +87,48 @@ pub struct Warp34AttentionBatch {
 }
 
 const _: [(); 96] = [(); core::mem::size_of::<Warp34AttentionBatch>()];
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Warp34MoeHybridDesc {
+    pub d_req_slot: *mut c_void,
+    pub x_f16: *const c_void,
+    pub global_topk_ids: *const i32,
+    pub topk_weights: *const f32,
+    pub expert_to_slot: *mut i32,
+    pub slot_to_expert: *mut i32,
+    pub slot_last_used: *mut u64,
+    pub step_counter: *mut u64,
+    pub expert_freq: *mut u8,
+    pub remapped_topk_ids: *mut i32,
+    pub pulled_topk_ids: *mut i32,
+    pub miss_local_experts: *mut i32,
+    pub miss_victim_slots: *mut i32,
+    pub num_misses_buf: *mut i32,
+    pub mapped_host_packs: *const c_void,
+    pub gate_up_packed_base: *mut u32,
+    pub gate_up_scales_base: *mut c_void,
+    pub down_packed_base: *mut u32,
+    pub down_scales_base: *mut c_void,
+    pub pull_stream: *mut c_void,
+    pub plan_event: *mut c_void,
+    pub pull_done_event: *mut c_void,
+    pub pack_stride_bytes: usize,
+    pub num_tokens: i32,
+    pub top_k: i32,
+    pub global_expert_offset: i32,
+    pub local_num_experts: i32,
+    pub k_static: i32,
+    pub k_hot: i32,
+    pub n_interm: i32,
+    pub k_hidden: i32,
+    pub group_size: i32,
+    pub bits: i32,
+    pub gpu_share_frac: f32,
+    pub reserved: i32,
+}
+
+const _: [(); 232] = [(); core::mem::size_of::<Warp34MoeHybridDesc>()];
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

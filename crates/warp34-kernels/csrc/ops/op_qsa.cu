@@ -1014,16 +1014,18 @@ __global__ void qsa_select_blocks_merge_f16_kernel(
     if (need_mid > 0 && mid_end > mid_start) {
         for (int s = 1; s < num_splits; ++s) {
             const size_t base_s = ((size_t)tok * num_splits + s) * 512;
-            s_cand_sc[tid] = partial_sc[base_s + tid];
-            s_cand_blk[tid] = partial_blk[base_s + tid];
-            s_cand_sc[tid + 256] = partial_sc[base_s + tid + 256];
-            s_cand_blk[tid + 256] = partial_blk[base_s + tid + 256];
-            __syncthreads();
-
             const float thresh_sc = s_top_sc[need_mid - 1];
             const int32_t thresh_blk = s_top_blk[need_mid - 1];
-            // Both lists are already sorted descending, so s_cand[0] is the max of split `s`.
-            if (qsa_cand_better(s_cand_sc[0], s_cand_blk[0], thresh_sc, thresh_blk)) {
+            // Both lists are sorted descending, so `partial_sc[base_s]` is the max of split `s`.
+            // Checking global index 0 before loading `s_cand_*` avoids unnecessary 4 KiB global
+            // reads on cold splits and preserves CTA barrier lockstep across warps.
+            if (qsa_cand_better(
+                    __ldg(&partial_sc[base_s]), __ldg(&partial_blk[base_s]), thresh_sc, thresh_blk)) {
+                s_cand_sc[tid] = partial_sc[base_s + tid];
+                s_cand_blk[tid] = partial_blk[base_s + tid];
+                s_cand_sc[tid + 256] = partial_sc[base_s + tid + 256];
+                s_cand_blk[tid + 256] = partial_blk[base_s + tid + 256];
+                __syncthreads();
 #pragma unroll
                 for (int half_idx = 0; half_idx < 512; half_idx += 256) {
                     const int i = tid + half_idx;
@@ -1038,6 +1040,7 @@ __global__ void qsa_select_blocks_merge_f16_kernel(
                 qsa_bitonic_merge_512_desc(s_top_sc, s_top_blk, tid);
             }
         }
+        __syncthreads();
     }
 
 #pragma unroll
@@ -1562,8 +1565,8 @@ __device__ __forceinline__ void qsa_mma_m16n8k16_f32_f16(
           "f"(c0), "f"(c1), "f"(c2), "f"(c3));
 }
 
-// Tensor-Core (`mma.sync.aligned.m16n8k16`) GQA QSA kernel for `TQ4`/`Q8_0`/`FP16` KV caches
-// (`head_dim = 256`, `full_gqa <= 16`, `num_splits == 1`). Processes all `full_gqa` Q-heads per
+// Tensor-Core (`mma.sync.aligned.m16n8k16`) GQA + Split-K QSA kernel for `TQ4`/`Q8_0`/`FP16` KV caches
+// (`head_dim = 256`, `4 <= full_gqa <= 16`, `num_splits >= 1`). Processes all `full_gqa` Q-heads per
 // KV-head in a single CTA over 16-KV-token tiles (4 QSA 4-token groups per iteration), eliminating
 // redundant KV loads and accelerating `Q @ K^T` and `P @ V` on Tensor Cores.
 template <bool APPLY_HAD64 = false>
@@ -1618,7 +1621,7 @@ __global__ void __launch_bounds__(128, 2) qsa_sparse_paged_attn_mma_f16_kernel(
     const int g = lane >> 2;
     const int t4 = lane & 3;
 
-    union QsaMmaSmem {
+    union __align__(16) QsaMmaSmem {
         struct {
             __half q[16][256];
             __half kv[16][264];
@@ -1629,7 +1632,7 @@ __global__ void __launch_bounds__(128, 2) qsa_sparse_paged_attn_mma_f16_kernel(
             float alpha[16];
             uint8_t valid[16];
         } loop;
-        float out_f32[16][256];
+        float out_f32[16][260];
     };
     __shared__ QsaMmaSmem smem;
 

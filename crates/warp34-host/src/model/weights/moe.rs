@@ -699,7 +699,7 @@ impl FfnBlockWeights {
     /// Executes the host/VRAM tiered MoE dispatch when `self` is a tiered `FfnBlockWeights::Moe`;
     /// no-op for `Dense` and VRAM-resident `Moe`.
     /// Executes a tiered MoE FFN layer while overlapping `shared_expert` (`gate_up -> SiLU -> down`)
-    /// behind `warp34_moe_hybrid_submit_and_pull_forked` so CPU `eval_expert_vnni` wakes immediately
+    /// behind `warp34_moe_hybrid_submit_and_pull` so CPU `eval_expert_vnni` wakes immediately
     /// after `warp34_moe_topk_router_f16`. Falls back to sequential execution for non-tiered FFNs
     /// or mixed-Hadamard layouts where `normed_buf` must be rotated after `shared_gate_up_proj`.
     #[allow(clippy::too_many_arguments)]

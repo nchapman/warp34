@@ -520,14 +520,31 @@ pub(crate) enum RawLinearHost {
 }
 
 impl RawLinearHost {
-    pub(crate) fn into_u8b128_if_dense(self) -> Self {
+    pub(crate) fn lm_head_online_u8_group_size(
+        cfg: &ModelConfig,
+        local_n: usize,
+        k: usize,
+    ) -> Option<usize> {
+        let marlin_ok = (local_n.is_multiple_of(MARLIN_TILE_N)
+            && k.is_multiple_of(MARLIN_TILE_K_W4))
+            || (local_n.is_multiple_of(MARLIN_TILE_K_W4) && k.is_multiple_of(MARLIN_TILE_N));
+        if cfg.uses_tiered_moe()
+            && cfg.vocab_size >= 65_536
+            && !matches!(cfg.quant, QuantScheme::Unquantized)
+            && !cfg.tie_word_embeddings
+            && marlin_ok
+            && (k.is_multiple_of(64) || k.is_multiple_of(128))
+        {
+            Some(if k.is_multiple_of(64) { 64 } else { 128 })
+        } else {
+            None
+        }
+    }
+
+    pub(crate) fn into_lm_head_u8b128_if_eligible(self, cfg: &ModelConfig) -> Self {
         match self {
             Self::DenseF16 { weight, n, k } => {
-                let marlin_ok = (n.is_multiple_of(MARLIN_TILE_N)
-                    && k.is_multiple_of(MARLIN_TILE_K_W4))
-                    || (n.is_multiple_of(MARLIN_TILE_K_W4) && k.is_multiple_of(MARLIN_TILE_N));
-                if marlin_ok && (k.is_multiple_of(64) || k.is_multiple_of(128)) {
-                    let group_size = if k.is_multiple_of(64) { 64 } else { 128 };
+                if let Some(group_size) = Self::lm_head_online_u8_group_size(cfg, n, k) {
                     let (packed, scales) =
                         crate::loader::quantize_f16_n_major_to_u8b128(&weight, n, k, group_size);
                     Self::U8B128NMajor {

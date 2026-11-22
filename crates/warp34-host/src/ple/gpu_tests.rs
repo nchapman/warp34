@@ -1263,6 +1263,103 @@ fn test_gpu_hc_ple_qsa_kernels_parity() {
     exp_all.dedup();
     assert_eq!(exp_all.len(), lg_select_k);
 
+    // 6a-split. Verify Split-B `qsa_select_blocks_split_f16_kernel` + `qsa_select_blocks_merge_f16_kernel`
+    // (`ex.scratch_ptr != 0`, `total_tokens <= 16`) matches non-split `qsa_select_blocks_f16_kernel`
+    // bit-for-bit when cold middle splits (`qsa_cand_better == false`) alternate with hot splits (`true`).
+    {
+        let sb_pages = 1030usize;
+        let sb_seq_len = 16_402usize; // 4100 completed groups + 1 tail group (4100); per_split = 507
+        let sb_blk_tbl: Vec<i32> = (0..sb_pages as i32).collect();
+        let d_sb_blk_tbl = dev_from_slice(&sb_blk_tbl, &stream);
+        let d_sb_ctx_before = dev_from_slice(&[(sb_seq_len - 1) as i32], &stream);
+        let d_sb_seq_after = dev_from_slice(&[sb_seq_len as i32], &stream);
+        let d_sb_slot = dev_from_slice(&[(sb_seq_len - 1) as i32], &stream);
+        let sb_batch = Warp34AttentionBatch {
+            query_start_loc: d_lg_qsl.addr() as usize as *const i32,
+            context_lens_before: d_sb_ctx_before.addr() as usize as *const i32,
+            seq_lens_after: d_sb_seq_after.addr() as usize as *const i32,
+            block_tables: d_sb_blk_tbl.addr() as usize as *const i32,
+            write_slot_mapping: d_sb_slot.addr() as usize as *const i32,
+            valid_token_mask: std::ptr::null(),
+            num_reqs: 1,
+            total_tokens: 1,
+            max_q_len: 1,
+            max_seq_len: sb_seq_len as i32,
+            max_blocks_per_req: sb_pages as i32,
+            ..nu_attn_batch
+        };
+        let mut h_sb_comp_k = vec![f32_to_f16(-1.0); sb_pages * 4 * 128];
+        // Fill split 0 (`[16..480)`) with positive scores (`0.5 + 0.001 * i`) so `thresh_sc > 0`,
+        // leave splits 1, 3, 4, 6 completely cold (`score = 0 < thresh_sc` -> `false` branch),
+        // and plant higher-scoring overrides in splits 2, 5, and 7 (`true` branch after `false`).
+        for i in 0..464usize {
+            let g = 16 + i;
+            let v = f32_to_f16(0.5 + (i as f32) * 0.002);
+            h_sb_comp_k[g * 128..(g + 1) * 128].fill(v);
+        }
+        for (k_i, g) in [1040usize, 1050, 2560, 2570, 3600, 3610]
+            .into_iter()
+            .enumerate()
+        {
+            let v = f32_to_f16(2.0 + (k_i as f32) * 0.1);
+            h_sb_comp_k[g * 128..(g + 1) * 128].fill(v);
+        }
+        let d_sb_comp_k = dev_from_slice(&h_sb_comp_k, &stream);
+        let d_sb_scratch = DeviceBuffer::alloc(0, 64 * 1024).unwrap();
+        let ex_sb = stream.exec(d_sb_scratch.addr(), 64 * 1024);
+
+        let d_ref_phys = DeviceBuffer::alloc(0, lg_select_k * 4).unwrap();
+        let d_ref_log = DeviceBuffer::alloc(0, lg_select_k * 4).unwrap();
+        let d_ref_num = DeviceBuffer::alloc(0, 4).unwrap();
+        let d_ref_pos = DeviceBuffer::alloc(0, 4).unwrap();
+        let d_got_phys = DeviceBuffer::alloc(0, lg_select_k * 4).unwrap();
+        let d_got_log = DeviceBuffer::alloc(0, lg_select_k * 4).unwrap();
+        let d_got_num = DeviceBuffer::alloc(0, 4).unwrap();
+        let d_got_pos = DeviceBuffer::alloc(0, 4).unwrap();
+
+        gpu_ops::qsa_select_blocks_f16(
+            &ex,
+            d_lg_q_idx.addr(),
+            d_sb_comp_k.addr(),
+            &sb_batch,
+            d_ref_phys.addr(),
+            d_ref_log.addr(),
+            d_ref_num.addr(),
+            d_ref_pos.addr(),
+            4,
+            128,
+            block_size,
+            lg_select_k,
+            lg_sink,
+            lg_recent,
+        )
+        .unwrap();
+        gpu_ops::qsa_select_blocks_f16(
+            &ex_sb,
+            d_lg_q_idx.addr(),
+            d_sb_comp_k.addr(),
+            &sb_batch,
+            d_got_phys.addr(),
+            d_got_log.addr(),
+            d_got_num.addr(),
+            d_got_pos.addr(),
+            4,
+            128,
+            block_size,
+            lg_select_k,
+            lg_sink,
+            lg_recent,
+        )
+        .unwrap();
+
+        let ref_log: Vec<i32> = dev_to_vec(&d_ref_log, lg_select_k, &stream);
+        let got_log: Vec<i32> = dev_to_vec(&d_got_log, lg_select_k, &stream);
+        let ref_phys: Vec<i32> = dev_to_vec(&d_ref_phys, lg_select_k, &stream);
+        let got_phys: Vec<i32> = dev_to_vec(&d_got_phys, lg_select_k, &stream);
+        assert_eq!(got_log, ref_log, "Split-B QSA logical block mismatch");
+        assert_eq!(got_phys, ref_phys, "Split-B QSA physical block mismatch");
+    }
+
     // Verify GQA-6 (`local_q_heads = 6, local_kv_heads = 1`) with and without Split-K scratch:
     let gqa6_heads = 6usize;
     let h_gqa6_q: Vec<u16> = (0..gqa6_heads * head_dim)

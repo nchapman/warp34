@@ -154,64 +154,65 @@ impl TieredMoeEngine {
                 && store.mapped_dev_ptr() != 0
                 && crate::moe_cpu_bridge::has_avx512()
                 && num_tokens >= 2;
+            let hybrid_desc = warp34_kernels::ffi::Warp34MoeHybridDesc {
+                d_req_slot: req_ptr,
+                x_f16: x_addr as *const core::ffi::c_void,
+                global_topk_ids: d_topk_ids_addr as *const i32,
+                topk_weights: d_topk_weights_addr as *const f32,
+                expert_to_slot: cache.d_expert_to_slot.addr() as *mut i32,
+                slot_to_expert: cache.d_slot_to_expert.addr() as *mut i32,
+                slot_last_used: cache.d_slot_last_used.addr() as *mut u64,
+                step_counter: cache.d_step_counter.addr() as *mut u64,
+                expert_freq: cache.d_expert_freq.addr() as *mut u8,
+                remapped_topk_ids: ws.d_remapped_topk_ids[0].addr() as *mut i32,
+                pulled_topk_ids: if use_overlapped_pull {
+                    ws.d_remapped_topk_ids[1].addr() as *mut i32
+                } else {
+                    core::ptr::null_mut()
+                },
+                miss_local_experts: ws.d_miss_local_experts.addr() as *mut i32,
+                miss_victim_slots: ws.d_miss_victim_slots.addr() as *mut i32,
+                num_misses_buf: ws.d_num_misses.addr() as *mut i32,
+                mapped_host_packs: store.mapped_dev_ptr() as *const core::ffi::c_void,
+                gate_up_packed_base: cache.slots.gate_up_packed.addr() as *mut u32,
+                gate_up_scales_base: cache.slots.gate_up_scales.addr() as *mut core::ffi::c_void,
+                down_packed_base: cache.slots.down_packed.addr() as *mut u32,
+                down_scales_base: cache.slots.down_scales.addr() as *mut core::ffi::c_void,
+                pull_stream: if use_overlapped_pull {
+                    ws.h2d_stream.handle as *mut core::ffi::c_void
+                } else {
+                    core::ptr::null_mut()
+                },
+                plan_event: if use_overlapped_pull {
+                    ws.hybrid_plan_event.handle as *mut core::ffi::c_void
+                } else {
+                    core::ptr::null_mut()
+                },
+                pull_done_event: if use_overlapped_pull {
+                    ws.hybrid_pull_done_event.handle as *mut core::ffi::c_void
+                } else {
+                    core::ptr::null_mut()
+                },
+                pack_stride_bytes: store.layout().stride,
+                num_tokens: num_tokens as i32,
+                top_k: top_k as i32,
+                global_expert_offset: cache.expert_ids.start as i32,
+                local_num_experts: cache.expert_ids.len() as i32,
+                k_static: cache.k_static as i32,
+                k_hot: k_hot as i32,
+                n_interm: store.layout().intermediate as i32,
+                k_hidden: store.layout().hidden as i32,
+                group_size: store.layout().group_size as i32,
+                bits: store.layout().bits as i32,
+                gpu_share_frac: gpu_share,
+                reserved: 0,
+            };
             crate::cuda::check_rc(
                 // SAFETY: device pointers and capacities are owned and validated by `cache` and `ws`.
                 unsafe {
-                    warp34_kernels::ffi::warp34_moe_hybrid_submit_and_pull_forked(
-                        &ex,
-                        req_ptr,
-                        x_addr as *const core::ffi::c_void,
-                        d_topk_ids_addr as *const i32,
-                        d_topk_weights_addr as *const f32,
-                        cache.d_expert_to_slot.addr() as *mut i32,
-                        cache.d_slot_to_expert.addr() as *mut i32,
-                        cache.d_slot_last_used.addr() as *mut u64,
-                        cache.d_step_counter.addr() as *mut u64,
-                        cache.d_expert_freq.addr() as *mut u8,
-                        ws.d_remapped_topk_ids[0].addr() as *mut i32,
-                        if use_overlapped_pull {
-                            ws.d_remapped_topk_ids[1].addr() as *mut i32
-                        } else {
-                            core::ptr::null_mut()
-                        },
-                        ws.d_miss_local_experts.addr() as *mut i32,
-                        ws.d_miss_victim_slots.addr() as *mut i32,
-                        ws.d_num_misses.addr() as *mut i32,
-                        store.mapped_dev_ptr() as *const core::ffi::c_void,
-                        cache.slots.gate_up_packed.addr() as *mut u32,
-                        cache.slots.gate_up_scales.addr() as *mut core::ffi::c_void,
-                        cache.slots.down_packed.addr() as *mut u32,
-                        cache.slots.down_scales.addr() as *mut core::ffi::c_void,
-                        num_tokens as i32,
-                        top_k as i32,
-                        cache.expert_ids.start as i32,
-                        cache.expert_ids.len() as i32,
-                        cache.k_static as i32,
-                        k_hot as i32,
-                        store.layout().stride,
-                        store.layout().intermediate as i32,
-                        store.layout().hidden as i32,
-                        store.layout().group_size as i32,
-                        store.layout().bits as i32,
-                        gpu_share,
-                        if use_overlapped_pull {
-                            ws.h2d_stream.handle as *mut core::ffi::c_void
-                        } else {
-                            core::ptr::null_mut()
-                        },
-                        if use_overlapped_pull {
-                            ws.hybrid_plan_event.handle as *mut core::ffi::c_void
-                        } else {
-                            core::ptr::null_mut()
-                        },
-                        if use_overlapped_pull {
-                            ws.hybrid_pull_done_event.handle as *mut core::ffi::c_void
-                        } else {
-                            core::ptr::null_mut()
-                        },
-                    )
+                    warp34_kernels::ffi::warp34_moe_hybrid_submit_and_pull(&ex, &hybrid_desc)
                 },
-                "warp34_moe_hybrid_submit_and_pull_forked",
+                "warp34_moe_hybrid_submit_and_pull",
             )?;
             if let Some(hook) = pre_routed_hook.as_deref_mut() {
                 hook(compute_stream)?;
@@ -254,7 +255,7 @@ impl TieredMoeEngine {
             return crate::cuda::check_rc(
                 // SAFETY: `out_addr` is a valid `[num_tokens, hidden]` FP16 buffer.
                 unsafe {
-                    warp34_kernels::ffi::warp34_moe_hybrid_wait_and_add_joined(
+                    warp34_kernels::ffi::warp34_moe_hybrid_wait_and_add(
                         &ex,
                         req_ptr,
                         resp_ptr,
@@ -262,10 +263,9 @@ impl TieredMoeEngine {
                         ws.d_num_misses.addr() as *const i32,
                         num_tokens as i32,
                         store.layout().hidden as i32,
-                        core::ptr::null_mut(),
                     )
                 },
-                "warp34_moe_hybrid_wait_and_add_joined",
+                "warp34_moe_hybrid_wait_and_add",
             );
         }
         if let Some(hook) = pre_routed_hook {
@@ -1009,7 +1009,9 @@ impl TieredMoeEngine {
                         chunk.len(),
                     )?;
                     if c_idx == 0 && !promote_victim_slots.is_empty() {
-                        if promote_victim_slots.len() <= 1024 {
+                        let max_pinned_victims =
+                            1024usize.min(ws.d_miss_victim_slots.len_bytes / 4);
+                        if promote_victim_slots.len() <= max_pinned_victims {
                             // SAFETY: `[0..1024]` i32s in `h_chunk_slot_pinned` are reserved for
                             // `promote_victim_slots` (`<= 16` i32s), protected by `pinned_h2d_done_event`.
                             unsafe {

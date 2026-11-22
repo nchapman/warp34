@@ -918,6 +918,64 @@ int warp34_moe_gpu_lru_update_and_pull(
     int local_num_experts, int k_hot, int max_misses,
     size_t pack_stride_bytes, int n_interm, int k_hidden, int group_size, int bits);
 
+typedef struct {
+    void*          d_req_slot;
+    const void*    x_f16;
+    const int32_t* global_topk_ids;
+    const float*   topk_weights;
+    int32_t*       expert_to_slot;
+    int32_t*       slot_to_expert;
+    uint64_t*      slot_last_used;
+    uint64_t*      step_counter;
+    uint8_t*       expert_freq;
+    int32_t*       remapped_topk_ids;
+    int32_t*       pulled_topk_ids;
+    int32_t*       miss_local_experts;
+    int32_t*       miss_victim_slots;
+    int32_t*       num_misses_buf;
+    const void*    mapped_host_packs;
+    uint32_t*      gate_up_packed_base;
+    void*          gate_up_scales_base;
+    uint32_t*      down_packed_base;
+    void*          down_scales_base;
+    void*          pull_stream;
+    void*          plan_event;
+    void*          pull_done_event;
+    size_t         pack_stride_bytes;
+    int32_t        num_tokens;
+    int32_t        top_k;
+    int32_t        global_expert_offset;
+    int32_t        local_num_experts;
+    int32_t        k_static;
+    int32_t        k_hot;
+    int32_t        n_interm;
+    int32_t        k_hidden;
+    int32_t        group_size;
+    int32_t        bits;
+    float          gpu_share_frac;
+    int32_t        reserved;
+} warp34_moe_hybrid_desc;
+
+static_assert(sizeof(warp34_moe_hybrid_desc) == 232, "warp34_moe_hybrid_desc ABI size mismatch");
+
+int warp34_moe_hybrid_submit_and_pull(
+    const warp34_exec* ex, const warp34_moe_hybrid_desc* desc);
+int warp34_moe_hybrid_wait_and_add(
+    const warp34_exec* ex, const void* d_req_slot, const void* d_resp_slot,
+    void* out_f16, const int32_t* num_misses_buf, int num_tokens, int k_hidden);
+int warp34_moe_w4a16_pulled_add_f16(
+    const warp34_exec* ex, const void* x, const uint32_t* gate_up_packed,
+    const void* gate_up_scales, const uint32_t* down_packed, const void* down_scales,
+    const int32_t* pulled_topk_ids, const float* topk_weights, const int32_t* active_count,
+    void* interm_buf, void* out, int num_tokens, int top_k, int num_experts,
+    int n_interm, int k_hidden, int group_size, int down_hadamard_block_size);
+int warp34_moe_w2a16_pulled_add_f16(
+    const warp34_exec* ex, const void* x, const uint32_t* gate_up_packed,
+    const void* gate_up_scales, const uint32_t* down_packed, const void* down_scales,
+    const int32_t* pulled_topk_ids, const float* topk_weights, const int32_t* active_count,
+    void* interm_buf, void* out, int num_tokens, int top_k, int num_experts,
+    int n_interm, int k_hidden, int group_size, int down_hadamard_block_size);
+
 int warp34_gemma_rms_norm_hadamard_f16(
     const warp34_exec* ex, const void* x, const void* weight, void* out, void* out_had64,
     const uint8_t* valid_token_mask, int num_tokens, int hidden_size, float eps);

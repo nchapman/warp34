@@ -72,7 +72,7 @@ pub const LARGE_MODEL_WEIGHT_THRESHOLD_BYTES: usize = 15 * 1024 * 1024 * 1024;
 #[cfg(any(test, feature = "cuda"))]
 pub(super) const VISION_ENCODER_LAZY_RESERVE_BYTES: usize = 1536 * 1024 * 1024;
 
-/// Compact lazy `Qwen3VisionEncoder` reserve (`352 MiB`) for tiered-MoE checkpoints (`qwen4_exp`),
+/// Compact lazy `Qwen3VisionEncoder` reserve (`200 MiB`) for tiered-MoE checkpoints (`qwen4_exp`),
 /// whose ViT weights are ~230 MiB and where `ensure_vision_encoder_loaded` clears CUDA graphs on demand.
 #[cfg(any(test, feature = "cuda"))]
 pub(super) const TIERED_MOE_VISION_LAZY_RESERVE_BYTES: usize = 200 * 1024 * 1024;
@@ -261,7 +261,7 @@ pub const TIERED_MOE_SYNTHETIC_EXTRA_RESERVE_BYTES: usize = 64 * 1024 * 1024;
 /// Double-buffered H2D staging capacity (`96` experts) for `RankTieredMoe` on `TP=1` / `TP=2`.
 pub const TIERED_MOE_STAGE_CAPACITY_DEFAULT: usize = 96;
 
-/// Single-buffered H2D staging capacity (`16` experts) for `RankTieredMoe` on `TP=1` AVX-512 CPU-bridge ranks.
+/// Double-buffered H2D staging capacity (`16` experts) for `RankTieredMoe` on `TP=1` AVX-512 CPU-bridge ranks.
 pub const TIERED_MOE_STAGE_CAPACITY_TP1_BRIDGE: usize = 16;
 
 /// Double-buffered H2D staging capacity (`32` experts) for `RankTieredMoe` on `TP >= 4` and compact `< 12 GiB` budgets.
