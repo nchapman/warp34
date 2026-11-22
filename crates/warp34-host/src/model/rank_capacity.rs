@@ -72,13 +72,16 @@ pub const LARGE_MODEL_WEIGHT_THRESHOLD_BYTES: usize = 15 * 1024 * 1024 * 1024;
 #[cfg(any(test, feature = "cuda"))]
 pub(super) const VISION_ENCODER_LAZY_RESERVE_BYTES: usize = 1536 * 1024 * 1024;
 
-/// Compact lazy `Qwen3VisionEncoder` reserve (`200 MiB`) for tiered-MoE checkpoints (`qwen4_exp`),
-/// whose ViT weights are ~230 MiB and where `ensure_vision_encoder_loaded` clears CUDA graphs on demand.
+/// Lazy `Qwen3VisionEncoder` reserve (`320 MiB`) for single-GPU tiered-MoE checkpoints (`qwen4_exp`),
+/// covering `Qwen3VisionEncoder::try_load` peak arena + repack staging (~262 MiB on HGPTQ, ~294 MiB
+/// raw+slack) plus ViT activation workspace while preserving `hot_per_layer = 128` and 131K TQ4
+/// auto-fit on 24 GiB cards.
 #[cfg(any(test, feature = "cuda"))]
-pub(super) const TIERED_MOE_VISION_LAZY_RESERVE_BYTES: usize = 200 * 1024 * 1024;
+pub(super) const TIERED_MOE_VISION_LAZY_RESERVE_BYTES: usize = 320 * 1024 * 1024;
 
 /// Steady-state post-pool headroom (`200 MiB`) on single-GPU (`<= 28 GiB`) tiered-MoE long-context
-/// deployments, matching [`TIERED_MOE_VISION_LAZY_RESERVE_BYTES`].
+/// deployments when no lazy vision reserve applies (`vision_lazy_extra_headroom` adds the delta above
+/// this baseline when `has_vision` is true).
 #[cfg(any(test, feature = "cuda"))]
 pub(super) const TIERED_MOE_TP1_LONGCTX_HEADROOM_BYTES: usize = 200 * 1024 * 1024;
 

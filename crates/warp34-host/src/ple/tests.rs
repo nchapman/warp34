@@ -464,6 +464,18 @@ fn test_ple_mmap_table_lut4_gptq() {
         ),
         0,
     );
+    // Cgroup v2 `memory.max - memory.current` must cap a larger `/proc/meminfo` `MemAvailable`
+    // so container-limited deployments skip prefaulting instead of risking an OOM kill.
+    let cgroup_capped_avail = crate::cache::parse_available_host_ram(
+        "MemAvailable:   67108864 kB\n",
+        Some("2097152\n"),
+        Some("2096128\n"),
+    );
+    assert_eq!(cgroup_capped_avail, Some(1024));
+    assert_eq!(
+        synth_table.populate_into_page_cache_with_available_ram(cgroup_capped_avail, 1024),
+        0,
+    );
     assert_eq!(
         synth_table.populate_into_page_cache_with_available_ram(
             Some(synth_table.total_mapped_bytes() + 1024),

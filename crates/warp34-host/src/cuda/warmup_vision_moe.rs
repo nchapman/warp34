@@ -444,15 +444,19 @@ pub(super) fn warmup_vision_moe_and_qwen4(
         ),
         "warmup warp34_hc_combine_f16"
     )?;
+    let hc_inject_w = buf_d;
+    let hc_tap_out = buf_d + 4096;
+    let hc_next_norm_w = buf_a + 4096;
+    let hc_next_norm_out = buf_d + 8192;
     warmup_ffi!(
         ffi::warp34_hc_combine_tap_f16(
             ex,
             buf_a as *const c_void,
             buf_b as *const c_void,
-            buf_d as *const f32,
+            hc_inject_w as *const f32,
             core::ptr::null(),
             buf_c as *mut c_void,
-            buf_d as *mut c_void,
+            hc_tap_out as *mut c_void,
             core::ptr::null(),
             1,
             4,
@@ -467,12 +471,12 @@ pub(super) fn warmup_vision_moe_and_qwen4(
             ex,
             buf_a as *const c_void,
             buf_b as *const c_void,
-            buf_d as *const f32,
+            hc_inject_w as *const f32,
             core::ptr::null(),
             buf_c as *mut c_void,
             core::ptr::null_mut(),
-            buf_a as *const c_void,
-            buf_b as *mut c_void,
+            hc_next_norm_w as *const c_void,
+            hc_next_norm_out as *mut c_void,
             core::ptr::null(),
             1,
             4,
@@ -488,12 +492,12 @@ pub(super) fn warmup_vision_moe_and_qwen4(
             ex,
             buf_a as *const c_void,
             buf_b as *const c_void,
-            buf_d as *const f32,
+            hc_inject_w as *const f32,
             core::ptr::null(),
             buf_c as *mut c_void,
-            buf_d as *mut c_void,
-            buf_a as *const c_void,
-            buf_b as *mut c_void,
+            hc_tap_out as *mut c_void,
+            hc_next_norm_w as *const c_void,
+            hc_next_norm_out as *mut c_void,
             core::ptr::null(),
             1,
             4,

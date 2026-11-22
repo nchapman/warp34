@@ -836,12 +836,35 @@ pub fn prepare_execution_plan(device_id: i32) -> Result<()> {
         )?;
     }
 
+    let bf16_layout_128 = Warp34KvLayerLayout {
+        namespace_id: ffi::WARP34_KV_NAMESPACE_DFLASH_DRAFT_CTX,
+        head_dim: 128,
+        k_token_stride_bytes: 256,
+        v_token_stride_bytes: 256,
+        k_head_stride_bytes: 16 * 256,
+        v_head_stride_bytes: 16 * 256,
+        k_page_stride_bytes: 16 * 256,
+        v_page_stride_bytes: 16 * 256,
+        k_format: ffi::WARP34_KV_FORMAT_BF16,
+        v_format: ffi::WARP34_KV_FORMAT_BF16,
+        ..layout
+    };
     let bf16_layout = Warp34KvLayerLayout {
         namespace_id: ffi::WARP34_KV_NAMESPACE_DFLASH_DRAFT_CTX,
         k_format: ffi::WARP34_KV_FORMAT_BF16,
         v_format: ffi::WARP34_KV_FORMAT_BF16,
         ..layout
     };
+    warmup_ffi!(
+        ffi::warp34_kv_cache_write_bf16(
+            &ex,
+            &bf16_layout_128,
+            &attn_batch,
+            buf_c as *const c_void,
+            buf_c as *const c_void,
+        ),
+        "warmup warp34_kv_cache_write_bf16 hd128"
+    )?;
     warmup_ffi!(
         ffi::warp34_kv_cache_write_bf16(
             &ex,
@@ -855,7 +878,7 @@ pub fn prepare_execution_plan(device_id: i32) -> Result<()> {
     warmup_ffi!(
         ffi::warp34_paged_attention_bf16(
             &ex,
-            &bf16_layout,
+            &bf16_layout_128,
             &attn_batch,
             buf_c as *const c_void,
             buf_d as *mut c_void,
@@ -866,7 +889,7 @@ pub fn prepare_execution_plan(device_id: i32) -> Result<()> {
     warmup_ffi!(
         ffi::warp34_paged_attention_bf16(
             &ex,
-            &bf16_layout,
+            &bf16_layout_128,
             &attn_batch_m2,
             buf_c as *const c_void,
             buf_d as *mut c_void,
@@ -877,7 +900,7 @@ pub fn prepare_execution_plan(device_id: i32) -> Result<()> {
     warmup_ffi!(
         ffi::warp34_paged_attention_bf16(
             &ex_split,
-            &bf16_layout,
+            &bf16_layout_128,
             &attn_batch_m2,
             buf_c as *const c_void,
             buf_d as *mut c_void,
@@ -1746,4 +1769,12 @@ pub fn prepare_execution_plan(device_id: i32) -> Result<()> {
     )?;
 
     dev.synchronize()
+}
+
+#[cfg(all(test, feature = "cuda"))]
+mod tests {
+    #[test]
+    fn test_prepare_execution_plan_succeeds() {
+        super::prepare_execution_plan(0).expect("prepare_execution_plan(0)");
+    }
 }

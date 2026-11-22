@@ -737,6 +737,7 @@ pub(crate) fn serving_reserve(
 struct DFlashGraphIo {
     forward_graph: Option<CudaGraph>,
     select_greedy_graphs: [Option<CudaGraph>; MAX_DFLASH_BATCH_SLOTS],
+    oom_disabled: bool,
     forward_arena: DeviceArena,
     meta_dev: DeviceBuffer,
     topk_ids_dev: DeviceBuffer,
@@ -1398,6 +1399,7 @@ impl DFlash2Rank {
         let graph_io = DFlashGraphIo {
             forward_graph: None,
             select_greedy_graphs: std::array::from_fn(|_| None),
+            oom_disabled: false,
             forward_arena: DeviceArena::new(t.device.device_id, DFLASH2_FORWARD_GRAPH_ARENA_BYTES)?,
             meta_dev: DeviceBuffer::alloc(t.device.device_id, (3 * cfg.block_size + 4) * 4)?,
             topk_ids_dev: DeviceBuffer::alloc(t.device.device_id, topk_elems * 4)?,
@@ -2389,13 +2391,27 @@ impl DFlash2Rank {
         }
         self.proposal_anchor = None;
         self.upload_forward_meta(t, anchor)?;
-        if self.use_cuda_graph {
-            self.ensure_forward_graph(t, comm)?;
-            self.graph_io
-                .forward_graph
-                .as_ref()
-                .unwrap()
-                .launch(&t.stream)?;
+        if self.use_cuda_graph && !self.graph_io.oom_disabled {
+            let graph_res = self.ensure_forward_graph(t, comm).and_then(|()| {
+                self.graph_io
+                    .forward_graph
+                    .as_ref()
+                    .unwrap()
+                    .launch(&t.stream)
+            });
+            match graph_res {
+                Ok(()) => {}
+                // `cudaErrorMemoryAllocation` (`code == 2`) on single-rank DFlash2 disables graph
+                // replay for the rank lifetime and falls back to eager execution without retrying
+                // `CudaGraph::capture` on every token.
+                Err(e) if self.tp == 1 && e.code == 2 => {
+                    self.graph_io.forward_graph = None;
+                    self.graph_io.oom_disabled = true;
+                    let (batch, ids_ptr, pos_ptr) = self.fixed_forward_batch_ptrs();
+                    self.enqueue_forward_device_topk(t, &batch, ids_ptr, pos_ptr, comm)?;
+                }
+                Err(e) => return Err(e),
+            }
         } else {
             let (batch, ids_ptr, pos_ptr) = self.fixed_forward_batch_ptrs();
             self.enqueue_forward_device_topk(t, &batch, ids_ptr, pos_ptr, comm)?;
@@ -2436,11 +2452,20 @@ impl DFlash2Rank {
         if (self.tp > 1) != comm.is_some() {
             return Err(loader_err("invalid DFlash forward"));
         }
-        if self.use_cuda_graph && self.can_capture_select_greedy() {
+        if self.use_cuda_graph && !self.graph_io.oom_disabled && self.can_capture_select_greedy() {
             self.prepare_select_greedy_graph_inputs_async(t, anchor)?;
-            self.ensure_select_greedy_graph(t, comm)?;
-            self.replay_select_greedy_graph_async(t)?;
-            return self.collect_select_greedy_host(t, anchor);
+            let graph_res = self
+                .ensure_select_greedy_graph(t, comm)
+                .and_then(|()| self.replay_select_greedy_graph_async(t));
+            match graph_res {
+                Ok(()) => return self.collect_select_greedy_host(t, anchor),
+                Err(e) if self.tp == 1 && e.code == 2 => {
+                    let slot_idx = if self.batch_mode { self.active_slot } else { 0 };
+                    self.graph_io.select_greedy_graphs[slot_idx] = None;
+                    self.graph_io.oom_disabled = true;
+                }
+                Err(e) => return Err(e),
+            }
         }
         let (ids_dev, scores_dev) = self.forward_device_topk(t, anchor, comm)?;
         if let Some(comm) = comm {

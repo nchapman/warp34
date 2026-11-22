@@ -16,24 +16,6 @@ const MADV_RANDOM: i32 = 1;
 const MADV_SEQUENTIAL: i32 = 2;
 const MADV_WILLNEED: i32 = 3;
 
-fn available_host_ram_bytes() -> Option<usize> {
-    #[cfg(target_os = "linux")]
-    {
-        let text = std::fs::read_to_string("/proc/meminfo").ok()?;
-        for line in text.lines() {
-            if let Some(rest) = line.strip_prefix("MemAvailable:") {
-                let kib: usize = rest.split_whitespace().next()?.parse().ok()?;
-                return kib.checked_mul(1024);
-            }
-        }
-        None
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        None
-    }
-}
-
 unsafe extern "C" {
     fn mmap(
         addr: *mut core::ffi::c_void,
@@ -900,11 +882,12 @@ impl PleMmapTable {
         total
     }
 
-    /// Queries `/proc/meminfo` (`MemAvailable`) and prefaults all PLE `.safetensors` pages
-    /// into RAM when `MemAvailable >= total_mapped_bytes() + safety_headroom_bytes`.
+    /// Queries cgroup-aware available host RAM (`crate::cache::detect_available_host_ram_bytes`,
+    /// capping `/proc/meminfo` `MemAvailable` by cgroup v2 `memory.max - memory.current`) and
+    /// prefaults all PLE `.safetensors` pages into RAM when headroom permits.
     pub fn populate_into_page_cache_if_fits(&self, safety_headroom_bytes: usize) -> usize {
         self.populate_into_page_cache_with_available_ram(
-            available_host_ram_bytes(),
+            crate::cache::detect_available_host_ram_bytes(),
             safety_headroom_bytes,
         )
     }

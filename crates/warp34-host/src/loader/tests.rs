@@ -641,6 +641,104 @@ fn test_awq_and_u8b128_unpack_and_dequant_roundtrip() {
 }
 
 #[test]
+fn test_quantize_f16_n_major_to_u8b128_edge_cases_and_parallel_roundtrip() {
+    // 1. All-zero group, signed extrema, and ties-to-even rounding boundaries.
+    let size_n = 3usize;
+    let size_k = 8usize;
+    let group_size = 4usize;
+    let sc_exact = 0.25f32; // exact in FP16 (`max_abs = 31.75`, `31.75 / 127 = 0.25`)
+    let max_val = 127.0f32 * sc_exact;
+    let src_f32: [f32; 24] = [
+        // Row 0: group 0 = all zeros; group 1 = signed extrema + zero
+        0.0,
+        -0.0,
+        0.0,
+        0.0,
+        max_val,
+        -max_val,
+        0.0,
+        -max_val,
+        // Row 1: group 0 = positive ties-to-even boundaries (`0.5 -> 0`, `1.5 -> 2`, `2.5 -> 2`)
+        max_val,
+        0.5 * sc_exact,
+        1.5 * sc_exact,
+        2.5 * sc_exact,
+        // Row 1: group 1 = negative ties-to-even boundaries (`-0.5 -> 0`, `-1.5 -> -2`, `-2.5 -> -2`)
+        -max_val,
+        -0.5 * sc_exact,
+        -1.5 * sc_exact,
+        -2.5 * sc_exact,
+        // Row 2: subnormal / tiny group + mixed interior values
+        1e-4,
+        -0.5e-4,
+        0.25e-4,
+        0.0,
+        -1.75,
+        0.875,
+        -0.125,
+        1.25,
+    ];
+    let src_f16: Vec<u16> = src_f32.iter().map(|&v| f32_to_f16(v)).collect();
+    let (packed, scales) = quantize_f16_n_major_to_u8b128(&src_f16, size_n, size_k, group_size);
+
+    // Row 0 group 0: all-zero group emits scale 0 and neutral +128 bytes (`0x8080_8080`).
+    assert_eq!(f16_to_f32(scales[0]), 0.0);
+    assert_eq!(packed[0], 0x8080_8080);
+    // Row 0 group 1: `+max_val -> 255`, `-max_val -> 1`, `0.0 -> 128`.
+    assert_eq!(f16_to_f32(scales[1]), sc_exact);
+    assert_eq!(packed[1].to_le_bytes(), [255, 1, 128, 1]);
+    // Row 1 ties-to-even: `[+127, 0, +2, +2] + 128` and `[-127, 0, -2, -2] + 128`.
+    assert_eq!(packed[2].to_le_bytes(), [255, 128, 130, 130]);
+    assert_eq!(packed[3].to_le_bytes(), [1, 128, 126, 126]);
+
+    let deq = dequant_u8b128_n_major_to_f16(&packed, &scales, size_n, size_k, group_size);
+    for &bits in deq.iter().take(4) {
+        assert_eq!(f16_to_f32(bits), 0.0);
+    }
+    assert_eq!(f16_to_f32(deq[4]), max_val);
+    assert_eq!(f16_to_f32(deq[5]), -max_val);
+
+    // 2. Grouped (`32`, `128`) and channelwise (`0`) roundtrip accuracy + parallel equivalence
+    // (`size_n = 2048, size_k = 512 -> 1,048,576` elements crosses the multithreaded threshold).
+    let big_n = 2048usize;
+    let big_k = 512usize;
+    let big_f16: Vec<u16> = (0..big_n * big_k)
+        .map(|i| {
+            if (i / big_k) == 17 {
+                0u16 // exercise an all-zero row inside the parallel path
+            } else {
+                let s = (((i * 37 + (i / big_k) * 13) % 509) as f32 - 254.0) / 128.0;
+                f32_to_f16(s)
+            }
+        })
+        .collect();
+    for gs in [32usize, 128, 0] {
+        let (par_packed, par_scales) = quantize_f16_n_major_to_u8b128(&big_f16, big_n, big_k, gs);
+        // Compare selected slices against the single-threaded (<16 rows) path for bit-exact parity.
+        for row_off in [0usize, 16, 1020, 2040] {
+            let sub = &big_f16[row_off * big_k..(row_off + 8) * big_k];
+            let (seq_p, seq_s) = quantize_f16_n_major_to_u8b128(sub, 8, big_k, gs);
+            let wp = big_k / 4;
+            let gp = big_k.checked_div(gs).unwrap_or(1);
+            assert_eq!(&par_packed[row_off * wp..(row_off + 8) * wp], &seq_p[..]);
+            assert_eq!(&par_scales[row_off * gp..(row_off + 8) * gp], &seq_s[..]);
+        }
+        let eff_gs = if gs == 0 { big_k } else { gs };
+        let deq_big = dequant_u8b128_n_major_to_f16(&par_packed, &par_scales, big_n, big_k, eff_gs);
+        for (idx, (&orig_bits, &got_bits)) in big_f16.iter().zip(deq_big.iter()).enumerate() {
+            let orig = f16_to_f32(orig_bits);
+            let got = f16_to_f32(got_bits);
+            let g_idx = (idx / big_k) * (big_k / eff_gs) + (idx % big_k) / eff_gs;
+            let sc = f16_to_f32(par_scales[g_idx]);
+            assert!(
+                (orig - got).abs() <= 0.52 * sc + 2e-3,
+                "gs={gs} idx={idx}: orig={orig}, got={got}, scale={sc}"
+            );
+        }
+    }
+}
+
+#[test]
 fn standalone_dflash_window_policy_preserves_backbone_validation() {
     let tmp = std::env::temp_dir().join(format!("warp34_drafter_config_{}", std::process::id()));
     std::fs::create_dir_all(&tmp).unwrap();

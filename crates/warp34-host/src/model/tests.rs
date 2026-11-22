@@ -1943,6 +1943,84 @@ mod serving_capacity_tests {
             "expected TP=1 DFlash2 M=8 state slots in 11..=16 to preserve CUDA Graph VRAM headroom, got {slots_tp1_m8}"
         );
 
+        // Multimodal `qwen4_exp` (`archive_has_vision = true`) must reserve enough extra headroom
+        // (`>= 120 MiB` above the 200 MiB baseline, i.e. `>= 320 MiB` total covering
+        // `Qwen3VisionEncoder::try_load` peak ~262–294 MiB + ViT workspace) to reject a tight
+        // budget where text-only (`archive_has_vision = false`) still fits, while fitting 131K
+        // (`8,192` pages) and `hot_per_layer >= 128` on a 24 GiB TP=1 card.
+        let (slots_tp1_m8_vis, _, hot_tp1_m8_vis) =
+            super::rank_capacity::evaluate_serving_kv_candidate_budget(
+                &tiered_cfg,
+                1,
+                KvFormatPolicy::Tq4,
+                false,
+                8192,
+                3_560 * mib,
+                512 * mib,
+                8 * mib,
+                23_600 * mib,
+                64,
+                false,
+                false,
+                true,
+                512 * mib,
+                11,
+                LoraCapacityReserve::default(),
+                true,
+            )
+            .expect("TP=1 multimodal tiered MoE + DFlash2 M=8 must fit 131K on 24 GiB");
+        assert!(
+            (11..=16).contains(&slots_tp1_m8_vis),
+            "expected multimodal TP=1 DFlash2 M=8 state slots in 11..=16, got {slots_tp1_m8_vis}"
+        );
+        assert!(
+            hot_tp1_m8_vis >= 126,
+            "expected multimodal TP=1 hot_per_layer >= 126, got {hot_tp1_m8_vis}"
+        );
+        // Behavioral verification: compare the minimum VRAM (`min_mib`) needed with
+        // `archive_has_vision = true` vs `false` inside the `[20 GiB, 28 GiB)` 24 GiB card band,
+        // proving `archive_has_vision = true` enforces `>= 120 MiB` extra headroom (`>= 320 MiB`
+        // total reserve above the 200 MiB baseline).
+        let min_fit_mib = |has_vis: bool| {
+            let mut lo = 20_500usize;
+            let mut hi = 28_000usize;
+            while lo < hi {
+                let mid = (lo + hi) / 2;
+                if super::rank_capacity::evaluate_serving_kv_candidate_budget(
+                    &tiered_cfg,
+                    1,
+                    KvFormatPolicy::Tq4,
+                    false,
+                    8192,
+                    16_500 * mib,
+                    512 * mib,
+                    8 * mib,
+                    mid * mib,
+                    64,
+                    false,
+                    false,
+                    has_vis,
+                    512 * mib,
+                    11,
+                    LoraCapacityReserve::default(),
+                    true,
+                )
+                .is_some()
+                {
+                    hi = mid;
+                } else {
+                    lo = mid + 1;
+                }
+            }
+            lo
+        };
+        let min_txt_mib = min_fit_mib(false);
+        let min_vis_mib = min_fit_mib(true);
+        assert!(
+            min_vis_mib >= min_txt_mib + 120,
+            "expected multimodal reserve to require >= 120 MiB above text-only floor (txt={min_txt_mib} MiB, vis={min_vis_mib} MiB)"
+        );
+
         // When `dflash_min_state_slots` is larger (e.g. `M=16` -> `19` slots on >= 40 GiB),
         // `.max(dflash_min_state_slots)` must still honor the drafter's minimum requirement.
         let (slots_tp1_m16, _, _) = super::rank_capacity::evaluate_serving_kv_candidate_budget(
