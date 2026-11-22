@@ -1,6 +1,5 @@
 //! FFI bindings to `csrc/warp34_cuda.h`.
 
-#[cfg(feature = "cuda")]
 use core::ffi::c_void;
 
 #[repr(C)]
@@ -88,6 +87,48 @@ pub struct Warp34AttentionBatch {
 }
 
 const _: [(); 96] = [(); core::mem::size_of::<Warp34AttentionBatch>()];
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Warp34MoeHybridDesc {
+    pub d_req_slot: *mut c_void,
+    pub x_f16: *const c_void,
+    pub global_topk_ids: *const i32,
+    pub topk_weights: *const f32,
+    pub expert_to_slot: *mut i32,
+    pub slot_to_expert: *mut i32,
+    pub slot_last_used: *mut u64,
+    pub step_counter: *mut u64,
+    pub expert_freq: *mut u8,
+    pub remapped_topk_ids: *mut i32,
+    pub pulled_topk_ids: *mut i32,
+    pub miss_local_experts: *mut i32,
+    pub miss_victim_slots: *mut i32,
+    pub num_misses_buf: *mut i32,
+    pub mapped_host_packs: *const c_void,
+    pub gate_up_packed_base: *mut u32,
+    pub gate_up_scales_base: *mut c_void,
+    pub down_packed_base: *mut u32,
+    pub down_scales_base: *mut c_void,
+    pub pull_stream: *mut c_void,
+    pub plan_event: *mut c_void,
+    pub pull_done_event: *mut c_void,
+    pub pack_stride_bytes: usize,
+    pub num_tokens: i32,
+    pub top_k: i32,
+    pub global_expert_offset: i32,
+    pub local_num_experts: i32,
+    pub k_static: i32,
+    pub k_hot: i32,
+    pub n_interm: i32,
+    pub k_hidden: i32,
+    pub group_size: i32,
+    pub bits: i32,
+    pub gpu_share_frac: f32,
+    pub reserved: i32,
+}
+
+const _: [(); 232] = [(); core::mem::size_of::<Warp34MoeHybridDesc>()];
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1247,6 +1288,22 @@ unsafe extern "C" {
         table_rows: i32,
         eps: f32,
     ) -> i32;
+    pub fn warp34_dflash_qk_norm_rope_kv_write_bf16_inv_freq(
+        ex: *const Warp34Exec,
+        qkv: *mut c_void,
+        q_out: *mut c_void,
+        positions: *const i32,
+        qw: *const c_void,
+        kw: *const c_void,
+        inv_freq: *const f32,
+        kv_layout: *const Warp34KvLayerLayout,
+        write_slot_mapping: *const i32,
+        rows: i32,
+        q_heads: i32,
+        kv_heads: i32,
+        dim: i32,
+        eps: f32,
+    ) -> i32;
     pub fn warp34_dflash_select_greedy_bf16(
         ex: *const Warp34Exec,
         ids: *const i32,
@@ -1261,6 +1318,21 @@ unsafe extern "C" {
         rank: i32,
         vocab: i32,
     ) -> i32;
+    pub fn warp34_dflash_select_greedy_with_conf_bf16(
+        ex: *const Warp34Exec,
+        ids: *const i32,
+        unary: *const f32,
+        hidden: *const c_void,
+        pred: *const c_void,
+        succ: *const c_void,
+        out_path: *mut i32,
+        out_confs: *mut f32,
+        anchor: i32,
+        k: i32,
+        topk: i32,
+        rank: i32,
+        vocab: i32,
+    ) -> i32;
     pub fn warp34_dflash_select_greedy_dev_anchor_bf16(
         ex: *const Warp34Exec,
         ids: *const i32,
@@ -1269,6 +1341,21 @@ unsafe extern "C" {
         pred: *const c_void,
         succ: *const c_void,
         out_path: *mut i32,
+        anchor_dev: *const i32,
+        k: i32,
+        topk: i32,
+        rank: i32,
+        vocab: i32,
+    ) -> i32;
+    pub fn warp34_dflash_select_greedy_dev_anchor_with_conf_bf16(
+        ex: *const Warp34Exec,
+        ids: *const i32,
+        unary: *const f32,
+        hidden: *const c_void,
+        pred: *const c_void,
+        succ: *const c_void,
+        out_path: *mut i32,
+        out_confs: *mut f32,
         anchor_dev: *const i32,
         k: i32,
         topk: i32,

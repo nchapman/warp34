@@ -1270,21 +1270,37 @@ impl Qwen3VisionEncoder {
 
         let _dev = CudaDevice::set_current(device_id)?;
         let visual_prefix = format!("{pfx}.");
+        let is_hgptq = quant
+            .input_hadamard(&format!("{pfx}.blocks.0.mlp.linear_fc2"))
+            .ok()
+            .flatten()
+            .is_some();
         let raw_visual_bytes: usize = archive
             .iter_entries()
             .filter(|(name, _)| name.starts_with(&visual_prefix))
             .map(|(_, info)| {
                 let bytes = info.len_bytes as usize;
                 if matches!(info.dtype.as_str(), "I32" | "U32") {
-                    bytes.saturating_mul(2)
+                    if is_hgptq {
+                        // HGPTQ pads N/K to Marlin 64x128 tiles in-place (<= ~1.5% on ViT shapes)
+                        // and never dequantizes packed W2/W4 weights to FP16.
+                        bytes.saturating_add(bytes / 16)
+                    } else {
+                        bytes.saturating_mul(2)
+                    }
                 } else {
                     bytes
                 }
             })
             .sum();
+        let slack_bytes = if is_hgptq {
+            16 * 1024 * 1024
+        } else {
+            64 * 1024 * 1024
+        };
         let est_bytes = if raw_visual_bytes > 0 {
             raw_visual_bytes
-                .saturating_add(64 * 1024 * 1024)
+                .saturating_add(slack_bytes)
                 .clamp(64 * 1024 * 1024, 1280 * 1024 * 1024)
         } else {
             1280 * 1024 * 1024

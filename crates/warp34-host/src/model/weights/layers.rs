@@ -233,6 +233,15 @@ impl HcBlockWeights {
         ctx: &HcStepContext<'_>,
         [out_mixed_buf, out_had64_buf]: [u64; 2],
     ) -> Result<()> {
+        self.forward_mix_with_targets_ex(ctx, [out_mixed_buf, out_had64_buf], false)
+    }
+
+    pub fn forward_mix_with_targets_ex(
+        &self,
+        ctx: &HcStepContext<'_>,
+        [out_mixed_buf, out_had64_buf]: [u64; 2],
+        skip_rmsnorm: bool,
+    ) -> Result<()> {
         let ex = ctx.ex;
         let cublas = ctx.cublas;
         let marlin_ws_ptr = ctx.marlin_ws_ptr;
@@ -247,17 +256,19 @@ impl HcBlockWeights {
         let eps = ctx.eps;
         let hc_down_buf = ple_val_buf;
         let hc_inj_raw_buf = ple_val_buf + (num_tokens * low_dim * 2) as u64;
-        crate::ple::gpu_ops::hc_rmsnorm_f16(
-            ex,
-            hc_residual_buf,
-            self.hc_norm_ptr,
-            ple_buf_a,
-            0,
-            num_tokens,
-            hc_count,
-            h_dim,
-            eps,
-        )?;
+        if !skip_rmsnorm {
+            crate::ple::gpu_ops::hc_rmsnorm_f16(
+                ex,
+                hc_residual_buf,
+                self.hc_norm_ptr,
+                ple_buf_a,
+                0,
+                num_tokens,
+                hc_count,
+                h_dim,
+                eps,
+            )?;
+        }
         // Fuse HC down (`N0 <= 512`, e.g. `hc_lowrank = 320`) + inject (`N1 <= 256`, e.g. `4`)
         // for decode and speculative verification (`num_tokens <= 16`), preserving 0-ULP parity
         // between `M = 1` decode and `M <= 16` speculative verify while keeping `m > 16` prefill
@@ -377,7 +388,18 @@ impl HcBlockWeights {
         block_out_buf: u64,
         tap: TapExport,
     ) -> Result<()> {
-        crate::ple::gpu_ops::hc_combine_tap_f16(
+        self.forward_combine_tap_rmsnorm(ctx, block_out_buf, 0, 0, tap)
+    }
+
+    pub fn forward_combine_tap_rmsnorm(
+        &self,
+        ctx: &HcStepContext<'_>,
+        block_out_buf: u64,
+        next_norm_weight: u64,
+        next_normed_out: u64,
+        tap: TapExport,
+    ) -> Result<()> {
+        crate::ple::gpu_ops::hc_combine_tap_rmsnorm_f16(
             ctx.ex,
             ctx.hc_residual_buf,
             block_out_buf,
@@ -385,10 +407,13 @@ impl HcBlockWeights {
             0,
             ctx.hc_residual_buf,
             tap.dst,
+            next_norm_weight,
+            next_normed_out,
             0,
             ctx.num_tokens,
             ctx.hc_count,
             ctx.h_dim,
+            ctx.eps,
             tap.stride,
             tap.offset,
         )
@@ -424,6 +449,13 @@ impl LayerResidual {
         }
     }
 
+    pub fn hc_input_norm_ptr(&self) -> Option<u64> {
+        match self {
+            Self::SingleStream { .. } => None,
+            Self::HyperConnection { attn_hc, .. } => Some(attn_hc.hc_norm_ptr),
+        }
+    }
+
     pub fn single_stream_post_attn_norm_ptr(&self) -> Option<u64> {
         match self {
             Self::SingleStream {
@@ -456,6 +488,16 @@ impl LayerResidual {
         ctx: &HcStepContext<'_>,
         [norm_out, norm_had64]: [u64; 2],
     ) -> Result<()> {
+        self.pre_attn_with_targets_ex(layer_idx, false, ctx, [norm_out, norm_had64])
+    }
+
+    pub fn pre_attn_with_targets_ex(
+        &self,
+        layer_idx: usize,
+        hc_pre_normed: bool,
+        ctx: &HcStepContext<'_>,
+        [norm_out, norm_had64]: [u64; 2],
+    ) -> Result<()> {
         match self {
             Self::SingleStream {
                 input_layernorm_ptr,
@@ -484,7 +526,7 @@ impl LayerResidual {
                 Ok(())
             }
             Self::HyperConnection { attn_hc, .. } => {
-                attn_hc.forward_mix_with_targets(ctx, [norm_out, norm_had64])
+                attn_hc.forward_mix_with_targets_ex(ctx, [norm_out, norm_had64], hc_pre_normed)
             }
         }
     }
@@ -595,9 +637,15 @@ impl LayerResidual {
                         0,
                     )?;
                 } else {
-                    attn_hc.forward_combine(ctx, block_out_buf)?;
+                    attn_hc.forward_combine_tap_rmsnorm(
+                        ctx,
+                        block_out_buf,
+                        mlp_hc.hc_norm_ptr,
+                        ctx.ple_bufs[0],
+                        TapExport::default(),
+                    )?;
                 }
-                mlp_hc.forward_mix_with_targets(ctx, [norm_out, norm_had64])
+                mlp_hc.forward_mix_with_targets_ex(ctx, [norm_out, norm_had64], tp2.is_none())
             }
         }
     }
@@ -695,7 +743,13 @@ impl LayerResidual {
                         tap.offset,
                     )
                 } else {
-                    mlp_hc.forward_combine_with_tap(ctx, mlp_out_buf, tap)
+                    mlp_hc.forward_combine_tap_rmsnorm(
+                        ctx,
+                        mlp_out_buf,
+                        next_norm_weight,
+                        next_norm_out,
+                        tap,
+                    )
                 }
             }
         }
@@ -718,6 +772,13 @@ impl FinalResidual {
         match self {
             Self::SingleStream { norm_ptr } => Some(*norm_ptr),
             Self::HyperConnection { .. } => None,
+        }
+    }
+
+    pub fn hc_norm_ptr(&self) -> Option<u64> {
+        match self {
+            Self::SingleStream { .. } => None,
+            Self::HyperConnection { mixer } => Some(mixer.hc_norm_ptr),
         }
     }
 
@@ -761,6 +822,23 @@ impl FinalResidual {
         final_norm_out_buf: u64,
         last_final_hidden_f16: Option<&DeviceBuffer>,
     ) -> Result<()> {
+        self.finish_stack_ex(
+            ctx,
+            stream,
+            final_norm_out_buf,
+            last_final_hidden_f16,
+            false,
+        )
+    }
+
+    pub fn finish_stack_ex(
+        &self,
+        ctx: &HcStepContext<'_>,
+        stream: &CudaStream,
+        final_norm_out_buf: u64,
+        last_final_hidden_f16: Option<&DeviceBuffer>,
+        hc_pre_normed: bool,
+    ) -> Result<()> {
         match self {
             Self::SingleStream { .. } => Ok(()),
             Self::HyperConnection { mixer } => {
@@ -783,7 +861,7 @@ impl FinalResidual {
                 }
                 let mut mix_ctx = *ctx;
                 mix_ctx.hc_inj_weights_buf = 0;
-                mixer.forward_mix(&mix_ctx, final_norm_out_buf)
+                mixer.forward_mix_with_targets_ex(&mix_ctx, [final_norm_out_buf, 0], hc_pre_normed)
             }
         }
     }

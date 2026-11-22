@@ -505,21 +505,33 @@ impl Qwen3_5ModelRank {
                             self.cfg.quant,
                             QuantScheme::CompressedTensors { rules: Some(_), .. }
                         ) {
-                            let max_dim = self
-                                .cfg
-                                .hidden_size
-                                .max(self.cfg.intermediate_size)
-                                .max(self.cfg.num_attention_heads * self.cfg.head_dim)
-                                .max(
-                                    self.cfg.linear_num_value_heads
-                                        * self.cfg.linear_value_head_dim,
-                                )
-                                .div_ceil(128)
-                                * 128;
-                            tokens
-                                .saturating_mul(max_dim)
-                                .saturating_mul(4)
-                                .saturating_add(512)
+                            if self.cfg.uses_tiered_moe() {
+                                // On tiered MoE (`qwen4_exp`), producer-fused H_64 covers
+                                // `o_proj`, `out_proj`, and `shared_down_proj`, so `ex.scratch_ptr`
+                                // only holds one `hidden_size`-wide prerotated FP16 input buffer
+                                // (`required_bytes` already includes the first 8 MiB of `ex.scratch_size`).
+                                tokens
+                                    .saturating_mul(self.cfg.hidden_size.div_ceil(128) * 128)
+                                    .saturating_mul(2)
+                                    .saturating_add(512)
+                                    .saturating_sub(8 * 1024 * 1024)
+                            } else {
+                                let max_dim = self
+                                    .cfg
+                                    .hidden_size
+                                    .max(self.cfg.intermediate_size)
+                                    .max(self.cfg.num_attention_heads * self.cfg.head_dim)
+                                    .max(
+                                        self.cfg.linear_num_value_heads
+                                            * self.cfg.linear_value_head_dim,
+                                    )
+                                    .div_ceil(128)
+                                    * 128;
+                                tokens
+                                    .saturating_mul(max_dim)
+                                    .saturating_mul(4)
+                                    .saturating_add(512)
+                            }
                         } else {
                             0
                         };

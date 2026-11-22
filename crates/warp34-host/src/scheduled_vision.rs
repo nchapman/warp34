@@ -254,6 +254,9 @@ impl ScheduledVision {
                     }
                     let mut rank_bufs = Vec::with_capacity(engine.ranks.len());
                     if engine.ranks.len() == 1 {
+                        if engine.cfg.uses_tiered_moe() {
+                            enc.clear_workspace();
+                        }
                         rank_bufs.push(dev0);
                     } else {
                         let peers: Vec<(i32, &cuda::CudaStream)> = engine.ranks[1..]

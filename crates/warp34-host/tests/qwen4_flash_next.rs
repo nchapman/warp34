@@ -1297,8 +1297,8 @@ fn verify_qwen4_mtp_engine_worker_and_capacity(
         min_state_12k,
     );
     assert_eq!(
-        hot_12k, 104,
-        "expected adaptive hot_per_layer == 104 for 12288-page TP=2 + MTP, got {hot_12k}"
+        hot_12k, 102,
+        "expected adaptive hot_per_layer == 102 for 12288-page TP=2 + MTP, got {hot_12k}"
     );
     assert!(
         base_plus_kv_12k + min_state_12k + reserve_12k <= 19_600 * 1024 * 1024,

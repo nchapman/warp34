@@ -658,6 +658,17 @@ impl Qwen3_5Engine {
         keys
     }
 
+    pub fn captured_spec_verify_graph_shapes(&self) -> Vec<(usize, bool)> {
+        let mut shapes: Vec<(usize, bool)> = self.ranks[0]
+            .spec_verify_graphs
+            .iter()
+            .map(|(k, _, _)| (k.0, k.1))
+            .collect();
+        shapes.sort_unstable();
+        shapes.dedup();
+        shapes
+    }
+
     pub fn captured_batched_spec_verify_graph_shapes(&self) -> Vec<(usize, usize, usize, bool)> {
         let mut shapes: Vec<(usize, usize, usize, bool)> = self.ranks[0]
             .batched_spec_verify_graphs
@@ -1132,7 +1143,7 @@ impl Qwen3_5Engine {
         };
         let lora_mode = self.batch_lora_mode(1);
         let spec_key = (q_len, long_ctx, sample_mode, lora_mode);
-        let can_use_spec_graph = (2..=MAX_SPEC_VERIFY_TOKENS).contains(&q_len)
+        let can_use_spec_graph = (1..=MAX_SPEC_VERIFY_TOKENS).contains(&q_len)
             && s.has_initial_state
             && s.emit_all_query_tokens
             && s.spec_slots.len() == q_len
@@ -1230,7 +1241,7 @@ impl Qwen3_5Engine {
             lora_mode,
         );
         let can_use_batched_spec = valid_inputs
-            && (2..=MAX_SPEC_VERIFY_TOKENS).contains(&max_q)
+            && (1..=MAX_SPEC_VERIFY_TOKENS).contains(&max_q)
             && total_q <= MAX_BATCHED_SPEC_TOKENS
             && self
                 .ranks

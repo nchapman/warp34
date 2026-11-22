@@ -1941,6 +1941,143 @@ __global__ void small_n_gemm_dual_4x4_f16_kernel(
     reduce_store_tile_4x4_f16(acc, s_warp, out, m_base, n_base, rows, cols, size_n);
 }
 
+// 8-row x 4-col tile variant for speculative verify (`m = 5..8` in a single CTA along Y),
+// halving HBM weight reads vs `small_n_gemm_dual_4x4_f16_kernel` (`gridY = 1` instead of `2`).
+__global__ void small_n_gemm_dual_8x4_f16_kernel(
+    const __half* __restrict__ x,
+    const __half* __restrict__ w0,
+    __half* __restrict__ out0,
+    int size_n0,
+    int tiles_n0,
+    const __half* __restrict__ w1,
+    __half* __restrict__ out1,
+    int size_n1,
+    int m,
+    int size_k) {
+    const int m_base = (int)blockIdx.y * 8;
+    if (m_base >= m) return;
+
+    const bool second = ((int)blockIdx.x >= tiles_n0);
+    const int tile_x = second ? ((int)blockIdx.x - tiles_n0) : (int)blockIdx.x;
+    const int n_base = tile_x * 4;
+    const int size_n = second ? size_n1 : size_n0;
+    if (n_base >= size_n) return;
+
+    const __half* w = second ? w1 : w0;
+    __half* out = second ? out1 : out0;
+    const int rows = (m - m_base < 8) ? (m - m_base) : 8;
+    const int cols = (size_n - n_base < 4) ? (size_n - n_base) : 4;
+
+    float acc_lo[4][4];
+    float acc_hi[4][4];
+#pragma unroll
+    for (int r = 0; r < 4; r++) {
+#pragma unroll
+        for (int c = 0; c < 4; c++) {
+            acc_lo[r][c] = 0.0f;
+            acc_hi[r][c] = 0.0f;
+        }
+    }
+
+    if (rows == 8 && cols == 4) {
+#pragma unroll 1
+        for (int k = (int)threadIdx.x * 8; k < size_k; k += 2048) {
+            uint4 wv[4];
+#pragma unroll
+            for (int c = 0; c < 4; c++) {
+                wv[c] = *reinterpret_cast<const uint4*>(
+                    w + (size_t)(n_base + c) * size_k + k);
+            }
+#pragma unroll
+            for (int r = 0; r < 4; r++) {
+                const uint4 xv = *reinterpret_cast<const uint4*>(
+                    x + (size_t)(m_base + r) * size_k + k);
+                const __half* xh = reinterpret_cast<const __half*>(&xv);
+#pragma unroll
+                for (int c = 0; c < 4; c++) {
+                    const __half* wh = reinterpret_cast<const __half*>(&wv[c]);
+#pragma unroll
+                    for (int j = 0; j < 8; j++) {
+                        acc_lo[r][c] = fmaf(__half2float(xh[j]), __half2float(wh[j]), acc_lo[r][c]);
+                    }
+                }
+            }
+#pragma unroll
+            for (int r = 0; r < 4; r++) {
+                const uint4 xv = *reinterpret_cast<const uint4*>(
+                    x + (size_t)(m_base + 4 + r) * size_k + k);
+                const __half* xh = reinterpret_cast<const __half*>(&xv);
+#pragma unroll
+                for (int c = 0; c < 4; c++) {
+                    const __half* wh = reinterpret_cast<const __half*>(&wv[c]);
+#pragma unroll
+                    for (int j = 0; j < 8; j++) {
+                        acc_hi[r][c] = fmaf(__half2float(xh[j]), __half2float(wh[j]), acc_hi[r][c]);
+                    }
+                }
+            }
+        }
+    } else {
+#pragma unroll 1
+        for (int k = (int)threadIdx.x * 8; k < size_k; k += 2048) {
+            uint4 wv[4];
+#pragma unroll
+            for (int c = 0; c < 4; c++) {
+                if (c < cols) {
+                    wv[c] = *reinterpret_cast<const uint4*>(
+                        w + (size_t)(n_base + c) * size_k + k);
+                }
+            }
+#pragma unroll
+            for (int r = 0; r < 4; r++) {
+                if (r < rows) {
+                    const uint4 xv = *reinterpret_cast<const uint4*>(
+                        x + (size_t)(m_base + r) * size_k + k);
+                    const __half* xh = reinterpret_cast<const __half*>(&xv);
+#pragma unroll
+                    for (int c = 0; c < 4; c++) {
+                        if (c < cols) {
+                            const __half* wh = reinterpret_cast<const __half*>(&wv[c]);
+#pragma unroll
+                            for (int j = 0; j < 8; j++) {
+                                acc_lo[r][c] =
+                                    fmaf(__half2float(xh[j]), __half2float(wh[j]), acc_lo[r][c]);
+                            }
+                        }
+                    }
+                }
+            }
+#pragma unroll
+            for (int r = 0; r < 4; r++) {
+                if (4 + r < rows) {
+                    const uint4 xv = *reinterpret_cast<const uint4*>(
+                        x + (size_t)(m_base + 4 + r) * size_k + k);
+                    const __half* xh = reinterpret_cast<const __half*>(&xv);
+#pragma unroll
+                    for (int c = 0; c < 4; c++) {
+                        if (c < cols) {
+                            const __half* wh = reinterpret_cast<const __half*>(&wv[c]);
+#pragma unroll
+                            for (int j = 0; j < 8; j++) {
+                                acc_hi[r][c] =
+                                    fmaf(__half2float(xh[j]), __half2float(wh[j]), acc_hi[r][c]);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    __shared__ float s_warp[16][8];
+    const int lo_rows = (rows < 4) ? rows : 4;
+    reduce_store_tile_4x4_f16(acc_lo, s_warp, out, m_base, n_base, lo_rows, cols, size_n);
+    if (rows > 4) {
+        __syncthreads();
+        reduce_store_tile_4x4_f16(acc_hi, s_warp, out, m_base + 4, n_base, rows - 4, cols, size_n);
+    }
+}
+
 }  // namespace warp34
 
 extern "C" int warp34_small_n_gemm_f16(
@@ -2019,6 +2156,12 @@ extern "C" int warp34_small_n_gemm_dual_f16(
         dim3 grid((unsigned)(size_n0 + size_n1), (unsigned)tiles_m);
         warp34::small_n_gemm_dual_f16_kernel<4, 4><<<grid, 256, 0, stream>>>(
             (const __half*)x, (const __half*)w0, (__half*)out0, size_n0,
+            (const __half*)w1, (__half*)out1, size_n1, m, size_k);
+    } else if (m >= 5 && m <= 16 && (t0 + t1) >= 64) {
+        const int tiles_m8 = (m + 7) / 8;
+        dim3 grid((unsigned)(t0 + t1), (unsigned)tiles_m8);
+        warp34::small_n_gemm_dual_8x4_f16_kernel<<<grid, 256, 0, stream>>>(
+            (const __half*)x, (const __half*)w0, (__half*)out0, size_n0, t0,
             (const __half*)w1, (__half*)out1, size_n1, m, size_k);
     } else {
         dim3 grid((unsigned)(t0 + t1), (unsigned)tiles_m);

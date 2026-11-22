@@ -435,6 +435,7 @@ extern "C" int warp34_graph_begin_capture(uintptr_t stream) {
     if (err == cudaSuccess) {
         tls_capturing_stream = stream;
     } else {
+        (void)cudaGetLastError();
         g_capture_sync_mutex.unlock_shared();
     }
     return (int)err;
@@ -446,6 +447,7 @@ extern "C" int warp34_graph_end_capture(uintptr_t stream, uintptr_t* out_graph, 
         if (owns_lock) {
             cudaGraph_t abandoned = nullptr;
             cudaStreamEndCapture((cudaStream_t)stream, &abandoned);
+            (void)cudaGetLastError();
             if (abandoned != nullptr) cudaGraphDestroy(abandoned);
             tls_capturing_stream = 0;
             g_capture_sync_mutex.unlock_shared();
@@ -458,11 +460,16 @@ extern "C" int warp34_graph_end_capture(uintptr_t stream, uintptr_t* out_graph, 
         tls_capturing_stream = 0;
         g_capture_sync_mutex.unlock_shared();
     }
-    if (err != cudaSuccess) return (int)err;
+    if (err != cudaSuccess) {
+        (void)cudaGetLastError();
+        return (int)err;
+    }
     cudaGraphExec_t ge = nullptr;
     err = cudaGraphInstantiate(&ge, g, 0);
     if (err != cudaSuccess) {
+        (void)cudaGetLastError();
         cudaGraphDestroy(g);
+        (void)cudaGetLastError();
         return (int)err;
     }
     *out_graph = (uintptr_t)g;
@@ -471,7 +478,11 @@ extern "C" int warp34_graph_end_capture(uintptr_t stream, uintptr_t* out_graph, 
 }
 
 extern "C" int warp34_graph_launch(uintptr_t graph_exec, uintptr_t stream) {
-    return (int)cudaGraphLaunch((cudaGraphExec_t)graph_exec, (cudaStream_t)stream);
+    cudaError_t err = cudaGraphLaunch((cudaGraphExec_t)graph_exec, (cudaStream_t)stream);
+    if (err != cudaSuccess) {
+        (void)cudaGetLastError();
+    }
+    return (int)err;
 }
 
 extern "C" int warp34_graph_destroy(uintptr_t graph, uintptr_t graph_exec) {

@@ -520,6 +520,49 @@ pub(crate) enum RawLinearHost {
 }
 
 impl RawLinearHost {
+    pub(crate) fn lm_head_online_u8_group_size(
+        cfg: &ModelConfig,
+        local_n: usize,
+        k: usize,
+    ) -> Option<usize> {
+        let marlin_ok = (local_n.is_multiple_of(MARLIN_TILE_N)
+            && k.is_multiple_of(MARLIN_TILE_K_W4))
+            || (local_n.is_multiple_of(MARLIN_TILE_K_W4) && k.is_multiple_of(MARLIN_TILE_N));
+        if cfg.uses_tiered_moe()
+            && cfg.vocab_size >= 65_536
+            && !matches!(cfg.quant, QuantScheme::Unquantized)
+            && !cfg.tie_word_embeddings
+            && marlin_ok
+            && (k.is_multiple_of(64) || k.is_multiple_of(128))
+        {
+            Some(if k.is_multiple_of(64) { 64 } else { 128 })
+        } else {
+            None
+        }
+    }
+
+    pub(crate) fn into_lm_head_u8b128_if_eligible(self, cfg: &ModelConfig) -> Self {
+        match self {
+            Self::DenseF16 { weight, n, k } => {
+                if let Some(group_size) = Self::lm_head_online_u8_group_size(cfg, n, k) {
+                    let (packed, scales) =
+                        crate::loader::quantize_f16_n_major_to_u8b128(&weight, n, k, group_size);
+                    Self::U8B128NMajor {
+                        packed,
+                        scales,
+                        n,
+                        k,
+                        group_size,
+                        channelwise: false,
+                    }
+                } else {
+                    Self::DenseF16 { weight, n, k }
+                }
+            }
+            other => other,
+        }
+    }
+
     pub(crate) fn dims(&self) -> (usize, usize) {
         match self {
             Self::Hadamard { inner, .. } => inner.dims(),
@@ -2156,27 +2199,31 @@ impl RawLinearHost {
         let bytes = packed.len() * 4;
         let b_q_weight_ptr = arena.alloc_aligned(bytes)?;
         let ex = stream.exec(0, 0);
+        let mut oversized_buf = None;
         let (r_slot, staging_addr) = match staging {
             UploadStaging::Single(repack_staging) => {
                 if bytes > repack_staging.len_bytes {
-                    return Err(loader_err_msg(format!(
-                        "packed weight size {} exceeds repack staging buffer {}",
-                        bytes, repack_staging.len_bytes
-                    )));
+                    let buf = DeviceBuffer::alloc_on_stream(stream.device_id, bytes, stream)?;
+                    buf.copy_from_host(packed, stream)?;
+                    let addr = buf.addr();
+                    oversized_buf = Some(buf);
+                    (None, addr)
+                } else {
+                    repack_staging.copy_from_host(packed, stream)?;
+                    (None, repack_staging.addr())
                 }
-                repack_staging.copy_from_host(packed, stream)?;
-                (None, repack_staging.addr())
             }
             UploadStaging::Pipelined(ring) => {
                 if bytes > ring.repack_capacity() {
-                    return Err(loader_err_msg(format!(
-                        "packed weight size {} exceeds repack staging buffer {}",
-                        bytes,
-                        ring.repack_capacity()
-                    )));
+                    let buf = DeviceBuffer::alloc_on_stream(stream.device_id, bytes, stream)?;
+                    buf.copy_from_host(packed, stream)?;
+                    let addr = buf.addr();
+                    oversized_buf = Some(buf);
+                    (None, addr)
+                } else {
+                    let (idx, addr) = ring.stage_repack_input(packed, stream)?;
+                    (Some(idx), addr)
                 }
-                let (idx, addr) = ring.stage_repack_input(packed, stream)?;
-                (Some(idx), addr)
             }
         };
         // SAFETY: staging capacity is checked and the destination reserves the
@@ -2212,6 +2259,10 @@ impl RawLinearHost {
         check_rc(rc, "warp34_marlin_repack")?;
         if let (UploadStaging::Pipelined(ring), Some(idx)) = (staging, r_slot) {
             ring.finish_repack_stage(idx, stream)?;
+        }
+        if oversized_buf.is_some() {
+            stream.synchronize()?;
+            drop(oversized_buf);
         }
         Ok(b_q_weight_ptr)
     }

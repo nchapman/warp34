@@ -47,9 +47,9 @@ pub const DEFAULT_SCRATCH_ARENA_BYTES: usize = 512 * 1024 * 1024;
 /// (e.g. [`EXTREME_LONGCTX_SCRATCH_ARENA_BYTES`] or [`LARGE_MODEL_TP1_SCRATCH_ARENA_BYTES`]).
 pub const MEDIUM_SCRATCH_MAX_BATCHED_TOKENS: usize = 1024;
 
-/// Expanded transient `scratch_arena` size (`1,056 MiB`) for tiered-MoE checkpoints (`qwen4_exp`)
-/// when `requested_kv_pages <= TIERED_MOE_FULL_SCRATCH_MAX_KV_PAGES`.
-pub const TIERED_MOE_SCRATCH_ARENA_BYTES: usize = 1056 * 1024 * 1024;
+/// Expanded transient `scratch_arena` size (`880 MiB`) for tiered-MoE checkpoints (`qwen4_exp`)
+/// when `requested_kv_pages <= TIERED_MOE_FULL_SCRATCH_MAX_KV_PAGES` (`6,144`-token prefill needs `835.9 MiB`).
+pub const TIERED_MOE_SCRATCH_ARENA_BYTES: usize = 880 * 1024 * 1024;
 
 /// Maximum requested KV pages (`8,192` pages = `128K` tokens) for allocating [`TIERED_MOE_SCRATCH_ARENA_BYTES`].
 pub const TIERED_MOE_FULL_SCRATCH_MAX_KV_PAGES: usize = 8192;

@@ -671,7 +671,27 @@ impl Qwen3_5ModelRank {
                 || name.contains(".out_proj.")
                 || name.contains(".down_proj.");
             let raw_gpu_bytes = match info.dtype.as_str() {
-                "F16" | "BF16" => info.num_elems().saturating_mul(2),
+                "F16" | "BF16" => {
+                    // Online-quantize untied `lm_head.weight` (`N = 248320`) to `MarlinW8A16`
+                    // while keeping hyper-connection spine matrices in exact `DenseF16`.
+                    let online_u8_gs = if info.shape.len() == 2
+                        && (name == "lm_head.weight" || name.ends_with(".lm_head.weight"))
+                    {
+                        RawLinearHost::lm_head_online_u8_group_size(
+                            cfg,
+                            info.shape[0] / tp_size.max(1),
+                            info.shape[1],
+                        )
+                    } else {
+                        None
+                    };
+                    if let Some(gs) = online_u8_gs {
+                        info.num_elems()
+                            .saturating_add((info.num_elems() / gs).saturating_mul(2))
+                    } else {
+                        info.num_elems().saturating_mul(2)
+                    }
+                }
                 "F32" => {
                     if name.ends_with(".A_log") {
                         info.num_elems().saturating_mul(4)
@@ -1246,7 +1266,7 @@ impl Qwen3_5ModelRank {
             requested_kv_pages,
             capacity.lora_reserve,
         );
-        if cfg.uses_tiered_moe() && free_vram < TIERED_MOE_COMPACT_VRAM_THRESHOLD_BYTES {
+        if should_use_compact_tiered_moe_scratch(cfg, tp_size, free_vram, capacity.lora_reserve) {
             scratch_bytes = crate::scheduler::DEFAULT_SCRATCH_ARENA_BYTES;
         }
         let pages = requested_kv_pages.unwrap_or(DEFAULT_TARGET_KV_PAGES);
@@ -1299,7 +1319,7 @@ impl Qwen3_5ModelRank {
             // Apply vision reserve symmetrically across TP ranks so all ranks make the same
             // host-embed offload decision and never leak unused slots on non-zero ranks.
             let vision = if archive_has_vision {
-                VISION_ENCODER_LAZY_RESERVE_BYTES
+                vision_lazy_reserve_bytes(cfg, tp_size)
                     .saturating_sub(target_base_headroom(cfg, tp_size, pages, free_vram))
             } else {
                 0
@@ -1426,7 +1446,7 @@ impl Qwen3_5ModelRank {
                 size_k: cfg.hidden_size,
             })
         } else if has_untied_lm_head {
-            let sharded = RawLinearHost::load_row_shard(
+            let mut sharded = RawLinearHost::load_row_shard(
                 archive,
                 "lm_head",
                 &cfg.quant,
@@ -1440,6 +1460,7 @@ impl Qwen3_5ModelRank {
                     cfg.hidden_size
                 )));
             }
+            sharded = sharded.into_lm_head_u8b128_if_eligible(cfg);
             Some(sharded.upload_pipelined(&mut weight_arena, &stream, &mut upload_ring)?)
         } else {
             None
@@ -1892,6 +1913,8 @@ impl PrePoolModelRank {
             if cfg.uses_tiered_moe() {
                 let post_weight_available = device.mem_info()?.0;
                 let moe_vision_extra = vision_lazy_extra_headroom(
+                    &cfg,
+                    tp_size,
                     capacity.state_slots.is_some() && has_vision_weights(&cfg, archive),
                     base_headroom,
                 );
@@ -1988,6 +2011,10 @@ impl PrePoolModelRank {
                     } else {
                         18
                     }
+                } else if capacity.dflash_reserve_bytes > 0 {
+                    // Preserve `>= 384 MiB` post-drafter VRAM headroom on 24 GiB TP=1 cards so all
+                    // `m_verify = 1..=8` speculative verification CUDA Graphs fit without OOM.
+                    16
                 } else {
                     20
                 }
@@ -2019,8 +2046,12 @@ impl PrePoolModelRank {
                     MIN_ACTIVE_STATE_SLOTS
                 };
                 let min_state_bytes = bytes_per_state_slot.saturating_mul(min_state_floor);
-                let desired_vision_extra =
-                    vision_lazy_extra_headroom(has_vision_weights(&cfg, archive), base_headroom);
+                let desired_vision_extra = vision_lazy_extra_headroom(
+                    &cfg,
+                    tp_size,
+                    has_vision_weights(&cfg, archive),
+                    base_headroom,
+                );
                 let vision_reserve = available_for_pools
                     .saturating_sub(base_reserved.saturating_add(min_state_bytes))
                     .min(desired_vision_extra);

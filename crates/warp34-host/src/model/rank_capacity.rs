@@ -69,13 +69,41 @@ pub const LARGE_MODEL_WEIGHT_THRESHOLD_BYTES: usize = 15 * 1024 * 1024 * 1024;
 
 /// Dedicated VRAM reserve (`1.5 GiB`) set aside symmetrically across serving ranks for
 /// lazy `Qwen3VisionEncoder` loading when serving multimodal checkpoints.
-#[cfg(feature = "cuda")]
+#[cfg(any(test, feature = "cuda"))]
 pub(super) const VISION_ENCODER_LAZY_RESERVE_BYTES: usize = 1536 * 1024 * 1024;
 
+/// Lazy `Qwen3VisionEncoder` reserve (`320 MiB`) for single-GPU tiered-MoE checkpoints (`qwen4_exp`),
+/// covering `Qwen3VisionEncoder::try_load` peak arena + repack staging (~262 MiB on HGPTQ, ~294 MiB
+/// raw+slack) plus ViT activation workspace while preserving `hot_per_layer = 128` and 131K TQ4
+/// auto-fit on 24 GiB cards.
+#[cfg(any(test, feature = "cuda"))]
+pub(super) const TIERED_MOE_VISION_LAZY_RESERVE_BYTES: usize = 320 * 1024 * 1024;
+
+/// Steady-state post-pool headroom (`200 MiB`) on single-GPU (`<= 28 GiB`) tiered-MoE long-context
+/// deployments when no lazy vision reserve applies (`vision_lazy_extra_headroom` adds the delta above
+/// this baseline when `has_vision` is true).
+#[cfg(any(test, feature = "cuda"))]
+pub(super) const TIERED_MOE_TP1_LONGCTX_HEADROOM_BYTES: usize = 200 * 1024 * 1024;
+
+#[cfg(any(test, feature = "cuda"))]
+#[inline]
+pub(super) fn vision_lazy_reserve_bytes(cfg: &ModelConfig, tp_size: usize) -> usize {
+    if cfg.uses_tiered_moe() && tp_size == 1 {
+        TIERED_MOE_VISION_LAZY_RESERVE_BYTES
+    } else {
+        VISION_ENCODER_LAZY_RESERVE_BYTES
+    }
+}
+
 #[cfg(feature = "cuda")]
-pub(super) fn vision_lazy_extra_headroom(has_vision: bool, base_headroom: usize) -> usize {
+pub(super) fn vision_lazy_extra_headroom(
+    cfg: &ModelConfig,
+    tp_size: usize,
+    has_vision: bool,
+    base_headroom: usize,
+) -> usize {
     if has_vision {
-        VISION_ENCODER_LAZY_RESERVE_BYTES.saturating_sub(base_headroom)
+        vision_lazy_reserve_bytes(cfg, tp_size).saturating_sub(base_headroom)
     } else {
         0
     }
@@ -236,6 +264,9 @@ pub const TIERED_MOE_SYNTHETIC_EXTRA_RESERVE_BYTES: usize = 64 * 1024 * 1024;
 /// Double-buffered H2D staging capacity (`96` experts) for `RankTieredMoe` on `TP=1` / `TP=2`.
 pub const TIERED_MOE_STAGE_CAPACITY_DEFAULT: usize = 96;
 
+/// Double-buffered H2D staging capacity (`16` experts) for `RankTieredMoe` on `TP=1` AVX-512 CPU-bridge ranks.
+pub const TIERED_MOE_STAGE_CAPACITY_TP1_BRIDGE: usize = 16;
+
 /// Double-buffered H2D staging capacity (`32` experts) for `RankTieredMoe` on `TP >= 4` and compact `< 12 GiB` budgets.
 pub const TIERED_MOE_STAGE_CAPACITY_TP4: usize = 32;
 
@@ -336,8 +367,29 @@ pub(super) fn select_tiered_moe_stage_capacity(
     tp_size: usize,
     hot_per_layer: usize,
 ) -> usize {
+    select_tiered_moe_stage_capacity_with_bridge(
+        cfg,
+        tp_size,
+        hot_per_layer,
+        crate::moe_offload::HotExpertCache::auto_cpu_bridge_preferred(),
+    )
+}
+
+pub(super) fn select_tiered_moe_stage_capacity_with_bridge(
+    cfg: &ModelConfig,
+    tp_size: usize,
+    hot_per_layer: usize,
+    cpu_bridge_preferred: bool,
+) -> usize {
     let local_experts = (cfg.num_experts / tp_size.max(1)).max(1);
-    if tp_size >= 4
+    let cpu_bridge_tp1 =
+        tp_size == 1 && cfg.num_experts >= TIERED_MOE_MIN_MODEL_EXPERTS && cpu_bridge_preferred;
+    let cpu_bridge_tp2 =
+        tp_size == 2 && cfg.num_experts >= TIERED_MOE_MIN_MODEL_EXPERTS && cpu_bridge_preferred;
+    if cpu_bridge_tp1 && hot_per_layer > TIERED_MOE_COMPACT_MAX_HOT_EXPERTS {
+        local_experts.clamp(1, TIERED_MOE_STAGE_CAPACITY_TP1_BRIDGE)
+    } else if tp_size >= 4
+        || cpu_bridge_tp2
         || (cfg.num_experts >= TIERED_MOE_MIN_MODEL_EXPERTS
             && hot_per_layer <= TIERED_MOE_COMPACT_MAX_HOT_EXPERTS)
     {
@@ -368,10 +420,16 @@ pub fn plan_scratch_arena_bytes_with_lora(
         && requested_kv_pages.unwrap_or(0) >= EXTREME_LONGCTX_MIN_PAGES
     {
         crate::scheduler::EXTREME_LONGCTX_SCRATCH_ARENA_BYTES
-    } else if (cfg.uses_tiered_moe() || cfg.requires_atomic_prefix_prefill())
+    } else if ((cfg.uses_ple()
+        || cfg.requires_atomic_prefix_prefill()
+        || cfg.intermediate_size > 0)
+        && cfg.uses_tiered_moe()
+        || cfg.requires_atomic_prefix_prefill())
         && requested_kv_pages.unwrap_or(0) <= crate::scheduler::TIERED_MOE_FULL_SCRATCH_MAX_KV_PAGES
     {
         crate::scheduler::TIERED_MOE_SCRATCH_ARENA_BYTES
+    } else if cfg.uses_tiered_moe() {
+        crate::scheduler::DEFAULT_SCRATCH_ARENA_BYTES
     } else if tp_size == 1 && est_weight_bytes >= LARGE_MODEL_WEIGHT_THRESHOLD_BYTES {
         crate::scheduler::LARGE_MODEL_TP1_SCRATCH_ARENA_BYTES
     } else {
@@ -520,7 +578,24 @@ pub fn plan_tiered_moe_hot_per_layer_with_options(
     } else {
         TIERED_MOE_TP1_MIN_HOT_EXPERTS.min(local_experts)
     };
-    let stage_slots_default = TIERED_MOE_STAGE_CAPACITY_DEFAULT.saturating_mul(2);
+    let cpu_bridge_tp1 = tp_size == 1
+        && cfg.num_experts >= TIERED_MOE_MIN_MODEL_EXPERTS
+        && crate::moe_offload::HotExpertCache::auto_cpu_bridge_preferred();
+    let cpu_bridge_tp2 = tp_size == 2
+        && cfg.num_experts >= TIERED_MOE_MIN_MODEL_EXPERTS
+        && crate::moe_offload::HotExpertCache::auto_cpu_bridge_preferred();
+    let stage_slots_default = if cpu_bridge_tp1 {
+        TIERED_MOE_STAGE_CAPACITY_TP1_BRIDGE.saturating_mul(2)
+    } else if cpu_bridge_tp2 {
+        TIERED_MOE_STAGE_CAPACITY_TP4.saturating_mul(2)
+    } else {
+        TIERED_MOE_STAGE_CAPACITY_DEFAULT.saturating_mul(2)
+    };
+    let dflash_meta_reserve = if cpu_bridge_tp1 {
+        512 * 1024 * 1024
+    } else {
+        TIERED_MOE_DFLASH_METADATA_RESERVE_BYTES
+    };
     let extra_reserve = if tp_size >= 4 {
         (TIERED_MOE_TP4_STAGE_RESERVE_SLOTS * exp_bytes).saturating_add(dflash_reserve_bytes)
     } else if native_mtp {
@@ -528,7 +603,7 @@ pub fn plan_tiered_moe_hot_per_layer_with_options(
             .saturating_add(TIERED_MOE_MTP_AND_GRAPH_RESERVE_BYTES.max(dflash_reserve_bytes))
     } else if dflash_reserve_bytes > 0 {
         (stage_slots_default * exp_bytes)
-            .saturating_add(TIERED_MOE_DFLASH_METADATA_RESERVE_BYTES)
+            .saturating_add(dflash_meta_reserve)
             .saturating_add(dflash_reserve_bytes)
     } else {
         (stage_slots_default * exp_bytes).saturating_add(TIERED_MOE_PLAIN_METADATA_RESERVE_BYTES)
@@ -563,8 +638,12 @@ pub fn plan_tiered_moe_hot_per_layer_with_options(
             if max_affordable >= local_experts {
                 local_experts
             } else {
-                let aligned = (max_affordable / TIERED_MOE_HOT_SLOT_ALIGNMENT)
-                    * TIERED_MOE_HOT_SLOT_ALIGNMENT;
+                let align = if tp_size <= 2 {
+                    2
+                } else {
+                    TIERED_MOE_HOT_SLOT_ALIGNMENT
+                };
+                let aligned = (max_affordable / align) * align;
                 aligned.clamp(min_hot, local_experts)
             }
         } else {
@@ -864,14 +943,40 @@ pub(super) fn target_pool_geometry_with_fp8(
 }
 
 #[cfg(any(test, feature = "cuda"))]
+pub(super) fn should_use_compact_tiered_moe_scratch(
+    cfg: &ModelConfig,
+    tp_size: usize,
+    free_vram: usize,
+    lora: LoraCapacityReserve,
+) -> bool {
+    if !cfg.uses_tiered_moe() {
+        return false;
+    }
+    if free_vram < TIERED_MOE_COMPACT_VRAM_THRESHOLD_BYTES {
+        return true;
+    }
+    tp_size <= 2
+        && free_vram < 28 * 1024 * 1024 * 1024
+        && !lora.has_midloop
+        && !lora.requires_atomic_prefix
+        && lora.device_bytes_per_rank == 0
+}
+
+#[cfg(any(test, feature = "cuda"))]
 pub(super) fn target_base_headroom(
     cfg: &ModelConfig,
     tp: usize,
     pages: usize,
     free: usize,
 ) -> usize {
-    if (tp == 1
-        && cfg.num_hidden_layers >= EXTREME_LONGCTX_MIN_LAYERS
+    if tp == 1
+        && cfg.uses_tiered_moe()
+        && pages >= EXTREME_LONGCTX_MIN_PAGES
+        && (TIERED_MOE_COMPACT_VRAM_THRESHOLD_BYTES..28 * 1024 * 1024 * 1024).contains(&free)
+    {
+        TIERED_MOE_TP1_LONGCTX_HEADROOM_BYTES
+    } else if (tp == 1
+        && (cfg.num_hidden_layers >= EXTREME_LONGCTX_MIN_LAYERS || cfg.uses_tiered_moe())
         && pages >= EXTREME_LONGCTX_MIN_PAGES)
         || (cfg.uses_tiered_moe() && free < TIERED_MOE_COMPACT_VRAM_THRESHOLD_BYTES)
     {
@@ -987,6 +1092,8 @@ pub(super) fn tiered_moe_min_state_slots_for_budget(
         } else {
             18
         }
+    } else if dflash_reserve_bytes > 0 {
+        dflash_min_state_slots.max(SINGLE_GPU_DFLASH2_MIN_STATE_SLOTS)
     } else {
         PLE_OR_LARGE_MODEL_DEFAULT_STATE_SLOTS.max(dflash_min_state_slots)
     };
@@ -1028,7 +1135,7 @@ pub(super) fn evaluate_serving_kv_candidate_budget(
         Some(pages),
         lora_reserve,
     );
-    if cfg.uses_tiered_moe() && free_vram < TIERED_MOE_COMPACT_VRAM_THRESHOLD_BYTES {
+    if should_use_compact_tiered_moe_scratch(cfg, tp_size, free_vram, lora_reserve) {
         scratch_bytes = crate::scheduler::DEFAULT_SCRATCH_ARENA_BYTES;
     }
     let (page_bytes, state_bytes) =
@@ -1057,7 +1164,7 @@ pub(super) fn evaluate_serving_kv_candidate_budget(
         resident_moe_mtp_serving_reserve(cfg, true, native_mtp, mtp_experts_w4);
     let desired_slots = requested_state_slots.max(min_state_floor);
     let vision_extra = if archive_has_vision {
-        VISION_ENCODER_LAZY_RESERVE_BYTES.saturating_sub(base_headroom)
+        vision_lazy_reserve_bytes(cfg, tp_size).saturating_sub(base_headroom)
     } else {
         0
     };
@@ -1133,7 +1240,7 @@ pub(super) fn evaluate_serving_kv_candidate_budget(
         };
     let available_for_pools = post_weight_available.checked_sub(allocated_moe_bytes)?;
     let vision_headroom = if archive_has_vision && auto_fit_mode {
-        VISION_ENCODER_LAZY_RESERVE_BYTES.saturating_sub(base_headroom)
+        vision_lazy_reserve_bytes(cfg, tp_size).saturating_sub(base_headroom)
     } else {
         0
     };
@@ -1146,6 +1253,8 @@ pub(super) fn evaluate_serving_kv_candidate_budget(
     let effective_requested_state_slots = if cfg.uses_tiered_moe() {
         let max_tiered_serving_slots = if tp_size >= 2 {
             if native_mtp && pages < 2048 { 16 } else { 18 }
+        } else if dflash_reserve_bytes > 0 {
+            16
         } else {
             20
         }

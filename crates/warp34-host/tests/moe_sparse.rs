@@ -53,14 +53,12 @@ fn sparse_moe_parity_and_partition() {
         expected_regime: 0,
         check_tp2_partition: true,
     };
-    for m in [1, 2, 3] {
-        check_sparse(SparseShape {
-            num_tokens: m,
-            expected_regime: 0,
-            ..base
-        });
-    }
-    for m in [4, 7] {
+    check_sparse(SparseShape {
+        num_tokens: 1,
+        expected_regime: 0,
+        ..base
+    });
+    for m in [2, 3, 4, 7] {
         check_sparse(SparseShape {
             num_tokens: m,
             expected_regime: 1,
@@ -1757,5 +1755,201 @@ fn moe_down_accum_subwarp_packing_matches_unaligned_fallback() {
                 "down_accum subwarp_vec mismatch for n_interm={n_interm}, top_k={top_k}, m={m}"
             );
         }
+    }
+}
+
+#[test]
+fn moe_pulled_add_hadamard64_skips_inactive_and_matches_reference() {
+    let _guard = GPU_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _dev = CudaDevice::set_current(0).unwrap();
+    let stream = CudaStream::new(0).unwrap();
+    let d_scratch = DeviceBuffer::alloc(0, 512 * 1024).unwrap();
+    let ex = stream.exec(d_scratch.addr(), 512 * 1024);
+
+    let m = 4usize;
+    let top_k = 8usize;
+    let pairs = m * top_k;
+    let num_experts = 8usize;
+    let n_interm = 128usize;
+    let k_hidden = 128usize;
+    let group_size = 64usize;
+
+    let x_host: Vec<u16> = (0..m * k_hidden)
+        .map(|i| f32_to_f16(((i % 37) as f32 - 18.0) * 0.03125))
+        .collect();
+    let gu_packed: Vec<u32> = (0..num_experts * 2 * n_interm * (k_hidden / 8))
+        .map(|i| {
+            let mut w = 0u32;
+            for p in 0..8 {
+                w |= (((i * 11 + p * 5 + 3) % 16) as u32) << (p * 4);
+            }
+            w
+        })
+        .collect();
+    let gu_scales: Vec<u16> = (0..num_experts * 2 * n_interm * (k_hidden / group_size))
+        .map(|i| f32_to_f16(((i % 13) as f32 + 1.0) * 0.015625))
+        .collect();
+    let dn_packed: Vec<u32> = (0..num_experts * k_hidden * (n_interm / 8))
+        .map(|i| {
+            let mut w = 0u32;
+            for p in 0..8 {
+                w |= (((i * 7 + p * 3 + 9) % 16) as u32) << (p * 4);
+            }
+            w
+        })
+        .collect();
+    let dn_scales: Vec<u16> = (0..num_experts * k_hidden * (n_interm / group_size))
+        .map(|i| f32_to_f16(((i % 17) as f32 + 1.0) * 0.015625))
+        .collect();
+    let base_out: Vec<u16> = (0..m * k_hidden)
+        .map(|i| f32_to_f16(((i % 23) as f32 - 11.0) * 0.0625))
+        .collect();
+    let mut pulled_ids = vec![-1i32; pairs];
+    pulled_ids[2] = 3; // tok 0, slot 2
+    pulled_ids[19] = 5; // tok 2, slot 3
+    let topk_w: Vec<f32> = (0..pairs).map(|p| 0.1 + (p as f32) * 0.005).collect();
+
+    let d_x = DeviceBuffer::alloc(0, x_host.len() * 2).unwrap();
+    let d_gup = DeviceBuffer::alloc(0, gu_packed.len() * 4).unwrap();
+    let d_gus = DeviceBuffer::alloc(0, gu_scales.len() * 2).unwrap();
+    let d_dnp = DeviceBuffer::alloc(0, dn_packed.len() * 4).unwrap();
+    let d_dns = DeviceBuffer::alloc(0, dn_scales.len() * 2).unwrap();
+    let d_ids = DeviceBuffer::alloc(0, pulled_ids.len() * 4).unwrap();
+    let d_tw = DeviceBuffer::alloc(0, topk_w.len() * 4).unwrap();
+    let d_cnt = DeviceBuffer::alloc(0, 4).unwrap();
+    let d_interm = DeviceBuffer::alloc(0, pairs * n_interm * 2).unwrap();
+    let d_out = DeviceBuffer::alloc(0, base_out.len() * 2).unwrap();
+    let d_ref_out = DeviceBuffer::alloc(0, base_out.len() * 2).unwrap();
+
+    d_x.copy_from_host(&x_host, &stream).unwrap();
+    d_gup.copy_from_host(&gu_packed, &stream).unwrap();
+    d_gus.copy_from_host(&gu_scales, &stream).unwrap();
+    d_dnp.copy_from_host(&dn_packed, &stream).unwrap();
+    d_dns.copy_from_host(&dn_scales, &stream).unwrap();
+    d_ids.copy_from_host(&pulled_ids, &stream).unwrap();
+    d_tw.copy_from_host(&topk_w, &stream).unwrap();
+
+    // Case 1: `active_count == 0` must neither touch `interm_buf` nor mutate `out`.
+    let sentinel = vec![0x3400u16; pairs * n_interm];
+    d_interm.copy_from_host(&sentinel, &stream).unwrap();
+    d_out.copy_from_host(&base_out, &stream).unwrap();
+    d_cnt.copy_from_host(&[0i32], &stream).unwrap();
+    // SAFETY: All device buffers are live on device 0 and sized for `(m, top_k, num_experts, n_interm, k_hidden)`.
+    let rc0 = unsafe {
+        warp34_kernels::ffi::warp34_moe_w4a16_pulled_add_f16(
+            &ex,
+            d_x.addr() as *const c_void,
+            d_gup.addr() as *const u32,
+            d_gus.addr() as *const c_void,
+            d_dnp.addr() as *const u32,
+            d_dns.addr() as *const c_void,
+            d_ids.addr() as *const i32,
+            d_tw.addr() as *const f32,
+            d_cnt.addr() as *const i32,
+            d_interm.addr() as *mut c_void,
+            d_out.addr() as *mut c_void,
+            m as i32,
+            top_k as i32,
+            num_experts as i32,
+            n_interm as i32,
+            k_hidden as i32,
+            group_size as i32,
+            64,
+        )
+    };
+    assert_eq!(rc0, 0);
+    let mut got_interm0 = vec![0u16; pairs * n_interm];
+    let mut got_out0 = vec![0u16; base_out.len()];
+    d_interm.copy_to_host(&mut got_interm0, &stream).unwrap();
+    d_out.copy_to_host(&mut got_out0, &stream).unwrap();
+    stream.synchronize().unwrap();
+    assert_eq!(
+        got_interm0, sentinel,
+        "active_count == 0 must not RMW interm_buf"
+    );
+    assert_eq!(got_out0, base_out, "active_count == 0 must not mutate out");
+
+    // Case 2: `active_count == 2` must leave all inactive rows untouched and match `warp34_moe_w4a16_mlp_ex_f16`.
+    d_interm.copy_from_host(&sentinel, &stream).unwrap();
+    d_out.copy_from_host(&base_out, &stream).unwrap();
+    d_cnt.copy_from_host(&[2i32], &stream).unwrap();
+    // SAFETY: All device buffers are live on device 0 and sized for `(m, top_k, num_experts, n_interm, k_hidden)`.
+    let rc2 = unsafe {
+        warp34_kernels::ffi::warp34_moe_w4a16_pulled_add_f16(
+            &ex,
+            d_x.addr() as *const c_void,
+            d_gup.addr() as *const u32,
+            d_gus.addr() as *const c_void,
+            d_dnp.addr() as *const u32,
+            d_dns.addr() as *const c_void,
+            d_ids.addr() as *const i32,
+            d_tw.addr() as *const f32,
+            d_cnt.addr() as *const i32,
+            d_interm.addr() as *mut c_void,
+            d_out.addr() as *mut c_void,
+            m as i32,
+            top_k as i32,
+            num_experts as i32,
+            n_interm as i32,
+            k_hidden as i32,
+            group_size as i32,
+            64,
+        )
+    };
+    assert_eq!(rc2, 0);
+    let mut got_interm2 = vec![0u16; pairs * n_interm];
+    let mut got_out2 = vec![0u16; base_out.len()];
+    d_interm.copy_to_host(&mut got_interm2, &stream).unwrap();
+    d_out.copy_to_host(&mut got_out2, &stream).unwrap();
+    stream.synchronize().unwrap();
+    for p in 0..pairs {
+        if pulled_ids[p] < 0 {
+            assert_eq!(
+                &got_interm2[p * n_interm..(p + 1) * n_interm],
+                &sentinel[p * n_interm..(p + 1) * n_interm],
+                "inactive pair {p} must not be touched by moe_pulled_hadamard64_f16_kernel"
+            );
+        }
+    }
+
+    let d_ref_interm = DeviceBuffer::alloc(0, pairs * n_interm * 2).unwrap();
+    let d_base = DeviceBuffer::alloc(0, base_out.len() * 2).unwrap();
+    d_base.copy_from_host(&base_out, &stream).unwrap();
+    // SAFETY: All device buffers are live on device 0 and sized for `(m, top_k, num_experts, n_interm, k_hidden)`.
+    let rc_ref = unsafe {
+        warp34_kernels::ffi::warp34_moe_w4a16_mlp_ex_f16(
+            &ex,
+            d_x.addr() as *const c_void,
+            d_gup.addr() as *const u32,
+            d_gus.addr() as *const c_void,
+            d_dnp.addr() as *const u32,
+            d_dns.addr() as *const c_void,
+            d_ids.addr() as *const i32,
+            d_tw.addr() as *const f32,
+            d_base.addr() as *const c_void,
+            core::ptr::null(),
+            d_ref_interm.addr() as *mut c_void,
+            d_ref_out.addr() as *mut c_void,
+            m as i32,
+            top_k as i32,
+            num_experts as i32,
+            n_interm as i32,
+            k_hidden as i32,
+            group_size as i32,
+            64,
+        )
+    };
+    assert_eq!(rc_ref, 0);
+    let mut ref_out = vec![0u16; base_out.len()];
+    d_ref_out.copy_to_host(&mut ref_out, &stream).unwrap();
+    stream.synchronize().unwrap();
+    for (idx, (&a, &b)) in got_out2.iter().zip(ref_out.iter()).enumerate() {
+        let diff = (f16_to_f32(a) - f16_to_f32(b)).abs();
+        assert!(
+            diff <= 2e-3,
+            "pulled_add output mismatch at {idx}: {} vs {} (diff={diff})",
+            f16_to_f32(a),
+            f16_to_f32(b)
+        );
     }
 }

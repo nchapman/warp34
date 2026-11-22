@@ -1065,6 +1065,77 @@ impl DeviceExpertSlotTable {
             label,
         )
     }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn launch_moe_w4a16_pulled_add(
+        &self,
+        ex: &warp34_kernels::ffi::Warp34Exec,
+        x_addr: u64,
+        pulled_topk_ids_addr: u64,
+        topk_weights_addr: u64,
+        active_count_addr: u64,
+        interm_buf_addr: u64,
+        out_addr: u64,
+        num_tokens: usize,
+        top_k: usize,
+    ) -> crate::cuda::Result<()> {
+        let (rc, label) = if self.layout.bits == 2 {
+            (
+                // SAFETY: all device addresses are valid for `num_tokens` and `top_k`.
+                unsafe {
+                    warp34_kernels::ffi::warp34_moe_w2a16_pulled_add_f16(
+                        ex,
+                        x_addr as *const core::ffi::c_void,
+                        self.gate_up_packed.addr() as *const u32,
+                        self.gate_up_scales.addr() as *const core::ffi::c_void,
+                        self.down_packed.addr() as *const u32,
+                        self.down_scales.addr() as *const core::ffi::c_void,
+                        pulled_topk_ids_addr as *const i32,
+                        topk_weights_addr as *const f32,
+                        active_count_addr as *const i32,
+                        interm_buf_addr as *mut core::ffi::c_void,
+                        out_addr as *mut core::ffi::c_void,
+                        num_tokens as i32,
+                        top_k as i32,
+                        self.capacity as i32,
+                        self.layout.intermediate as i32,
+                        self.layout.hidden as i32,
+                        self.layout.group_size as i32,
+                        self.layout.down_hadamard_block_size as i32,
+                    )
+                },
+                "warp34_moe_w2a16_pulled_add_f16",
+            )
+        } else {
+            (
+                // SAFETY: all device addresses are valid for `num_tokens` and `top_k`.
+                unsafe {
+                    warp34_kernels::ffi::warp34_moe_w4a16_pulled_add_f16(
+                        ex,
+                        x_addr as *const core::ffi::c_void,
+                        self.gate_up_packed.addr() as *const u32,
+                        self.gate_up_scales.addr() as *const core::ffi::c_void,
+                        self.down_packed.addr() as *const u32,
+                        self.down_scales.addr() as *const core::ffi::c_void,
+                        pulled_topk_ids_addr as *const i32,
+                        topk_weights_addr as *const f32,
+                        active_count_addr as *const i32,
+                        interm_buf_addr as *mut core::ffi::c_void,
+                        out_addr as *mut core::ffi::c_void,
+                        num_tokens as i32,
+                        top_k as i32,
+                        self.capacity as i32,
+                        self.layout.intermediate as i32,
+                        self.layout.hidden as i32,
+                        self.layout.group_size as i32,
+                        self.layout.down_hadamard_block_size as i32,
+                    )
+                },
+                "warp34_moe_w4a16_pulled_add_f16",
+            )
+        };
+        crate::cuda::check_rc(rc, label)
+    }
 }
 
 /// Per-layer VRAM hot expert cache (`K_hot` slots) with LRU eviction tracking and telemetry.
@@ -1076,11 +1147,13 @@ pub struct HotExpertCache {
     /// Global expert ID resident in each VRAM slot (`-1` if empty).
     pub slot_to_expert: Vec<i32>,
     pub slot_last_used: Vec<u64>,
+    pub expert_freq: Vec<u8>,
     pub d_expert_to_slot: crate::cuda::DeviceBuffer,
     pub d_prefill_expert_to_slot: crate::cuda::DeviceBuffer,
     pub d_slot_to_expert: crate::cuda::DeviceBuffer,
     pub d_slot_last_used: crate::cuda::DeviceBuffer,
     pub d_step_counter: crate::cuda::DeviceBuffer,
+    pub d_expert_freq: crate::cuda::DeviceBuffer,
     pub(crate) bridge_runtime: Option<std::sync::Arc<crate::moe_cpu_bridge::Runtime>>,
     pub(crate) bridge_mailbox: Option<std::sync::Arc<crate::moe_cpu_bridge::Mailbox>>,
     pub ep_size: usize,
@@ -1121,6 +1194,7 @@ impl HotExpertCache {
             crate::cuda::DeviceBuffer::alloc(device_id, k_hot * core::mem::size_of::<u64>())?;
         let d_step_counter =
             crate::cuda::DeviceBuffer::alloc(device_id, core::mem::size_of::<u64>())?;
+        let d_expert_freq = crate::cuda::DeviceBuffer::alloc(device_id, local_count.max(1))?;
         Ok(Self {
             slots,
             expert_ids,
@@ -1128,11 +1202,13 @@ impl HotExpertCache {
             prefill_expert_to_slot: vec![-1; local_count],
             slot_to_expert: vec![-1; k_hot],
             slot_last_used: vec![0; k_hot],
+            expert_freq: vec![0; local_count],
             d_expert_to_slot,
             d_prefill_expert_to_slot,
             d_slot_to_expert,
             d_slot_last_used,
             d_step_counter,
+            d_expert_freq,
             bridge_runtime: None,
             bridge_mailbox: None,
             ep_size: 1,
@@ -1189,6 +1265,8 @@ impl HotExpertCache {
             core::mem::size_of::<u64>(),
             stream,
         )?;
+        let d_expert_freq =
+            crate::cuda::DeviceBuffer::alloc_on_stream(device_id, local_count.max(1), stream)?;
         Ok(Self {
             slots,
             expert_ids,
@@ -1196,11 +1274,13 @@ impl HotExpertCache {
             prefill_expert_to_slot: vec![-1; local_count],
             slot_to_expert: vec![-1; k_hot],
             slot_last_used: vec![0; k_hot],
+            expert_freq: vec![0; local_count],
             d_expert_to_slot,
             d_prefill_expert_to_slot,
             d_slot_to_expert,
             d_slot_last_used,
             d_step_counter,
+            d_expert_freq,
             bridge_runtime: None,
             bridge_mailbox: None,
             ep_size: 1,
@@ -1236,6 +1316,10 @@ impl HotExpertCache {
             .copy_from_host(&self.slot_to_expert, stream)?;
         self.d_slot_last_used
             .copy_from_host(&self.slot_last_used, stream)?;
+        if !self.expert_freq.is_empty() {
+            self.d_expert_freq
+                .copy_from_host(&self.expert_freq, stream)?;
+        }
         self.d_step_counter
             .copy_from_host(std::slice::from_ref(&self.step_clock), stream)
     }
@@ -1276,15 +1360,28 @@ impl HotExpertCache {
         self.initial_slot_to_expert = chosen.iter().map(|&ge| ge as i32).collect();
         self.adapted_slots_dirty = false;
         self.expert_to_slot.fill(-1);
+        self.expert_freq.fill(0);
         for (slot, &ge) in chosen.iter().enumerate() {
             let le = ge - self.expert_ids.start;
             self.expert_to_slot[le] = slot as i32;
             self.slot_to_expert[slot] = ge as i32;
-            // Preserve ranking order so the least-hot initial slot (`k_hot - 1`) is evicted
-            // before the hottest initial slot (`0`).
+            self.expert_freq[le] = if slot == 0 {
+                16
+            } else if slot < 24 {
+                8
+            } else if slot < 56 {
+                5
+            } else if slot < 88 {
+                3
+            } else {
+                1
+            };
+            // Preserve ranking order (`k_hot - slot`) while keeping `step_clock` >= 40 steps
+            // ahead of slots `24..k_hot` so unused non-core static slots can be smoothly
+            // replaced by active conversation experts without waiting 32 decode rounds.
             self.slot_last_used[slot] = (k_hot - slot) as u64;
         }
-        self.step_clock = (k_hot as u64) + 1;
+        self.step_clock = (k_hot as u64) + 40;
 
         // Upload in chunks of `ws.stage_capacity`.
         let chunk_cap = ws.stage_capacity;
@@ -1309,7 +1406,11 @@ impl HotExpertCache {
         if self.slots.capacity >= self.expert_ids.len() {
             self.slots.capacity
         } else if self.has_cpu_bridge() {
-            self.k_static
+            if self.k_static <= 1 {
+                self.slots.capacity
+            } else {
+                self.k_static
+            }
         } else if self.slots.capacity > TIERED_MOE_GPU_LRU_TAIL_SLOTS {
             self.slots.capacity - TIERED_MOE_GPU_LRU_TAIL_SLOTS
         } else {
@@ -1403,11 +1504,15 @@ impl HotExpertCache {
             .copy_to_host(&mut self.slot_to_expert, stream)?;
         self.d_slot_last_used
             .copy_to_host(&mut self.slot_last_used, stream)?;
+        if !self.expert_freq.is_empty() {
+            self.d_expert_freq
+                .copy_to_host(&mut self.expert_freq, stream)?;
+        }
         self.d_step_counter.copy_to_host(&mut step_arr, stream)?;
         stream.synchronize()?;
         self.step_clock = step_arr[0].saturating_add(1).max(1);
         let check_limit = if self.has_cpu_bridge() {
-            self.k_static
+            if self.k_static <= 1 { 0 } else { self.k_static }
         } else {
             self.prefill_hot_limit()
         }
@@ -1514,16 +1619,22 @@ pub struct TieredMoeWorkspace {
     pub d_stage_packs: [crate::cuda::DeviceBuffer; 2],
     pub d_stage_src_local_experts: [crate::cuda::DeviceBuffer; 2],
     pub d_stage_slots: [crate::cuda::DeviceBuffer; 2],
-    pub stage_tables: [DeviceExpertSlotTable; 2],
+    pub stage_table: DeviceExpertSlotTable,
     pub h2d_stream: crate::cuda::CudaStream,
     pub h2d_done_events: [crate::cuda::CudaEvent; 2],
     pub compute_done_events: [crate::cuda::CudaEvent; 2],
+    pub hybrid_plan_event: crate::cuda::CudaEvent,
+    pub hybrid_pull_done_event: crate::cuda::CudaEvent,
     pub d_remapped_topk_ids: [crate::cuda::DeviceBuffer; 2],
     pub d_interm_buf: crate::cuda::DeviceBuffer,
     pub d_chunk_out: crate::cuda::DeviceBuffer,
     pub d_scratch: crate::cuda::DeviceBuffer,
+    /// Optional larger caller-owned scratch tail `(addr, len_bytes)` borrowed for the duration of
+    /// a single `execute_layer_auto` call so large prefill chunks avoid `sparse_chunks` splitting.
+    pub external_scratch: (u64, usize),
     pub d_miss_local_experts: crate::cuda::DeviceBuffer,
     pub d_miss_victim_slots: crate::cuda::DeviceBuffer,
+    pub d_chunk_slot_tables: crate::cuda::DeviceBuffer,
     pub d_num_misses: crate::cuda::DeviceBuffer,
     pub h_prefill_x: MappedHostBuffer,
     pub h_prefill_out: MappedHostBuffer,
@@ -1582,20 +1693,12 @@ impl TieredMoeWorkspace {
                 &h2d_stream,
             )?,
         ];
-        let stage_tables = [
-            DeviceExpertSlotTable::alloc_on_stream(
-                device_id,
-                stage_cap,
-                layout.clone(),
-                &h2d_stream,
-            )?,
-            DeviceExpertSlotTable::alloc_on_stream(
-                device_id,
-                stage_cap,
-                layout.clone(),
-                &h2d_stream,
-            )?,
-        ];
+        let stage_table = DeviceExpertSlotTable::alloc_on_stream(
+            device_id,
+            stage_cap,
+            layout.clone(),
+            &h2d_stream,
+        )?;
         let identity_slots: Vec<i32> = (0..stage_cap as i32).collect();
         d_stage_slots[0].copy_from_host(&identity_slots, &h2d_stream)?;
         d_stage_slots[1].copy_from_host(&identity_slots, &h2d_stream)?;
@@ -1607,6 +1710,8 @@ impl TieredMoeWorkspace {
             CudaEvent::new(device_id, false)?,
             CudaEvent::new(device_id, false)?,
         ];
+        let hybrid_plan_event = CudaEvent::new(device_id, false)?;
+        let hybrid_pull_done_event = CudaEvent::new(device_id, false)?;
         // Record initial compute_done_events so the first wait_event is immediately satisfied.
         compute_done_events[0].record(&h2d_stream)?;
         compute_done_events[1].record(&h2d_stream)?;
@@ -1646,6 +1751,11 @@ impl TieredMoeWorkspace {
             max_misses * core::mem::size_of::<i32>(),
             &h2d_stream,
         )?;
+        let d_chunk_slot_tables = DeviceBuffer::alloc_on_stream(
+            device_id,
+            512 * 512 * core::mem::size_of::<i32>(),
+            &h2d_stream,
+        )?;
         let d_num_misses =
             DeviceBuffer::alloc_on_stream(device_id, 2 * core::mem::size_of::<i32>(), &h2d_stream)?;
         let prefill_buf_bytes = max_tokens.max(1) * layout.hidden * core::mem::size_of::<u16>();
@@ -1670,16 +1780,20 @@ impl TieredMoeWorkspace {
             d_stage_packs,
             d_stage_src_local_experts,
             d_stage_slots,
-            stage_tables,
+            stage_table,
             h2d_stream,
             h2d_done_events,
             compute_done_events,
+            hybrid_plan_event,
+            hybrid_pull_done_event,
             d_remapped_topk_ids,
             d_interm_buf,
             d_chunk_out,
             d_scratch,
+            external_scratch: (0, 0),
             d_miss_local_experts,
             d_miss_victim_slots,
+            d_chunk_slot_tables,
             d_num_misses,
             h_prefill_x,
             h_prefill_out,

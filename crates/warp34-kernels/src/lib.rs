@@ -35,6 +35,9 @@ mod tests {
         assert_eq!(size_of::<Warp34AttentionBatch>(), 96);
         assert_eq!(align_of::<Warp34AttentionBatch>(), 8);
 
+        assert_eq!(size_of::<Warp34MoeHybridDesc>(), 232);
+        assert_eq!(align_of::<Warp34MoeHybridDesc>(), 8);
+
         assert_eq!(size_of::<Warp34GdnBatch>(), 80);
         assert_eq!(align_of::<Warp34GdnBatch>(), 8);
 

@@ -3,7 +3,9 @@
 //! A proposal writes only a private, disposable M-row suffix; it never advances
 //! committed context. Attention/MLP are TP-sharded; context FC and convs replicated.
 use crate::cache::{KvFormatPolicy, KvPool};
-use crate::cuda::{CudaGraph, DeviceArena, DeviceBuffer, Result, Tp2Collectives, check_rc};
+use crate::cuda::{
+    CudaGraph, DeviceArena, DeviceBuffer, MappedHostBuffer, Result, Tp2Collectives, check_rc,
+};
 use crate::loader::{
     ModelConfig, QuantScheme, SUPPORTED_HADAMARD_BLOCKS, SafetensorsArchive,
     marlin_permute_scales_from_n_major,
@@ -459,6 +461,21 @@ fn linear_metadata(
     }
 }
 
+/// Threshold (`32 MiB` per codebook) above which `DFlash2` selector codebooks
+/// (`predecessor_codebook` / `successor_codebook`, `242.5 MiB` combined on 248K-vocab models)
+/// are hosted in zero-copy pinned `MappedHostBuffer` instead of GPU VRAM. Each draft round
+/// reads only `~31.5 KiB` across `k = 7` slots (`~18 µs` over PCIe 4.0 x8) at 0-ULP BF16 parity.
+const DFLASH2_HOST_CODEBOOK_MIN_BYTES: usize = 32 * 1024 * 1024;
+
+#[inline]
+fn use_host_selector_codebooks(cfg: &DFlash2Config) -> bool {
+    cfg.model
+        .vocab_size
+        .saturating_mul(cfg.selector_rank)
+        .saturating_mul(2)
+        >= DFLASH2_HOST_CODEBOOK_MIN_BYTES
+}
+
 fn weight_arena_bytes(
     cfg: &DFlash2Config,
     a: &SafetensorsArchive,
@@ -489,20 +506,29 @@ fn weight_arena_bytes(
     }
     let coeff = product(&[2, cfg.taps, h / cfg.group])?;
     let rows = sum(&[capacity, cfg.block_size])?;
+    let host_codebooks = use_host_selector_codebooks(cfg);
+    let use_inv_freq = rows > 8192;
     let mut bytes = vec![
         DFLASH2_WEIGHT_ARENA_SLACK_BYTES,
-        product(&[rows, d, 4])?,
+        if use_inv_freq {
+            product(&[d / 2, 4])?
+        } else {
+            product(&[rows, d, 4])?
+        },
         product(&[rows.div_ceil(16), 4])?,
     ];
     for name in ["hidden_norm.weight", "norm.weight"] {
         bytes.push(dense_metadata(a, name, &[h])?);
     }
     for name in ["predecessor_codebook", "successor_codebook"] {
-        bytes.push(dense_metadata(
+        let sz = dense_metadata(
             a,
             &format!("candidate_selector.{name}"),
             &[c.vocab_size, cfg.selector_rank],
-        )?);
+        )?;
+        if !host_codebooks {
+            bytes.push(sz);
+        }
     }
     let fc_k = product(&[h, cfg.target_layers.len()])?;
     bytes.push(linear_metadata(cfg, a, "fc", h, fc_k, h, fc_k)?);
@@ -608,8 +634,13 @@ fn dflash_ring_params(cfg: &DFlash2Config, tp: usize) -> (usize, usize) {
             ((cfg.window + cfg.block_size).div_ceil(DFLASH2_KV_PAGE_BLOCK_TOKENS) + 16).max(144),
         )
     } else {
+        let slots = if tp == 1 && cfg.model.hidden_size == 2560 {
+            4
+        } else {
+            8
+        };
         (
-            8,
+            slots,
             (cfg.window + cfg.block_size).div_ceil(DFLASH2_KV_PAGE_BLOCK_TOKENS) + 9,
         )
     }
@@ -706,6 +737,7 @@ pub(crate) fn serving_reserve(
 struct DFlashGraphIo {
     forward_graph: Option<CudaGraph>,
     select_greedy_graphs: [Option<CudaGraph>; MAX_DFLASH_BATCH_SLOTS],
+    oom_disabled: bool,
     forward_arena: DeviceArena,
     meta_dev: DeviceBuffer,
     topk_ids_dev: DeviceBuffer,
@@ -743,9 +775,12 @@ pub struct DFlash2Rank {
     layers: Vec<Layer>,
     rope: u64,
     rope_rows: usize,
+    rope_uses_inv_freq: bool,
     hp: Linear,
     pred: u64,
     succ: u64,
+    _host_pred: Option<MappedHostBuffer>,
+    _host_succ: Option<MappedHostBuffer>,
     pub hidden: DeviceBuffer,
     projected: DeviceBuffer,
 }
@@ -1257,31 +1292,61 @@ impl DFlash2Rank {
             0,
             h,
         )?;
-        let pred = upload(
-            &mut weights,
-            &mut upload_ring,
-            "candidate_selector.predecessor_codebook",
-            &[c.vocab_size, cfg.selector_rank],
-        )?;
-        let succ = upload(
-            &mut weights,
-            &mut upload_ring,
-            "candidate_selector.successor_codebook",
-            &[c.vocab_size, cfg.selector_rank],
-        )?;
+        let (pred, succ, host_pred, host_succ) = if use_host_selector_codebooks(&cfg) {
+            let load_host_codebook = |name: &str| -> Result<(u64, MappedHostBuffer)> {
+                let bits = read(&archive, name, &[c.vocab_size, cfg.selector_rank])?;
+                let bytes = bits.len() * core::mem::size_of::<u16>();
+                let buf = MappedHostBuffer::alloc_unzeroed(bytes)?;
+                // SAFETY: `buf` is allocated for `bytes` contiguous bytes and `bits` has `bytes` bytes.
+                unsafe {
+                    core::ptr::copy_nonoverlapping(
+                        bits.as_ptr().cast::<u8>(),
+                        buf.host_ptr.cast::<u8>(),
+                        bytes,
+                    );
+                }
+                Ok((buf.dev_ptr as u64, buf))
+            };
+            let (p_ptr, p_buf) = load_host_codebook("candidate_selector.predecessor_codebook")?;
+            let (s_ptr, s_buf) = load_host_codebook("candidate_selector.successor_codebook")?;
+            (p_ptr, s_ptr, Some(p_buf), Some(s_buf))
+        } else {
+            let p_ptr = upload(
+                &mut weights,
+                &mut upload_ring,
+                "candidate_selector.predecessor_codebook",
+                &[c.vocab_size, cfg.selector_rank],
+            )?;
+            let s_ptr = upload(
+                &mut weights,
+                &mut upload_ring,
+                "candidate_selector.successor_codebook",
+                &[c.vocab_size, cfg.selector_rank],
+            )?;
+            (p_ptr, s_ptr, None, None)
+        };
         drop(upload_ring);
-        // SGLang RotaryEmbedding deliberately retains its CUDA cache in FP32,
-        // even when Q/K and model weights are BF16. Quantizing this table loses
-        // ~0.2% at the first Q projection and amplifies across the five layers.
-        let mut table = vec![0f32; rope_rows * d];
-        for pos in 0..rope_rows {
-            for j in 0..d / 2 {
-                let angle = pos as f32 * (1.0 / c.rope_theta.powf((2 * j) as f32 / d as f32));
-                table[pos * d + j] = angle.cos();
-                table[pos * d + d / 2 + j] = angle.sin();
+        // For compact contexts (`<= 8192` rows, `<= 4 MiB`), keep the exact host-computed FP32
+        // cos/sin table for 0-ULP SGLang donor parity; for long contexts (`> 8192` rows, e.g.
+        // 128K serving), store FP32 `inv_freq` [d / 2] and evaluate `sincosf` on the fly to save
+        // 64 MiB VRAM.
+        let rope_uses_inv_freq = rope_rows > 8192;
+        let rope = if rope_uses_inv_freq {
+            let inv_freq: Vec<f32> = (0..d / 2)
+                .map(|j| 1.0f32 / c.rope_theta.powf((2 * j) as f32 / d as f32))
+                .collect();
+            weights.upload_slice(&inv_freq, &t.stream)?
+        } else {
+            let mut table = vec![0f32; rope_rows * d];
+            for pos in 0..rope_rows {
+                for j in 0..d / 2 {
+                    let angle = pos as f32 * (1.0 / c.rope_theta.powf((2 * j) as f32 / d as f32));
+                    table[pos * d + j] = angle.cos();
+                    table[pos * d + d / 2 + j] = angle.sin();
+                }
             }
-        }
-        let rope = weights.upload_slice(&table, &t.stream)?;
+            weights.upload_slice(&table, &t.stream)?
+        };
         let layer_ids: Vec<usize> = (0..c.num_hidden_layers).collect();
         let logical_pages = rope_rows.div_ceil(DFLASH2_KV_PAGE_BLOCK_TOKENS);
         let (slot_count, ring_phys_per_slot) = dflash_ring_params(&cfg, tp);
@@ -1334,11 +1399,12 @@ impl DFlash2Rank {
         let graph_io = DFlashGraphIo {
             forward_graph: None,
             select_greedy_graphs: std::array::from_fn(|_| None),
+            oom_disabled: false,
             forward_arena: DeviceArena::new(t.device.device_id, DFLASH2_FORWARD_GRAPH_ARENA_BYTES)?,
             meta_dev: DeviceBuffer::alloc(t.device.device_id, (3 * cfg.block_size + 4) * 4)?,
             topk_ids_dev: DeviceBuffer::alloc(t.device.device_id, topk_elems * 4)?,
             topk_scores_dev: DeviceBuffer::alloc(t.device.device_id, topk_elems * 4)?,
-            out_path_dev: DeviceBuffer::alloc(t.device.device_id, k_draft * 4)?,
+            out_path_dev: DeviceBuffer::alloc(t.device.device_id, 2 * k_draft * 4)?,
         };
         t.stream.synchronize()?;
         let all_pages = raw_pages;
@@ -1372,9 +1438,12 @@ impl DFlash2Rank {
             layers,
             rope,
             rope_rows,
+            rope_uses_inv_freq,
             hp,
             pred,
             succ,
+            _host_pred: host_pred,
+            _host_succ: host_succ,
             hidden,
             projected,
         })
@@ -1619,7 +1688,7 @@ impl DFlash2Rank {
             total_tokens: rows as i32,
             max_blocks_per_req: self.pages.len() as i32,
             max_q_len: rows as i32,
-            max_seq_len: after as i32,
+            max_seq_len: (self.capacity + self.cfg.block_size) as i32,
             sliding_window: self.cfg.window as i32,
             mask_mode: ffi::WARP34_ATTN_MASK_NONCAUSAL_WINDOW,
             sm_scale: 1.0 / (self.cfg.model.head_dim as f32).sqrt(),
@@ -1669,23 +1738,42 @@ impl DFlash2Rank {
         check_rc(
             // SAFETY: device pointers and write_slot_mapping are valid allocations for rows BF16 QKV entries according to kv_layout.
             unsafe {
-                ffi::warp34_dflash_qk_norm_rope_kv_write_bf16_f32_table(
-                    &t.stream.exec(0, 0),
-                    qkv as *mut c_void,
-                    q_out as *mut c_void,
-                    pos as *const i32,
-                    layer.q_norm as *const c_void,
-                    layer.k_norm as *const c_void,
-                    self.rope as *const c_void,
-                    kv_layout,
-                    write_slot_mapping,
-                    rows as i32,
-                    qheads as i32,
-                    (self.cfg.model.num_key_value_heads / self.tp) as i32,
-                    self.cfg.model.head_dim as i32,
-                    self.rope_rows as i32,
-                    self.cfg.model.rms_norm_eps,
-                )
+                if self.rope_uses_inv_freq {
+                    ffi::warp34_dflash_qk_norm_rope_kv_write_bf16_inv_freq(
+                        &t.stream.exec(0, 0),
+                        qkv as *mut c_void,
+                        q_out as *mut c_void,
+                        pos as *const i32,
+                        layer.q_norm as *const c_void,
+                        layer.k_norm as *const c_void,
+                        self.rope as *const f32,
+                        kv_layout,
+                        write_slot_mapping,
+                        rows as i32,
+                        qheads as i32,
+                        (self.cfg.model.num_key_value_heads / self.tp) as i32,
+                        self.cfg.model.head_dim as i32,
+                        self.cfg.model.rms_norm_eps,
+                    )
+                } else {
+                    ffi::warp34_dflash_qk_norm_rope_kv_write_bf16_f32_table(
+                        &t.stream.exec(0, 0),
+                        qkv as *mut c_void,
+                        q_out as *mut c_void,
+                        pos as *const i32,
+                        layer.q_norm as *const c_void,
+                        layer.k_norm as *const c_void,
+                        self.rope as *const c_void,
+                        kv_layout,
+                        write_slot_mapping,
+                        rows as i32,
+                        qheads as i32,
+                        (self.cfg.model.num_key_value_heads / self.tp) as i32,
+                        self.cfg.model.head_dim as i32,
+                        self.rope_rows as i32,
+                        self.cfg.model.rms_norm_eps,
+                    )
+                }
             },
             "DFlash QK norm/RoPE + KV write",
         )
@@ -1876,7 +1964,15 @@ impl DFlash2Rank {
             .graph_io
             .forward_arena
             .alloc_aligned(m * h.max(q).max(i) * 2)?;
+        let head_input = self.graph_io.forward_arena.alloc_aligned((m - 1) * h * 2)?;
+        let logits_bytes = (m - 1) * t.local_vocab_size * 2;
+        let attn_split_ws_bytes = logits_bytes.max(4 * 1024 * 1024);
+        let logits = self
+            .graph_io
+            .forward_arena
+            .alloc_aligned(attn_split_ws_bytes)?;
         let ex = t.stream.exec(0, 0);
+        let attn_ex = t.stream.exec(logits, attn_split_ws_bytes);
         check_rc(
             // SAFETY: ids_ptr contains m valid token IDs, embed_tokens_ptr is valid device memory of vocab_size * h half elements, residual has capacity for m * h BF16 elements.
             unsafe {
@@ -1915,10 +2011,10 @@ impl DFlash2Rank {
                 m,
             )?;
             check_rc(
-                // SAFETY: kv layout and attention batch describe valid paged memory, qb and attn are valid device buffers for m * q elements.
+                // SAFETY: kv layout and attention batch describe valid paged memory, qb and attn are valid device buffers for m * q elements, and attn_ex holds disjoint forward_arena scratch.
                 unsafe {
                     ffi::warp34_paged_attention_bf16(
-                        &ex,
+                        &attn_ex,
                         &self.kv.layers[l].layout,
                         batch,
                         qb as *const c_void,
@@ -1959,11 +2055,6 @@ impl DFlash2Rank {
         let draft_hidden = self.hidden.addr() + (h * 2) as u64;
         self.hp
             .run(t, draft_hidden, self.projected.addr(), m - 1, had_scratch)?;
-        let head_input = self.graph_io.forward_arena.alloc_aligned((m - 1) * h * 2)?;
-        let logits = self
-            .graph_io
-            .forward_arena
-            .alloc_aligned((m - 1) * t.local_vocab_size * 2)?;
         // Explicit dtype boundary into the target's single resident FP16 head.
         check_rc(
             // SAFETY: draft_hidden contains (m - 1) * h BF16 elements, head_input has capacity for (m - 1) * h FP16 elements.
@@ -2082,10 +2173,11 @@ impl DFlash2Rank {
                     n as i32,
                 )?;
             }
+            let out_confs = out_path + (k * 4) as u64;
             check_rc(
-                // SAFETY: device arrays topk_ids, topk_scores, projected, pred, succ, out_path, and ids_ptr are valid and sized for k proposals and n candidates.
+                // SAFETY: device arrays topk_ids, topk_scores, projected, pred, succ, out_path (+ out_confs), and ids_ptr are valid and sized for k proposals and n candidates.
                 unsafe {
-                    ffi::warp34_dflash_select_greedy_dev_anchor_bf16(
+                    ffi::warp34_dflash_select_greedy_dev_anchor_with_conf_bf16(
                         &ex,
                         topk_ids as *const i32,
                         topk_scores as *const f32,
@@ -2093,6 +2185,7 @@ impl DFlash2Rank {
                         pred as *const c_void,
                         succ as *const c_void,
                         out_path as *mut i32,
+                        out_confs as *mut f32,
                         ids_ptr as *const i32,
                         k as i32,
                         n as i32,
@@ -2129,64 +2222,67 @@ impl DFlash2Rank {
     }
 
     /// Truncates a greedy DFlash2 draft path on offloaded (non-fully-resident) tiered MoE models
-    /// at the first position (`j >= 1`) whose top-k softmax probability falls below `min_conf`,
-    /// avoiding paying linear cold-expert verify latency on low-probability tail tokens.
-    fn truncate_path_by_topk_confidence(
+    /// using conditioned post-trilinear step softmax probabilities (`confs[j]`):
+    /// - When `allow_zero_drafts` is `true` (TP=1 offloaded MoE), applies a pure cumulative
+    ///   confidence threshold `prod_{i=0..=j} confs[i] >= min_cum_conf` starting at `j = 0`,
+    ///   allowing `0` drafts (`T = 1` verify) on uncertain tokens so doomed speculative tokens
+    ///   never pay linear cold-expert DDR5 latency.
+    /// - When `allow_zero_drafts` is `false`, retains `j = 0` (`keep >= 1`) and stops at the
+    ///   first `j >= 1` where `confs[j] < min_step_conf` or `cum_conf < min_cum_conf`.
+    fn truncate_path_by_step_confidences(
         path: &mut Vec<i32>,
-        topk_ids: &[i32],
-        topk_scores: &[f32],
-        top_k: usize,
+        confs: &[f32],
         max_draft: usize,
-        min_conf: f32,
+        min_step_conf: f32,
+        min_cum_conf: f32,
+        allow_zero_drafts: bool,
     ) {
-        if top_k == 0 || path.len() <= 1 {
+        if path.is_empty() || (!allow_zero_drafts && path.len() <= 1) {
             return;
         }
-        let limit = path.len().min(max_draft);
+        let limit = path.len().min(max_draft).min(confs.len());
+        if limit == 0 {
+            if allow_zero_drafts {
+                path.clear();
+            }
+            return;
+        }
         let mut keep = limit;
-        for (j, &chosen_id) in path.iter().take(limit).enumerate() {
-            let row_start = j * top_k;
-            let row_end = row_start + top_k;
-            if row_end > topk_ids.len() || row_end > topk_scores.len() {
+        let mut cum_conf = 1.0f32;
+        for (j, &conf) in confs.iter().take(limit).enumerate() {
+            if !conf.is_finite() || conf <= 0.0 {
+                keep = if allow_zero_drafts { j } else { j.max(1) };
                 break;
             }
-            let ids_row = &topk_ids[row_start..row_end];
-            let scores_row = &topk_scores[row_start..row_end];
-            let max_s = scores_row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-            if !max_s.is_finite() {
-                keep = j.max(1);
-                break;
-            }
-            let mut denom = 0.0f32;
-            let mut sel_s = f32::NEG_INFINITY;
-            for (&id, &s) in ids_row.iter().zip(scores_row.iter()) {
-                let e = (s - max_s).exp();
-                denom += e;
-                if id == chosen_id {
-                    sel_s = s;
+            cum_conf *= conf;
+            if allow_zero_drafts {
+                if conf < min_step_conf || cum_conf < min_cum_conf {
+                    keep = j;
+                    break;
                 }
-            }
-            let conf = if denom > 0.0 && sel_s.is_finite() {
-                (sel_s - max_s).exp() / denom
-            } else {
-                0.0
-            };
-            if j >= 1 && conf < min_conf {
+            } else if j >= 1 && (conf < min_step_conf || cum_conf < min_cum_conf) {
                 keep = j;
                 break;
             }
         }
-        path.truncate(keep.max(1));
+        path.truncate(if allow_zero_drafts { keep } else { keep.max(1) });
     }
 
-    fn offloaded_moe_draft_confidence_gate(t: &Qwen3_5ModelRank) -> Option<(usize, f32)> {
+    fn offloaded_moe_draft_confidence_gate(
+        t: &Qwen3_5ModelRank,
+    ) -> Option<(usize, f32, f32, bool)> {
         t.tiered_moe.as_ref()?;
         let local_experts = (t.cfg.num_experts / t.tp_size.max(1)).max(1);
         if t.tiered_moe_hot_per_layer >= local_experts {
             return None;
         }
-        let min_conf = if t.tp_size >= 2 { 0.30 } else { 0.50 };
-        Some((6, min_conf))
+        if t.tp_size >= 2 {
+            Some((7, 0.35, 0.20, false))
+        } else if crate::moe_cpu_bridge::has_avx512() && t.tiered_moe_hot_per_layer >= 64 {
+            Some((7, 0.35, 0.35, true))
+        } else {
+            Some((7, 0.0, 0.70, true))
+        }
     }
 
     pub fn collect_select_greedy_host(
@@ -2195,30 +2291,25 @@ impl DFlash2Rank {
         anchor: i32,
     ) -> Result<Vec<i32>> {
         let k = self.cfg.block_size - 1;
-        let mut path = vec![0i32; k];
+        let mut raw = vec![0u32; 2 * k];
         self.graph_io
             .out_path_dev
-            .copy_to_host(&mut path, &t.stream)?;
+            .copy_to_host(&mut raw, &t.stream)?;
+        let mut path: Vec<i32> = raw[..k].iter().map(|&w| w as i32).collect();
         if path.first().is_some_and(|&id| id < 0) {
             return Err(loader_err("nonfinite DFlash edges"));
         }
-        if let Some((max_draft, min_conf)) = Self::offloaded_moe_draft_confidence_gate(t) {
-            let topk_elems = k * self.cfg.top_k;
-            let mut topk_ids = vec![0i32; topk_elems];
-            let mut topk_scores = vec![0.0f32; topk_elems];
-            self.graph_io
-                .topk_ids_dev
-                .copy_to_host(&mut topk_ids, &t.stream)?;
-            self.graph_io
-                .topk_scores_dev
-                .copy_to_host(&mut topk_scores, &t.stream)?;
-            Self::truncate_path_by_topk_confidence(
+        if let Some((max_draft, min_step_conf, min_cum_conf, allow_zero_drafts)) =
+            Self::offloaded_moe_draft_confidence_gate(t)
+        {
+            let confs: Vec<f32> = raw[k..2 * k].iter().map(|&w| f32::from_bits(w)).collect();
+            Self::truncate_path_by_step_confidences(
                 &mut path,
-                &topk_ids,
-                &topk_scores,
-                self.cfg.top_k,
+                &confs,
                 max_draft,
-                min_conf,
+                min_step_conf,
+                min_cum_conf,
+                allow_zero_drafts,
             );
         }
         self.proposal_anchor = Some(anchor);
@@ -2300,13 +2391,27 @@ impl DFlash2Rank {
         }
         self.proposal_anchor = None;
         self.upload_forward_meta(t, anchor)?;
-        if self.use_cuda_graph {
-            self.ensure_forward_graph(t, comm)?;
-            self.graph_io
-                .forward_graph
-                .as_ref()
-                .unwrap()
-                .launch(&t.stream)?;
+        if self.use_cuda_graph && !self.graph_io.oom_disabled {
+            let graph_res = self.ensure_forward_graph(t, comm).and_then(|()| {
+                self.graph_io
+                    .forward_graph
+                    .as_ref()
+                    .unwrap()
+                    .launch(&t.stream)
+            });
+            match graph_res {
+                Ok(()) => {}
+                // `cudaErrorMemoryAllocation` (`code == 2`) on single-rank DFlash2 disables graph
+                // replay for the rank lifetime and falls back to eager execution without retrying
+                // `CudaGraph::capture` on every token.
+                Err(e) if self.tp == 1 && e.code == 2 => {
+                    self.graph_io.forward_graph = None;
+                    self.graph_io.oom_disabled = true;
+                    let (batch, ids_ptr, pos_ptr) = self.fixed_forward_batch_ptrs();
+                    self.enqueue_forward_device_topk(t, &batch, ids_ptr, pos_ptr, comm)?;
+                }
+                Err(e) => return Err(e),
+            }
         } else {
             let (batch, ids_ptr, pos_ptr) = self.fixed_forward_batch_ptrs();
             self.enqueue_forward_device_topk(t, &batch, ids_ptr, pos_ptr, comm)?;
@@ -2347,11 +2452,20 @@ impl DFlash2Rank {
         if (self.tp > 1) != comm.is_some() {
             return Err(loader_err("invalid DFlash forward"));
         }
-        if self.use_cuda_graph && self.can_capture_select_greedy() {
+        if self.use_cuda_graph && !self.graph_io.oom_disabled && self.can_capture_select_greedy() {
             self.prepare_select_greedy_graph_inputs_async(t, anchor)?;
-            self.ensure_select_greedy_graph(t, comm)?;
-            self.replay_select_greedy_graph_async(t)?;
-            return self.collect_select_greedy_host(t, anchor);
+            let graph_res = self
+                .ensure_select_greedy_graph(t, comm)
+                .and_then(|()| self.replay_select_greedy_graph_async(t));
+            match graph_res {
+                Ok(()) => return self.collect_select_greedy_host(t, anchor),
+                Err(e) if self.tp == 1 && e.code == 2 => {
+                    let slot_idx = if self.batch_mode { self.active_slot } else { 0 };
+                    self.graph_io.select_greedy_graphs[slot_idx] = None;
+                    self.graph_io.oom_disabled = true;
+                }
+                Err(e) => return Err(e),
+            }
         }
         let (ids_dev, scores_dev) = self.forward_device_topk(t, anchor, comm)?;
         if let Some(comm) = comm {
@@ -2380,11 +2494,12 @@ impl DFlash2Rank {
     ) -> Result<Vec<i32>> {
         let (k, n) = (self.cfg.block_size - 1, self.cfg.top_k);
         if self.cfg.selector_rank <= 256 && n <= 32 && k <= 16 {
-            let path_dev = self.scratch.alloc_aligned(k * 4)?;
+            let path_dev = self.scratch.alloc_aligned(2 * k * 4)?;
+            let conf_dev = path_dev + (k * 4) as u64;
             check_rc(
-                // SAFETY: ids, vals, projected, pred, succ, and path_dev are valid device buffers on t.stream.
+                // SAFETY: ids, vals, projected, pred, succ, path_dev, and conf_dev are valid device buffers on t.stream.
                 unsafe {
-                    ffi::warp34_dflash_select_greedy_bf16(
+                    ffi::warp34_dflash_select_greedy_with_conf_bf16(
                         &t.stream.exec(0, 0),
                         ids as *const i32,
                         vals as *const f32,
@@ -2392,6 +2507,7 @@ impl DFlash2Rank {
                         self.pred as *const c_void,
                         self.succ as *const c_void,
                         path_dev as *mut i32,
+                        conf_dev as *mut f32,
                         anchor,
                         k as i32,
                         n as i32,
@@ -2401,59 +2517,35 @@ impl DFlash2Rank {
                 },
                 "DFlash greedy selector",
             )?;
-            let mut path = vec![0i32; k];
+            let mut raw = vec![0u32; 2 * k];
             check_rc(
-                // SAFETY: path has capacity for k i32 elements, path_dev is valid device buffer of k * 4 bytes.
+                // SAFETY: raw has capacity for 2 * k u32 elements, path_dev is valid device buffer of 2 * k * 4 bytes.
                 unsafe {
                     ffi::warp34_memcpy_d2h_async(
-                        path.as_mut_ptr().cast(),
+                        raw.as_mut_ptr().cast(),
                         path_dev as *const c_void,
-                        k * 4,
+                        2 * k * 4,
                         t.stream.handle,
                     )
                 },
-                "DFlash greedy path copy",
+                "DFlash greedy path+conf copy",
             )?;
             t.stream.synchronize()?;
+            let mut path: Vec<i32> = raw[..k].iter().map(|&w| w as i32).collect();
             if path.first().is_some_and(|&id| id < 0) {
                 return Err(loader_err("nonfinite DFlash edges"));
             }
-            if let Some((max_draft, min_conf)) = Self::offloaded_moe_draft_confidence_gate(t) {
-                let topk_elems = k * n;
-                let mut topk_ids = vec![0i32; topk_elems];
-                let mut topk_scores = vec![0.0f32; topk_elems];
-                check_rc(
-                    // SAFETY: ids and vals are valid device buffers of topk_elems * 4 bytes.
-                    unsafe {
-                        ffi::warp34_memcpy_d2h_async(
-                            topk_ids.as_mut_ptr().cast(),
-                            ids as *const c_void,
-                            topk_elems * 4,
-                            t.stream.handle,
-                        )
-                    },
-                    "DFlash greedy topk ids copy",
-                )?;
-                check_rc(
-                    // SAFETY: ids and vals are valid device buffers of topk_elems * 4 bytes.
-                    unsafe {
-                        ffi::warp34_memcpy_d2h_async(
-                            topk_scores.as_mut_ptr().cast(),
-                            vals as *const c_void,
-                            topk_elems * 4,
-                            t.stream.handle,
-                        )
-                    },
-                    "DFlash greedy topk scores copy",
-                )?;
-                t.stream.synchronize()?;
-                Self::truncate_path_by_topk_confidence(
+            if let Some((max_draft, min_step_conf, min_cum_conf, allow_zero_drafts)) =
+                Self::offloaded_moe_draft_confidence_gate(t)
+            {
+                let confs: Vec<f32> = raw[k..2 * k].iter().map(|&w| f32::from_bits(w)).collect();
+                Self::truncate_path_by_step_confidences(
                     &mut path,
-                    &topk_ids,
-                    &topk_scores,
-                    n,
+                    &confs,
                     max_draft,
-                    min_conf,
+                    min_step_conf,
+                    min_cum_conf,
+                    allow_zero_drafts,
                 );
             }
             return Ok(path);
@@ -2698,10 +2790,9 @@ mod memory_tests {
                 c.block_size = block;
                 let weights = weight_arena_bytes(&c, &a, tp, 262144).unwrap();
                 let short = weight_arena_bytes(&c, &a, tp, 256).unwrap();
-                assert_eq!(
-                    weights - short,
-                    (262144 - 256) * 128 * 4 + (262144 - 256) / 16 * 4
-                );
+                // `262144` uses `inv_freq` (`d/2 * 4B`) while `256` keeps the compact table (`(256+block)*d*4B`).
+                let rope_delta = (256 + block) * 128 * 4 - (128 / 2) * 4;
+                assert_eq!(weights + rope_delta - short, (262144 - 256) / 16 * 4);
                 assert!(
                     mandatory_bytes(&c, &c.model, tp, 262144, weights).unwrap()
                         > weights + 64 * 1024 * 1024

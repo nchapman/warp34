@@ -460,6 +460,21 @@ pub fn prepare_execution_plan(device_id: i32) -> Result<()> {
             "warmup warp34_small_n_gemm_dual_f16"
         )?;
     }
+    warmup_ffi!(
+        ffi::warp34_small_n_gemm_dual_f16(
+            &ex,
+            buf_a as *const c_void,
+            buf_b as *const c_void,
+            buf_c as *mut c_void,
+            128,
+            buf_b as *const c_void,
+            buf_d as *mut c_void,
+            128,
+            8,
+            128,
+        ),
+        "warmup warp34_small_n_gemm_dual_f16 (8x4)"
+    )?;
     for hs in [128i32, 3072, 5120, 6144] {
         // SAFETY: Pure query returning constant signal struct byte size.
         let sig_bytes = unsafe { ffi::warp34_tp2_signal_bytes() };
@@ -821,12 +836,35 @@ pub fn prepare_execution_plan(device_id: i32) -> Result<()> {
         )?;
     }
 
+    let bf16_layout_128 = Warp34KvLayerLayout {
+        namespace_id: ffi::WARP34_KV_NAMESPACE_DFLASH_DRAFT_CTX,
+        head_dim: 128,
+        k_token_stride_bytes: 256,
+        v_token_stride_bytes: 256,
+        k_head_stride_bytes: 16 * 256,
+        v_head_stride_bytes: 16 * 256,
+        k_page_stride_bytes: 16 * 256,
+        v_page_stride_bytes: 16 * 256,
+        k_format: ffi::WARP34_KV_FORMAT_BF16,
+        v_format: ffi::WARP34_KV_FORMAT_BF16,
+        ..layout
+    };
     let bf16_layout = Warp34KvLayerLayout {
         namespace_id: ffi::WARP34_KV_NAMESPACE_DFLASH_DRAFT_CTX,
         k_format: ffi::WARP34_KV_FORMAT_BF16,
         v_format: ffi::WARP34_KV_FORMAT_BF16,
         ..layout
     };
+    warmup_ffi!(
+        ffi::warp34_kv_cache_write_bf16(
+            &ex,
+            &bf16_layout_128,
+            &attn_batch,
+            buf_c as *const c_void,
+            buf_c as *const c_void,
+        ),
+        "warmup warp34_kv_cache_write_bf16 hd128"
+    )?;
     warmup_ffi!(
         ffi::warp34_kv_cache_write_bf16(
             &ex,
@@ -840,13 +878,35 @@ pub fn prepare_execution_plan(device_id: i32) -> Result<()> {
     warmup_ffi!(
         ffi::warp34_paged_attention_bf16(
             &ex,
-            &bf16_layout,
+            &bf16_layout_128,
             &attn_batch,
             buf_c as *const c_void,
             buf_d as *mut c_void,
             2,
         ),
         "warmup warp34_paged_attention_bf16 hd128"
+    )?;
+    warmup_ffi!(
+        ffi::warp34_paged_attention_bf16(
+            &ex,
+            &bf16_layout_128,
+            &attn_batch_m2,
+            buf_c as *const c_void,
+            buf_d as *mut c_void,
+            2,
+        ),
+        "warmup warp34_paged_attention_bf16 hd128 packed"
+    )?;
+    warmup_ffi!(
+        ffi::warp34_paged_attention_bf16(
+            &ex_split,
+            &bf16_layout_128,
+            &attn_batch_m2,
+            buf_c as *const c_void,
+            buf_d as *mut c_void,
+            2,
+        ),
+        "warmup warp34_paged_attention_bf16 hd128 splitk"
     )?;
     let bf16_layout_256 = Warp34KvLayerLayout {
         namespace_id: ffi::WARP34_KV_NAMESPACE_DFLASH_DRAFT_CTX,
@@ -864,6 +924,28 @@ pub fn prepare_execution_plan(device_id: i32) -> Result<()> {
             2,
         ),
         "warmup warp34_paged_attention_bf16 hd256"
+    )?;
+    warmup_ffi!(
+        ffi::warp34_paged_attention_bf16(
+            &ex,
+            &bf16_layout_256,
+            &attn_batch_m2,
+            buf_c as *const c_void,
+            buf_d as *mut c_void,
+            2,
+        ),
+        "warmup warp34_paged_attention_bf16 hd256 packed"
+    )?;
+    warmup_ffi!(
+        ffi::warp34_paged_attention_bf16(
+            &ex_split,
+            &bf16_layout_256,
+            &attn_batch_m2,
+            buf_c as *const c_void,
+            buf_d as *mut c_void,
+            2,
+        ),
+        "warmup warp34_paged_attention_bf16 hd256 splitk"
     )?;
     warmup_ffi!(
         ffi::warp34_paged_attention_bf16(
@@ -1333,6 +1415,25 @@ pub fn prepare_execution_plan(device_id: i32) -> Result<()> {
         "warmup BF16 QK/RoPE + KV write"
     )?;
     warmup_ffi!(
+        ffi::warp34_dflash_qk_norm_rope_kv_write_bf16_inv_freq(
+            &ex,
+            buf_a as *mut c_void,
+            buf_d as *mut c_void,
+            candidate_ids as *const i32,
+            buf_b as *const c_void,
+            buf_b as *const c_void,
+            buf_c as *const f32,
+            &bf16_layout,
+            slot_map as *const i32,
+            1,
+            1,
+            1,
+            256,
+            1e-6,
+        ),
+        "warmup BF16 QK/RoPE inv_freq + KV write"
+    )?;
+    warmup_ffi!(
         ffi::warp34_dflash_select_greedy_bf16(
             &ex,
             candidate_ids as *const i32,
@@ -1668,4 +1769,12 @@ pub fn prepare_execution_plan(device_id: i32) -> Result<()> {
     )?;
 
     dev.synchronize()
+}
+
+#[cfg(all(test, feature = "cuda"))]
+mod tests {
+    #[test]
+    fn test_prepare_execution_plan_succeeds() {
+        super::prepare_execution_plan(0).expect("prepare_execution_plan(0)");
+    }
 }

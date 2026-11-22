@@ -220,6 +220,49 @@ pub fn hc_combine_tap_f16(
     check(rc, "warp34_hc_combine_tap_f16")
 }
 
+#[allow(clippy::too_many_arguments)]
+pub fn hc_combine_tap_rmsnorm_f16(
+    ex: &Warp34Exec,
+    residual_in: u64,
+    block_out: u64,
+    inject_weights: u64,
+    ple_delta: u64,
+    residual_out: u64,
+    tap_bf16_out: u64,
+    next_norm_weight: u64,
+    next_normed_out: u64,
+    valid_token_mask: u64,
+    num_tokens: usize,
+    hc_count: usize,
+    hidden_size: usize,
+    eps: f32,
+    tap_stride_elems: i32,
+    tap_offset_elems: i32,
+) -> Result<()> {
+    // SAFETY: Device pointers are validated by the caller.
+    let rc = unsafe {
+        ffi::warp34_hc_combine_tap_rmsnorm_f16(
+            ex,
+            residual_in as usize as *const c_void,
+            block_out as usize as *const c_void,
+            inject_weights as usize as *const f32,
+            ple_delta as usize as *const c_void,
+            residual_out as usize as *mut c_void,
+            tap_bf16_out as usize as *mut c_void,
+            next_norm_weight as usize as *const c_void,
+            next_normed_out as usize as *mut c_void,
+            valid_token_mask as usize as *const u8,
+            num_tokens as i32,
+            hc_count as i32,
+            hidden_size as i32,
+            eps,
+            tap_stride_elems,
+            tap_offset_elems,
+        )
+    };
+    check(rc, "warp34_hc_combine_tap_rmsnorm_f16")
+}
+
 pub fn ple_dequant_f8_to_f16(
     ex: &Warp34Exec,
     f8_in: u64,

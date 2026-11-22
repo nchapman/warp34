@@ -46,6 +46,26 @@ fn hot_expert_rankings_filter_dedup_and_backfill_per_ep_rank() {
     assert_eq!(rankings.select_for_layer(2, 0..8, 3), None);
 }
 
+#[test]
+fn hot_expert_rankings_hit_curve_keeps_terminal_full_coverage_rate() {
+    let rankings = super::HotExpertRankings::from_json(&serde_json::json!({
+        "layers": {
+            "0": {
+                "num_experts": 16,
+                "ranked_expert_ids": [0, 1, 2, 3],
+                "hit_rate_by_cache_size": {
+                    "top_4": 0.50,
+                    "top_16": 0.97
+                }
+            }
+        }
+    }))
+    .unwrap();
+    assert_eq!(rankings.interp_hit_rate(0, 16), Some(1.0));
+    assert_eq!(rankings.interp_hit_rate(0, 32), Some(1.0));
+    assert_eq!(rankings.interp_hit_rate(0, 4), Some(0.50));
+}
+
 #[cfg(feature = "cuda")]
 mod cuda_tests {
     use super::super::*;

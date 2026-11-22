@@ -1167,6 +1167,493 @@ __global__ void paged_attention_gqa_bf16_kernel(
     }
 }
 
+// Multi-token packed GQA BF16 paged attention with optional Split-K across KV tiles.
+// Packs `tok_group <= 16 / q_group` query tokens from a single request into one 16-row
+// `m16n8k16` MMA tile so all `tok_group` draft tokens share coalesced K/V global loads,
+// and optionally partitions the KV tile range across `gridDim.z = split_k` CTAs.
+// Grid: (cdiv(total_tokens, tok_group), local_kv_heads * q_subgroups, split_k), Block: 128.
+template <int HEAD_DIM>
+__global__ void paged_attention_gqa_packed_bf16_kernel(
+    warp34_kv_layer_layout layout,
+    warp34_attention_batch batch,
+    const __nv_bfloat16* __restrict__ q_in,
+    __nv_bfloat16* __restrict__ attn_out,
+    float* __restrict__ split_partial_num,
+    float2* __restrict__ split_stats,
+    int num_q_heads,
+    int gqa_ratio,
+    int q_group,
+    int q_subgroups,
+    int tok_group,
+    int split_k) {
+    constexpr int TILE = (HEAD_DIM <= 128) ? 64 : 16;
+    constexpr int K_STEPS = HEAD_DIM >> 4;
+    constexpr int V_STEPS = HEAD_DIM >> 5;
+    constexpr int WARP_COLS = HEAD_DIM >> 2;
+    constexpr int VEC_PER_ROW = HEAD_DIM >> 3;
+    constexpr int SMEM_STRIDE = HEAD_DIM + 8;
+    constexpr int P_STRIDE = TILE + 8;
+
+    if (batch.valid_req_mask != nullptr && batch.valid_req_mask[0] == 0) return;
+
+    const int q_start = batch.query_start_loc[0];
+    const int q_end = batch.query_start_loc[1];
+    const int ctx_before = (batch.context_lens_before != nullptr)
+        ? batch.context_lens_before[0]
+        : (batch.seq_lens_after[0] - (q_end - q_start));
+    const int seq_after = batch.seq_lens_after[0];
+
+    const int tok_blk = (int)blockIdx.x;
+    const int tok_base = tok_blk * tok_group;
+    const int kv_sub = (int)blockIdx.y;
+    const int kv_head = kv_sub / q_subgroups;
+    const int q_head_base = kv_head * gqa_ratio + (kv_sub % q_subgroups) * q_group;
+    const int split_idx = (int)blockIdx.z;
+
+    const int tid = threadIdx.x;
+    const int wid = tid >> 5;
+    const int lane = tid & 31;
+    const int group_id = lane >> 2;
+    const int tid_in_grp = lane & 3;
+    const int active_rows = tok_group * q_group;
+
+    __shared__ __align__(16) uint16_t s_q[16][SMEM_STRIDE];
+    __shared__ __align__(16) uint16_t s_kv[TILE][SMEM_STRIDE];
+    __shared__ float scores[16][TILE + 4];
+    __shared__ __align__(16) uint16_t p_bits[16][P_STRIDE];
+    __shared__ float s_max[16];
+    __shared__ float s_alpha[16];
+    __shared__ float s_denom[16];
+    __shared__ int s_min_kv[16];
+    __shared__ int s_max_kv[16];
+    __shared__ uint8_t s_row_valid[16];
+    __shared__ int s_blk_bounds[2]; // [blk_min_kv, blk_max_kv]
+
+    if (tid < 16) {
+        const int tok_sub = tid / q_group;
+        const int tok = tok_base + tok_sub;
+        const bool valid_row = (tid < active_rows) && (tok < batch.total_tokens) &&
+                               (tok >= q_start) && (tok < q_end);
+        s_row_valid[tid] = valid_row ? 1u : 0u;
+        int min_kv = 1;
+        int max_kv = 0;
+        if (valid_row) {
+            const int q_offset_in_req = tok - q_start;
+            max_kv = (batch.mask_mode == WARP34_ATTN_MASK_SYMMETRIC_WINDOW)
+                ? (seq_after - 1)
+                : (ctx_before + q_offset_in_req);
+            if (max_kv >= seq_after) max_kv = seq_after - 1;
+            min_kv = 0;
+            if (batch.sliding_window > 0) {
+                const int ref_pos = ctx_before + q_offset_in_req;
+                const int win_start = ref_pos - batch.sliding_window + 1;
+                if (win_start > min_kv) min_kv = win_start;
+            }
+        }
+        s_min_kv[tid] = min_kv;
+        s_max_kv[tid] = max_kv;
+        s_max[tid] = -FLT_MAX;
+        s_alpha[tid] = 0.f;
+        s_denom[tid] = 0.f;
+    }
+    __syncthreads();
+
+    if (tid == 0) {
+        int bmin = INT_MAX;
+        int bmax = -1;
+        for (int r = 0; r < active_rows; ++r) {
+            if (s_row_valid[r] && s_min_kv[r] <= s_max_kv[r]) {
+                if (s_min_kv[r] < bmin) bmin = s_min_kv[r];
+                if (s_max_kv[r] > bmax) bmax = s_max_kv[r];
+            }
+        }
+        s_blk_bounds[0] = bmin;
+        s_blk_bounds[1] = bmax;
+    }
+    __syncthreads();
+
+    const int blk_min_kv = s_blk_bounds[0];
+    const int blk_max_kv = s_blk_bounds[1];
+    if (blk_min_kv > blk_max_kv) {
+        if (split_k <= 1) {
+            for (int idx = tid; idx < active_rows * VEC_PER_ROW; idx += 128) {
+                const int r = idx / VEC_PER_ROW;
+                if (s_row_valid[r]) {
+                    const int v = idx % VEC_PER_ROW;
+                    const int tok = tok_base + r / q_group;
+                    const int q_off = r % q_group;
+                    __nv_bfloat16* out_row =
+                        attn_out + ((size_t)tok * num_q_heads + q_head_base + q_off) * HEAD_DIM;
+                    *reinterpret_cast<uint4*>(out_row + (v << 3)) = make_uint4(0u, 0u, 0u, 0u);
+                }
+            }
+        } else if (tid < active_rows && s_row_valid[tid]) {
+            const int tok = tok_base + tid / q_group;
+            const int q_off = tid % q_group;
+            const size_t st_idx =
+                ((size_t)tok * num_q_heads + q_head_base + q_off) * (size_t)split_k + split_idx;
+            split_stats[st_idx] = make_float2(-FLT_MAX, 0.f);
+        }
+        return;
+    }
+
+    const int first_tile = (blk_min_kv > 0) ? (blk_min_kv / TILE) : 0;
+    const int last_tile = blk_max_kv / TILE;
+    const int num_tiles = last_tile - first_tile + 1;
+    const int tiles_per_split = (num_tiles + split_k - 1) / split_k;
+    const int my_t0 = first_tile + split_idx * tiles_per_split;
+    const int my_t1_unclamped = my_t0 + tiles_per_split;
+    const int my_t1 = (my_t1_unclamped < last_tile + 1) ? my_t1_unclamped : (last_tile + 1);
+    if (split_k > 1 && my_t0 >= my_t1) {
+        if (tid < active_rows && s_row_valid[tid]) {
+            const int tok = tok_base + tid / q_group;
+            const int q_off = tid % q_group;
+            const size_t st_idx =
+                ((size_t)tok * num_q_heads + q_head_base + q_off) * (size_t)split_k + split_idx;
+            split_stats[st_idx] = make_float2(-FLT_MAX, 0.f);
+        }
+        return;
+    }
+
+    for (int idx = tid; idx < 16 * VEC_PER_ROW; idx += 128) {
+        const int r = idx / VEC_PER_ROW;
+        const int v = idx % VEC_PER_ROW;
+        if (r < active_rows && s_row_valid[r]) {
+            const int tok = tok_base + r / q_group;
+            const int q_off = r % q_group;
+            const __nv_bfloat16* q_row =
+                q_in + ((size_t)tok * num_q_heads + q_head_base + q_off) * HEAD_DIM;
+            *reinterpret_cast<uint4*>(&s_q[r][v << 3]) =
+                *reinterpret_cast<const uint4*>(q_row + (v << 3));
+        } else {
+            *reinterpret_cast<uint4*>(&s_q[r][v << 3]) = make_uint4(0u, 0u, 0u, 0u);
+        }
+    }
+    __syncthreads();
+
+    auto ptx_exp2 = [](float x) {
+        float y;
+        asm volatile("ex2.approx.ftz.f32 %0, %1;" : "=f"(y) : "f"(x));
+        return y;
+    };
+    auto ptx_rcp = [](float x) {
+        float y;
+        asm volatile("rcp.approx.ftz.f32 %0, %1;" : "=f"(y) : "f"(x));
+        return y;
+    };
+
+    float num_frag[V_STEPS][4];
+#pragma unroll
+    for (int step = 0; step < V_STEPS; ++step) {
+        num_frag[step][0] = 0.f;
+        num_frag[step][1] = 0.f;
+        num_frag[step][2] = 0.f;
+        num_frag[step][3] = 0.f;
+    }
+
+    const int32_t* req_blocks = batch.block_tables;
+    const float scale = batch.sm_scale * 1.4426950408889634f;
+    const int row_r = tid >> 3;
+    const int sub_lane = tid & 7;
+    const int min_g0 = s_min_kv[group_id];
+    const int max_g0 = s_max_kv[group_id];
+    const int min_g8 = s_min_kv[group_id + 8];
+    const int max_g8 = s_max_kv[group_id + 8];
+    const int min_rr = s_min_kv[row_r];
+    const int max_rr = s_max_kv[row_r];
+    const bool rr_valid = (row_r < active_rows) && (s_row_valid[row_r] != 0);
+
+    for (int tile_idx = my_t0; tile_idx < my_t1; ++tile_idx) {
+        const int base = tile_idx * TILE;
+        for (int idx = tid; idx < TILE * VEC_PER_ROW; idx += 128) {
+            const int t = idx / VEC_PER_ROW;
+            const int v = idx % VEC_PER_ROW;
+            const int kv = base + t;
+            if (kv >= blk_min_kv && kv <= blk_max_kv) {
+                const uint8_t* kp = (const uint8_t*)(uintptr_t)layout.k_base
+                    + (size_t)req_blocks[kv >> 4] * layout.k_page_stride_bytes
+                    + (size_t)kv_head * layout.k_head_stride_bytes
+                    + (size_t)(kv & 15) * layout.k_token_stride_bytes;
+                *reinterpret_cast<uint4*>(&s_kv[t][v << 3]) =
+                    *reinterpret_cast<const uint4*>(kp + (v << 4));
+            } else {
+                *reinterpret_cast<uint4*>(&s_kv[t][v << 3]) = make_uint4(0u, 0u, 0u, 0u);
+            }
+        }
+        __syncthreads();
+
+        for (int t = wid * 8; t < TILE; t += 32) {
+            float d0 = 0.f, d1 = 0.f, d2 = 0.f, d3 = 0.f;
+#pragma unroll
+            for (int ks = 0; ks < K_STEPS; ++ks) {
+                const int col = ks * 16 + 2 * tid_in_grp;
+                const uint32_t a0 = *reinterpret_cast<const uint32_t*>(&s_q[group_id][col]);
+                const uint32_t a1 = *reinterpret_cast<const uint32_t*>(&s_q[group_id + 8][col]);
+                const uint32_t a2 = *reinterpret_cast<const uint32_t*>(&s_q[group_id][col + 8]);
+                const uint32_t a3 = *reinterpret_cast<const uint32_t*>(&s_q[group_id + 8][col + 8]);
+                const uint32_t b0 = *reinterpret_cast<const uint32_t*>(&s_kv[t + group_id][col]);
+                const uint32_t b1 = *reinterpret_cast<const uint32_t*>(&s_kv[t + group_id][col + 8]);
+                asm volatile(
+                    "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
+                    "{%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};\n"
+                    : "+f"(d0), "+f"(d1), "+f"(d2), "+f"(d3)
+                    : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+            }
+            const int kv0 = base + t + 2 * tid_in_grp;
+            const int kv1 = kv0 + 1;
+            scores[group_id][t + 2 * tid_in_grp] =
+                (kv0 >= min_g0 && kv0 <= max_g0) ? d0 : -FLT_MAX;
+            scores[group_id][t + 2 * tid_in_grp + 1] =
+                (kv1 >= min_g0 && kv1 <= max_g0) ? d1 : -FLT_MAX;
+            scores[group_id + 8][t + 2 * tid_in_grp] =
+                (kv0 >= min_g8 && kv0 <= max_g8) ? d2 : -FLT_MAX;
+            scores[group_id + 8][t + 2 * tid_in_grp + 1] =
+                (kv1 >= min_g8 && kv1 <= max_g8) ? d3 : -FLT_MAX;
+        }
+        __syncthreads();
+
+        const float prev_max = s_max[row_r];
+        float next_max = prev_max;
+#pragma unroll
+        for (int t = sub_lane; t < TILE; t += 8) {
+            next_max = fmaxf(next_max, scores[row_r][t]);
+        }
+        next_max = fmaxf(next_max, __shfl_xor_sync(0xffffffffu, next_max, 4));
+        next_max = fmaxf(next_max, __shfl_xor_sync(0xffffffffu, next_max, 2));
+        next_max = fmaxf(next_max, __shfl_xor_sync(0xffffffffu, next_max, 1));
+        const float alpha = (next_max == -FLT_MAX) ? 0.f : ptx_exp2(prev_max * scale - next_max * scale);
+        __syncwarp();
+        if (sub_lane == 0) {
+            s_max[row_r] = next_max;
+            s_alpha[row_r] = alpha;
+            s_denom[row_r] *= alpha;
+        }
+#pragma unroll
+        for (int t = sub_lane; t < TILE; t += 8) {
+            const int kv = base + t;
+            p_bits[row_r][t] = (rr_valid && kv >= min_rr && kv <= max_rr)
+                ? __bfloat16_as_ushort(__float2bfloat16_rn(ptx_exp2(scores[row_r][t] * scale - next_max * scale)))
+                : 0u;
+        }
+        for (int idx = tid; idx < TILE * VEC_PER_ROW; idx += 128) {
+            const int t = idx / VEC_PER_ROW;
+            const int v = idx % VEC_PER_ROW;
+            const int kv = base + t;
+            if (kv >= blk_min_kv && kv <= blk_max_kv) {
+                const uint8_t* vp = (const uint8_t*)(uintptr_t)layout.v_base
+                    + (size_t)req_blocks[kv >> 4] * layout.v_page_stride_bytes
+                    + (size_t)kv_head * layout.v_head_stride_bytes
+                    + (size_t)(kv & 15) * layout.v_token_stride_bytes;
+                *reinterpret_cast<uint4*>(&s_kv[t][v << 3]) =
+                    *reinterpret_cast<const uint4*>(vp + (v << 4));
+            } else {
+                *reinterpret_cast<uint4*>(&s_kv[t][v << 3]) = make_uint4(0u, 0u, 0u, 0u);
+            }
+        }
+        __syncthreads();
+
+        const float al0 = s_alpha[group_id];
+        const float al1 = s_alpha[group_id + 8];
+#pragma unroll
+        for (int step = 0; step < V_STEPS; ++step) {
+            num_frag[step][0] *= al0;
+            num_frag[step][1] *= al0;
+            num_frag[step][2] *= al1;
+            num_frag[step][3] *= al1;
+        }
+        float den0 = (wid == 0 && tid_in_grp == 0) ? s_denom[group_id] : 0.f;
+        float den1 = (wid == 0 && tid_in_grp == 0) ? s_denom[group_id + 8] : 0.f;
+        for (int chunk = 0; chunk < TILE; chunk += 16) {
+            const uint32_t pa0 = *reinterpret_cast<const uint32_t*>(&p_bits[group_id][chunk + 2 * tid_in_grp]);
+            const uint32_t pa1 = *reinterpret_cast<const uint32_t*>(&p_bits[group_id + 8][chunk + 2 * tid_in_grp]);
+            const uint32_t pa2 = *reinterpret_cast<const uint32_t*>(&p_bits[group_id][chunk + 8 + 2 * tid_in_grp]);
+            const uint32_t pa3 = *reinterpret_cast<const uint32_t*>(&p_bits[group_id + 8][chunk + 8 + 2 * tid_in_grp]);
+            if (wid == 0) {
+                float d0 = den0, d1 = 0.f, d2 = den1, d3 = 0.f;
+                const uint32_t ones = (lane < 4) ? 0x3f803f80u : 0u;
+                asm volatile(
+                    "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
+                    "{%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};\n"
+                    : "+f"(d0), "+f"(d1), "+f"(d2), "+f"(d3)
+                    : "r"(pa0), "r"(pa1), "r"(pa2), "r"(pa3), "r"(ones), "r"(ones));
+                if (tid_in_grp == 0) {
+                    den0 = d0;
+                    den1 = d2;
+                }
+            }
+            const int k0 = chunk + 2 * tid_in_grp;
+            const int k1 = k0 + 1;
+            const int k2 = k0 + 8;
+            const int k3 = k2 + 1;
+#pragma unroll
+            for (int step = 0; step < V_STEPS; ++step) {
+                const int col = wid * WARP_COLS + step * 8 + group_id;
+                const uint32_t vb0 = (uint32_t)s_kv[k0][col] | ((uint32_t)s_kv[k1][col] << 16);
+                const uint32_t vb1 = (uint32_t)s_kv[k2][col] | ((uint32_t)s_kv[k3][col] << 16);
+                asm volatile(
+                    "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
+                    "{%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};\n"
+                    : "+f"(num_frag[step][0]), "+f"(num_frag[step][1]),
+                      "+f"(num_frag[step][2]), "+f"(num_frag[step][3])
+                    : "r"(pa0), "r"(pa1), "r"(pa2), "r"(pa3), "r"(vb0), "r"(vb1));
+            }
+        }
+        if (wid == 0 && tid_in_grp == 0) {
+            s_denom[group_id] = den0;
+            s_denom[group_id + 8] = den1;
+        }
+        __syncthreads();
+    }
+
+    if (split_k <= 1) {
+        if (group_id < active_rows && s_row_valid[group_id]) {
+            const float d_rcp = (s_max[group_id] > -FLT_MAX && s_denom[group_id] > 0.f)
+                ? ptx_rcp(s_denom[group_id])
+                : 0.f;
+            const int tok = tok_base + group_id / q_group;
+            const int q_off = group_id % q_group;
+            __nv_bfloat16* out_row =
+                attn_out + ((size_t)tok * num_q_heads + q_head_base + q_off) * HEAD_DIM;
+#pragma unroll
+            for (int step = 0; step < V_STEPS; ++step) {
+                const int col0 = wid * WARP_COLS + step * 8 + 2 * tid_in_grp;
+                out_row[col0] = __float2bfloat16_rn(num_frag[step][0] * d_rcp);
+                out_row[col0 + 1] = __float2bfloat16_rn(num_frag[step][1] * d_rcp);
+            }
+        }
+        if (group_id + 8 < active_rows && s_row_valid[group_id + 8]) {
+            const float d_rcp = (s_max[group_id + 8] > -FLT_MAX && s_denom[group_id + 8] > 0.f)
+                ? ptx_rcp(s_denom[group_id + 8])
+                : 0.f;
+            const int tok = tok_base + (group_id + 8) / q_group;
+            const int q_off = (group_id + 8) % q_group;
+            __nv_bfloat16* out_row =
+                attn_out + ((size_t)tok * num_q_heads + q_head_base + q_off) * HEAD_DIM;
+#pragma unroll
+            for (int step = 0; step < V_STEPS; ++step) {
+                const int col0 = wid * WARP_COLS + step * 8 + 2 * tid_in_grp;
+                out_row[col0] = __float2bfloat16_rn(num_frag[step][2] * d_rcp);
+                out_row[col0 + 1] = __float2bfloat16_rn(num_frag[step][3] * d_rcp);
+            }
+        }
+    } else {
+        if (group_id < active_rows && s_row_valid[group_id]) {
+            const int tok = tok_base + group_id / q_group;
+            const int q_off = group_id % q_group;
+            const size_t st_idx =
+                ((size_t)tok * num_q_heads + q_head_base + q_off) * (size_t)split_k + split_idx;
+            if (wid == 0 && tid_in_grp == 0) {
+                split_stats[st_idx] = (s_max[group_id] > -FLT_MAX && s_denom[group_id] > 0.f)
+                    ? make_float2(s_max[group_id] * scale, s_denom[group_id])
+                    : make_float2(-FLT_MAX, 0.f);
+            }
+            float* p_row = split_partial_num + st_idx * HEAD_DIM;
+#pragma unroll
+            for (int step = 0; step < V_STEPS; ++step) {
+                const int col0 = wid * WARP_COLS + step * 8 + 2 * tid_in_grp;
+                p_row[col0] = num_frag[step][0];
+                p_row[col0 + 1] = num_frag[step][1];
+            }
+        }
+        if (group_id + 8 < active_rows && s_row_valid[group_id + 8]) {
+            const int tok = tok_base + (group_id + 8) / q_group;
+            const int q_off = (group_id + 8) % q_group;
+            const size_t st_idx =
+                ((size_t)tok * num_q_heads + q_head_base + q_off) * (size_t)split_k + split_idx;
+            if (wid == 0 && tid_in_grp == 0) {
+                split_stats[st_idx] = (s_max[group_id + 8] > -FLT_MAX && s_denom[group_id + 8] > 0.f)
+                    ? make_float2(s_max[group_id + 8] * scale, s_denom[group_id + 8])
+                    : make_float2(-FLT_MAX, 0.f);
+            }
+            float* p_row = split_partial_num + st_idx * HEAD_DIM;
+#pragma unroll
+            for (int step = 0; step < V_STEPS; ++step) {
+                const int col0 = wid * WARP_COLS + step * 8 + 2 * tid_in_grp;
+                p_row[col0] = num_frag[step][2];
+                p_row[col0 + 1] = num_frag[step][3];
+            }
+        }
+    }
+}
+
+template <int HEAD_DIM>
+__global__ void paged_attention_gqa_splitk_reduce_bf16_kernel(
+    warp34_attention_batch batch,
+    const float* __restrict__ split_partial_num,
+    const float2* __restrict__ split_stats,
+    __nv_bfloat16* __restrict__ attn_out,
+    int num_q_heads,
+    int split_k) {
+    if (batch.valid_req_mask != nullptr && batch.valid_req_mask[0] == 0) return;
+    const int tok = (int)blockIdx.x;
+    const int q_h = (int)blockIdx.y;
+    if (tok >= batch.total_tokens) return;
+    const int q_lo = batch.query_start_loc[0];
+    const int q_hi = batch.query_start_loc[1];
+    if (tok < q_lo || tok >= q_hi) return;
+
+    __shared__ float2 s_st[16];
+    const int tid = (int)threadIdx.x;
+    const size_t base_st = ((size_t)tok * num_q_heads + q_h) * (size_t)split_k;
+    if (tid < split_k) {
+        s_st[tid] = split_stats[base_st + tid];
+    }
+    __syncthreads();
+
+    float m_global = -FLT_MAX;
+    for (int s = 0; s < split_k; ++s) {
+        m_global = fmaxf(m_global, s_st[s].x);
+    }
+    __nv_bfloat16* out_row = attn_out + ((size_t)tok * num_q_heads + q_h) * HEAD_DIM;
+    if (m_global == -FLT_MAX) {
+        for (int col = tid; col < HEAD_DIM; col += 128) {
+            out_row[col] = __float2bfloat16_rn(0.f);
+        }
+        return;
+    }
+
+    auto ptx_exp2 = [](float x) {
+        float y;
+        asm volatile("ex2.approx.ftz.f32 %0, %1;" : "=f"(y) : "f"(x));
+        return y;
+    };
+    auto ptx_rcp = [](float x) {
+        float y;
+        asm volatile("rcp.approx.ftz.f32 %0, %1;" : "=f"(y) : "f"(x));
+        return y;
+    };
+
+    __shared__ float s_w[16];
+    __shared__ float s_inv_denom;
+    if (tid == 0) {
+        float denom = 0.f;
+        for (int s = 0; s < split_k; ++s) {
+            const float w = (s_st[s].x > -FLT_MAX && s_st[s].y > 0.f)
+                ? ptx_exp2(s_st[s].x - m_global)
+                : 0.f;
+            s_w[s] = w;
+            denom += w * s_st[s].y;
+        }
+        s_inv_denom = (denom > 0.f) ? ptx_rcp(denom) : 0.f;
+    }
+    __syncthreads();
+    const float inv_denom = s_inv_denom;
+
+    constexpr int COLS_PER_THREAD = HEAD_DIM / 128;
+#pragma unroll
+    for (int c = 0; c < COLS_PER_THREAD; ++c) {
+        const int col = tid + c * 128;
+        float acc = 0.f;
+        for (int s = 0; s < split_k; ++s) {
+            const float w = s_w[s];
+            if (w > 0.f) {
+                acc += w * split_partial_num[(base_st + s) * HEAD_DIM + col];
+            }
+        }
+        out_row[col] = __float2bfloat16_rn(acc * inv_denom);
+    }
+}
+
 } // namespace warp34_attn
 
 extern "C" int warp34_kv_cache_write_strided_bf16(const warp34_exec* ex, const warp34_kv_layer_layout* layout,
@@ -1222,6 +1709,76 @@ extern "C" int warp34_paged_attention_bf16(const warp34_exec* ex, const warp34_k
             }
         }
         const int q_subgroups = gqa_ratio / q_group;
+        const int kv_groups = layout->local_kv_heads * q_subgroups;
+        warp34_device_props dev_props{};
+        const int sm_count =
+            (warp34_get_current_device_props(&dev_props) == 0 &&
+             dev_props.multi_processor_count > 0)
+                ? dev_props.multi_processor_count
+                : 84;
+        const int unpacked_ctas = batch->total_tokens * kv_groups;
+        if (batch->num_reqs == 1 && batch->valid_token_mask == nullptr &&
+            q_group <= 8 && batch->total_tokens > 1 && unpacked_ctas < sm_count) {
+            int tok_group = 16 / q_group;
+            if (tok_group > batch->total_tokens) tok_group = batch->total_tokens;
+            const int tok_blocks = (batch->total_tokens + tok_group - 1) / tok_group;
+            const int tile = (layout->head_dim <= 128) ? 64 : 16;
+            const int max_win = (batch->sliding_window > 0 &&
+                                 (batch->max_seq_len <= 0 || batch->sliding_window < batch->max_seq_len))
+                ? batch->sliding_window
+                : batch->max_seq_len;
+            const int max_tiles = (max_win > 0) ? ((max_win + tile - 1) / tile) : 1;
+            int split_k = 1;
+            if (max_tiles >= 24) {
+                split_k = 8;
+            } else if (max_tiles >= 8) {
+                split_k = 4;
+            }
+            float* split_partial = nullptr;
+            float2* split_stats = nullptr;
+            if (split_k > 1) {
+                const size_t total_entries =
+                    (size_t)batch->total_tokens * (size_t)num_q_heads * (size_t)split_k;
+                const size_t partial_bytes =
+                    ((total_entries * (size_t)layout->head_dim * sizeof(float)) + 15u) & ~size_t(15u);
+                const size_t stats_bytes = total_entries * sizeof(float2);
+                if (ex->scratch_ptr != 0 && (ex->scratch_ptr & 15u) == 0u &&
+                    ex->scratch_size >= partial_bytes + stats_bytes) {
+                    split_partial = reinterpret_cast<float*>((uintptr_t)ex->scratch_ptr);
+                    split_stats = reinterpret_cast<float2*>((uintptr_t)(ex->scratch_ptr + partial_bytes));
+                } else {
+                    split_k = 1;
+                }
+            }
+            dim3 pgrid(
+                (unsigned)tok_blocks,
+                (unsigned)(layout->local_kv_heads * q_subgroups),
+                (unsigned)split_k);
+            if (layout->head_dim == 128) {
+                warp34_attn::paged_attention_gqa_packed_bf16_kernel<128><<<pgrid, 128, 0, (cudaStream_t)ex->stream>>>(
+                    *layout, *batch, (const __nv_bfloat16*)q, (__nv_bfloat16*)out,
+                    split_partial, split_stats, num_q_heads, gqa_ratio, q_group, q_subgroups,
+                    tok_group, split_k);
+            } else {
+                warp34_attn::paged_attention_gqa_packed_bf16_kernel<256><<<pgrid, 128, 0, (cudaStream_t)ex->stream>>>(
+                    *layout, *batch, (const __nv_bfloat16*)q, (__nv_bfloat16*)out,
+                    split_partial, split_stats, num_q_heads, gqa_ratio, q_group, q_subgroups,
+                    tok_group, split_k);
+            }
+            if (split_k > 1) {
+                cudaError_t perr = cudaGetLastError();
+                if (perr != cudaSuccess) return (int)perr;
+                dim3 rgrid((unsigned)batch->total_tokens, (unsigned)num_q_heads);
+                if (layout->head_dim == 128) {
+                    warp34_attn::paged_attention_gqa_splitk_reduce_bf16_kernel<128><<<rgrid, 128, 0, (cudaStream_t)ex->stream>>>(
+                        *batch, split_partial, split_stats, (__nv_bfloat16*)out, num_q_heads, split_k);
+                } else {
+                    warp34_attn::paged_attention_gqa_splitk_reduce_bf16_kernel<256><<<rgrid, 128, 0, (cudaStream_t)ex->stream>>>(
+                        *batch, split_partial, split_stats, (__nv_bfloat16*)out, num_q_heads, split_k);
+                }
+            }
+            return (int)cudaGetLastError();
+        }
         dim3 grid((unsigned)batch->total_tokens, (unsigned)(layout->local_kv_heads * q_subgroups));
         if (layout->head_dim == 128) {
             warp34_attn::paged_attention_gqa_bf16_kernel<128><<<grid, 128, 0, (cudaStream_t)ex->stream>>>(

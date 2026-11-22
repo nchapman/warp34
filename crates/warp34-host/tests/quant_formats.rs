@@ -1477,3 +1477,140 @@ fn marlin_w4a8_prefill_flag_gates_m64_and_protects_overlapping_scratch() {
         );
     }
 }
+
+#[test]
+fn quantize_f16_to_u8b128_lm_head_marlin_gemm_matches_fp16_logits() {
+    use warp34_host::loader::{dequant_u8b128_n_major_to_f16, quantize_f16_n_major_to_u8b128};
+
+    let _guard = GPU_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _dev = CudaDevice::set_current(0).unwrap();
+    let stream = CudaStream::new(0).unwrap();
+    let ex = stream.exec(0, 0);
+
+    // Representative LM-head tile geometry (`group_size = 128` as used in `model/weights.rs`).
+    let (n, k, group_size) = (512usize, 512usize, 128usize);
+    let weight_f16: Vec<u16> = (0..n * k)
+        .map(|i| {
+            let r = i / k;
+            let c = i % k;
+            if r == 0 && c < group_size {
+                0u16 // include an all-zero group inside the quantized LM head
+            } else {
+                let v = (((r * 97 + c * 31 + (r ^ c) * 19) % 503) as f32 - 251.0) / 512.0;
+                f32_to_f16(v)
+            }
+        })
+        .collect();
+
+    let (packed, scales) = quantize_f16_n_major_to_u8b128(&weight_f16, n, k, group_size);
+    let deq_f16 = dequant_u8b128_n_major_to_f16(&packed, &scales, n, k, group_size);
+
+    let d_packed = upload(&packed, &stream);
+    let d_repacked = DeviceBuffer::alloc(0, packed.len() * 4).unwrap();
+    let d_scales = upload(
+        &marlin_permute_scales_from_n_major(&scales, k, n, group_size),
+        &stream,
+    );
+    let workspace = DeviceBuffer::alloc(0, 65536 * 4).unwrap();
+    assert_eq!(
+        // SAFETY: `d_packed` and `d_repacked` are valid device allocations sized `[N, K/4]`.
+        unsafe {
+            ffi::warp34_marlin_repack_int8(
+                &ex,
+                d_packed.addr() as *const u32,
+                d_repacked.addr() as *mut u32,
+                k as i64,
+                n as i64,
+            )
+        },
+        0
+    );
+
+    for m in [1usize, 8, 16] {
+        let acts: Vec<u16> = (0..m * k)
+            .map(|i| f32_to_f16((((i * 29 + (i / k) * 43) % 127) as f32 - 63.0) / 64.0))
+            .collect();
+        let mut ref_deq_logits = vec![0.0f32; m * n];
+        let mut ref_fp16_logits = vec![0.0f32; m * n];
+        for row in 0..m {
+            for col in 0..n {
+                let mut acc_deq = 0.0f32;
+                let mut acc_orig = 0.0f32;
+                for j in 0..k {
+                    let a = f16_to_f32(acts[row * k + j]);
+                    acc_deq += a * f16_to_f32(deq_f16[col * k + j]);
+                    acc_orig += a * f16_to_f32(weight_f16[col * k + j]);
+                }
+                ref_deq_logits[row * n + col] = acc_deq;
+                ref_fp16_logits[row * n + col] = acc_orig;
+            }
+        }
+
+        let d_acts = upload(&acts, &stream);
+        let d_out = DeviceBuffer::alloc(0, m * n * 2).unwrap();
+        workspace.zero_async(&stream).unwrap();
+        assert_eq!(
+            // SAFETY: device pointers and sizes match `[m, k] x [k, n]` Marlin U8B128 GEMM.
+            unsafe {
+                ffi::warp34_marlin_gemm_f16u8(
+                    &ex,
+                    d_acts.addr() as *const c_void,
+                    d_repacked.addr() as *const c_void,
+                    d_scales.addr() as *const c_void,
+                    d_out.addr() as *mut c_void,
+                    workspace.addr() as *mut i32,
+                    m as i64,
+                    n as i64,
+                    k as i64,
+                    65536,
+                    (group_size / 16) as i32,
+                )
+            },
+            0
+        );
+        let mut got = vec![0u16; m * n];
+        d_out.copy_to_host(&mut got, &stream).unwrap();
+        stream.synchronize().unwrap();
+
+        // Exact Marlin W8A16 parity vs dequantized U8B128 reference AND tight tracking of
+        // original FP16 LM-head logits (rel-L2 < 0.6%, max error < 0.08 across K=512).
+        assert_close(&got, &ref_deq_logits, &format!("u8b128 deq M={m}"));
+        let mut err_sq = 0.0f64;
+        let mut ref_sq = 0.0f64;
+        for row in 0..m {
+            let mut max_err = 0.0f32;
+            for col in 0..n {
+                let g = f16_to_f32(got[row * n + col]);
+                let r = ref_fp16_logits[row * n + col];
+                let diff = (g - r).abs();
+                max_err = max_err.max(diff);
+                err_sq += f64::from(diff).powi(2);
+                ref_sq += f64::from(r).powi(2);
+            }
+            assert!(
+                max_err < 0.08,
+                "M={m} row={row}: quantized U8B128 LM-head logit error {max_err} >= 0.08"
+            );
+            let mut sorted = ref_fp16_logits[row * n..(row + 1) * n].to_vec();
+            sorted.sort_by(|a, b| b.total_cmp(a));
+            if sorted[0] - sorted[1] > 0.08 {
+                let argmax_got = (0..n)
+                    .max_by(|&a, &b| {
+                        f16_to_f32(got[row * n + a]).total_cmp(&f16_to_f32(got[row * n + b]))
+                    })
+                    .unwrap();
+                let argmax_orig = (0..n)
+                    .max_by(|&a, &b| {
+                        ref_fp16_logits[row * n + a].total_cmp(&ref_fp16_logits[row * n + b])
+                    })
+                    .unwrap();
+                assert_eq!(
+                    argmax_got, argmax_orig,
+                    "M={m} row={row} greedy argmax drift"
+                );
+            }
+        }
+        let rel_l2 = (err_sq / ref_sq).sqrt();
+        assert!(rel_l2 < 0.006, "M={m}: rel_l2={rel_l2} >= 0.006");
+    }
+}

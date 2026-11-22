@@ -510,7 +510,7 @@ impl BatchedSpecVerifyGraphIo {
     ) -> Result<[i32; BATCHED_SPEC_META_I32_LEN]> {
         let num_reqs = slices.len();
         if !(2..=MAX_BATCHED_SPEC_REQS).contains(&num_reqs)
-            || !(2..=MAX_SPEC_VERIFY_TOKENS).contains(&max_verify_tokens)
+            || !(1..=MAX_SPEC_VERIFY_TOKENS).contains(&max_verify_tokens)
         {
             return Err(loader_err("invalid geometry for BatchedSpecVerifyGraphIo"));
         }
