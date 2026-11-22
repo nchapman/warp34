@@ -1536,6 +1536,36 @@ __device__ __forceinline__ void qsa_dequant_kv_row_to_smem_warp(
         out_u4.z = *reinterpret_cast<const uint32_t*>(&h45);
         out_u4.w = *reinterpret_cast<const uint32_t*>(&h67);
         *reinterpret_cast<uint4*>(dst_row + (sb << 6) + (sub << 3)) = out_u4;
+#if __CUDA_ARCH__ >= 890
+    } else if (kv_format == WARP34_KV_FORMAT_FP8_E4M3) {
+        const qsa_block_fp8_e4m3_256* blk = reinterpret_cast<const qsa_block_fp8_e4m3_256*>(ptr);
+        const float scale = (lane < 16) ? blk->d0 : blk->d1;
+        const uint32_t* qs32 = reinterpret_cast<const uint32_t*>(blk->qs + (lane << 3));
+        const uint32_t w0 = qs32[0];
+        const uint32_t w1 = qs32[1];
+        const __half2_raw hr01 =
+            __nv_cvt_fp8x2_to_halfraw2(static_cast<uint16_t>(w0 & 0xFFFFu), __NV_E4M3);
+        const __half2_raw hr23 =
+            __nv_cvt_fp8x2_to_halfraw2(static_cast<uint16_t>(w0 >> 16), __NV_E4M3);
+        const __half2_raw hr45 =
+            __nv_cvt_fp8x2_to_halfraw2(static_cast<uint16_t>(w1 & 0xFFFFu), __NV_E4M3);
+        const __half2_raw hr67 =
+            __nv_cvt_fp8x2_to_halfraw2(static_cast<uint16_t>(w1 >> 16), __NV_E4M3);
+        const float2 f01 = __half22float2(*reinterpret_cast<const __half2*>(&hr01));
+        const float2 f23 = __half22float2(*reinterpret_cast<const __half2*>(&hr23));
+        const float2 f45 = __half22float2(*reinterpret_cast<const __half2*>(&hr45));
+        const float2 f67 = __half22float2(*reinterpret_cast<const __half2*>(&hr67));
+        const __half2 h01 = __floats2half2_rn(scale * f01.x, scale * f01.y);
+        const __half2 h23 = __floats2half2_rn(scale * f23.x, scale * f23.y);
+        const __half2 h45 = __floats2half2_rn(scale * f45.x, scale * f45.y);
+        const __half2 h67 = __floats2half2_rn(scale * f67.x, scale * f67.y);
+        uint4 out_u4;
+        out_u4.x = *reinterpret_cast<const uint32_t*>(&h01);
+        out_u4.y = *reinterpret_cast<const uint32_t*>(&h23);
+        out_u4.z = *reinterpret_cast<const uint32_t*>(&h45);
+        out_u4.w = *reinterpret_cast<const uint32_t*>(&h67);
+        *reinterpret_cast<uint4*>(dst_row + (lane << 3)) = out_u4;
+#endif
     } else {
         *reinterpret_cast<uint4*>(dst_row + (lane << 3)) =
             reinterpret_cast<const uint4*>(ptr)[lane];
@@ -2434,9 +2464,11 @@ static int launch_qsa_sparse_paged_attn_f16(
         const bool mma_kv_supported =
             (kv_layout->k_format == WARP34_KV_FORMAT_TQ4 ||
              kv_layout->k_format == WARP34_KV_FORMAT_Q8_0 ||
+             kv_layout->k_format == WARP34_KV_FORMAT_FP8_E4M3 ||
              kv_layout->k_format == WARP34_KV_FORMAT_FP16) &&
             (kv_layout->v_format == WARP34_KV_FORMAT_TQ4 ||
              kv_layout->v_format == WARP34_KV_FORMAT_Q8_0 ||
+             kv_layout->v_format == WARP34_KV_FORMAT_FP8_E4M3 ||
              kv_layout->v_format == WARP34_KV_FORMAT_FP16);
         if (mma_kv_supported && mma_full_gqa >= 4 && mma_full_gqa <= 16) {
             dim3 mma_grid(num_tokens, kv_layout->local_kv_heads, num_splits);

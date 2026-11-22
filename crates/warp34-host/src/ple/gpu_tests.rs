@@ -1443,9 +1443,9 @@ fn test_gpu_hc_ple_qsa_kernels_parity() {
     );
 
     // 6b. Verify Tensor-Core `qsa_sparse_paged_attn_mma_f16_kernel` (`num_splits == 1`) against
-    // Split-K `qsa_sparse_paged_attn_gqa_f16_kernel` (`num_splits > 1`) across `TQ4` and `Q8_0`
-    // KV caches (with Rademacher+WHT256 transform on `TQ4`).
-    for (label, kv_fmt, kv_xform, row_stride) in [
+    // Split-K `qsa_sparse_paged_attn_gqa_f16_kernel` (`num_splits > 1`) across `TQ4`, `Q8_0`,
+    // and (on `sm_89+`) `FP8_E4M3` KV caches.
+    let mut mma_kv_cases = vec![
         (
             "TQ4",
             WARP34_KV_FORMAT_TQ4,
@@ -1458,7 +1458,21 @@ fn test_gpu_hc_ple_qsa_kernels_parity() {
             WARP34_KV_TRANSFORM_IDENTITY,
             272usize,
         ),
-    ] {
+    ];
+    if CudaDevice::set_current(0)
+        .unwrap()
+        .props()
+        .unwrap()
+        .supports_fp8_kv()
+    {
+        mma_kv_cases.push((
+            "FP8_E4M3",
+            WARP34_KV_FORMAT_FP8_E4M3,
+            WARP34_KV_TRANSFORM_RADEMACHER_WHT256,
+            264usize,
+        ));
+    }
+    for (label, kv_fmt, kv_xform, row_stride) in mma_kv_cases {
         let q_bytes = nu_pages * block_size * row_stride;
         let d_k_q = DeviceBuffer::alloc(0, q_bytes).unwrap();
         let d_v_q = DeviceBuffer::alloc(0, q_bytes).unwrap();

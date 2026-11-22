@@ -1295,15 +1295,17 @@ impl Qwen3_5ModelRank {
                 if fork {
                     self.stream.wait_event(&self.aux_join_event)?;
                 }
-                // Never borrow the overlay tail while persistent HC/PLE/QSA data can be live.
-                let tail = if self.cfg.uses_hyper_connection()
-                    || self.cfg.uses_ple()
-                    || self.cfg.uses_qsa()
-                {
-                    0
+                // Borrow the contiguous scratch arena tail `[normed .. arena_end)` for the
+                // parallel 3-stage split-WY workspace (`pa/pb/pv` in `s.ple`, post-stack
+                // `logits`, and `ex.scratch_ptr` are not live during `warp34_gdn_recurrent_strided_f16`).
+                let arena_end = if ex.scratch_ptr == 0 {
+                    s.overlay_end
                 } else {
-                    s.overlay_end.saturating_sub(normed) as usize
+                    ex.scratch_ptr
+                        .saturating_add(ex.scratch_size as u64)
+                        .max(s.overlay_end)
                 };
+                let tail = arena_end.saturating_sub(normed) as usize;
                 let recurrent_ex = if tail > ex.scratch_size {
                     self.stream.exec(normed, tail)
                 } else {

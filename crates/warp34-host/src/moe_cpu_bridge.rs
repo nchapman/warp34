@@ -799,7 +799,23 @@ fn read_cpu_core_key(cpu: usize) -> Option<(i32, i32)> {
     ))
 }
 
+fn effective_max_workers(avail_parallelism: Option<usize>, allowed_cpus: usize) -> usize {
+    match avail_parallelism {
+        Some(avail) if avail > 0 && avail < allowed_cpus => {
+            // Inside a cgroup CFS CPU-quota container (`avail < allowed_cpus`), reserve
+            // 25% of the quota (at least 2 cores when avail >= 8) for caller, tokio, and
+            // CUDA driver threads so 15ms-spinning worker threads never trigger CFS
+            // bandwidth throttling or completion-barrier preemption stalls.
+            let reserve = if avail >= 8 { (avail / 4).max(2) } else { 0 };
+            avail.saturating_sub(reserve).clamp(1, MAX_WORKERS)
+        }
+        Some(avail) if avail > 0 => avail.min(MAX_WORKERS),
+        _ => MAX_WORKERS,
+    }
+}
+
 fn detect_worker_cpus() -> Vec<usize> {
+    let avail = std::thread::available_parallelism().ok().map(|n| n.get());
     #[cfg(target_os = "linux")]
     // SAFETY: initialized cpu_set_t, valid current-thread affinity query.
     unsafe {
@@ -807,12 +823,14 @@ fn detect_worker_cpus() -> Vec<usize> {
         if libc::sched_getaffinity(0, std::mem::size_of_val(&allowed), &mut allowed) == 0 {
             let candidates = (0..libc::CPU_SETSIZE as usize)
                 .filter(|&c| libc::CPU_ISSET(c, &allowed))
-                .map(|c| (c, read_cpu_core_key(c)));
-            return select_physical_cpus(candidates, MAX_WORKERS);
+                .map(|c| (c, read_cpu_core_key(c)))
+                .collect::<Vec<_>>();
+            let cap = effective_max_workers(avail, candidates.len());
+            return select_physical_cpus(candidates, cap);
         }
     }
-    let n = std::thread::available_parallelism().map_or(1, |n| n.get());
-    select_physical_cpus((0..n).map(|c| (c, None)), MAX_WORKERS)
+    let n = avail.unwrap_or(1);
+    select_physical_cpus((0..n).map(|c| (c, None)), n.min(MAX_WORKERS))
 }
 
 fn pin_current_thread(cpu: usize) {
@@ -1866,6 +1884,16 @@ mod tests {
         assert_eq!(
             select_physical_cpus(std::iter::empty(), MAX_WORKERS),
             vec![0]
+        );
+        // Bare-metal 16C/32T host (`avail == allowed == 32`) keeps full cap so all 16 physical cores are used.
+        assert_eq!(effective_max_workers(Some(32), 32), 32);
+        // Container with 192 host cores in `sched_getaffinity` but 36-core CFS quota (`avail == 36 < 192`)
+        // reserves 25% CFS headroom (`36 - 9 = 27` workers) to prevent CFS bandwidth throttling.
+        assert_eq!(effective_max_workers(Some(36), 192), 27);
+        let epyc_192 = (0..192).map(|c| (c, Some((0, c as i32))));
+        assert_eq!(
+            select_physical_cpus(epyc_192, effective_max_workers(Some(36), 192)).len(),
+            27
         );
     }
 

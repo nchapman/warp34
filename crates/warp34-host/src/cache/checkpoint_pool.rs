@@ -183,7 +183,7 @@ pub fn parse_available_host_ram(
         let max_trim = max_raw.trim();
         if max_trim != "max"
             && let (Ok(max_b), Ok(cur_b)) = (max_trim.parse::<u64>(), cur_raw.trim().parse::<u64>())
-            && max_b < (u64::MAX / 2)
+            && max_b < (1u64 << 60)
         {
             avail = avail.min(max_b.saturating_sub(cur_b));
         }
@@ -191,11 +191,15 @@ pub fn parse_available_host_ram(
     usize::try_from(avail).ok()
 }
 
-/// Queries available host RAM on Linux while respecting container cgroup v2 limits.
+/// Queries available host RAM on Linux while respecting container cgroup v2 and v1 limits.
 pub fn detect_available_host_ram_bytes() -> Option<usize> {
     let meminfo = std::fs::read_to_string("/proc/meminfo").ok()?;
-    let cgroup_max = std::fs::read_to_string("/sys/fs/cgroup/memory.max").ok();
-    let cgroup_cur = std::fs::read_to_string("/sys/fs/cgroup/memory.current").ok();
+    let cgroup_max = std::fs::read_to_string("/sys/fs/cgroup/memory.max")
+        .or_else(|_| std::fs::read_to_string("/sys/fs/cgroup/memory/memory.limit_in_bytes"))
+        .ok();
+    let cgroup_cur = std::fs::read_to_string("/sys/fs/cgroup/memory.current")
+        .or_else(|_| std::fs::read_to_string("/sys/fs/cgroup/memory/memory.usage_in_bytes"))
+        .ok();
     parse_available_host_ram(&meminfo, cgroup_max.as_deref(), cgroup_cur.as_deref())
 }
 
@@ -865,6 +869,15 @@ mod tests {
         assert_eq!(tight, Some(8 * 1024 * 1024 * 1024));
         let slots_tight = plan_auto_host_checkpoint_slots(layout.bundle_bytes, 1, tight);
         assert!((20..=26).contains(&slots_tight), "got {slots_tight}");
+
+        // Linux cgroup v1 unlimited sentinel (`0x7ffffffffffff000` = 9223372036854771712)
+        // must be ignored rather than clamping available RAM.
+        let cgroup_v1_unlimited = parse_available_host_ram(
+            "MemAvailable:   67108864 kB\n",
+            Some("9223372036854771712\n"),
+            Some("9223372036854770000\n"),
+        );
+        assert_eq!(cgroup_v1_unlimited, Some(64 * 1024 * 1024 * 1024));
     }
 
     #[cfg(feature = "cuda")]

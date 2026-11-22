@@ -808,6 +808,32 @@ mod serving_capacity_tests {
         )
         .expect("tiered 2048-token scratch layout");
         assert!(tiered_2k_scratch_bytes <= tiered_bytes);
+        for (tp, min_expected) in [(1usize, 3840usize), (2usize, 6016usize)] {
+            let streams = tiered_cfg.hc_count.max(1);
+            let cap_512m = crate::model::scratch::token_capacity_up_to(
+                crate::scheduler::DEFAULT_SCRATCH_ARENA_BYTES,
+                tiered_cfg.hidden_size,
+                tiered_cfg.vocab_size / tp,
+                16,
+                256,
+                |tokens| {
+                    let hc_extra = tokens * (streams - 1) * tiered_cfg.hidden_size * 2
+                        + tokens * streams * 4
+                        + 512;
+                    let transform = (tokens * (tiered_cfg.hidden_size.div_ceil(128) * 128) * 2
+                        + 512)
+                        .saturating_sub(8 * 1024 * 1024);
+                    crate::model::layer_scratch_layout(&tiered_cfg, tp, tokens)
+                        .ok()
+                        .map(|l| l.0 + hc_extra + transform)
+                },
+            )
+            .expect("tiered 512 MiB token capacity");
+            assert!(
+                cap_512m >= min_expected,
+                "expected >= {min_expected} tokens on TP={tp}, got {cap_512m}"
+            );
+        }
         let mut sched = SchedulerConfig::default();
         sched.clamp_for_scratch_bytes(tiered_bytes);
         assert_eq!(

@@ -39,27 +39,27 @@ pub(super) fn layer_layout(d: Dimensions, tokens: usize) -> Option<LayerLayout> 
     let mut gdn = Phase::default();
     let mut ffn = Phase::default();
     let mut ple_hc = Phase::default();
-    let fa_offsets = [
-        fa.alloc(&[
-            tokens,
-            d.q.checked_mul(2)?.checked_add(d.kv.checked_mul(2)?)?,
-            2,
-        ])?,
-        fa.alloc(&[tokens, d.q, 2])?,
-        fa.alloc(&[tokens, d.kv, 2])?,
-        fa.alloc(&[tokens, d.q, 2])?,
-        fa.alloc(&[tokens, d.q, 2])?,
-        fa.alloc(&[tokens, d.q, 2])?,
-    ];
+    let fa_qkv = fa.alloc(&[
+        tokens,
+        d.q.checked_mul(2)?.checked_add(d.kv.checked_mul(2)?)?,
+        2,
+    ])?;
+    let fa_q = fa.alloc(&[tokens, d.q, 2])?;
+    let fa_k = fa.alloc(&[tokens, d.kv, 2])?;
+    let fa_gate = fa.alloc(&[tokens, d.q, 2])?;
+    let fa_gated = fa.alloc(&[tokens, d.q, 2])?;
+    let mut qsa = Phase { bytes: fa.bytes };
+    let fa_out = fa.alloc(&[tokens, d.q, 2])?;
+    let fa_offsets = [fa_qkv, fa_q, fa_k, fa_gate, fa_out, fa_gated];
     let qsa_offsets = if d.indexer_head_dim > 0 {
         [
-            fa.alloc(&[tokens, d.indexer_head_dim.checked_mul(5)?, 2])?,
-            fa.alloc(&[tokens, d.indexer_head_dim.checked_mul(4)?, 2])?,
-            fa.alloc(&[tokens, d.indexer_head_dim, 2])?,
-            fa.alloc(&[tokens, 513, 4])?,
-            fa.alloc(&[tokens, 513, 4])?,
-            fa.alloc(&[tokens, 4])?,
-            fa.alloc(&[tokens, 4])?,
+            qsa.alloc(&[tokens, d.indexer_head_dim.checked_mul(5)?, 2])?,
+            qsa.alloc(&[tokens, d.indexer_head_dim.checked_mul(4)?, 2])?,
+            qsa.alloc(&[tokens, d.indexer_head_dim, 2])?,
+            qsa.alloc(&[tokens, 513, 4])?,
+            qsa.alloc(&[tokens, 513, 4])?,
+            qsa.alloc(&[tokens, 4])?,
+            qsa.alloc(&[tokens, 4])?,
         ]
     } else {
         [0; 7]
@@ -82,10 +82,18 @@ pub(super) fn layer_layout(d: Dimensions, tokens: usize) -> Option<LayerLayout> 
         gdn.alloc(&[tokens, d.v, 2])?,
     ];
     if tokens >= 256 && d.v == d.v_heads.saturating_mul(128) && d.k.is_multiple_of(128) {
-        // Reserve split-WY workspace tail (including cached K_norm on 9B TP=1 and 27B TP=2;
-        // on 27B TP=1 `v_heads == 48`, clamp to `ffn`/`gdn` envelope so 262K single-card budget
-        // adds 0 bytes).
-        let bytes_per_tok_vh = if d.v_heads >= 48 { 800 } else { 1056 };
+        // Reserve split-WY workspace tail (including cached K_norm on 9B TP=1; on 3:1 GDN
+        // `3 * d.k <= d.v` such as 27B and `qwen4_exp` at TP=1/TP=2, `k_norm` is only
+        // 85.3 B/(tok,vh) and `forward.rs` also borrows `[s.overlay_end .. arena_end)` during
+        // GDN recurrence, so 600 B/(tok,vh) in `gdn.bytes` covers the full 729.3 B/(tok,vh)
+        // split-WY workspace while fitting >= 6,016 prefill tokens in 512 MiB on TP=2).
+        let bytes_per_tok_vh = if d.k.saturating_mul(3) <= d.v {
+            600
+        } else if d.v_heads >= 48 {
+            800
+        } else {
+            1056
+        };
         let wy_tail = gdn_offsets[4].checked_add(
             tokens
                 .checked_mul(d.v_heads)?
@@ -111,7 +119,7 @@ pub(super) fn layer_layout(d: Dimensions, tokens: usize) -> Option<LayerLayout> 
         offsets[9] = Some(ffn.alloc(&[tokens, 2])?);
     }
     Some((
-        overlay_bytes(&[fa, gdn, ffn, ple_hc]),
+        overlay_bytes(&[fa, qsa, gdn, ffn, ple_hc]),
         fa_offsets,
         gdn_offsets,
         offsets,

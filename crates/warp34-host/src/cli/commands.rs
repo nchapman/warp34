@@ -485,13 +485,13 @@ pub(crate) fn run_bench(
             };
             let (v_prompt_str, mm_imgs_a) = prepare_multimodal_prompt_and_images(
                 &engine.cfg,
-                "Describe the colors, geometry, and layout of this image in detail across several sentences.",
+                "Describe the colors, geometry, and layout of the image in detail across several sentences.",
                 &urls,
                 allow_remote_images,
             )?;
             let (_, mm_imgs_b) = prepare_multimodal_prompt_and_images(
                 &engine.cfg,
-                "Describe the colors, geometry, and layout of this image in detail across several sentences.",
+                "Describe the colors, geometry, and layout of the image in detail across several sentences.",
                 &["rgb://https://warp34.test/bench_img_b_distinct.ppm".to_string()],
                 allow_remote_images,
             )?;

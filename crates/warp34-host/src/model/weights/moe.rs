@@ -101,6 +101,7 @@ impl FfnBlockWeights {
                         let extra_ws = moe
                             .shared_down_proj
                             .as_ref()
+                            .filter(|p| !p.can_fuse_h64_from_producer())
                             .and_then(|p| p.input_transform_workspace_bytes(rows))
                             .unwrap_or(0);
                         if ex.scratch_ptr != 0
