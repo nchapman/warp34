@@ -95,9 +95,15 @@ const DFLASH_MEMO_MAX_TOKENS: usize = 4096;
 
 #[cfg(any(test, feature = "cuda"))]
 #[inline]
-pub(crate) fn memo_fits_budget(cur_tokens: usize, add_tokens: usize, row_bytes: usize) -> bool {
+pub(crate) fn memo_fits_budget(
+    kind: SpeculativeKind,
+    cur_tokens: usize,
+    add_tokens: usize,
+    row_bytes: usize,
+) -> bool {
     let total_tokens = cur_tokens.saturating_add(add_tokens);
-    let within_dflash_cap = row_bytes <= 8192 || total_tokens <= DFLASH_MEMO_MAX_TOKENS;
+    let within_dflash_cap =
+        kind != SpeculativeKind::DFlash2 || total_tokens <= DFLASH_MEMO_MAX_TOKENS;
     within_dflash_cap && total_tokens.saturating_mul(row_bytes) <= MEMO_BUDGET
 }
 
@@ -564,7 +570,14 @@ impl NativeProposer {
     ) -> Result<StagedMemoAppend> {
         if let Some(memo) = current {
             let aligned = memo.features.len() == memo.tokens.len().saturating_mul(row_bytes);
-            if !aligned || !memo_fits_budget(memo.tokens.len(), tokens.len(), row_bytes) {
+            if !aligned
+                || !memo_fits_budget(
+                    SpeculativeKind::DFlash2,
+                    memo.tokens.len(),
+                    tokens.len(),
+                    row_bytes,
+                )
+            {
                 *current = None;
             }
         }
@@ -1181,7 +1194,12 @@ impl NativeProposer {
                 if let Some(memo) = &mut self.current {
                     let aligned =
                         memo.features.len() == memo.tokens.len().saturating_mul(self.row_bytes);
-                    let within_cap = memo_fits_budget(memo.tokens.len(), skip_rows, self.row_bytes);
+                    let within_cap = memo_fits_budget(
+                        SpeculativeKind::DFlash2,
+                        memo.tokens.len(),
+                        skip_rows,
+                        self.row_bytes,
+                    );
                     if aligned && within_cap {
                         let t0 = &engine.ranks[0];
                         let copy_res: Result<()> = (|| {
@@ -1292,8 +1310,13 @@ impl NativeProposer {
         // multi-prefix workloads (`prefix-primed`, multi-session agents) never reject a warm
         // target `MambaRadixCache` hit when the drafter's active GPU slot switched prefixes.
         if let Some(memo) = &self.current {
+            let kind = match self.ranks {
+                Ranks::DFlash(_) => SpeculativeKind::DFlash2,
+                Ranks::Mtp(_) => SpeculativeKind::Mtp,
+            };
             let aligned = memo.features.len() == memo.tokens.len().saturating_mul(self.row_bytes);
-            if !aligned || !memo_fits_budget(memo.tokens.len(), tokens.len(), self.row_bytes) {
+            if !aligned || !memo_fits_budget(kind, memo.tokens.len(), tokens.len(), self.row_bytes)
+            {
                 self.current = None;
             }
         }
@@ -2990,9 +3013,29 @@ mod tests {
         ));
 
         // `memo_fits_budget` caps wide DFlash features (`20,480 B/row`) at `DFLASH_MEMO_MAX_TOKENS`
-        // (`4,096` tokens) while allowing compact MTP features (`4,096 B/row`) past `4,096`.
-        assert!(memo_fits_budget(0, 4096, 20_480));
-        assert!(!memo_fits_budget(0, 5000, 20_480));
-        assert!(memo_fits_budget(0, 5000, 4_096));
+        // (`4,096` tokens) while allowing MTP features past `4,096` up to `MEMO_BUDGET`.
+        assert!(memo_fits_budget(SpeculativeKind::DFlash2, 0, 4096, 20_480));
+        assert!(!memo_fits_budget(SpeculativeKind::DFlash2, 0, 5000, 20_480));
+        assert!(memo_fits_budget(SpeculativeKind::Mtp, 0, 5000, 4_096));
+    }
+
+    #[test]
+    fn mtp_27b_wide_hidden_memo_fits_64k_and_120k_swe_agent() {
+        // Qwen3.8-27B MTP has `hidden_size = 5120` (`10,240 B/row` > `8,192 B/row`) and has no
+        // sliding-window ring shortcut, so `memo_fits_budget` must permit 64K and 120K prefix
+        // memos up to `MEMO_BUDGET` (`4 GiB`) instead of mistaking `row_bytes > 8192` for DFlash2.
+        let mtp_27b_row_bytes = 5120 * 2;
+        assert!(memo_fits_budget(
+            SpeculativeKind::Mtp,
+            0,
+            65_536,
+            mtp_27b_row_bytes
+        ));
+        assert!(memo_fits_budget(
+            SpeculativeKind::Mtp,
+            65_536,
+            65_536,
+            mtp_27b_row_bytes
+        ));
     }
 }
