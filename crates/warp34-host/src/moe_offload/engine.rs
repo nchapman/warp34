@@ -141,7 +141,7 @@ impl TieredMoeEngine {
             let resp_ptr = mailbox.response_ptr();
             let gpu_share = if cache.k_static < k_hot && store.mapped_dev_ptr() != 0 {
                 if crate::moe_cpu_bridge::has_avx512() && k_hot >= 64 {
-                    0.25f32
+                    0.30f32
                 } else if crate::moe_cpu_bridge::has_avx512() || (num_tokens == 1 && k_hot >= 64) {
                     TIERED_MOE_CPU_BRIDGE_COLD_WEIGHT_THRESHOLD
                 } else {
@@ -153,7 +153,7 @@ impl TieredMoeEngine {
             let use_overlapped_pull = cache.k_static < k_hot
                 && store.mapped_dev_ptr() != 0
                 && crate::moe_cpu_bridge::has_avx512()
-                && num_tokens >= 2;
+                && num_tokens >= 1;
             let hybrid_desc = warp34_kernels::ffi::Warp34MoeHybridDesc {
                 d_req_slot: req_ptr,
                 x_f16: x_addr as *const core::ffi::c_void,
@@ -763,18 +763,20 @@ impl TieredMoeEngine {
                                 .max((rem_misses * cpu_share_pct) / 100);
                             (jobs, max_tok_per_job)
                         } else if num_tokens <= 384 {
+                            // Multi-rank (`TP=2`) ranks share one host CPU: cap per-rank prefill
+                            // tail offload to ultra-sparse `<= 4`-token experts so CPU evaluation
+                            // finishes well inside Pass 0 + Chunk 0 GPU compute.
                             let jobs = misses_in_step
                                 .len()
                                 .saturating_sub(ws.stage_capacity)
-                                .max(misses_in_step.len() / 5)
-                                .min(24);
-                            (jobs, 6usize)
+                                .min(12);
+                            (jobs, 4usize)
                         } else {
                             let jobs = misses_in_step
                                 .len()
-                                .saturating_sub(2 * ws.stage_capacity)
-                                .min(20);
-                            (jobs, 24usize)
+                                .saturating_sub(ws.stage_capacity)
+                                .min(8);
+                            (jobs, 3usize)
                         };
                         let mut light_candidates: Vec<(usize, usize)> = misses_in_step
                             .iter()
@@ -929,9 +931,71 @@ impl TieredMoeEngine {
                     "warp34_moe_remap_topk_ids_i32 (Pass 0)",
                 )?;
 
+                // Pre-upload `promote_victim_slots` and all `chunks.len()` per-chunk slot tables
+                // on `compute_stream` BEFORE kicking off `ws.h2d_stream`'s large expert H2D DMAs.
+                // NVIDIA GPUs serialize all `cudaMemcpyAsync(H2D)` calls through a single hardware
+                // H2D copy engine; issuing per-chunk `local_to_chunk_slot` H2D copies inside the
+                // streaming loop would stall `compute_stream` behind `next_chunk`'s 40 MB PCIe DMA.
+                let chunks: Vec<&[usize]> = gpu_misses.chunks(ws.stage_capacity).collect();
+                if !chunks.is_empty() && !promote_victim_slots.is_empty() {
+                    let max_pinned_victims = 1024usize.min(ws.d_miss_victim_slots.len_bytes / 4);
+                    if promote_victim_slots.len() <= max_pinned_victims {
+                        // SAFETY: `[0..1024]` i32s in `h_chunk_slot_pinned` are reserved for
+                        // `promote_victim_slots`, protected across calls by `pinned_h2d_done_event`.
+                        unsafe {
+                            let p_vic = ws.h_chunk_slot_pinned.host_ptr.cast::<i32>();
+                            core::ptr::copy_nonoverlapping(
+                                promote_victim_slots.as_ptr(),
+                                p_vic,
+                                promote_victim_slots.len(),
+                            );
+                            crate::cuda::check_rc(
+                                warp34_kernels::ffi::warp34_memcpy_h2d_async(
+                                    ws.d_miss_victim_slots.addr() as *mut core::ffi::c_void,
+                                    p_vic.cast(),
+                                    promote_victim_slots.len() * 4,
+                                    compute_stream.handle,
+                                ),
+                                "warp34_memcpy_h2d_async (promote_victim_slots)",
+                            )?;
+                        }
+                    } else {
+                        ws.d_miss_victim_slots
+                            .copy_from_host(&promote_victim_slots, compute_stream)?;
+                    }
+                }
+                let preuploaded_slot_tables = !chunks.is_empty()
+                    && local_len <= 512
+                    && chunks.len() <= 512
+                    && chunks.len() * local_len * 4 <= ws.d_chunk_slot_tables.len_bytes;
+                if preuploaded_slot_tables {
+                    // SAFETY: `h_chunk_slot_pinned` reserves `512 * 512` i32s starting at offset
+                    // `1024`, protected across calls by `pinned_h2d_done_event`.
+                    unsafe {
+                        let p_base = ws.h_chunk_slot_pinned.host_ptr.cast::<i32>().add(1024);
+                        let total_i32 = chunks.len() * local_len;
+                        let all_slots = core::slice::from_raw_parts_mut(p_base, total_i32);
+                        all_slots.fill(-1);
+                        for (c_idx, chunk) in chunks.iter().enumerate() {
+                            let row = &mut all_slots[c_idx * local_len..(c_idx + 1) * local_len];
+                            for (pos, &ge) in chunk.iter().enumerate() {
+                                row[ge - local_start] = pos as i32;
+                            }
+                        }
+                        crate::cuda::check_rc(
+                            warp34_kernels::ffi::warp34_memcpy_h2d_async(
+                                ws.d_chunk_slot_tables.addr() as *mut core::ffi::c_void,
+                                p_base.cast(),
+                                total_i32 * 4,
+                                compute_stream.handle,
+                            ),
+                            "warp34_memcpy_h2d_async (all local_to_chunk_slot tables)",
+                        )?;
+                    }
+                }
+
                 // Before launching Pass 0 on `compute_stream`, kick off Chunk 0 H2D DMA on `ws.h2d_stream`
                 // so hardware PCIe DMA overlaps 100% with Pass 0 GPU compute!
-                let chunks: Vec<&[usize]> = gpu_misses.chunks(ws.stage_capacity).collect();
                 if !chunks.is_empty() {
                     let c0 = chunks[0];
                     let dst_slots: Vec<i32> = (0..c0.len() as i32).collect();
@@ -954,6 +1018,7 @@ impl TieredMoeEngine {
                     top_k,
                 )?;
 
+                let mut need_lru_upload_after_chunks = false;
                 // Passes 1..=chunks.len(): Double-buffered hardware H2D DMA + Grouped-MMA streaming.
                 for (c_idx, chunk) in chunks.iter().enumerate() {
                     let buf_idx = c_idx & 1;
@@ -976,9 +1041,6 @@ impl TieredMoeEngine {
                         ws.h2d_done_events[next_buf].record(&ws.h2d_stream)?;
                     }
 
-                    // Stage per-expert chunk slot table (`<= 1024` i32s) in double-buffered pinned
-                    // host memory (`ws.h_chunk_slot_pinned`) so `warp34_memcpy_h2d_async` never blocks
-                    // `compute_stream` before CPU prefill starts.
                     let local_start = cache.expert_ids.start;
                     let local_len = cache.expert_ids.len();
 
@@ -1009,32 +1071,6 @@ impl TieredMoeEngine {
                         chunk.len(),
                     )?;
                     if c_idx == 0 && !promote_victim_slots.is_empty() {
-                        let max_pinned_victims =
-                            1024usize.min(ws.d_miss_victim_slots.len_bytes / 4);
-                        if promote_victim_slots.len() <= max_pinned_victims {
-                            // SAFETY: `[0..1024]` i32s in `h_chunk_slot_pinned` are reserved for
-                            // `promote_victim_slots` (`<= 16` i32s), protected by `pinned_h2d_done_event`.
-                            unsafe {
-                                let p_vic = ws.h_chunk_slot_pinned.host_ptr.cast::<i32>();
-                                core::ptr::copy_nonoverlapping(
-                                    promote_victim_slots.as_ptr(),
-                                    p_vic,
-                                    promote_victim_slots.len(),
-                                );
-                                crate::cuda::check_rc(
-                                    warp34_kernels::ffi::warp34_memcpy_h2d_async(
-                                        ws.d_miss_victim_slots.addr() as *mut core::ffi::c_void,
-                                        p_vic.cast(),
-                                        promote_victim_slots.len() * 4,
-                                        compute_stream.handle,
-                                    ),
-                                    "warp34_memcpy_h2d_async (promote_victim_slots)",
-                                )?;
-                            }
-                        } else {
-                            ws.d_miss_victim_slots
-                                .copy_from_host(&promote_victim_slots, compute_stream)?;
-                        }
                         cache.slots.unpack_staged(
                             compute_stream,
                             ws.d_stage_packs[0].addr(),
@@ -1060,34 +1096,12 @@ impl TieredMoeEngine {
                             cache.slot_to_expert[slot] = new_ge as i32;
                             cache.slot_last_used[slot] = promoted_ts;
                         }
-                        cache.upload_lru_metadata(compute_stream)?;
+                        need_lru_upload_after_chunks = true;
                     }
                     ws.compute_done_events[buf_idx].record(compute_stream)?;
 
-                    if local_len <= 512 && c_idx < 512 {
-                        // SAFETY: `h_chunk_slot_pinned` reserves a disjoint `512`-i32 slice per `c_idx`
-                        // (`0..512`) starting at offset `1024`, protected across calls by `pinned_h2d_done_event`.
-                        unsafe {
-                            let p_slot = ws
-                                .h_chunk_slot_pinned
-                                .host_ptr
-                                .cast::<i32>()
-                                .add(1024 + c_idx * 512);
-                            let slot_slice = core::slice::from_raw_parts_mut(p_slot, local_len);
-                            slot_slice.fill(-1);
-                            for (pos, &ge) in chunk.iter().enumerate() {
-                                slot_slice[ge - local_start] = pos as i32;
-                            }
-                            crate::cuda::check_rc(
-                                warp34_kernels::ffi::warp34_memcpy_h2d_async(
-                                    ws.d_miss_local_experts.addr() as *mut core::ffi::c_void,
-                                    p_slot.cast(),
-                                    local_len * 4,
-                                    compute_stream.handle,
-                                ),
-                                "warp34_memcpy_h2d_async (local_to_chunk_slot)",
-                            )?;
-                        }
+                    let chunk_slot_dev_addr = if preuploaded_slot_tables {
+                        ws.d_chunk_slot_tables.addr() + (c_idx * local_len * 4) as u64
                     } else {
                         let mut local_to_chunk_slot = vec![-1i32; local_len];
                         for (pos, &ge) in chunk.iter().enumerate() {
@@ -1095,14 +1109,15 @@ impl TieredMoeEngine {
                         }
                         ws.d_miss_local_experts
                             .copy_from_host(&local_to_chunk_slot, compute_stream)?;
-                    }
+                        ws.d_miss_local_experts.addr()
+                    };
                     crate::cuda::check_rc(
                         // SAFETY: pointers and counts match allocated device buffers.
                         unsafe {
                             warp34_kernels::ffi::warp34_moe_remap_topk_ids_i32(
                                 &ex,
                                 d_topk_ids_addr as *const i32,
-                                ws.d_miss_local_experts.addr() as *const i32,
+                                chunk_slot_dev_addr as *const i32,
                                 ws.d_remapped_topk_ids[buf_idx].addr() as *mut i32,
                                 (num_tokens * top_k) as i32,
                                 local_start as i32,
@@ -1123,6 +1138,9 @@ impl TieredMoeEngine {
                         num_tokens,
                         top_k,
                     )?;
+                }
+                if need_lru_upload_after_chunks {
+                    cache.upload_lru_metadata(compute_stream)?;
                 }
 
                 // While the GPU is executing Pass 0 + `chunks` on `compute_stream`, wait only for

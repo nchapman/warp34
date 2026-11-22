@@ -2011,6 +2011,10 @@ impl PrePoolModelRank {
                     } else {
                         18
                     }
+                } else if capacity.dflash_reserve_bytes > 0 {
+                    // Preserve `>= 384 MiB` post-drafter VRAM headroom on 24 GiB TP=1 cards so all
+                    // `m_verify = 1..=8` speculative verification CUDA Graphs fit without OOM.
+                    16
                 } else {
                     20
                 }

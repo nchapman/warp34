@@ -456,8 +456,29 @@ fn test_ple_mmap_table_lut4_gptq() {
             assert_eq!(out_f16[idx * head_dim + c], f32_to_f16(expected_f32));
         }
     }
+    assert!(synth_table.total_mapped_bytes() > 0);
+    assert_eq!(
+        synth_table.populate_into_page_cache_with_available_ram(
+            Some(synth_table.total_mapped_bytes() + 1024 - 1),
+            1024,
+        ),
+        0,
+    );
+    assert_eq!(
+        synth_table.populate_into_page_cache_with_available_ram(
+            Some(synth_table.total_mapped_bytes() + 1024),
+            1024,
+        ),
+        synth_table.total_mapped_bytes(),
+    );
+    let mut post_populate_f32 = vec![0.0f32; test_ids.len() * head_dim];
+    synth_table.gather_dequant_f32(&test_ids, &mut post_populate_f32);
+    assert_eq!(post_populate_f32, out_f32);
     let _ = std::fs::remove_dir_all(&tmp_dir);
+}
 
+#[test]
+fn test_ple_mmap_table_lut4_gptq_real_snapshot() {
     if let Ok(snap) = crate::loader::resolve_hf_model_dir("nchapman/Qwen3.8-Flash-Next-W4A16-HGPTQ")
     {
         let cfg = ModelConfig::from_dir(&snap).unwrap();

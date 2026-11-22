@@ -801,6 +801,12 @@ int warp34_hc_combine_tap_f16(const warp34_exec* ex, const void* residual_in, co
                            const uint8_t* valid_token_mask, int num_tokens,
                            int hc_count, int hidden_size, int tap_stride_elems,
                            int tap_offset_elems);
+int warp34_hc_combine_tap_rmsnorm_f16(
+    const warp34_exec* ex, const void* residual_in, const void* block_out,
+    const float* inject_weights, const void* ple_delta, void* residual_out,
+    void* tap_bf16_out, const void* next_norm_weight, void* next_normed_out,
+    const uint8_t* valid_token_mask, int num_tokens, int hc_count,
+    int hidden_size, float eps, int tap_stride_elems, int tap_offset_elems);
 int warp34_qwen4_mtp_broadcast_add_f16(const warp34_exec* ex, const void* fc_embed,
                                     const void* fc_hidden, void* out_multi_hidden,
                                     int num_tokens, int hc_count, int hidden_size);

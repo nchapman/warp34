@@ -593,6 +593,15 @@ impl Qwen3_5Engine {
                 Ok(out)
             })?
         };
+        // Drop cached pages for one-shot backbone/expert `.safetensors` files, then
+        // sequentially prefault PLE `.safetensors` shards into host page cache when
+        // `MemAvailable` leaves at least 8 GiB of headroom.
+        archive.drop_page_cache();
+        if let Some((_, ref ple_mmap_table)) = ple_shared {
+            const PLE_PREFAULT_SAFETY_HEADROOM_BYTES: usize = 8 * 1024 * 1024 * 1024;
+            let _ =
+                ple_mmap_table.populate_into_page_cache_if_fits(PLE_PREFAULT_SAFETY_HEADROOM_BYTES);
+        }
         if ranks.len() > 1 {
             let common_pages = ranks.iter().map(|r| r.kv_pool.num_pages).min().unwrap_or(0);
             let common_slots = ranks

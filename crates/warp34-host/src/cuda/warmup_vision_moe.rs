@@ -463,6 +463,48 @@ pub(super) fn warmup_vision_moe_and_qwen4(
         "warmup warp34_hc_combine_tap_f16"
     )?;
     warmup_ffi!(
+        ffi::warp34_hc_combine_tap_rmsnorm_f16(
+            ex,
+            buf_a as *const c_void,
+            buf_b as *const c_void,
+            buf_d as *const f32,
+            core::ptr::null(),
+            buf_c as *mut c_void,
+            core::ptr::null_mut(),
+            buf_a as *const c_void,
+            buf_b as *mut c_void,
+            core::ptr::null(),
+            1,
+            4,
+            128,
+            1e-6,
+            0,
+            0,
+        ),
+        "warmup warp34_hc_combine_tap_rmsnorm_f16 (notap)"
+    )?;
+    warmup_ffi!(
+        ffi::warp34_hc_combine_tap_rmsnorm_f16(
+            ex,
+            buf_a as *const c_void,
+            buf_b as *const c_void,
+            buf_d as *const f32,
+            core::ptr::null(),
+            buf_c as *mut c_void,
+            buf_d as *mut c_void,
+            buf_a as *const c_void,
+            buf_b as *mut c_void,
+            core::ptr::null(),
+            1,
+            4,
+            128,
+            1e-6,
+            128,
+            0,
+        ),
+        "warmup warp34_hc_combine_tap_rmsnorm_f16 (tap)"
+    )?;
+    warmup_ffi!(
         ffi::warp34_qwen4_mtp_broadcast_add_f16(
             ex,
             buf_a as *const c_void,

@@ -1250,6 +1250,8 @@ pub(super) fn evaluate_serving_kv_candidate_budget(
     let effective_requested_state_slots = if cfg.uses_tiered_moe() {
         let max_tiered_serving_slots = if tp_size >= 2 {
             if native_mtp && pages < 2048 { 16 } else { 18 }
+        } else if dflash_reserve_bytes > 0 {
+            16
         } else {
             20
         }

@@ -97,6 +97,43 @@ __global__ void hc_rmsnorm_f16_kernel(
     const __half* w = norm_weight + (size_t)stream_idx * hidden_size;
 
     __shared__ float s_warp[32];
+    const bool aligned_vec8 = ((hidden_size & 7) == 0) &&
+        ((((uintptr_t)src | (uintptr_t)w | (uintptr_t)dst) & 15u) == 0u);
+    if (aligned_vec8) {
+        const int vec_cols = hidden_size >> 3;
+        const uint4* src_v = reinterpret_cast<const uint4*>(src);
+        const uint4* w_v = reinterpret_cast<const uint4*>(w);
+        uint4* dst_v = reinterpret_cast<uint4*>(dst);
+        float sum_sq = 0.0f;
+        for (int v = threadIdx.x; v < vec_cols; v += blockDim.x) {
+            const uint4 sv = src_v[v];
+            const __half* sh = reinterpret_cast<const __half*>(&sv);
+#pragma unroll
+            for (int j = 0; j < 8; ++j) {
+                const float x = __half2float(sh[j]);
+                sum_sq += x * x;
+            }
+        }
+        sum_sq = hc_block_reduce_sum(sum_sq, s_warp);
+        const float inv_rms = rsqrtf(sum_sq / (float)hidden_size + eps);
+        for (int v = threadIdx.x; v < vec_cols; v += blockDim.x) {
+            const uint4 sv = src_v[v];
+            const uint4 wv = w_v[v];
+            const __half* sh = reinterpret_cast<const __half*>(&sv);
+            const __half* wh = reinterpret_cast<const __half*>(&wv);
+            uint4 ov;
+            __half* oh = reinterpret_cast<__half*>(&ov);
+#pragma unroll
+            for (int j = 0; j < 8; ++j) {
+                const float x = __half2float(sh[j]) * inv_rms;
+                const float wf = 1.0f + __half2float(wh[j]);
+                oh[j] = __float2half(x * wf);
+            }
+            dst_v[v] = ov;
+        }
+        return;
+    }
+
     float sum_sq = 0.0f;
     for (int d = threadIdx.x; d < hidden_size; d += blockDim.x) {
         const float v = __half2float(src[d]);
@@ -222,22 +259,42 @@ __global__ void hc_mix_streams_hadamard_f16_kernel(
 
     const int tile_span = (int)blockDim.x * 4;
     const int grid_span = (int)gridDim.y * tile_span;
+    const bool aligned_vec4 = (((uintptr_t)res_tok | (uintptr_t)up_tok) & 7u) == 0u;
     for (int base_col = (int)blockIdx.y * tile_span; base_col < hidden_size; base_col += grid_span) {
         const int col0 = base_col + (int)threadIdx.x * 4;
         if (col0 < hidden_size) {
             __half h[4];
-#pragma unroll
-            for (int j = 0; j < 4; ++j) {
-                const int d = col0 + j;
-                float acc = 0.0f;
+            if (aligned_vec4) {
+                float acc0 = 0.0f, acc1 = 0.0f, acc2 = 0.0f, acc3 = 0.0f;
                 for (int s = 0; s < hc_count; ++s) {
-                    const size_t idx = (size_t)s * hidden_size + d;
-                    const float u = __half2float(up_tok[idx]);
-                    const float gate = inv_hc / (1.0f + expf(-u));
-                    const float r = __half2float(res_tok[idx]);
-                    acc += gate * r;
+                    const size_t s_off = (size_t)s * hidden_size + col0;
+                    const uint2 u2 = *reinterpret_cast<const uint2*>(up_tok + s_off);
+                    const uint2 r2 = *reinterpret_cast<const uint2*>(res_tok + s_off);
+                    const __half* uh = reinterpret_cast<const __half*>(&u2);
+                    const __half* rh = reinterpret_cast<const __half*>(&r2);
+                    acc0 += (inv_hc / (1.0f + expf(-__half2float(uh[0])))) * __half2float(rh[0]);
+                    acc1 += (inv_hc / (1.0f + expf(-__half2float(uh[1])))) * __half2float(rh[1]);
+                    acc2 += (inv_hc / (1.0f + expf(-__half2float(uh[2])))) * __half2float(rh[2]);
+                    acc3 += (inv_hc / (1.0f + expf(-__half2float(uh[3])))) * __half2float(rh[3]);
                 }
-                h[j] = __float2half(acc);
+                h[0] = __float2half(acc0);
+                h[1] = __float2half(acc1);
+                h[2] = __float2half(acc2);
+                h[3] = __float2half(acc3);
+            } else {
+#pragma unroll
+                for (int j = 0; j < 4; ++j) {
+                    const int d = col0 + j;
+                    float acc = 0.0f;
+                    for (int s = 0; s < hc_count; ++s) {
+                        const size_t idx = (size_t)s * hidden_size + d;
+                        const float u = __half2float(up_tok[idx]);
+                        const float gate = inv_hc / (1.0f + expf(-u));
+                        const float r = __half2float(res_tok[idx]);
+                        acc += gate * r;
+                    }
+                    h[j] = __float2half(acc);
+                }
             }
             const uint2 v = *reinterpret_cast<const uint2*>(h);
             if (dst != nullptr) {
@@ -306,6 +363,237 @@ __global__ void hc_combine_f16_kernel(
         }
         if (tap_row != nullptr) {
             tap_row[d] = __float2bfloat16_rn(tap_sum * inv_hc);
+        }
+    }
+}
+
+// Fused per-stream HyperConnection combine + next-block GemmaRMSNorm when no tap export is needed.
+// Grid: (num_tokens, hc_count), Block: 256. Each CTA processes one `(tok, s)` stream independently
+// with 0-ULP bit-for-bit parity against `hc_combine_f16_kernel` + `hc_rmsnorm_f16_kernel`.
+__global__ void hc_combine_rmsnorm_notap_f16_kernel(
+    const __half* residual_in,
+    const __half* __restrict__ block_out,
+    const float* __restrict__ inject_weights,
+    const __half* ple_delta,
+    __half* residual_out,
+    const __half* __restrict__ next_norm_weight,
+    __half* __restrict__ next_normed_out,
+    const uint8_t* __restrict__ valid_token_mask,
+    int num_tokens,
+    int hc_count,
+    int hidden_size,
+    float eps) {
+    const int tok = (int)blockIdx.x;
+    const int s = (int)blockIdx.y;
+    if (tok >= num_tokens || s >= hc_count) return;
+
+    const size_t stream_offset = ((size_t)tok * hc_count + s) * hidden_size;
+    __half* norm_dst = next_normed_out + stream_offset;
+    if (valid_token_mask != nullptr && valid_token_mask[tok] == 0) {
+        for (int d = threadIdx.x; d < hidden_size; d += blockDim.x) {
+            norm_dst[d] = __float2half(0.0f);
+        }
+        return;
+    }
+
+    const __half* res_in_s = residual_in + stream_offset;
+    __half* res_out_s = residual_out + stream_offset;
+    const __half* blk_tok = block_out + (size_t)tok * hidden_size;
+    const __half* ple_s = (ple_delta != nullptr) ? (ple_delta + stream_offset) : nullptr;
+    const __half* w_s = next_norm_weight + (size_t)s * hidden_size;
+    const float inj_w = inject_weights[(size_t)tok * hc_count + s];
+
+    __shared__ float s_warp[32];
+    const bool aligned_vec8 = ((hidden_size & 7) == 0) &&
+        ((((uintptr_t)res_in_s | (uintptr_t)res_out_s | (uintptr_t)blk_tok |
+           (uintptr_t)w_s | (uintptr_t)norm_dst | (uintptr_t)ple_s) & 15u) == 0u);
+    if (aligned_vec8) {
+        const int vec_cols = hidden_size >> 3;
+        const uint4* rin_v = reinterpret_cast<const uint4*>(res_in_s);
+        uint4* rout_v = reinterpret_cast<uint4*>(res_out_s);
+        const uint4* blk_v = reinterpret_cast<const uint4*>(blk_tok);
+        const uint4* ple_v = (ple_s != nullptr) ? reinterpret_cast<const uint4*>(ple_s) : nullptr;
+        const uint4* w_v = reinterpret_cast<const uint4*>(w_s);
+        uint4* ndst_v = reinterpret_cast<uint4*>(norm_dst);
+
+        float sum_sq = 0.0f;
+        for (int v = threadIdx.x; v < vec_cols; v += blockDim.x) {
+            const uint4 rv = rin_v[v];
+            const uint4 bv = blk_v[v];
+            const uint4 pv = (ple_v != nullptr) ? ple_v[v] : make_uint4(0u, 0u, 0u, 0u);
+            const __half* rh = reinterpret_cast<const __half*>(&rv);
+            const __half* bh = reinterpret_cast<const __half*>(&bv);
+            const __half* ph = reinterpret_cast<const __half*>(&pv);
+            uint4 ov;
+            __half* oh = reinterpret_cast<__half*>(&ov);
+#pragma unroll
+            for (int j = 0; j < 8; ++j) {
+                float val = __half2float(rh[j]) + inj_w * __half2float(bh[j]);
+                if (ple_v != nullptr) {
+                    val += __half2float(ph[j]);
+                }
+                const __half h_out = __float2half(val);
+                oh[j] = h_out;
+                const float xf = __half2float(h_out);
+                sum_sq += xf * xf;
+            }
+            rout_v[v] = ov;
+        }
+        sum_sq = hc_block_reduce_sum(sum_sq, s_warp);
+        const float inv_rms = rsqrtf(sum_sq / (float)hidden_size + eps);
+        for (int v = threadIdx.x; v < vec_cols; v += blockDim.x) {
+            const uint4 sv = rout_v[v];
+            const uint4 wv = w_v[v];
+            const __half* sh = reinterpret_cast<const __half*>(&sv);
+            const __half* wh = reinterpret_cast<const __half*>(&wv);
+            uint4 nv;
+            __half* nh = reinterpret_cast<__half*>(&nv);
+#pragma unroll
+            for (int j = 0; j < 8; ++j) {
+                const float xf = __half2float(sh[j]) * inv_rms;
+                const float wf = 1.0f + __half2float(wh[j]);
+                nh[j] = __float2half(xf * wf);
+            }
+            ndst_v[v] = nv;
+        }
+        return;
+    }
+
+    float sum_sq = 0.0f;
+    for (int d = threadIdx.x; d < hidden_size; d += blockDim.x) {
+        float val = __half2float(res_in_s[d]) + inj_w * __half2float(blk_tok[d]);
+        if (ple_s != nullptr) {
+            val += __half2float(ple_s[d]);
+        }
+        const __half h_out = __float2half(val);
+        res_out_s[d] = h_out;
+        const float xf = __half2float(h_out);
+        sum_sq += xf * xf;
+    }
+    sum_sq = hc_block_reduce_sum(sum_sq, s_warp);
+    const float inv_rms = rsqrtf(sum_sq / (float)hidden_size + eps);
+    for (int d = threadIdx.x; d < hidden_size; d += blockDim.x) {
+        const float xf = __half2float(res_out_s[d]) * inv_rms;
+        const float wf = 1.0f + __half2float(w_s[d]);
+        norm_dst[d] = __float2half(xf * wf);
+    }
+}
+
+// Fused HyperConnection combine + BF16 stream-average tap export + next-block GemmaRMSNorm.
+// Grid: (num_tokens, 1), Block: 256. Preserves 0-ULP parity with `hc_combine_f16_kernel` + `hc_rmsnorm_f16_kernel`.
+__global__ void hc_combine_tap_rmsnorm_f16_kernel(
+    const __half* residual_in,
+    const __half* __restrict__ block_out,
+    const float* __restrict__ inject_weights,
+    const __half* ple_delta,
+    __half* residual_out,
+    __nv_bfloat16* __restrict__ tap_bf16_out,
+    const __half* __restrict__ next_norm_weight,
+    __half* __restrict__ next_normed_out,
+    const uint8_t* __restrict__ valid_token_mask,
+    int num_tokens,
+    int hc_count,
+    int hidden_size,
+    float eps,
+    int tap_stride_elems,
+    int tap_offset_elems) {
+    const int tok = (int)blockIdx.x;
+    if (tok >= num_tokens) return;
+
+    const size_t base = (size_t)tok * hc_count * hidden_size;
+    if (valid_token_mask != nullptr && valid_token_mask[tok] == 0) {
+        __half* norm_tok = next_normed_out + base;
+        const size_t total = (size_t)hc_count * hidden_size;
+        for (size_t d = threadIdx.x; d < total; d += blockDim.x) {
+            norm_tok[d] = __float2half(0.0f);
+        }
+        return;
+    }
+
+    const __half* res_in_tok = residual_in + base;
+    __half* res_out_tok = residual_out + base;
+    const __half* blk_tok = block_out + (size_t)tok * hidden_size;
+    const __half* ple_tok = (ple_delta != nullptr) ? (ple_delta + base) : nullptr;
+    const float* inj_tok = inject_weights + (size_t)tok * hc_count;
+    __nv_bfloat16* tap_row =
+        (tap_bf16_out != nullptr)
+            ? (tap_bf16_out + (size_t)tok * tap_stride_elems + tap_offset_elems)
+            : nullptr;
+    const float inv_hc = 1.0f / static_cast<float>(hc_count);
+
+    for (int d = threadIdx.x; d < hidden_size; d += blockDim.x) {
+        const float y = __half2float(blk_tok[d]);
+        float tap_sum = 0.0f;
+        for (int s = 0; s < hc_count; ++s) {
+            const size_t idx = (size_t)s * hidden_size + d;
+            float val = __half2float(res_in_tok[idx]) + inj_tok[s] * y;
+            if (ple_tok != nullptr) {
+                val += __half2float(ple_tok[idx]);
+            }
+            const __half out_h = __float2half(val);
+            res_out_tok[idx] = out_h;
+            if (tap_row != nullptr) {
+                tap_sum += __half2float(out_h);
+            }
+        }
+        if (tap_row != nullptr) {
+            tap_row[d] = __float2bfloat16_rn(tap_sum * inv_hc);
+        }
+    }
+    __syncthreads();
+
+    __shared__ float s_warp[32];
+    for (int s = 0; s < hc_count; ++s) {
+        const __half* src_s = res_out_tok + (size_t)s * hidden_size;
+        const __half* w_s = next_norm_weight + (size_t)s * hidden_size;
+        __half* dst_s = next_normed_out + base + (size_t)s * hidden_size;
+        const bool aligned_vec8 = ((hidden_size & 7) == 0) &&
+            ((((uintptr_t)src_s | (uintptr_t)w_s | (uintptr_t)dst_s) & 15u) == 0u);
+        if (aligned_vec8) {
+            const int vec_cols = hidden_size >> 3;
+            const uint4* src_v = reinterpret_cast<const uint4*>(src_s);
+            const uint4* w_v = reinterpret_cast<const uint4*>(w_s);
+            uint4* dst_v = reinterpret_cast<uint4*>(dst_s);
+            float sum_sq = 0.0f;
+            for (int v = threadIdx.x; v < vec_cols; v += blockDim.x) {
+                const uint4 sv = src_v[v];
+                const __half* sh = reinterpret_cast<const __half*>(&sv);
+#pragma unroll
+                for (int j = 0; j < 8; ++j) {
+                    const float x = __half2float(sh[j]);
+                    sum_sq += x * x;
+                }
+            }
+            sum_sq = hc_block_reduce_sum(sum_sq, s_warp);
+            const float inv_rms = rsqrtf(sum_sq / (float)hidden_size + eps);
+            for (int v = threadIdx.x; v < vec_cols; v += blockDim.x) {
+                const uint4 sv = src_v[v];
+                const uint4 wv = w_v[v];
+                const __half* sh = reinterpret_cast<const __half*>(&sv);
+                const __half* wh = reinterpret_cast<const __half*>(&wv);
+                uint4 ov;
+                __half* oh = reinterpret_cast<__half*>(&ov);
+#pragma unroll
+                for (int j = 0; j < 8; ++j) {
+                    const float x = __half2float(sh[j]) * inv_rms;
+                    const float wf = 1.0f + __half2float(wh[j]);
+                    oh[j] = __float2half(x * wf);
+                }
+                dst_v[v] = ov;
+            }
+        } else {
+            float sum_sq = 0.0f;
+            for (int d = threadIdx.x; d < hidden_size; d += blockDim.x) {
+                const float x = __half2float(src_s[d]);
+                sum_sq += x * x;
+            }
+            sum_sq = hc_block_reduce_sum(sum_sq, s_warp);
+            const float inv_rms = rsqrtf(sum_sq / (float)hidden_size + eps);
+            for (int d = threadIdx.x; d < hidden_size; d += blockDim.x) {
+                const float x = __half2float(src_s[d]) * inv_rms;
+                const float wf = 1.0f + __half2float(w_s[d]);
+                dst_s[d] = __float2half(x * wf);
+            }
         }
     }
 }
@@ -493,6 +781,86 @@ int warp34_hc_combine_tap_f16(
         hidden_size,
         tap_stride_elems,
         tap_offset_elems);
+    return (cudaGetLastError() == cudaSuccess) ? 0 : -2;
+}
+
+int warp34_hc_combine_tap_rmsnorm_f16(
+    const warp34_exec* ex,
+    const void* residual_in,
+    const void* block_out,
+    const float* inject_weights,
+    const void* ple_delta,
+    void* residual_out,
+    void* tap_bf16_out,
+    const void* next_norm_weight,
+    void* next_normed_out,
+    const uint8_t* valid_token_mask,
+    int num_tokens,
+    int hc_count,
+    int hidden_size,
+    float eps,
+    int tap_stride_elems,
+    int tap_offset_elems) {
+    if (!next_norm_weight || !next_normed_out) {
+        return warp34_hc_combine_tap_f16(
+            ex,
+            residual_in,
+            block_out,
+            inject_weights,
+            ple_delta,
+            residual_out,
+            tap_bf16_out,
+            valid_token_mask,
+            num_tokens,
+            hc_count,
+            hidden_size,
+            tap_stride_elems,
+            tap_offset_elems);
+    }
+    if (!ex || !residual_in || !block_out || !inject_weights || !residual_out || num_tokens < 0 ||
+        hc_count <= 0 || hidden_size <= 0 || hc_count > 8) {
+        return -1;
+    }
+    if (tap_bf16_out != nullptr &&
+        (tap_offset_elems < 0 || tap_stride_elems < tap_offset_elems + hidden_size)) {
+        return -1;
+    }
+    if (num_tokens == 0) return 0;
+    cudaStream_t stream = reinterpret_cast<cudaStream_t>(ex->stream);
+    if (tap_bf16_out == nullptr) {
+        dim3 grid((unsigned)num_tokens, (unsigned)hc_count);
+        warp34::hc_combine_rmsnorm_notap_f16_kernel<<<grid, 256, 0, stream>>>(
+            static_cast<const __half*>(residual_in),
+            static_cast<const __half*>(block_out),
+            inject_weights,
+            static_cast<const __half*>(ple_delta),
+            static_cast<__half*>(residual_out),
+            static_cast<const __half*>(next_norm_weight),
+            static_cast<__half*>(next_normed_out),
+            valid_token_mask,
+            num_tokens,
+            hc_count,
+            hidden_size,
+            eps);
+    } else {
+        dim3 grid((unsigned)num_tokens, 1u);
+        warp34::hc_combine_tap_rmsnorm_f16_kernel<<<grid, 256, 0, stream>>>(
+            static_cast<const __half*>(residual_in),
+            static_cast<const __half*>(block_out),
+            inject_weights,
+            static_cast<const __half*>(ple_delta),
+            static_cast<__half*>(residual_out),
+            static_cast<__nv_bfloat16*>(tap_bf16_out),
+            static_cast<const __half*>(next_norm_weight),
+            static_cast<__half*>(next_normed_out),
+            valid_token_mask,
+            num_tokens,
+            hc_count,
+            hidden_size,
+            eps,
+            tap_stride_elems,
+            tap_offset_elems);
+    }
     return (cudaGetLastError() == cudaSuccess) ? 0 : -2;
 }
 

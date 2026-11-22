@@ -1686,7 +1686,7 @@ impl DFlash2Rank {
             total_tokens: rows as i32,
             max_blocks_per_req: self.pages.len() as i32,
             max_q_len: rows as i32,
-            max_seq_len: after as i32,
+            max_seq_len: (self.capacity + self.cfg.block_size) as i32,
             sliding_window: self.cfg.window as i32,
             mask_mode: ffi::WARP34_ATTN_MASK_NONCAUSAL_WINDOW,
             sm_scale: 1.0 / (self.cfg.model.head_dim as f32).sqrt(),
@@ -1962,7 +1962,15 @@ impl DFlash2Rank {
             .graph_io
             .forward_arena
             .alloc_aligned(m * h.max(q).max(i) * 2)?;
+        let head_input = self.graph_io.forward_arena.alloc_aligned((m - 1) * h * 2)?;
+        let logits_bytes = (m - 1) * t.local_vocab_size * 2;
+        let attn_split_ws_bytes = logits_bytes.max(4 * 1024 * 1024);
+        let logits = self
+            .graph_io
+            .forward_arena
+            .alloc_aligned(attn_split_ws_bytes)?;
         let ex = t.stream.exec(0, 0);
+        let attn_ex = t.stream.exec(logits, attn_split_ws_bytes);
         check_rc(
             // SAFETY: ids_ptr contains m valid token IDs, embed_tokens_ptr is valid device memory of vocab_size * h half elements, residual has capacity for m * h BF16 elements.
             unsafe {
@@ -2001,10 +2009,10 @@ impl DFlash2Rank {
                 m,
             )?;
             check_rc(
-                // SAFETY: kv layout and attention batch describe valid paged memory, qb and attn are valid device buffers for m * q elements.
+                // SAFETY: kv layout and attention batch describe valid paged memory, qb and attn are valid device buffers for m * q elements, and attn_ex holds disjoint forward_arena scratch.
                 unsafe {
                     ffi::warp34_paged_attention_bf16(
-                        &ex,
+                        &attn_ex,
                         &self.kv.layers[l].layout,
                         batch,
                         qb as *const c_void,
@@ -2045,11 +2053,6 @@ impl DFlash2Rank {
         let draft_hidden = self.hidden.addr() + (h * 2) as u64;
         self.hp
             .run(t, draft_hidden, self.projected.addr(), m - 1, had_scratch)?;
-        let head_input = self.graph_io.forward_arena.alloc_aligned((m - 1) * h * 2)?;
-        let logits = self
-            .graph_io
-            .forward_arena
-            .alloc_aligned((m - 1) * t.local_vocab_size * 2)?;
         // Explicit dtype boundary into the target's single resident FP16 head.
         check_rc(
             // SAFETY: draft_hidden contains (m - 1) * h BF16 elements, head_input has capacity for (m - 1) * h FP16 elements.
@@ -2273,6 +2276,8 @@ impl DFlash2Rank {
         }
         if t.tp_size >= 2 {
             Some((7, 0.35, 0.20, false))
+        } else if crate::moe_cpu_bridge::has_avx512() && t.tiered_moe_hot_per_layer >= 64 {
+            Some((7, 0.35, 0.35, true))
         } else {
             Some((7, 0.0, 0.70, true))
         }

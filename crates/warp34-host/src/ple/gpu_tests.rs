@@ -1846,3 +1846,118 @@ fn test_gpu_hc_combine_tap_f16_parity() {
         .is_err()
     );
 }
+
+#[test]
+fn fused_hc_combine_tap_rmsnorm_matches_unfused_zero_ulp() {
+    let _dev = CudaDevice::set_current(0).unwrap();
+    let stream = CudaStream::new(0).unwrap();
+    let ex = stream.exec(0, 0);
+    let num_tokens = 5usize;
+    let hc_count = 4usize;
+    let hidden_size = 2560usize;
+    let eps = 1e-6f32;
+    let tap_stride = 5 * hidden_size;
+    let tap_offset = 2 * hidden_size;
+
+    let res_init: Vec<u16> = (0..(num_tokens * hc_count * hidden_size))
+        .map(|i| crate::cuda::f32_to_f16((((i * 19 + 7) % 97) as f32 - 48.0) * 0.03125))
+        .collect();
+    let blk_host: Vec<u16> = (0..(num_tokens * hidden_size))
+        .map(|i| crate::cuda::f32_to_f16((((i * 31 + 11) % 89) as f32 - 44.0) * 0.03125))
+        .collect();
+    let inj_host: Vec<f32> = (0..(num_tokens * hc_count))
+        .map(|i| 0.25 + ((i * 7 + 3) % 13) as f32 * 0.1)
+        .collect();
+    let norm_w_host: Vec<u16> = (0..(hc_count * hidden_size))
+        .map(|i| crate::cuda::f32_to_f16((((i * 23 + 5) % 61) as f32 - 30.0) * 0.015625))
+        .collect();
+    let mask_host: [u8; 5] = [1, 0, 1, 1, 0];
+
+    let d_blk = dev_from_slice(&blk_host, &stream);
+    let d_inj = dev_from_slice(&inj_host, &stream);
+    let d_norm_w = dev_from_slice(&norm_w_host, &stream);
+    let d_mask = dev_from_slice(&mask_host, &stream);
+
+    for with_tap in [false, true] {
+        for use_mask in [false, true] {
+            let mask_ptr = if use_mask { d_mask.addr() } else { 0 };
+            let d_res_ref = dev_from_slice(&res_init, &stream);
+            let d_res_fused = dev_from_slice(&res_init, &stream);
+
+            let d_norm_ref = DeviceBuffer::alloc(0, res_init.len() * 2).unwrap();
+            let d_norm_fused = DeviceBuffer::alloc(0, res_init.len() * 2).unwrap();
+            let d_tap_ref = DeviceBuffer::alloc(0, num_tokens * tap_stride * 2).unwrap();
+            let d_tap_fused = DeviceBuffer::alloc(0, num_tokens * tap_stride * 2).unwrap();
+            d_tap_ref.zero_async(&stream).unwrap();
+            d_tap_fused.zero_async(&stream).unwrap();
+
+            gpu_ops::hc_combine_tap_f16(
+                &ex,
+                d_res_ref.addr(),
+                d_blk.addr(),
+                d_inj.addr(),
+                0,
+                d_res_ref.addr(),
+                if with_tap { d_tap_ref.addr() } else { 0 },
+                mask_ptr,
+                num_tokens,
+                hc_count,
+                hidden_size,
+                if with_tap { tap_stride as i32 } else { 0 },
+                if with_tap { tap_offset as i32 } else { 0 },
+            )
+            .unwrap();
+            gpu_ops::hc_rmsnorm_f16(
+                &ex,
+                d_res_ref.addr(),
+                d_norm_w.addr(),
+                d_norm_ref.addr(),
+                mask_ptr,
+                num_tokens,
+                hc_count,
+                hidden_size,
+                eps,
+            )
+            .unwrap();
+
+            gpu_ops::hc_combine_tap_rmsnorm_f16(
+                &ex,
+                d_res_fused.addr(),
+                d_blk.addr(),
+                d_inj.addr(),
+                0,
+                d_res_fused.addr(),
+                if with_tap { d_tap_fused.addr() } else { 0 },
+                d_norm_w.addr(),
+                d_norm_fused.addr(),
+                mask_ptr,
+                num_tokens,
+                hc_count,
+                hidden_size,
+                eps,
+                if with_tap { tap_stride as i32 } else { 0 },
+                if with_tap { tap_offset as i32 } else { 0 },
+            )
+            .unwrap();
+
+            let ref_res: Vec<u16> = dev_to_vec(&d_res_ref, res_init.len(), &stream);
+            let fused_res: Vec<u16> = dev_to_vec(&d_res_fused, res_init.len(), &stream);
+            let ref_norm: Vec<u16> = dev_to_vec(&d_norm_ref, res_init.len(), &stream);
+            let fused_norm: Vec<u16> = dev_to_vec(&d_norm_fused, res_init.len(), &stream);
+            assert_eq!(
+                fused_res, ref_res,
+                "res mismatch tap={with_tap} mask={use_mask}"
+            );
+            assert_eq!(
+                fused_norm, ref_norm,
+                "norm mismatch tap={with_tap} mask={use_mask}"
+            );
+            if with_tap {
+                let ref_tap: Vec<u16> = dev_to_vec(&d_tap_ref, num_tokens * tap_stride, &stream);
+                let fused_tap: Vec<u16> =
+                    dev_to_vec(&d_tap_fused, num_tokens * tap_stride, &stream);
+                assert_eq!(fused_tap, ref_tap, "tap mismatch mask={use_mask}");
+            }
+        }
+    }
+}

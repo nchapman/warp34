@@ -184,6 +184,8 @@ impl Qwen3_5ModelRank {
         } else {
             MAX_SPEC_VERIFY_CACHED_GRAPHS
         };
+        const MIN_SPEC_GRAPH_CAPTURE_SOFT_VRAM_BYTES: usize = 96 * 1024 * 1024;
+        const MIN_SPEC_GRAPH_CAPTURE_HARD_VRAM_BYTES: usize = 64 * 1024 * 1024;
         if self.spec_verify_graphs.len() >= max_cached {
             self.stream.synchronize()?;
             let evict_idx = if lora_mode != GraphLoraMode::BaseOnly {
@@ -195,6 +197,25 @@ impl Qwen3_5ModelRank {
                 0
             };
             self.spec_verify_graphs.remove(evict_idx);
+        }
+        while !self.spec_verify_graphs.is_empty()
+            && self.device.mem_info()?.0 < MIN_SPEC_GRAPH_CAPTURE_SOFT_VRAM_BYTES
+        {
+            self.stream.synchronize()?;
+            let evict_idx = if lora_mode != GraphLoraMode::BaseOnly {
+                self.spec_verify_graphs
+                    .iter()
+                    .position(|((_, _, _, lm), _, _)| *lm != GraphLoraMode::BaseOnly)
+                    .unwrap_or(0)
+            } else {
+                0
+            };
+            self.spec_verify_graphs.remove(evict_idx);
+        }
+        if self.device.mem_info()?.0 < MIN_SPEC_GRAPH_CAPTURE_HARD_VRAM_BYTES {
+            return Err(loader_err(
+                "insufficient free VRAM for spec_verify CUDA Graph capture",
+            ));
         }
         let max_seq_len = if long_ctx {
             (self.spec_verify_io.max_blocks_per_req * 16).max(2048) as i32
@@ -345,9 +366,22 @@ impl Qwen3_5ModelRank {
             }
             return Ok(());
         }
+        const MIN_BATCHED_SPEC_GRAPH_SOFT_VRAM_BYTES: usize = 96 * 1024 * 1024;
+        const MIN_BATCHED_SPEC_GRAPH_HARD_VRAM_BYTES: usize = 64 * 1024 * 1024;
         if self.batched_spec_verify_graphs.len() >= MAX_BATCHED_SPEC_CACHED_GRAPHS {
             self.stream.synchronize()?;
             self.batched_spec_verify_graphs.remove(0);
+        }
+        while !self.batched_spec_verify_graphs.is_empty()
+            && self.device.mem_info()?.0 < MIN_BATCHED_SPEC_GRAPH_SOFT_VRAM_BYTES
+        {
+            self.stream.synchronize()?;
+            self.batched_spec_verify_graphs.remove(0);
+        }
+        if self.device.mem_info()?.0 < MIN_BATCHED_SPEC_GRAPH_HARD_VRAM_BYTES {
+            return Err(loader_err(
+                "insufficient free VRAM for batched_spec_verify CUDA Graph capture",
+            ));
         }
         let max_seq_len = if long_ctx {
             (self.batched_decode_io.max_blocks_per_req * 16).max(2048) as i32

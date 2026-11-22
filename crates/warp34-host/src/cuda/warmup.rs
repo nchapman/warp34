@@ -863,6 +863,28 @@ pub fn prepare_execution_plan(device_id: i32) -> Result<()> {
         ),
         "warmup warp34_paged_attention_bf16 hd128"
     )?;
+    warmup_ffi!(
+        ffi::warp34_paged_attention_bf16(
+            &ex,
+            &bf16_layout,
+            &attn_batch_m2,
+            buf_c as *const c_void,
+            buf_d as *mut c_void,
+            2,
+        ),
+        "warmup warp34_paged_attention_bf16 hd128 packed"
+    )?;
+    warmup_ffi!(
+        ffi::warp34_paged_attention_bf16(
+            &ex_split,
+            &bf16_layout,
+            &attn_batch_m2,
+            buf_c as *const c_void,
+            buf_d as *mut c_void,
+            2,
+        ),
+        "warmup warp34_paged_attention_bf16 hd128 splitk"
+    )?;
     let bf16_layout_256 = Warp34KvLayerLayout {
         namespace_id: ffi::WARP34_KV_NAMESPACE_DFLASH_DRAFT_CTX,
         k_format: ffi::WARP34_KV_FORMAT_BF16,
@@ -879,6 +901,28 @@ pub fn prepare_execution_plan(device_id: i32) -> Result<()> {
             2,
         ),
         "warmup warp34_paged_attention_bf16 hd256"
+    )?;
+    warmup_ffi!(
+        ffi::warp34_paged_attention_bf16(
+            &ex,
+            &bf16_layout_256,
+            &attn_batch_m2,
+            buf_c as *const c_void,
+            buf_d as *mut c_void,
+            2,
+        ),
+        "warmup warp34_paged_attention_bf16 hd256 packed"
+    )?;
+    warmup_ffi!(
+        ffi::warp34_paged_attention_bf16(
+            &ex_split,
+            &bf16_layout_256,
+            &attn_batch_m2,
+            buf_c as *const c_void,
+            buf_d as *mut c_void,
+            2,
+        ),
+        "warmup warp34_paged_attention_bf16 hd256 splitk"
     )?;
     warmup_ffi!(
         ffi::warp34_paged_attention_bf16(

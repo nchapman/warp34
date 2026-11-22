@@ -58,6 +58,30 @@ fn dflash_confidence_gate_truncates_low_prob_tail_and_cum_prob() {
     );
     assert_eq!(chain_draft, vec![10, 20]);
 
+    // AVX-512 TP=1 gate `(7, 0.35, 0.35, true)` drops uncertain j = 0 (`0.27 < 0.35`)
+    // while retaining multi-step confident chains (`cum = 0.658 >= 0.35`).
+    let mut avx512_zero = vec![10, 20, 30, 40];
+    DFlash2Rank::truncate_path_by_step_confidences(
+        &mut avx512_zero,
+        &uncertain_confs,
+        7,
+        0.35,
+        0.35,
+        true,
+    );
+    assert!(avx512_zero.is_empty());
+
+    let mut avx512_chain = vec![10, 20, 30, 40];
+    DFlash2Rank::truncate_path_by_step_confidences(
+        &mut avx512_chain,
+        &chain_confs,
+        7,
+        0.35,
+        0.35,
+        true,
+    );
+    assert_eq!(avx512_chain, vec![10, 20, 30, 40]);
+
     // 3. When all positions remain above both step and cumulative floors, caps at `max_draft`.
     let mut high = vec![10, 20, 30, 40, 50, 60, 70];
     let high_confs = vec![0.99; 7];

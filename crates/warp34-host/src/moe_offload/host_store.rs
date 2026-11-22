@@ -1634,6 +1634,7 @@ pub struct TieredMoeWorkspace {
     pub external_scratch: (u64, usize),
     pub d_miss_local_experts: crate::cuda::DeviceBuffer,
     pub d_miss_victim_slots: crate::cuda::DeviceBuffer,
+    pub d_chunk_slot_tables: crate::cuda::DeviceBuffer,
     pub d_num_misses: crate::cuda::DeviceBuffer,
     pub h_prefill_x: MappedHostBuffer,
     pub h_prefill_out: MappedHostBuffer,
@@ -1750,6 +1751,11 @@ impl TieredMoeWorkspace {
             max_misses * core::mem::size_of::<i32>(),
             &h2d_stream,
         )?;
+        let d_chunk_slot_tables = DeviceBuffer::alloc_on_stream(
+            device_id,
+            512 * 512 * core::mem::size_of::<i32>(),
+            &h2d_stream,
+        )?;
         let d_num_misses =
             DeviceBuffer::alloc_on_stream(device_id, 2 * core::mem::size_of::<i32>(), &h2d_stream)?;
         let prefill_buf_bytes = max_tokens.max(1) * layout.hidden * core::mem::size_of::<u16>();
@@ -1787,6 +1793,7 @@ impl TieredMoeWorkspace {
             external_scratch: (0, 0),
             d_miss_local_experts,
             d_miss_victim_slots,
+            d_chunk_slot_tables,
             d_num_misses,
             h_prefill_x,
             h_prefill_out,

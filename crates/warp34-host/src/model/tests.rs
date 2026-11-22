@@ -1908,4 +1908,99 @@ mod serving_capacity_tests {
             .unwrap();
         assert_eq!(h_prerot_after, h_prerot_before);
     }
+
+    #[test]
+    fn tp1_tiered_moe_dflash2_caps_state_slots_for_graph_headroom() {
+        let mib = 1024 * 1024;
+        let gib = 1024 * mib;
+        let tiered_cfg = sample_qwen4_exp_config();
+        // On a 24 GiB TP=1 card with Qwen3.8-Flash-Next + DFlash2 (`M=8`, `min_slots=11`),
+        // `evaluate_serving_kv_candidate_budget` must cap serving GDN state slots to `<= 16`
+        // (`2 * 8` full concurrent DFlash2 verify sequences) rather than filling up to `19-20`
+        // slots and starving CUDA Graph instantiation (`m_verify = 1..=8`, ~28 MiB/shape).
+        let (slots_tp1_m8, _, _) = super::rank_capacity::evaluate_serving_kv_candidate_budget(
+            &tiered_cfg,
+            1,
+            KvFormatPolicy::Tq4,
+            false,
+            8192,
+            3_560 * mib,
+            512 * mib,
+            8 * mib,
+            23_600 * mib,
+            64,
+            false,
+            false,
+            false,
+            520 * mib,
+            11,
+            LoraCapacityReserve::default(),
+            true,
+        )
+        .expect("TP=1 tiered MoE + DFlash2 M=8 must fit on 24 GiB");
+        assert!(
+            (11..=16).contains(&slots_tp1_m8),
+            "expected TP=1 DFlash2 M=8 state slots in 11..=16 to preserve CUDA Graph VRAM headroom, got {slots_tp1_m8}"
+        );
+
+        // When `dflash_min_state_slots` is larger (e.g. `M=16` -> `19` slots on >= 40 GiB),
+        // `.max(dflash_min_state_slots)` must still honor the drafter's minimum requirement.
+        let (slots_tp1_m16, _, _) = super::rank_capacity::evaluate_serving_kv_candidate_budget(
+            &tiered_cfg,
+            1,
+            KvFormatPolicy::Tq4,
+            false,
+            8192,
+            3_560 * mib,
+            512 * mib,
+            8 * mib,
+            40 * gib,
+            64,
+            false,
+            false,
+            false,
+            2_400 * mib,
+            19,
+            LoraCapacityReserve::default(),
+            true,
+        )
+        .expect("TP=1 tiered MoE + DFlash2 M=16 must fit on 40 GiB");
+        assert_eq!(slots_tp1_m16, 19);
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn graph_launch_failure_clears_sticky_cuda_last_error() {
+        let _dev = CudaDevice::set_current(0).unwrap();
+        let stream = CudaStream::new(0).unwrap();
+        let ex = stream.exec(0, 0);
+        // Trigger a non-zero return from `warp34_graph_launch` (simulating OOM / invalid handle
+        // during speculative CUDA Graph capture/launch fallback).
+        // SAFETY: `0` is intentionally invalid and handled by CUDA runtime; `stream.handle` is live.
+        let launch_rc = unsafe { ffi::warp34_graph_launch(0, stream.handle) };
+        assert_ne!(launch_rc, 0);
+
+        // An immediately following eager kernel that inspects `cudaGetLastError()` must NOT
+        // fail due to a sticky error left behind by `warp34_graph_launch`.
+        let d_in = DeviceBuffer::alloc(0, 256 * 2).unwrap();
+        let d_out = DeviceBuffer::alloc(0, 4 * 256 * 2).unwrap();
+        d_in.copy_from_host(&vec![0u16; 256], &stream).unwrap();
+        // SAFETY: `d_in` (`[1, 256]`) and `d_out` (`[1, 4, 256]`) are live device buffers.
+        let eager_rc = unsafe {
+            ffi::warp34_hc_init_streams_f16(
+                &ex,
+                d_in.addr() as *const std::ffi::c_void,
+                d_out.addr() as *mut std::ffi::c_void,
+                std::ptr::null(),
+                1,
+                4,
+                256,
+            )
+        };
+        assert_eq!(
+            eager_rc, 0,
+            "sticky CUDA runtime error from failed graph launch poisoned subsequent eager kernel"
+        );
+        stream.synchronize().unwrap();
+    }
 }
