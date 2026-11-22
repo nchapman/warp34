@@ -597,12 +597,12 @@ impl TieredMoeEngine {
                 let use_cpu_bridge = cache.bridge_runtime.is_some()
                     && num_tokens <= ws.max_tokens
                     && h_topk_weights.len() == num_tokens * top_k;
-                // Only run `dynamic_short_adapt` on short/medium prompts (`64 <= num_tokens < 1024`)
+                // Only run `dynamic_short_adapt` on short/medium prompts (`32 <= num_tokens < 1024`)
                 // so multi-chunk long-context prefills (`code-context-r64`, 2048-tok chunks) do not
                 // overwrite the hot decode cache with high-`expert_freq` prompt-only experts.
                 let dynamic_short_adapt = cache.k_static <= 1
                     && cache.slots.capacity >= 64
-                    && (64..TIERED_MOE_LONG_PROMPT_ADAPT_MIN_TOKENS).contains(&num_tokens);
+                    && (32..TIERED_MOE_LONG_PROMPT_ADAPT_MIN_TOKENS).contains(&num_tokens);
                 let want_freq_stats = use_cpu_bridge
                     || dynamic_short_adapt
                     || (num_tokens >= TIERED_MOE_LONG_PROMPT_ADAPT_MIN_TOKENS && adapt_end >= 64);
@@ -1273,7 +1273,7 @@ impl TieredMoeEngine {
         out_addr: u64,
         num_tokens: usize,
         top_k: usize,
-        pre_routed_hook: Option<PreRoutedHook<'_>>,
+        mut pre_routed_hook: Option<PreRoutedHook<'_>>,
     ) -> crate::cuda::Result<()> {
         if num_tokens == 0 {
             return Ok(());
@@ -1302,18 +1302,17 @@ impl TieredMoeEngine {
                 pre_routed_hook,
             );
         }
-        if let Some(hook) = pre_routed_hook {
-            hook(compute_stream)?;
-        }
-        // For short warm-prefix tails and micro-batches (`9..=24` tokens, `<= 3` slices of `8`),
-        // slice into `<= 8`-token device-bridge launches so we avoid 48-layer
-        // `sync_from_device_if_dirty` + routing D2H stalls without losing cross-token deduplication.
+        // For GDN checkpoint warm-prefix tails and short micro-batches (`9..=40` tokens,
+        // `<= 5` slices of `8`), slice into `<= 8`-token
+        // device-bridge launches so we avoid 48-layer `sync_from_device_if_dirty` + routing D2H
+        // stalls while promoting hot suffix experts via GPU TinyLFU and overlapping slice 0's
+        // CPU/PCIe work with the full `[num_tokens, h_dim]` shared-expert GPU projection.
         if !is_capturing_graph
             && matches!(mode, MoeOffloadMode::Auto | MoeOffloadMode::GpuLru)
-            && num_tokens <= 24
+            && num_tokens <= 40
             && top_k <= TIERED_MOE_CPU_BRIDGE_MAX_TOP_K
             && cache.has_cpu_bridge()
-            && cache.slots.capacity >= 64
+            && cache.slots.capacity >= crate::model::TIERED_MOE_DYNAMIC_LRU_MIN_HOT_EXPERTS
         {
             let hidden_f16_bytes = (store.layout().hidden * core::mem::size_of::<u16>()) as u64;
             let topk_i32_bytes = (top_k * core::mem::size_of::<i32>()) as u64;
@@ -1321,7 +1320,7 @@ impl TieredMoeEngine {
             for c0 in (0..num_tokens).step_by(TIERED_MOE_CPU_BRIDGE_MAX_DECODE_TOKENS) {
                 let m = (num_tokens - c0).min(TIERED_MOE_CPU_BRIDGE_MAX_DECODE_TOKENS);
                 let c0_u64 = c0 as u64;
-                Self::execute_layer_device_lru(
+                Self::execute_layer_device_lru_with_hook(
                     store,
                     cache,
                     ws,
@@ -1342,9 +1341,13 @@ impl TieredMoeEngine {
                     out_addr + c0_u64 * hidden_f16_bytes,
                     m,
                     top_k,
+                    pre_routed_hook.take(),
                 )?;
             }
             return Ok(());
+        }
+        if let Some(hook) = pre_routed_hook {
+            hook(compute_stream)?;
         }
         let pairs = num_tokens * top_k;
         let ids_bytes = pairs * 4;

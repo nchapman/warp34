@@ -324,7 +324,7 @@ Each row pits `warp34` (`W4A16-HGPTQ`) against a dedicated single-model engine o
 | **[`ninfer-3090`](https://github.com/Don-Chad/ninfer-3090)** (`115dee6`) | `27B` W4 on `1× 3090 Ti` *(MTP)* | `C=1` / `C=8` / agent / primed | `94.1` / `260.3` / `69.2` / `39.8` | **`109.1` / `417.2` / `96.0` / `109.6`** | **`+16%` – `2.75×`** |
 | **[`qwen38-flash-next-3090`](https://github.com/DominikBucko/qwen38-flash-next-3090)** (`10b24c2`) | `180B Flash-Next` W4 on `1× 3090 Ti` *(MTP)* | chat / `6K` code / primed | `30.6` / `21.2` / `10.2` | **`53.7` / `26.3` / `49.6`** | **`+24%` – `4.86×`** |
 | **[`qwen38-flash-next-2x3090`](https://github.com/DominikBucko/qwen38-flash-next-2x3090)** (`4dca58f`) | `180B Flash-Next` W4 on `2× 3090 Ti` *(MTP)* | chat / `6K` code / primed | `55.6` / `28.3` / `20.5` | **`99.4` / `39.1` / `93.1`** | **`+38%` – `4.54×`** |
-| **[`Strata v0.2.17`](https://github.com/Niko1221/Strata)** (`3142b66`) | `180B Flash-Next` W4 on `1× 3090 Ti` *(DFlash2)* | chat / prefill / primed / agent | **`80.9`** / `23.6` / **`82.9`** / **`64.7`** | `77.7` / **`32.4`** / `74.2` / `51.9` | **`+37%` prefill; `-4%`–`-20%` decode** |
+| **[`Strata v0.2.17`](https://github.com/Niko1221/Strata)** (`3142b66`) | `180B Flash-Next` W4 on `1× 3090 Ti` *(DFlash2)* | chat / prefill / primed / agent | `80.9` / `23.6` / **`82.9`** / **`64.7`** | **`83.9`** / **`32.1`** / `74.0` / `58.4` | **`+4%` chat, `+36%` prefill; `-10%` primed/agent** |
 | **[`Strata v0.2.17`](https://github.com/Niko1221/Strata)** (`3142b66`) | `180B Flash-Next` W4 on `1× 4090` *(DFlash2)* | chat / prefill / primed / agent | `118.0` / `40.3` / `109.4` / `98.0` | **`120.0` / `49.0` / `118.6` / `101.1`** | **`+2%` – `+22%`** |
 | **[`Strata v0.2.17`](https://github.com/Niko1221/Strata)** (`3142b66`) | `180B Flash-Next` W4 on `2× 3090 Ti` *(DFlash2)* | chat / prefill / primed / agent | `120.9` / `37.1` / `112.8` / `96.1` | **`140.1` / `51.0` / `123.5` / `123.6`** | **`+10%` – `+38%`** |
 | **[`Strata v0.2.17`](https://github.com/Niko1221/Strata)** (`3142b66`) | `180B Flash-Next` W4 on `2× 4090` *(DFlash2)* | chat / prefill / primed / agent | `132.7` / `51.1` / `113.1` / `112.6` | **`179.6` / `68.5` / `178.7` / `184.7`** | **`+34%` – `+64%`** |
@@ -338,7 +338,7 @@ Each row pits `warp34` (`W4A16-HGPTQ`) against a dedicated single-model engine o
 | **`Qwen3.5-9B`** | `234 tok/s` | `253 tok/s` | `339 tok/s` | `369 tok/s` |
 | **`Qwen3.8-27B`** | `150 tok/s` | `162 tok/s` | `252 tok/s` | `246 tok/s` |
 | **`Qwen3.6-35B-A3B`** | `429 tok/s` | `512 tok/s` | `553 tok/s` | `672 tok/s` |
-| **`Qwen3.8-Flash-Next`** *(180B MoE)* | `54 tok/s` *(DFlash2 `78`)* | `58 tok/s` *(DFlash2 `120`)* | `99 tok/s` *(DFlash2 `140`)* | `117 tok/s` *(DFlash2 `180`)* |
+| **`Qwen3.8-Flash-Next`** *(180B MoE)* | `54 tok/s` *(DFlash2 `84`)* | `58 tok/s` *(DFlash2 `120`)* | `99 tok/s` *(DFlash2 `140`)* | `117 tok/s` *(DFlash2 `180`)* |
 
 *All rows use lossless `MTP-3` on `W4A16-HGPTQ` (Q4) checkpoints (`9B` and `Flash-Next` are end-to-end HTTP serving p50s; `27B` and `35B-A3B` are `warp34 bench` peak acceptance—realistic coding prompts achieve `96–113 tok/s` on `1× 3090 Ti` and `156–184 tok/s` on `2×` GPUs for `27B MTP-3`). Full `27B`, `Flash-Next`, `DFlash2`, prefill, and `Plain` (non-MTP) campaigns are in [`docs/STATE.md`](docs/STATE.md) and [`benchmarks/perf/campaigns/standings.md`](benchmarks/perf/campaigns/standings.md).*
 

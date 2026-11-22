@@ -731,8 +731,9 @@ impl FfnBlockWeights {
         prerotated_input_buf: u64,
     ) -> Result<()> {
         let input_prerotated = prerotated_input_buf != 0;
-        let can_defer_shared = num_tokens
+        let can_defer_shared = (num_tokens
             <= crate::moe_offload::TIERED_MOE_CPU_BRIDGE_MAX_DECODE_TOKENS
+            || (!is_capturing_graph && num_tokens <= 40))
             && match self {
                 Self::Moe(moe) => {
                     matches!(moe.experts, MoeExpertStorage::Tiered { .. })

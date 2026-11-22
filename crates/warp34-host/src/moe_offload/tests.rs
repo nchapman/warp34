@@ -66,6 +66,51 @@ fn hot_expert_rankings_hit_curve_keeps_terminal_full_coverage_rate() {
     assert_eq!(rankings.interp_hit_rate(0, 4), Some(0.50));
 }
 
+#[test]
+fn plan_layer_capacities_preserves_dynamic_lru_floor_at_mean_64() {
+    let rankings = super::HotExpertRankings::from_json(&serde_json::json!({
+        "layers": {
+            "0": {
+                "num_experts": 512,
+                "ranked_expert_ids": [0, 1, 2, 3],
+                "hit_rate_by_cache_size": {
+                    "top_16": 0.08,
+                    "top_32": 0.14,
+                    "top_64": 0.24,
+                    "top_88": 0.26,
+                    "top_128": 0.30
+                }
+            },
+            "1": {
+                "num_experts": 512,
+                "ranked_expert_ids": [0, 1, 2, 3],
+                "hit_rate_by_cache_size": {
+                    "top_16": 0.08,
+                    "top_32": 0.14,
+                    "top_64": 0.24,
+                    "top_88": 0.45,
+                    "top_128": 0.65
+                }
+            }
+        }
+    }))
+    .unwrap();
+    // At `mean_hot = 64` (`TIERED_MOE_DYNAMIC_LRU_MIN_HOT_EXPERTS`), no layer may drop below 64
+    // (which would set `k_static = ck_hot`, disabling TinyLFU and overlapped PCIe pull).
+    let caps_64 = rankings.plan_layer_capacities(
+        2,
+        super::TIERED_MOE_DYNAMIC_LRU_MIN_HOT_EXPERTS,
+        super::TIERED_MOE_CPU_BRIDGE_MIN_HOT_EXPERTS,
+        512,
+        2,
+    );
+    assert_eq!(caps_64, vec![64, 64]);
+    // At `mean_hot = 66`, layer 0 stays at the 64-slot dynamic-LRU floor while layer 1 gets 68.
+    let caps_66 =
+        rankings.plan_layer_capacities(2, 66, super::TIERED_MOE_CPU_BRIDGE_MIN_HOT_EXPERTS, 512, 2);
+    assert_eq!(caps_66, vec![64, 68]);
+}
+
 #[cfg(feature = "cuda")]
 mod cuda_tests {
     use super::super::*;

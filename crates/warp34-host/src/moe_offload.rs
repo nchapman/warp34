@@ -469,7 +469,11 @@ impl HotExpertRankings {
             return vec![mean_hot; num_layers];
         }
         let total_budget = num_layers * mean_hot;
-        let dyn_floor = if mean_hot >= 72 { 72 } else { min_hot };
+        let dyn_floor = if mean_hot >= TIERED_MOE_DYNAMIC_LRU_MIN_HOT_EXPERTS {
+            TIERED_MOE_DYNAMIC_LRU_MIN_HOT_EXPERTS
+        } else {
+            min_hot
+        };
         let floor = ((mean_hot * 3 / 4) / step * step).clamp(dyn_floor.max(min_hot), mean_hot);
         let ceil = ((mean_hot * 5 / 4).max(mean_hot + 32) / step * step)
             .min(max_hot)
@@ -575,6 +579,10 @@ pub const TIERED_MOE_CPU_BRIDGE_AVX2_GPU_SHARE_FRAC: f32 = 0.50;
 
 /// Minimum GPU hot expert count (`16`) required before auto-enabling the `TP=1` CPU MoE bridge.
 pub const TIERED_MOE_CPU_BRIDGE_MIN_HOT_EXPERTS: usize = 16;
+
+/// Minimum per-layer GPU hot expert capacity (`64`) required before enabling dynamic TinyLFU
+/// slot replacement (`k_static = 1`) and overlapped PCIe expert staging on the CPU MoE bridge.
+pub const TIERED_MOE_DYNAMIC_LRU_MIN_HOT_EXPERTS: usize = 64;
 
 /// Execution policy for tiered 512-expert MoE layers on multi-token prefill batches.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
