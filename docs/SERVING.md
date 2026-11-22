@@ -93,11 +93,12 @@ browser account/login system; use a proxy if the entire dashboard needs a login.
 
 ## Model identity
 
-`--served-model-name NAME` sets the public model identity in `/v1/models`,
-generative responses, and metrics. It does not change the download repository,
-revision, tokenizer, or loaded weights. Without an alias the original `--model`
-ID or local path is retained, not the resolved Hub cache path. A public alias also
-avoids exposing local filesystem paths in telemetry.
+`--served-model-name NAME` (aliases: `--alias NAME`, `-a NAME`) sets the public
+model identity in `/v1/models`, generative responses, and metrics. It does not
+change the download repository, revision, tokenizer, or loaded weights. Without
+an alias the original `--model` ID or local path is retained, not the resolved
+Hub cache path. A public alias also avoids exposing local filesystem paths in
+telemetry.
 
 This is still a single-model server: request `model` is not a routing selector,
 and adding an alias does not introduce strict model-name validation. Decision
@@ -108,10 +109,13 @@ the advertised alias rather than relying on permissive request-name handling.
 
 | Option | Default | Meaning |
 |---|---|---|
-| `--max-num-seqs N` (aliases: `--max-running-requests`, `--parallel`, `-np`) | 16 | Active sequences, **1–16**; used for both GDN state-pool planning and worker scheduling |
-| `-c N`, `--ctx-size N` (aliases: `--context-length`, `--kv-tokens`) | Automatic (up to `32k` tokens on `serve`) | Shared target KV pool in **tokens** (supports `k`/`M` suffixes like `8k`, `32k`, `64k`, `128k`; rounds up to 16-token pages) |
+| `--max-num-seqs N` (aliases: `--max-running-requests`, `--parallel`, `-np`) | `16` | Active sequences, **1–16**; used for both GDN state-pool planning and worker scheduling (promoted to at least `6` for state-pool planning when `DFlash2` is active) |
+| `-c N`, `--ctx-size N` (aliases: `--context-length`, `--kv-tokens`) | `auto` (up to `256k` / `262,144` tokens on `serve`) | Shared target KV pool in **tokens** (`auto`, or `k`/`M` suffixes like `8k`, `32k`, `64k`, `128k`, `256k`; rounds up to 16-token pages) |
 | `--max-model-len N` | `min(allocated_kv_tokens, max_position_embeddings)` | Per-request total prompt + requested output admission ceiling (supports `k`/`M` suffixes; auto-expands target KV pool when `-c`/`--kv-pages` is omitted) |
-| `--kv-pages N` (alias: `--num-gpu-blocks-override`) | Automatic (up to `2,048` pages on `serve`, including `--speculative`) | Low-level alternative to `--ctx-size`: shared target KV pool in 16-token pages (mutually exclusive with `--ctx-size`) |
+| `--kv-pages N` (alias: `--num-gpu-blocks-override`) | `auto` (up to `16,384` pages on `serve`, including `--speculative`) | Low-level alternative to `--ctx-size`: shared target KV pool in 16-token pages (mutually exclusive with `--ctx-size`) |
+| `--reasoning-effort LEVEL` | Checkpoint / request default | Server-wide default `reasoning_effort` (`off\|none\|minimal\|low\|medium\|high\|xhigh\|max`) |
+| `--reasoning-budget <auto\|off\|N>` | `auto` | Default thinking token budget (`auto` applies OpenRouter effort ratios up to `32k`; `off`/`-1` disables budget forcing) |
+| `--reasoning-budget-message TEXT` | Built-in cutoff prompt | Transition text injected before `</think>` on budget exhaustion (`""` for none; `--no-reasoning-effort-budget` disables percentage caps) |
 
 `--max-num-seqs` is an upper bound, not a promise that N arbitrary contexts fit at
 once. GPU memory may reduce state capacity, and KV availability can serialize or
@@ -203,11 +207,14 @@ is lost on restart; a partially delivered stream cannot be transparently retried
 ## CLI scope and intentional omissions
 
 The deployment settings (`--api-key`, `--api-key-env`, `--no-webui`,
-`--served-model-name`, `--max-num-seqs`, `--max-model-len`) are **serve-only**.
-`serve` rejects generation, benchmarking, and oracle-only options it formerly
-accepted without effect. In particular, `--batch-size` is a benchmark option;
-use `--max-num-seqs` for serving. `--no-thinking` is a chat option; serving callers
-control thinking in their requests.
+`--served-model-name` / `--alias` / `-a`, `--max-num-seqs`, `--max-model-len`,
+`--reasoning-effort`, `--reasoning-budget`, `--reasoning-budget-message`,
+`--no-reasoning-effort-budget`) are **serve-only**.
+`serve` rejects single-prompt generation, benchmarking, and oracle-only options
+it formerly accepted without effect (such as `--batch-size`, `--stage`, `--prompt`,
+`--prompt-file`, `--prompt-len`, `--gen-len`, `--max-tokens`, `--golden`,
+`--dump-dir`, `--compare-tp2`, and `--out`). In particular, `--batch-size` is a
+benchmark option; use `--max-num-seqs` for serving.
 
 We deliberately retain the fixed FP16 target spine, automatic checkpoint
 quantization detection, SDK-owned Hub credentials/cache, built-in Qwen parsers,

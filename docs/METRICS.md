@@ -15,7 +15,7 @@ optional; use it for durable history, alerting, and fleet-wide aggregation.
 docker logs --since 1h qwen3.8-27b-warp34 2>&1 | jq -Rc 'fromjson? | select(.event == "inference.turn_end" and .length_limit != null) | {request_id, length_limit, prompt_tokens, cached_prompt_tokens, output_tokens, requested_max_output_tokens, effective_max_output_tokens, context_window}'
 ```
 
-`length_limit` distinguishes a requested output budget, the server default, the remaining context window (including a tie with the requested budget), and runtime KV capacity. Output counts include reasoning (`reasoning_tokens`), emitted tool calls (`tool_calls`), and hidden stop tokens, alongside chat request shape (`messages`, `tools`, `enable_thinking`) and effective sampling parameters (`sampling`: `temperature`, `top_p`, `top_k`, `min_p`, `seed`). Request IDs (`chatcmpl-<32 hex>`, `cmpl-<32 hex>`, `resp_<32 hex>`, `msg_<32 hex>`) are 128-bit CSPRNG identifiers that remain globally unique across container restarts. `ttft_ms` and `duration_ms` start after request preparation, before worker submission; `output_tokens_per_s` measures tokens observed by the handler *after* the first token, not prompt throughput or network delivery. Missing observations are `null`. A dropped unfinished response is `cancelled`; a stream error is `error` even if SSE headers already returned HTTP 200. Non-success HTTP responses to inference POSTs, including pre-generation rejections, also emit `inference.http_error` with the route and status.
+`length_limit` distinguishes a requested output budget, the server default, the remaining context window (including a tie with the requested budget), and runtime KV capacity. Output counts include reasoning (`reasoning_tokens`), emitted tool calls (`tool_calls`), and hidden stop tokens, alongside protocol/outcome metadata (`api`, `stream`, `status`, `finish_reason`), chat request shape (`messages`, `tools`, `enable_thinking`, `reasoning_effort`, `reasoning_budget_tokens`, `thinking_budget_exhausted`), and effective sampling parameters (`sampling`: `temperature`, `top_p`, `top_k`, `min_p`, `seed`). Request IDs (`chatcmpl-<32 hex>`, `cmpl-<32 hex>`, `resp_<32 hex>`, `msg_<32 hex>`) are 128-bit CSPRNG identifiers that remain globally unique across container restarts. `ttft_ms` and `duration_ms` start after request preparation, before worker submission; `output_tokens_per_s` measures tokens observed by the handler *after* the first token, not prompt throughput or network delivery. Missing observations are `null`. A dropped unfinished response is `cancelled`; a stream error is `error` even if SSE headers already returned HTTP 200. Non-success HTTP responses to inference POSTs, including pre-generation rejections, also emit `inference.http_error` with the route and status.
 
 For slow follow-ups, compare three counts at admission alongside `messages` and `tools` counts instead of relying on a lifetime cache-hit percentage:
 
@@ -225,8 +225,8 @@ Docker builds the same locked frontend in a separate Node stage and copies only
 
 ## Donor requirements
 
-The first version follows vLLM 0.31.0's counter/histogram approach
-(`v1/metrics/{stats,loggers,buckets}.py`) and SGLang v0.5.19's separation of active,
+The telemetry design follows `vLLM 0.34.0`'s counter/histogram approach
+(`v1/metrics/{stats,loggers,buckets}.py`) and `SGLang v0.5.23`'s separation of active,
 evictable, and free hybrid pools (`srt/observability/metrics_collector.py` and
 `scheduler_components/pool_stats_observer.py`). We adopt their operational semantics,
 not their entire metric inventory or Python implementation. High-cardinality request

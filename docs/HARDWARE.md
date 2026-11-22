@@ -228,8 +228,8 @@ smem and `test_wait`-style barriers** — Hopper niceties don't exist here.
 
 ## 9. Roofline mapping to our workloads
 
-`warp34` executes Safetensors checkpoints in unified Marlin **`W4A16` / `W8A16`**
-tile layout (`docs/MODELS.md`, `crates/warp34-kernels/csrc/ops/op_marlin.cu`). The
+`warp34` executes Safetensors checkpoints in unified Marlin **`W4A16` / `W2A16` / `W8A16` / shared-weight `W4A8`**
+tile layout ([`docs/MODELS.md`](MODELS.md), `crates/warp34-kernels/csrc/ops/op_marlin.cu`). The
 GGUF `Q4_K_M` figures below are included as reference math for cross-engine
 roofline comparisons (`benchmarks/perf/`). Bandwidth model uses the **measured
 959.5 GB/s** read ceiling (§11; 95.2% of 1008 theory).
@@ -464,7 +464,7 @@ nvidia-smi --query-gpu=index,name,power.limit,power.default_limit,clocks.sm,cloc
    - Where 4090 pulls ahead by `1.26×–1.72×` over 3090 Ti is whenever work becomes compute-bound, L2-resident, or multi-CTA occupancy-sensitive: **prefill (`M=512`)** (`11,291 tok/s` on `4B`, `6,496 tok/s` on `9B`, `4,868 tok/s` on `35B TP=2`), **speculative verification (`M=3..16`)** (`817.6 tok/s` on `4B DFlash2`, `507.1 tok/s` on `35B TP=2 MTP`, `400.7 tok/s` on `9B TP=2 MTP`, `182.0 tok/s` on `27B TP=2 DFlash2`), and **sparse MoE decode** (`308.4 tok/s` on `35B TP=2`, `242.4 tok/s` on `35B TP=1`).
 2. **Untapped `sm_89`-Only Hardware Opportunities (Future Passes):**
    - **Native Ada `FP8` (`e4m3` / `e5m2`) Tensor Core MMA (`mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32` — `330.3 TFLOPS` FP32-acc on 4090):**
-     - `sm_86` lacks hardware `FP8`, whereas `sm_89` provides `2×` Tensor Core throughput (`330.3 TF` vs `165.2 TF` FP16/BF16) and `0.5×` weight bandwidth in `FP8`. Quantizing the 5-layer `DFlash2` drafter from `BF16` (`cuBLAS`, `2,798.7 µs/round` on `4B`) to `FP8` (`W8A8-FP8` or `W4A8-FP8`) on `sm_89` would cut drafter latency in half, pushing `4B DFlash2` past `~950+ tok/s` and `27B DFlash2` past `~200+ tok/s`, and accelerating `M >= 64` prefill.
+     - `sm_86` lacks hardware `FP8`, whereas `sm_89` provides `2×` Tensor Core throughput (`330.3 TF` vs `165.2 TF` FP16/BF16) and `0.5×` weight bandwidth in `FP8`. (Note: `warp34` already provides quantized `W4A16-HGPTQ` `DFlash2` drafters — `nchapman/Qwen3.8-27B-DFlash2-W4A16-HGPTQ` and `nchapman/Qwen3.8-Flash-Next-DFlash2-W4A16-HGPTQ` — running native `BF16`-activation Marlin `U4B8` on both `sm_86` and `sm_89`.) Adding an `sm_89`-native `W8A8-FP8` or `W4A8-FP8` MMA path would further accelerate `M >= 64` prefill and unquantized `BF16` drafters on Ada GPUs.
    - **Multi-Token `m_e in {2, 3}` Register-Broadcast Sparse MoE GEMV (`op_moe.cu`):**
      - During `35B-A3B` speculative verify (`M=3` for `MTP k=2`), `MoE` takes `1,236.2 µs/round` (vs `564.3 µs/step` at `M=1`) because with `M=3 × top-8 = 24` expert assignments across `256` experts, most active experts receive `m_e = 1` or `2` tokens (falling below the `m_e >= 4` `mma.sync` tile threshold and streaming weights per token row). A specialized `m_e in {2, 3}` warp-per-expert GEMV that loads each expert's packed `int32` weight once into registers and multiplies against `2` or `3` token activation vectors simultaneously would save `~200–250 µs/round` on `35B-A3B MTP` (`507 -> ~550+ tok/s`).
 

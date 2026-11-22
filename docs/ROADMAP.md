@@ -2,10 +2,10 @@
 
 > **Posture:** `warp34` is a clean-room Rust + CUDA inference engine for **Qwen 3.5 / 3.6 / 3.8 hybrid models** on **1–4× NVIDIA A100 (`sm_80`), RTX 30-series (`sm_86`), and RTX 40-series (`sm_89`) GPUs** (primary reference targets: A100 40GB/80GB, RTX 3090 / 3090 Ti, and RTX 4090).
 >
-> **Source-of-Truth Rubric:** Every subsystem has **one explicit reference donor** chosen by where the mechanism is proven:
-> 1. **`vLLM 0.31.0` (`8352b2427`)** — Primary donor for the **`FP16` model spine**, **Marlin GEMMs** (`W4A16` / `W8A16` / `W4A8` / `moe_wna16`), **layer fusions** (`GemmaRMSNorm`, `fused_qk_rmsnorm_rope_gate`, GDN `chunk` + `fused_recurrent`), **native `MTP`**, **9-step GPU sampler**, and **Qwen3 reasoning/tool/vision parsers**.
-> 2. **`SGLang v0.5.19` (`0bcd822377` / `lmsysorg/sglang:v0.5.19`)** — Primary donor for **Hybrid Prefix Caching (`MambaRadixCache` + `HybridReqToTokenPool` `extra_buffer` strategy)** and **`DFlash2` (`DFlashWorkerV2` `M=8` / `M=16` speculative verify + GDN state management)**, where `vLLM 0.31.0` is either inert on `TP=2` (`DFlash2` `tau=1.000` bug) or lacks radix prefix reuse under hybrid speculation.
-> 3. **`warp3090` (in-house proven `sm_86` IP)** — Primary donor for **TurboQuant 4-bit KV (`TQ4`)** (`block_tq4_0` 4.125 bpw, Rademacher+WHT-256 rotation, Beta(256) Lloyd-Max codebook, rotated `Q8_0` boundary layers, fused `fattn_mma_tq` + GQA-8 `fattn_vec_tq`) and **Pinned-Sysmem / NVLink P2P `TP=2` & `TP=4` Collectives**.
+> **Source-of-Truth Rubric:** Every subsystem has **one explicit reference donor** chosen by where the mechanism is proven (`BASELINE.txt`):
+> 1. **`vLLM 0.34.0` (`62d4bc3c7`)** — Primary donor for the **`FP16` model spine**, **Marlin GEMMs** (`W4A16` / `W2A16` / `W8A16` / `W4A8` / `moe_wna16`), **layer fusions** (`GemmaRMSNorm`, `fused_qk_rmsnorm_rope_gate`, GDN `chunk` + `fused_recurrent`), **native `MTP`**, **9-step GPU sampler**, and **Qwen3 reasoning/tool/vision parsers**.
+> 2. **`SGLang v0.5.23` (`297e54fd10` / `lmsysorg/sglang:v0.5.23`)** — Primary donor for **Hybrid Prefix Caching (`MambaRadixCache` + `HybridReqToTokenPool` `extra_buffer` strategy)** and **`DFlash2` (`DFlashWorkerV2` `M=8` / `M=16` speculative verify + GDN state management)**, where `vLLM` is either inert on `TP=2` (`DFlash2` `tau=1.000` bug) or lacks radix prefix reuse under hybrid speculation.
+> 3. **`warp3090` (in-house proven `sm_86` IP)** — Primary donor for **TurboQuant 4-bit KV (`TQ4`)** (`block_tq4_0` 4.125 bpw, Rademacher+WHT-256 rotation, Beta(256) Lloyd-Max codebook, rotated `Q8_0` / `FP8_E4M3` boundary layers, fused `fattn_mma_tq` + GQA-8 `fattn_vec_tq`) and **Pinned-Sysmem / NVLink P2P `TP=2` & `TP=4` Collectives**.
 >
 > **Core Rule:** Nothing lands without **both** a correctness check and a performance measurement against `vLLM` / `SGLang` on the exact same checkpoint, prompt, and batch shape.
 
@@ -15,7 +15,7 @@
 
 1. **Subsystem-Specific Reference Oracle & Donor Matrix (No Ad-Hoc Hybrids).**
    - No `llama.cpp` / `ggml` `f32` activation spine, no GGUF loader, no `llama-bench` side-quests.
-   - Each subsystem is verified against its authoritative oracle (`vLLM 0.31.0` for model spine/Marlin/MTP/sampler/parsers; `SGLang v0.5.19` for `MambaRadixCache` and `DFlashWorkerV2`; `warp3090` for `TQ4` and sysmem/NVLink collectives) and must prove an end-to-end wall-time or capacity win.
+   - Each subsystem is verified against its authoritative oracle (`vLLM 0.34.0` for model spine/Marlin/MTP/sampler/parsers; `SGLang v0.5.23` for `MambaRadixCache` and `DFlashWorkerV2`; `warp3090` for `TQ4` and sysmem/NVLink collectives) and must prove an end-to-end wall-time or capacity win.
 2. **Explicit Precision Policy (`FP16` Target Spine + `BF16` Drafter Preservation + `FP32` State/Reductions).**
    - **Target model spine (`FP16` / `__half`):** Every target hidden state, residual stream, norm I/O, RoPE tensor, attention Q/K/V/O, GDN activation I/O, and Marlin GEMM I/O is `FP16` — eliminating the ~891 `f32 ↔ f16` adapter casts per round that bottlenecked `warp3090`.
    - **Drafter `BF16` preservation (`__nv_bfloat16`):** Checkpoints whose dynamic range exceeds `FP16` max (`65504`) — specifically the **4B `DFlash2` drafter** — retain native `BF16` weights and activations (`sm_86` and `sm_89` support native `BF16` MMA and elementwise ops). Never blindly downcast `BF16` drafter weights to `FP16`.
@@ -36,13 +36,13 @@ Five foundational seams govern how `vLLM`, `SGLang`, and `warp3090` components c
 
 1. **KV Cache & Attention Descriptor Seam (`docs/contracts/cache-layout.md`):**
    - **Logical vs. Physical:** `token_slot = physical_page_id * B + u` (`B = 16`) is a logical allocation identifier, never multiplied by a single global "bytes per token".
-   - **Per-Layer `KvLayerLayout`:** Stores `cache_namespace` (`TargetFullAttn`, `MtpFullAttn`, `DFlashDraftContext`), `local_kv_heads`, `head_dim ∈ {128, 256}`, `k_format / v_format ∈ {FP16, BF16, TQ4, Q8_0}`, independent `k_transform / v_transform ∈ {Identity, RademacherWht256}`, and explicit byte strides (`page_stride_bytes`, `head_stride_bytes`, `token_stride_bytes`). Note that `TQ4` rows (`132 B` for `d=256`) are not 16-byte aligned at row boundaries even when page bases (`2112 B`) are aligned; kernels use byte-offset + `block_tq4_0`-aware loads.
+   - **Per-Layer `KvLayerLayout`:** Stores `cache_namespace` (`TargetFullAttn`, `MtpFullAttn`, `DFlashDraftContext`, `QsaIndexerRaw`, `QsaIndexerCompressed`), `local_kv_heads`, `head_dim ∈ {128, 256}`, `k_format / v_format ∈ {FP16, BF16, FP8, TQ4, Q8_0}`, independent `k_transform / v_transform ∈ {Identity, RademacherWht256}`, and explicit byte strides (`page_stride_bytes`, `head_stride_bytes`, `token_stride_bytes`). Note that `TQ4` rows (`132 B` for `d=256`) and `FP8` rows (`264 B` for `d=256` on `sm_89+`) are not 16-byte aligned at every row boundary even when page bases (`2112 B` / `4224 B`) are aligned; kernels use byte-offset + `block_tq4_0` / `block_fp8_e4m3`-aware loads.
    - **`AttentionBatch` Descriptor:** Distinguishes `context_lens_before` from `seq_lens_after`, carries `query_start_loc`, `block_tables[R_max, P_max]`, `write_slot_mapping[N_max]`, `valid_token_mask`, and mask geometry (`Causal` vs non-causal query-relative left window `window=2048` for 27B `DFlash2`), so prefix-hit prefill and speculative verify share the same descriptor.
 2. **GDN Native CUDA Donor & Independent Versioned `StateBundle` Seam (`docs/contracts/state-transaction.md`):**
    - **Executable CUDA C++ Donor:** Because `vLLM 0.31.0` dispatches GDN via Python/Triton (`flash_linear_attention`), `warp34-kernels` ports native CUDA C++ GDN kernels from **`vllm.cpp` (`src/vt/cuda/cuda_gdn.cu` at `50d425bec`)** cross-checked against `vLLM` FLA golden dumps and `warp3090`'s recurrence math.
    - **Explicit Input / Output / Spec / Checkpoint Indexing:** Kernels never assume `state_out == state_in`. Every GDN launch takes `state_in_indices[req]`, `spec_state_indices[req, verify_step]`, `checkpoint_dst_indices[req, event]`, `checkpoint_token_positions[req, event]`, and `has_initial_state[req]`.
    - **Three Distinct Chunk Geometries:** KV page size `B = 16`; GDN prefill compute tile `BT = 64` (`4` KV pages); and `MambaRadixCache` checkpoint interval `C = k * 64` (satisfying `C >= max_spec_verify_rows`).
-   - **Explicit VRAM Ledger:** One 27B GDN `StateBundle` (`48` layers × `48` value heads × `128 × 128` `FP32` + `conv_state` `FP16`) is `~144 MiB` unsharded (`~72 MiB/rank` on `TP=2`, `~36 MiB/rank` on `TP=4`). Active + `spec_state` + ping-pong + radix checkpoint slots are budgeted upfront by `CapacityPlanner`.
+   - **Explicit VRAM Ledger & Tiered `WHT128-Q8_0` Checkpoints:** One 27B GDN `StateBundle` (`48` layers × `48` value heads × `128 × 128` `FP32` + `conv_state` `FP16`) is `~144 MiB` unsharded (`~72 MiB/rank` on `TP=2`, `~36 MiB/rank` on `TP=4`). Active + `spec_state` + ping-pong slots remain in full `FP32` in `StateBundlePool`, while `MambaRadixCache` checkpoints can use the tiered `WHT128-Q8_0` pool (`crates/warp34-host/src/cache/checkpoint_pool.rs`, `4.06×` compression: `17.7 MiB/rank` on 27B `TP=2`, `35.4 MiB` on `TP=1`, with L1 VRAM + L2 pinned host RAM tiers).
 3. **Speculative Commit Transaction & Draft-Context Prefix Seam (`docs/contracts/execution-contract.md`):**
    - **Four Tracked Lengths per Request:**
      - `processed_len`: tokens whose target KV and GDN state have been computed and committed.
@@ -60,11 +60,11 @@ Five foundational seams govern how `vLLM`, `SGLang`, and `warp3090` components c
 
 ---
 
-## 2. Cross-Checked `vLLM 0.31.0` Reference Map (`file:line`)
+## 2. Cross-Checked `vLLM 0.34.0` & `SGLang v0.5.23` Reference Map (`file:line`)
 
-Verified against the local `vLLM 0.31.0` runtime (`~/.local/share/mise/installs/python/3.12.12/lib/python3.12/site-packages/vllm/`) and `vendor/vllm/`:
+Verified against the local `vLLM 0.34.0` runtime (`62d4bc3c7`, `~/.local/share/mise/installs/python/3.12.12/lib/python3.12/site-packages/vllm/`), `SGLang v0.5.23` (`297e54fd10`), and `vllm.cpp` (`50d425bec`):
 
-| Subsystem | `vLLM 0.31.0` Source (`file:line`) | Key Implementation Details Uncovered by Audit |
+| Subsystem | Donor Source (`file:line`) | Key Implementation Details Uncovered by Audit |
 |---|---|---|
 | **Dense Hybrid Model (`0.8B` / `4B` / `9B` / `27B`)** | `model_executor/models/qwen3_5.py:475` (`Qwen3_5ForConditionalGeneration`) & `qwen3_next.py:307-455` | Both `Qwen3.5-*` and `Qwen3.8-27B` checkpoints use `model_type="qwen3_5"` / `qwen3_5_text`. Interleaves 3× `"linear_attention"` (`QwenGatedDeltaNetAttention`) + 1× `"full_attention"` (`Qwen3NextAttention`). Norms use **`GemmaRMSNorm` (`1.0 + weight` unit-offset, `qwen3_5.py:42`)**. |
 | **MoE Hybrid Models (`Qwen3.6-35B-A3B` & `Qwen3.8-Flash-Next`)** | `model_executor/models/qwen3_5.py:704` (`Qwen3_5MoeForConditionalGeneration`) & `qwen3_next.py:143-259`; [`QWEN_FLASH_NEXT.md`](QWEN_FLASH_NEXT.md) | Uses `Qwen3NextSparseMoeBlock`: routed `top_k` experts + `shared_expert` + `shared_expert_gate` (`ReplicatedLinear`), with `moe_wna16` (`layers/quantization/moe_wna16.py:103`) Marlin kernel, plus `HyperConnection` (`hc_count=4`), Per-Layer Embeddings (`PLE`), Quality-Scored Sparse Attention (`QSA`), and tiered CPU/GPU 512-expert offloading on `Flash-Next`. |
@@ -86,12 +86,12 @@ Verified against the local `vLLM 0.31.0` runtime (`~/.local/share/mise/installs/
 Every subsystem is verified by three automated checks:
 
 1. **Layer & Op Tensor Parity (`warp34 dump-diff`)**
-   - Offline Python drivers (`tools/oracle/vllm_dump.py`, `sglang_dump.py`) run `vLLM 0.31.0` / `SGLang v0.5.19` with forward hooks dumping per-layer inputs/outputs (`norm`, `qkv`, `qk_norm_rope`, `attn`/`gdn`, `mlp`, `logits`, and DFlash2 target hidden taps).
+   - Offline Python drivers (`tools/oracle/vllm_dump.py`, `sglang_dump.py`) run `vLLM 0.34.0` / `SGLang v0.5.23` with forward hooks dumping per-layer inputs/outputs (`norm`, `qkv`, `qk_norm_rope`, `attn`/`gdn`, `mlp`, `logits`, and DFlash2 target hidden taps).
    - Rust test suites and `warp34 dump-diff` feed the exact input tensors into our kernels/layers and assert tight `FP16`/`BF16` tolerances (`max_abs_err`, `rel_l2`, cosine similarity) and `TP=1 == TP=2` parity.
 2. **End-to-End Greedy-Diff Oracle (`warp34 greedy-diff`)**
    - Runs the 12-prompt canonical suite across `4B`, `9B`, and `27B` against `vLLM` (`temp=0`, `ignore_eos=True`), verifying lossless speculative decoding (`--verify-lossless`) and warm radix prefix restoration (`--verify-radix-warm`).
 3. **Side-by-Side `nsys` Kernel Scoreboard (`warp34 profile-diff`)**
-   - Captures `nsys` SQLite traces of **both `vLLM 0.31.0` / `SGLang v0.5.19` and `warp34`** on identical workloads and renders a side-by-side table of **per-round GPU kernel time (`ms/round`) and launch counts** by category:
+   - Captures `nsys` SQLite traces of **both `vLLM 0.34.0` / `SGLang v0.5.23` and `warp34`** on identical workloads and renders a side-by-side table of **per-round GPU kernel time (`ms/round`) and launch counts** by category:
      - `marlin_gemm` (trunk + heads)
      - `full_attn` (FlashAttention prefill + paged decode)
      - `gdn_ssm` (`conv1d` + `chunk_gated_delta_rule` / `fused_recurrent`)
@@ -106,14 +106,17 @@ Every subsystem is verified by three automated checks:
 
 ### 4.1 Device Substrate, Loader, & Kernel Suite (`crates/warp34-kernels/`, `crates/warp34-host/src/{cuda,loader}.rs`)
 - **CUDA Runtime & `CapacityPlanner`:** Per-device context (`CudaDevice`), stream pool (compute, async D2H copy, auxiliary GDN/H2D/PLE streams), event pool, cuBLAS/cuBLASLt handles, preallocated `DeviceArena`, and `CapacityPlanner` budgeting weights, KV pages, GDN `StateBundle`s, proposer draft-context KV, and graph workspaces.
-- **Unified Safetensors & HF Hub Loader:** Resolves local directories or HuggingFace Hub repo IDs with native download-on-first-use, pinned revisions, and offline mode (`docs/MODELS.md`). Supports `compressed-tensors` (`W4A16`/`W8A16`), `gptq`, `awq`, `auto-round`, FP8 `PLE`, and unquantized `FP16`/`BF16`.
+- **Unified Safetensors & HF Hub Loader:** Resolves local directories or HuggingFace Hub repo IDs with native download-on-first-use, pinned revisions, and offline mode ([`docs/MODELS.md`](MODELS.md)). Supports `compressed-tensors` (`W4A16-HGPTQ`, mixed `W2.6A16-HGPTQ-RCO` / `W2.2A16-HGPTQ-RCO`, `W8A16`), `gptq`, `awq`, `auto-round`, `lut4-gptq` / FP8 `PLE`, and unquantized `FP16`/`BF16`.
 - **Kernel Suite (`crates/warp34-kernels/csrc/ops/`):**
-  - `op_marlin.cu`: `gptq_marlin_repack`, `awq_marlin_repack`, `warp34_marlin_repack_int8`, `warp34_marlin_quantize_f16_u4b8` (online GPU `MTP` `draft_lm_head` quantization), symmetric/asymmetric `W4A16` (`U4B8` / `U4` with zero-points), `W8A16` (`U8B128`), and small-N `warp34_small_n_gemm_f16` / `warp34_small_n_gemm_dual_f16`.
-  - `op_norms_rope_act.cu`: `gemma_rms_norm`, `fused_add_gemma_rms_norm`, `rms_norm_gated_silu_f16`, `fused_qk_rmsnorm_rope_gate` (with FP16-rounded rotary cache parity), `silu_and_mul`, and `apply_attn_output_gate`.
-  - `op_kv_cache.cu`, `op_paged_attn.cu`, & `op_paged_fa2.cu`: Descriptor-driven `kv_cache_write`, GQA-grouped `mma.sync` and Split-KV paged attention across `FP16`, `BF16`, `Q8_0`, and `TQ4` (`132 B` rows with Seed-42 Rademacher + WHT-256 rotation and Beta(256) codebook), plus FlashAttention-2 prefill.
-  - `op_gdn.cu` & `op_gdn_wy.cu`: Native CUDA `causal_conv1d` and `chunk_gated_delta_rule` (`BT = 64`) / `fused_sigmoid_gating_delta_rule_update` (`__launch_bounds__(128, 8)`) with explicit `state_in_indices`, `spec_state_indices`, and `checkpoint_dst_indices`, plus multi-stream `in_proj_ba` overlap.
-  - `op_moe.cu`, `op_moe_router.cu`, & `op_moe_cpu_bridge.cu`: Top-K softmax/sigmoid router, grouped `mma.sync` / `sparse_mma` `W4A16` & `FP16` MoE execution (`35B-A3B` 256 experts and `Flash-Next` 512 experts across `EP=1`, `EP=2`, `EP=4`), GPU LRU hot cache, and async mapped-memory GPU↔CPU mailbox for host AVX-512 / AVX2 / portable cold-expert offload.
-  - `op_collectives.cu`: Pinned-sysmem and NVLink P2P `TP=2` / `TP=4` collectives (`all_reduce_f16`, `all_reduce_residual_gemma_rms_norm_f16`, `all_reduce_bf16`, `all_reduce_f32`, `broadcast_i32`, `all_gather_top1_f32_i32`, `gather_vocab_f16`) with payload-proportional CTA sizing.
+  - `op_marlin.cu` & `op_hadamard.cu`: `gptq_marlin_repack`, `awq_marlin_repack`, `warp34_marlin_repack_int8`, `warp34_marlin_quantize_f16_u4b8` (online GPU `MTP` `draft_lm_head` quantization), symmetric/asymmetric `W4A16` (`U4B8` / `U4` with zero-points), 2-bit `W2A16` (`U2B2`), `W8A16` (`U8B128`), native `BF16` `W4A16` (`warp34_marlin_gemm_bf16u4` for `DFlash2-W4A16-HGPTQ`), shared-weight `W4A8` INT8-IMMA prefill (`warp34_marlin_gemm_s8u4_shared` on `sm_86`/`sm_89`), and vectorized `warp34_block_hadamard_f16` / `warp34_block_hadamard_bf16` (`B=16, 64`).
+  - `op_norms_rope_act.cu`: `gemma_rms_norm`, `fused_add_gemma_rms_norm`, `rms_norm_gated_silu_f16`, `fused_qk_rmsnorm_rope_gate` (with FP16-rounded rotary cache parity), `silu_and_mul`, `apply_attn_output_gate`, producer-fused `H_64` epilogues, and M-invariant `small_n_gemm_4x4_f16_kernel` / `small_n_gemm_dual_4x4_f16_kernel` / `small_n_gemm_dual_8x4_f16_kernel`.
+  - `op_kv_cache.cu`, `op_paged_attn.cu`, & `op_paged_fa2.cu`: Descriptor-driven `kv_cache_write`, GQA-grouped `mma.sync` and Split-KV paged attention across `FP16`, `BF16`, `FP8_E4M3` (`264 B` rows on `sm_89+`), `Q8_0` (`272 B` rows), and `TQ4` (`132 B` rows with Seed-42 Rademacher + WHT-256 rotation and Beta(256) codebook), plus FlashAttention-2 prefill.
+  - `op_gdn.cu`, `op_gdn_wy.cu`, & `op_gdn_wy_chunk64.cu`: Native CUDA `causal_conv1d` and `chunk_gated_delta_rule` (`BT = 64`) / `fused_sigmoid_gating_delta_rule_update` (`__launch_bounds__(128, 8)`) with explicit `state_in_indices`, `spec_state_indices`, and `checkpoint_dst_indices`, plus multi-stream `in_proj_ba` overlap and `WHT128-Q8_0` GDN checkpoint quantization/dequantization.
+  - `op_moe.cu`, `op_moe_router.cu`, & `op_moe_cpu_bridge.cu`: Top-K softmax/sigmoid router, grouped `mma.sync` / `sparse_mma` `W4A16`, `W2A16`, & `FP16` MoE execution (`35B-A3B` 256 experts and `Flash-Next` 512 experts across `EP=1`, `EP=2`, `EP=4`), GPU BIP-LRU & Dynamic TinyLFU + Clock-Pro hot cache, and async mapped-memory GPU↔CPU mailbox for host AVX-512 / AVX2 / portable cold-expert offload.
+  - `op_hc.cu`, `op_ple.cu`, & `op_qsa.cu`: `Qwen3.8-Flash-Next` (`qwen4_exp`) 4-stream `HyperConnection` (`GatedResidual`), N-Gram Per-Layer Embedding (`PLE`) gating + stateful dilated short-conv, and Query-Sparse Attention (`QSA`) 4:1 compressed block indexer + sparse paged GQA.
+  - `op_dflash2.cu`, `op_sampler.cu`, & `op_rejection.cu`: `DFlash2` low-rank candidate selector (`DFLASH2_MAX_TOP_K = 16`), 9-step GPU sampler + in-graph `FastGreedy`, and greedy/stochastic speculative rejection sampler.
+  - `op_vision.cu` & `op_vision_fa2.cu`: 2D axial rotary embeddings, bilinear position interpolation, 2×2 patch merger, and non-causal Vision FlashAttention-2.
+  - `op_collectives.cu`: Pinned-sysmem and NVLink P2P `TP=2` / `TP=4` collectives (`all_reduce_f16`, `all_reduce_residual_gemma_rms_norm_f16`, `all_reduce_bf16`, `all_reduce_f32`, `broadcast_i32`, `all_gather_top1_f32_i32`, `gather_vocab_f16`) with payload-proportional CTA sizing and Copy-Engine DMA TX (`>= 64 KiB`).
   - `op_lora.cu`: Graph-capturable multi-LoRA shrink+expand (`warp34_lora_shrink_expand_f16`) supporting mixed per-token `token_lora_ids` (`-1` base + up to 62 stacked PEFT adapters), block-diagonal fused projections, and host Hadamard pre-rotation ($H_B^T H_B = I$) for `W4A16-HGPTQ` base models.
 
 ### 4.2 Hybrid Backbone, Continuous Batching, & `MambaRadixCache` (`crates/warp34-host/src/{cache,model,radix,scheduler}.rs`)

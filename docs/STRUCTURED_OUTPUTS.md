@@ -2,22 +2,22 @@
 
 warp34 uses **`xgrammar-rs = 0.2.8`**, the pure-Rust port of
 [mlc-ai/XGrammar](https://github.com/mlc-ai/xgrammar), with the structured-output
-architecture of vLLM 0.31.0. There is no llguidance backend or fallback.
+architecture of `vLLM 0.34.0` (`62d4bc3c7`). There is no llguidance backend or fallback.
 
 ## Ownership
 
-- `request_constraints.rs`: normalize API controls, reject conflicting constraints,
+- `crates/warp34-host/src/request_constraints.rs`: normalize API controls, reject conflicting constraints,
   and enforce request-size limits (64 KiB output specifications / 512 KiB tools).
-- `constraints.rs`: one tokenizer-aware compiler per server, an explicitly bounded
+- `crates/warp34-host/src/constraints.rs`: one tokenizer-aware compiler per server, an explicitly bounded
   512 MiB compiler cache, request-local matcher, reasoning activation, and packed
   32-bit masks. Compilation runs through the HTTP CPU-work boundary, not on the
   GPU engine thread.
-- `tool_constraints.rs`: native XGrammar structural-tag descriptors, not a custom
+- `crates/warp34-host/src/tool_constraints.rs`: native XGrammar structural-tag descriptors, not a custom
   schema-to-grammar converter. Tools use `json_schema` with `style: qwen_xml`.
   Qwen sets the native
   `max_whitespace_cnt: 1` option to prevent empty-argument calls from exhausting
   their output budget in a whitespace loop.
-- `parser.rs`: sampler integration and output extraction. Native XML parameter
+- `crates/warp34-host/src/parser.rs`: sampler integration and output extraction. Native XML parameter
   strings are raw text; declared tool schemas distinguish strings such as `true`
   and `123` from booleans/numbers. JSON arrays and objects remain structured.
 
