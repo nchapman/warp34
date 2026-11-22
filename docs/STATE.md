@@ -99,6 +99,10 @@ Current verification status, architectural capabilities, and benchmark records f
     - `TP=1` (`1× 3090 Ti`): **`30.45 / 28.61 / 28.83 / 28.23 tok/s`** (`MTP-3`) and **`28.13 / 28.47 / 29.71 / 28.75 tok/s`** (`DFlash2`), beating `Strata TP=1` on `swe-c8-burst` (`17.83 tok/s`) by **`+58.3%` to `+61.2%`**.
 - **1-Hour Intact `Open-SWE` Soak (`soak-swe-27b.toml`, `1× RTX 3090 Ti`, `27B W4A16-HGPTQ`, `MTP-3`, `TQ4`, `4` sustained / `8` burst clients):**
   - Completed **`3,675.22 s`** with **`2,920` completed responses + `153` injected local disconnects** across `326` multi-turn trajectories (`16,221,154` prompt tokens, `365,786` completion tokens = **`99.53 tok/s` sustained over 1 hour on 1 GPU**), **`0` unexpected errors / invalid usage / SLO breaches**, final post-drain inference probe `"ok"`, GPU VRAM delta **`+8.0 MiB`** (`22,719 → 22,727 MiB`, budget `<= 256 MiB`), and host RSS delta **`-760.10 MiB`** post-warmup (`4,510 → 3,750 MiB`).
+- **Live `SWE-bench Verified` (`0:10`) Agentic Coding & Thinking-Effort Study (`docs/SWEBENCH.md`, `benchmarks/swebench/run_swebench.py`, `2× RTX 3090 Ti`, `TP=2`, `MTP-3`, omitted `max_tokens`):**
+  - **`Qwen3.8-27B-W4A16-HGPTQ`**: **`6 / 10 (60.0%)` RESOLVED** in **`7m 33s`** (`200` turns, `84,797` output tokens, `50,735` thinking tokens, `94.74%` prefix cache hit, `0` patch/format errors) under default `medium` (`16,384` thinking ceiling), and **`8 / 10 (80.0%)` RESOLVED** (`456` turns, `322,306` output tokens, `226,249` thinking tokens, `0` patch errors, solving 96-turn `astropy-13398`) under `--reasoning-effort max` (`31,129` ceiling, `--ctx-size 384k`).
+  - **`Qwen3.6-35B-A3B-W4A16-HGPTQ`**: **`6 / 10 (60.0%)` RESOLVED** in **`11m 31s`** (`416` turns, `174,760` output tokens, `96,857` thinking tokens, `96.61%` prefix cache hit, `0` format errors) under default `medium`, vs `4 / 10` (`5 / 10` normalized `-p1`, `16m 06s`, `422` turns, `230,381` output tokens) under `--reasoning-effort max`.
+  - Across all **`1,494` turns** in the 4 runs, natural thinking peaked at `8,826` tokens (`p99 = 2,634..4,886`) with **`0` false `thinking_budget_exhausted` cutoffs**.
 
 ---
 
