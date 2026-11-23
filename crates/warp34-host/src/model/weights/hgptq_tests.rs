@@ -1449,3 +1449,240 @@ fn moe_w2a16_sym_half_offset_matches_dilated_w4a16_zero_ulp() {
         }
     }
 }
+
+#[cfg(feature = "cuda")]
+#[test]
+fn producer_fused_hadamard512_matches_standalone_zero_ulp() {
+    let _device = CudaDevice::set_current(0).unwrap();
+    let stream = CudaStream::new(0).unwrap();
+    let ex = stream.exec(0, 0);
+    let upload = |src: &[u16]| {
+        let buf = DeviceBuffer::alloc(0, src.len() * 2).unwrap();
+        buf.copy_from_host(src, &stream).unwrap();
+        buf
+    };
+
+    for &(rows, dim) in &[(1usize, 512usize), (3, 2048), (2, 5120)] {
+        let a_h: Vec<u16> = (0..rows * 2 * dim)
+            .map(|i| f32_to_f16((((i * 37 + 13) % 101) as f32 / 50.0) - 1.0))
+            .collect();
+        let b_h: Vec<u16> = (0..rows * dim)
+            .map(|i| f32_to_f16((((i * 23 + 7) % 89) as f32 / 44.0) - 1.0))
+            .collect();
+        let w_h: Vec<u16> = (0..dim)
+            .map(|i| f32_to_f16((((i * 17 + 3) % 53) as f32 / 100.0) - 0.25))
+            .collect();
+        let d_a = upload(&a_h);
+        let d_b = upload(&b_h);
+        let d_w = upload(&w_h);
+        let d_res_ref = upload(&b_h);
+        let d_res_got = upload(&b_h);
+        let d_tmp = DeviceBuffer::alloc(0, rows * dim * 2).unwrap();
+        let d_ref = DeviceBuffer::alloc(0, rows * dim * 2).unwrap();
+        let d_got = DeviceBuffer::alloc(0, rows * dim * 2).unwrap();
+        let d_unrot_got = DeviceBuffer::alloc(0, rows * dim * 2).unwrap();
+
+        // 1. silu_and_mul_hadamard512_f16 vs silu_and_mul_f16 + block_hadamard_f16(512)
+        // SAFETY: all device buffers are allocated and sized for `rows * dim` (or `rows * 2 * dim`) FP16 elements.
+        unsafe {
+            assert_eq!(
+                ffi::warp34_silu_and_mul_f16(
+                    &ex,
+                    d_a.addr() as *const _,
+                    d_tmp.addr() as *mut _,
+                    core::ptr::null(),
+                    rows as i32,
+                    dim as i32,
+                ),
+                0
+            );
+            assert_eq!(
+                ffi::warp34_block_hadamard_f16(
+                    &ex,
+                    d_tmp.addr() as *const _,
+                    d_ref.addr() as *mut _,
+                    rows as i32,
+                    dim as i32,
+                    dim as i32,
+                    512,
+                ),
+                0
+            );
+            assert_eq!(
+                ffi::warp34_silu_and_mul_hadamard512_f16(
+                    &ex,
+                    d_a.addr() as *const _,
+                    d_got.addr() as *mut _,
+                    core::ptr::null(),
+                    rows as i32,
+                    dim as i32,
+                ),
+                0
+            );
+        }
+        let mut ref_h = vec![0u16; rows * dim];
+        let mut got_h = vec![0u16; rows * dim];
+        d_ref.copy_to_host(&mut ref_h, &stream).unwrap();
+        d_got.copy_to_host(&mut got_h, &stream).unwrap();
+        stream.synchronize().unwrap();
+        assert_eq!(
+            got_h, ref_h,
+            "silu_and_mul_hadamard512 rows={rows} dim={dim}"
+        );
+
+        // 2. apply_attn_output_gate_hadamard512_f16
+        // SAFETY: all device buffers are allocated and sized for `rows * dim` FP16 elements.
+        unsafe {
+            assert_eq!(
+                ffi::warp34_apply_attn_output_gate_f16(
+                    &ex,
+                    d_a.addr() as *const _,
+                    d_b.addr() as *const _,
+                    d_tmp.addr() as *mut _,
+                    core::ptr::null(),
+                    rows as i32,
+                    dim as i32,
+                ),
+                0
+            );
+            assert_eq!(
+                ffi::warp34_block_hadamard_f16(
+                    &ex,
+                    d_tmp.addr() as *const _,
+                    d_ref.addr() as *mut _,
+                    rows as i32,
+                    dim as i32,
+                    dim as i32,
+                    512,
+                ),
+                0
+            );
+            assert_eq!(
+                ffi::warp34_apply_attn_output_gate_hadamard512_f16(
+                    &ex,
+                    d_a.addr() as *const _,
+                    d_b.addr() as *const _,
+                    d_got.addr() as *mut _,
+                    core::ptr::null(),
+                    rows as i32,
+                    dim as i32,
+                ),
+                0
+            );
+        }
+        d_ref.copy_to_host(&mut ref_h, &stream).unwrap();
+        d_got.copy_to_host(&mut got_h, &stream).unwrap();
+        stream.synchronize().unwrap();
+        assert_eq!(
+            got_h, ref_h,
+            "apply_attn_output_gate_hadamard512 rows={rows} dim={dim}"
+        );
+
+        // 3. gemma_rms_norm_hadamard512_f16
+        // SAFETY: all device buffers are allocated and sized for `rows * dim` / `dim` FP16 elements.
+        unsafe {
+            assert_eq!(
+                ffi::warp34_gemma_rms_norm_f16(
+                    &ex,
+                    d_a.addr() as *const _,
+                    d_w.addr() as *const _,
+                    d_tmp.addr() as *mut _,
+                    core::ptr::null(),
+                    rows as i32,
+                    dim as i32,
+                    1e-6,
+                ),
+                0
+            );
+            assert_eq!(
+                ffi::warp34_block_hadamard_f16(
+                    &ex,
+                    d_tmp.addr() as *const _,
+                    d_ref.addr() as *mut _,
+                    rows as i32,
+                    dim as i32,
+                    dim as i32,
+                    512,
+                ),
+                0
+            );
+            assert_eq!(
+                ffi::warp34_gemma_rms_norm_hadamard512_f16(
+                    &ex,
+                    d_a.addr() as *const _,
+                    d_w.addr() as *const _,
+                    d_unrot_got.addr() as *mut _,
+                    d_got.addr() as *mut _,
+                    core::ptr::null(),
+                    rows as i32,
+                    dim as i32,
+                    1e-6,
+                ),
+                0
+            );
+        }
+        d_ref.copy_to_host(&mut ref_h, &stream).unwrap();
+        d_got.copy_to_host(&mut got_h, &stream).unwrap();
+        stream.synchronize().unwrap();
+        assert_eq!(
+            got_h, ref_h,
+            "gemma_rms_norm_hadamard512 rows={rows} dim={dim}"
+        );
+
+        // 4. fused_add_gemma_rms_norm_tap_hadamard512_f16
+        // SAFETY: all device buffers are allocated and sized for `rows * dim` / `dim` FP16 elements.
+        unsafe {
+            assert_eq!(
+                ffi::warp34_fused_add_gemma_rms_norm_f16(
+                    &ex,
+                    d_a.addr() as *const _,
+                    d_res_ref.addr() as *mut _,
+                    d_w.addr() as *const _,
+                    d_tmp.addr() as *mut _,
+                    core::ptr::null(),
+                    rows as i32,
+                    dim as i32,
+                    1e-6,
+                ),
+                0
+            );
+            assert_eq!(
+                ffi::warp34_block_hadamard_f16(
+                    &ex,
+                    d_tmp.addr() as *const _,
+                    d_ref.addr() as *mut _,
+                    rows as i32,
+                    dim as i32,
+                    dim as i32,
+                    512,
+                ),
+                0
+            );
+            assert_eq!(
+                ffi::warp34_fused_add_gemma_rms_norm_tap_hadamard512_f16(
+                    &ex,
+                    d_a.addr() as *const _,
+                    d_res_got.addr() as *mut _,
+                    d_w.addr() as *const _,
+                    d_unrot_got.addr() as *mut _,
+                    d_got.addr() as *mut _,
+                    core::ptr::null_mut(),
+                    core::ptr::null(),
+                    rows as i32,
+                    dim as i32,
+                    1e-6,
+                    0,
+                    0,
+                ),
+                0
+            );
+        }
+        d_ref.copy_to_host(&mut ref_h, &stream).unwrap();
+        d_got.copy_to_host(&mut got_h, &stream).unwrap();
+        stream.synchronize().unwrap();
+        assert_eq!(
+            got_h, ref_h,
+            "fused_add_gemma_rms_norm_tap_hadamard512 rows={rows} dim={dim}"
+        );
+    }
+}

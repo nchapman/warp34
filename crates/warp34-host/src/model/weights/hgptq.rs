@@ -266,25 +266,41 @@ impl LinearProj {
         }
     }
 
+    /// Whether this projection is a `block_size` Hadamard projection with unpadded `K` and `N`,
+    /// allowing a producer or shared-input kernel to emit `H_{block_size}`-rotated activations directly.
+    #[inline]
+    pub fn can_fuse_hadamard_from_producer(&self, target_block_size: usize) -> bool {
+        target_block_size > 0
+            && matches!(
+                self,
+                Self::Hadamard {
+                    inner,
+                    size_n,
+                    size_k,
+                    block_size,
+                } if *block_size == target_block_size
+                    && *size_k == inner.size_k()
+                    && *size_n == inner.size_n()
+                    && size_k.is_multiple_of(target_block_size)
+            )
+    }
+
     /// Whether this projection is a `B == 64` Hadamard projection with unpadded `K` and `N`,
     /// allowing its producer kernel to emit `H_64`-rotated activations directly.
     #[inline]
     pub fn can_fuse_h64_from_producer(&self) -> bool {
-        matches!(
-            self,
-            Self::Hadamard {
-                inner,
-                size_n,
-                size_k,
-                block_size: HADAMARD_BLOCK_64,
-            } if *size_k == inner.size_k()
-                && *size_n == inner.size_n()
-                && size_k.is_multiple_of(HADAMARD_BLOCK_64)
-        )
+        self.can_fuse_hadamard_from_producer(HADAMARD_BLOCK_64)
+    }
+
+    /// Whether this projection is a `B == 512` Hadamard projection with unpadded `K` and `N`,
+    /// allowing its producer kernel to emit `H_512`-rotated activations directly.
+    #[inline]
+    pub fn can_fuse_h512_from_producer(&self) -> bool {
+        self.can_fuse_hadamard_from_producer(512)
     }
 
     /// Executes the underlying GEMM directly when `input` has already been rotated by a
-    /// producer-fused `H_64` kernel, or falls back to `forward` otherwise.
+    /// producer-fused Hadamard kernel (`H_64`, `H_128`, or `H_512`), or falls back to `forward` otherwise.
     #[allow(clippy::too_many_arguments)]
     #[inline]
     pub fn forward_prerotated(
@@ -302,8 +318,12 @@ impl LinearProj {
                 inner,
                 size_n,
                 size_k,
-                block_size: HADAMARD_BLOCK_64,
-            } if *size_k == inner.size_k() && *size_n == inner.size_n() => {
+                block_size,
+            } if *block_size > 0
+                && *size_k == inner.size_k()
+                && *size_n == inner.size_n()
+                && size_k.is_multiple_of(*block_size) =>
+            {
                 let input_bytes = rows
                     .saturating_mul(*size_k)
                     .saturating_mul(2)

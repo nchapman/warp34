@@ -344,7 +344,9 @@ __global__ void Marlin(
 
   constexpr bool is_a_8bit = a_type.size_bits() == 8;
   static_assert(!shared_k16_layout ||
-                (a_type == vllm::kS8 && b_type == vllm::kU4B8 &&
+                (a_type == vllm::kS8 &&
+                 (b_type == vllm::kU4B8 || b_type == vllm::kU2B2 ||
+                  b_type == vllm::kU2B2Sym) &&
                  s_type == vllm::kFloat16 && !m_block_size_8));
   constexpr bool is_b_a8 = is_a_8bit && !shared_k16_layout;
   constexpr bool is_8bit_scale = s_type.size_bits() == 8;
@@ -584,8 +586,9 @@ __global__ void Marlin(
       b_sh_stride * thread_k_blocks / (is_b_a8 ? 2 : 1);
   constexpr int b_sh_wr_iters =
       is_a_8bit
-          ? (((thread_n_blocks * 16) * 16 / pack_factor) / 2 * thread_k_blocks /
-             2) /
+          ? (((thread_n_blocks * 16) * 16 /
+              (shared_k16_layout && b_type.size_bits() == 2 ? 8 : pack_factor)) /
+             2 * thread_k_blocks / 2) /
                 threads
           : (b_sh_stride_threads * thread_k_blocks) / threads;
   constexpr int b_g2s_iters = b_sh_stage / threads;
@@ -1010,13 +1013,21 @@ __global__ void Marlin(
       int w_odd = warp_col & 1;
       int kt0 = 2 * (warp_row * b_sh_wr_iters + (k % b_sh_wr_iters));
       int kt1 = kt0 + 1;
-      int2 const* sh_b_i2 = reinterpret_cast<int2 const*>(sh_b_stage);
-      int2 q0 = sh_b_i2[(kt0 * b_sh_stride + n_tile * 32 + th_id) * 2 + w_odd];
-      int2 q1 = sh_b_i2[(kt1 * b_sh_stride + n_tile * 32 + th_id) * 2 + w_odd];
-      frag_b_quant[k % 2][0][0] = q0.x;
-      frag_b_quant[k % 2][0][1] = q0.y;
-      frag_b_quant[k % 2][0][2] = q1.x;
-      frag_b_quant[k % 2][0][3] = q1.y;
+      if constexpr (b_type.size_bits() == 2) {
+        int32_t const* sh_b_i1 = reinterpret_cast<int32_t const*>(sh_b_stage);
+        frag_b_quant[k % 2][0][0] =
+            sh_b_i1[kt0 * (b_sh_stride * 4) + n_tile * 64 + th_id * 2 + w_odd];
+        frag_b_quant[k % 2][0][1] =
+            sh_b_i1[kt1 * (b_sh_stride * 4) + n_tile * 64 + th_id * 2 + w_odd];
+      } else {
+        int2 const* sh_b_i2 = reinterpret_cast<int2 const*>(sh_b_stage);
+        int2 q0 = sh_b_i2[(kt0 * b_sh_stride + n_tile * 32 + th_id) * 2 + w_odd];
+        int2 q1 = sh_b_i2[(kt1 * b_sh_stride + n_tile * 32 + th_id) * 2 + w_odd];
+        frag_b_quant[k % 2][0][0] = q0.x;
+        frag_b_quant[k % 2][0][1] = q0.y;
+        frag_b_quant[k % 2][0][2] = q1.x;
+        frag_b_quant[k % 2][0][3] = q1.y;
+      }
     } else if constexpr (b_type.size_bits() == 2) {
       int2 const* sh_b_stage_i2 = reinterpret_cast<int2 const*>(sh_b_stage);
       int2 v = sh_b_stage_i2[b_sh_stride_threads * (k % b_sh_wr_iters) + b_sh_rd];
@@ -1424,8 +1435,21 @@ __global__ void Marlin(
         int tg = threadIdx.x & 3;
         int pair_base = (tg & 1) * 2;
         uint32_t shift = (tg & 2) << 1;
-        uint32_t w_kt0 = static_cast<uint32_t>(frag_b_quant[k2][0][j]);
-        uint32_t w_kt1 = static_cast<uint32_t>(frag_b_quant[k2][0][2 + j]);
+        uint32_t w_kt0, w_kt1;
+        if constexpr (b_type.size_bits() == 2) {
+          auto expand_u2_to_u4_nibbles = [](uint32_t raw_w, int half_j) -> uint32_t {
+            uint32_t r = raw_w >> (half_j * 8);
+            return (r & 0x00030003u) | ((r & 0x000C000Cu) << 2) |
+                   ((r & 0x00300030u) << 4) | ((r & 0x00C000C0u) << 6);
+          };
+          w_kt0 = expand_u2_to_u4_nibbles(
+              static_cast<uint32_t>(frag_b_quant[k2][0][0]), j);
+          w_kt1 = expand_u2_to_u4_nibbles(
+              static_cast<uint32_t>(frag_b_quant[k2][0][1]), j);
+        } else {
+          w_kt0 = static_cast<uint32_t>(frag_b_quant[k2][0][j]);
+          w_kt1 = static_cast<uint32_t>(frag_b_quant[k2][0][2 + j]);
+        }
         uint32_t v0 = __shfl_sync(0xffffffffu, w_kt0, pair_base, 4) >> shift;
         uint32_t v1 = __shfl_sync(0xffffffffu, w_kt0, pair_base + 1, 4) >> shift;
         uint32_t u0 = __shfl_sync(0xffffffffu, w_kt1, pair_base, 4) >> shift;
@@ -1434,16 +1458,28 @@ __global__ void Marlin(
         uint32_t p_hi0 = __byte_perm(v0, v1, 0x7531);
         uint32_t p_lo1 = __byte_perm(u0, u1, 0x6420);
         uint32_t p_hi1 = __byte_perm(u0, u1, 0x7531);
-        auto deq_u4b8 = [](uint32_t p) -> uint32_t {
-          uint32_t masked = static_cast<uint32_t>(
-              lop3<(0xf0 & 0xcc) | 0xaa>(static_cast<int>(p), 0x0F0F0F0F, 0x80808080));
-          return (masked - 0x08080808u) ^ 0x80808080u;
+        auto deq_shared_a8 = [](uint32_t p) -> uint32_t {
+          if constexpr (b_type == vllm::kU2B2) {
+            uint32_t masked = static_cast<uint32_t>(
+                lop3<(0xf0 & 0xcc) | 0xaa>(static_cast<int>(p), 0x03030303, 0x80808080));
+            return (masked - 0x02020202u) ^ 0x80808080u;
+          } else if constexpr (b_type == vllm::kU2B2Sym) {
+            // Represent `q - 1.5` as exact `int8` `2*q - 3 in {-3, -1, +1, +3}` and fold
+            // the `0.5f` factor into the float scale accumulation.
+            uint32_t masked = static_cast<uint32_t>(
+                lop3<(0xf0 & 0xcc) | 0xaa>(static_cast<int>(p), 0x03030303, 0x40404040));
+            return ((masked << 1) - 0x03030303u) ^ 0x80808080u;
+          } else {
+            uint32_t masked = static_cast<uint32_t>(
+                lop3<(0xf0 & 0xcc) | 0xaa>(static_cast<int>(p), 0x0F0F0F0F, 0x80808080));
+            return (masked - 0x08080808u) ^ 0x80808080u;
+          }
         };
         uint32_t* fb = reinterpret_cast<uint32_t*>(&frag_b);
-        fb[0] = deq_u4b8(p_lo0);
-        fb[1] = deq_u4b8(p_lo1);
-        fb[2] = deq_u4b8(p_hi0);
-        fb[3] = deq_u4b8(p_hi1);
+        fb[0] = deq_shared_a8(p_lo0);
+        fb[1] = deq_shared_a8(p_lo1);
+        fb[2] = deq_shared_a8(p_hi0);
+        fb[3] = deq_shared_a8(p_hi1);
       } else if (is_a_8bit && b_type.size_bits() == 4 && !has_zp) {
         dequant_data(frag_b_quant[k2][0][j * 2],
                      reinterpret_cast<scalar_32bit_t*>(&frag_b));
@@ -1494,11 +1530,12 @@ __global__ void Marlin(
       if constexpr (group_blocks != -1) {
         if (group_blocks == 2 || k == 1) {
           if constexpr (shared_k16_layout) {
+            constexpr float sym_scale = (b_type == vllm::kU2B2Sym) ? 0.5f : 1.0f;
             half const* s_h = reinterpret_cast<half const*>(&frag_s[k2]);
-            float s0_g0 = __half2float(s_h[2 * j + 0]);
-            float s0_g1 = __half2float(s_h[4 + 2 * j + 0]);
-            float s1_g0 = __half2float(s_h[2 * j + 1]);
-            float s1_g1 = __half2float(s_h[4 + 2 * j + 1]);
+            float s0_g0 = __half2float(s_h[2 * j + 0]) * sym_scale;
+            float s0_g1 = __half2float(s_h[4 + 2 * j + 0]) * sym_scale;
+            float s1_g0 = __half2float(s_h[2 * j + 1]) * sym_scale;
+            float s1_g1 = __half2float(s_h[4 + 2 * j + 1]) * sym_scale;
   #pragma unroll
             for (int i = 0; i < thread_m_blocks; i++) {
   #pragma unroll
@@ -2105,6 +2142,10 @@ __global__ void Marlin(
                   c_val = __int2float_rn(*reinterpret_cast<int32_t*>(&c_val));
                 }
                 float s_val = frag_a_s[i * 2 + g / 2];
+                if constexpr (shared_k16_layout && b_type == vllm::kU2B2Sym &&
+                              group_blocks == -1) {
+                  s_val *= 0.5f;
+                }
                 frag_c[i][j][0][g] = c_val * s_val;
               }
   #pragma unroll
@@ -2116,6 +2157,10 @@ __global__ void Marlin(
                   c_val = __int2float_rn(*reinterpret_cast<int32_t*>(&c_val));
                 }
                 float s_val = frag_a_s[i * 2 + g / 2];
+                if constexpr (shared_k16_layout && b_type == vllm::kU2B2Sym &&
+                              group_blocks == -1) {
+                  s_val *= 0.5f;
+                }
                 frag_c[i][j][1][g] = c_val * s_val;
               }
             }

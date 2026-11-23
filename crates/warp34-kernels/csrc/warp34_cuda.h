@@ -1005,9 +1005,16 @@ int warp34_moe_w2a16_sym_pulled_add_f16(
 int warp34_gemma_rms_norm_hadamard_f16(
     const warp34_exec* ex, const void* x, const void* weight, void* out, void* out_had64,
     const uint8_t* valid_token_mask, int num_tokens, int hidden_size, float eps);
+int warp34_gemma_rms_norm_hadamard512_f16(
+    const warp34_exec* ex, const void* x, const void* weight, void* out, void* out_had512,
+    const uint8_t* valid_token_mask, int num_tokens, int hidden_size, float eps);
 int warp34_fused_add_gemma_rms_norm_tap_hadamard_f16(
     const warp34_exec* ex, const void* x, void* residual, const void* weight, void* out,
     void* out_had64, void* tap_dst_bf16, const uint8_t* valid_token_mask,
+    int num_tokens, int hidden_size, float eps, int tap_row_stride, int tap_col_offset);
+int warp34_fused_add_gemma_rms_norm_tap_hadamard512_f16(
+    const warp34_exec* ex, const void* x, void* residual, const void* weight, void* out,
+    void* out_had512, void* tap_dst_bf16, const uint8_t* valid_token_mask,
     int num_tokens, int hidden_size, float eps, int tap_row_stride, int tap_col_offset);
 int warp34_tp2_all_reduce_residual_gemma_rms_norm_hadamard_f16(
     const warp34_exec* ex, const void* local_in, void* ar_out, void* residual,
@@ -1037,7 +1044,13 @@ int warp34_rms_norm_gated_sigmoid_strided_hadamard_f16(
 int warp34_silu_and_mul_hadamard_f16(
     const warp34_exec* ex, const void* gate_up, void* out, const uint8_t* valid_token_mask,
     int num_tokens, int intermediate_size);
+int warp34_silu_and_mul_hadamard512_f16(
+    const warp34_exec* ex, const void* gate_up, void* out, const uint8_t* valid_token_mask,
+    int num_tokens, int intermediate_size);
 int warp34_apply_attn_output_gate_hadamard_f16(
+    const warp34_exec* ex, const void* attn_out, const void* gate, void* out,
+    const uint8_t* valid_token_mask, int num_tokens, int total_dim);
+int warp34_apply_attn_output_gate_hadamard512_f16(
     const warp34_exec* ex, const void* attn_out, const void* gate, void* out,
     const uint8_t* valid_token_mask, int num_tokens, int total_dim);
 int warp34_tp2_all_gather_topk_f32_i32(

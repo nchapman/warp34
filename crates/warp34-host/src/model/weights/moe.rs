@@ -73,27 +73,63 @@ impl FfnBlockWeights {
         rows: usize,
         h_dim: usize,
     ) -> [u64; 2] {
+        self.pre_mlp_norm_targets_with_block(normed_buf, mlp_out_buf, ex, rows, h_dim, false)
+            .0
+    }
+
+    #[inline]
+    pub fn pre_mlp_norm_targets_with_block(
+        &self,
+        normed_buf: u64,
+        mlp_out_buf: u64,
+        ex: &Warp34Exec,
+        rows: usize,
+        h_dim: usize,
+        allow_h512: bool,
+    ) -> ([u64; 2], usize) {
         if h_dim > PRODUCER_FUSED_H64_MAX_HIDDEN_SIZE || !h_dim.is_multiple_of(HADAMARD_BLOCK_64) {
-            return [normed_buf, 0];
+            return ([normed_buf, 0], 0);
         }
         match self {
-            Self::Dense { gate_up_proj, .. } if gate_up_proj.can_fuse_h64_from_producer() => {
-                [0, normed_buf]
+            Self::Dense { gate_up_proj, .. } => {
+                if gate_up_proj.can_fuse_h64_from_producer() {
+                    ([0, normed_buf], HADAMARD_BLOCK_64)
+                } else if allow_h512
+                    && h_dim.is_multiple_of(512)
+                    && gate_up_proj.can_fuse_h512_from_producer()
+                {
+                    ([0, normed_buf], 512)
+                } else {
+                    ([normed_buf, 0], 0)
+                }
             }
-            Self::Moe(moe)
-                if moe.routed_input_hadamard == HADAMARD_BLOCK_64
+            Self::Moe(moe) => {
+                let had_block = if moe.routed_input_hadamard == HADAMARD_BLOCK_64
                     && moe
                         .shared_gate_up_proj
                         .as_ref()
-                        .is_none_or(LinearProj::can_fuse_h64_from_producer) =>
-            {
+                        .is_none_or(LinearProj::can_fuse_h64_from_producer)
+                {
+                    HADAMARD_BLOCK_64
+                } else if allow_h512
+                    && moe.routed_input_hadamard == 512
+                    && h_dim.is_multiple_of(512)
+                    && moe
+                        .shared_gate_up_proj
+                        .as_ref()
+                        .is_none_or(LinearProj::can_fuse_h512_from_producer)
+                {
+                    512
+                } else {
+                    return ([normed_buf, 0], 0);
+                };
                 match &moe.experts {
                     MoeExpertStorage::W2A16 { .. }
                     | MoeExpertStorage::W4A16 { .. }
                     | MoeExpertStorage::W4A16Zp { .. }
                         if mlp_out_buf != 0 && mlp_out_buf != normed_buf =>
                     {
-                        [normed_buf, mlp_out_buf]
+                        ([normed_buf, mlp_out_buf], had_block)
                     }
                     MoeExpertStorage::Tiered { .. } => {
                         let reserved = align_up_hadamard_workspace(
@@ -102,7 +138,9 @@ impl FfnBlockWeights {
                         let extra_ws = moe
                             .shared_down_proj
                             .as_ref()
-                            .filter(|p| !p.can_fuse_h64_from_producer())
+                            .filter(|p| {
+                                !p.can_fuse_h64_from_producer() && !p.can_fuse_h512_from_producer()
+                            })
                             .and_then(|p| p.input_transform_workspace_bytes(rows))
                             .unwrap_or(0);
                         if ex.scratch_ptr != 0
@@ -111,15 +149,14 @@ impl FfnBlockWeights {
                                 .is_multiple_of(HADAMARD_WORKSPACE_ALIGN_BYTES as u64)
                             && ex.scratch_size >= reserved.saturating_add(extra_ws)
                         {
-                            [normed_buf, ex.scratch_ptr]
+                            ([normed_buf, ex.scratch_ptr], had_block)
                         } else {
-                            [normed_buf, 0]
+                            ([normed_buf, 0], 0)
                         }
                     }
-                    _ => [normed_buf, 0],
+                    _ => ([normed_buf, 0], 0),
                 }
             }
-            _ => [normed_buf, 0],
         }
     }
 
@@ -244,8 +281,11 @@ impl FfnBlockWeights {
                     )?;
                 }
                 let fuse_down_h64 = down_proj.can_fuse_h64_from_producer();
+                let fuse_down_h512 = !fuse_down_h64 && down_proj.can_fuse_h512_from_producer();
                 let silu_fn = if fuse_down_h64 {
                     ffi::warp34_silu_and_mul_hadamard_f16
+                } else if fuse_down_h512 {
+                    ffi::warp34_silu_and_mul_hadamard512_f16
                 } else {
                     ffi::warp34_silu_and_mul_f16
                 };
@@ -266,7 +306,7 @@ impl FfnBlockWeights {
                     },
                     "warp34_silu_and_mul_f16",
                 )?;
-                if fuse_down_h64 {
+                if fuse_down_h64 || fuse_down_h512 {
                     down_proj.forward_prerotated(
                         ex,
                         cublas,
@@ -386,16 +426,16 @@ impl FfnBlockWeights {
                     "warp34_moe_topk_router_f16",
                 )?;
 
-                let fuse_shared_and_routed_in_h64 = !input_prerotated
-                    && moe.routed_input_hadamard == HADAMARD_BLOCK_64
-                    && moe
-                        .shared_gate_up_proj
-                        .as_ref()
-                        .is_some_and(LinearProj::can_fuse_h64_from_producer);
-                if fuse_shared_and_routed_in_h64 {
+                let fuse_shared_and_routed_in_hadamard = !input_prerotated
+                    && moe.routed_input_hadamard > 0
+                    && h_dim.is_multiple_of(moe.routed_input_hadamard)
+                    && moe.shared_gate_up_proj.as_ref().is_some_and(|p| {
+                        p.can_fuse_hadamard_from_producer(moe.routed_input_hadamard)
+                    });
+                if fuse_shared_and_routed_in_hadamard {
                     check_rc(
                         // SAFETY: `normed_buf` holds `num_tokens * h_dim` FP16 elements with `h_dim`
-                        // divisible by `HADAMARD_BLOCK_64`; router_gate and shared_expert_gate have
+                        // divisible by `moe.routed_input_hadamard`; router_gate and shared_expert_gate have
                         // already consumed the unrotated input on `ex.stream`.
                         unsafe {
                             ffi::warp34_block_hadamard_inplace_f16(
@@ -403,7 +443,7 @@ impl FfnBlockWeights {
                                 normed_buf as *mut c_void,
                                 num_tokens as i32,
                                 h_dim as i32,
-                                HADAMARD_BLOCK_64 as i32,
+                                moe.routed_input_hadamard as i32,
                             )
                         },
                         "warp34_block_hadamard_inplace_f16 (moe shared+routed input)",
@@ -418,7 +458,7 @@ impl FfnBlockWeights {
                 let (sh_out_ptr, sh_gate_ptr) = if let (Some(sh_gu), Some(sh_dn)) =
                     (&moe.shared_gate_up_proj, &moe.shared_down_proj)
                 {
-                    if input_prerotated || fuse_shared_and_routed_in_h64 {
+                    if input_prerotated || fuse_shared_and_routed_in_hadamard {
                         sh_gu.forward_prerotated(
                             ex,
                             cublas,
@@ -440,8 +480,12 @@ impl FfnBlockWeights {
                         )?;
                     }
                     let fuse_sh_down_h64 = sh_dn.can_fuse_h64_from_producer();
+                    let fuse_sh_down_h512 =
+                        !fuse_sh_down_h64 && sh_dn.can_fuse_h512_from_producer();
                     let sh_silu_fn = if fuse_sh_down_h64 {
                         ffi::warp34_silu_and_mul_hadamard_f16
+                    } else if fuse_sh_down_h512 {
+                        ffi::warp34_silu_and_mul_hadamard512_f16
                     } else {
                         ffi::warp34_silu_and_mul_f16
                     };
@@ -461,7 +505,7 @@ impl FfnBlockWeights {
                         },
                         "warp34_silu_and_mul_f16 (shared_expert)",
                     )?;
-                    if fuse_sh_down_h64 {
+                    if fuse_sh_down_h64 || fuse_sh_down_h512 {
                         sh_dn.forward_prerotated(
                             ex,
                             cublas,
@@ -494,7 +538,7 @@ impl FfnBlockWeights {
 
                 if moe.routed_input_hadamard > 0
                     && !input_prerotated
-                    && !fuse_shared_and_routed_in_h64
+                    && !fuse_shared_and_routed_in_hadamard
                 {
                     check_rc(
                         // SAFETY: `normed_buf` holds `num_tokens * h_dim` FP16 elements with `h_dim`
@@ -775,11 +819,11 @@ impl FfnBlockWeights {
                     matches!(moe.experts, MoeExpertStorage::Tiered { .. })
                         && (input_prerotated
                             || moe.routed_input_hadamard == 0
-                            || (moe.routed_input_hadamard == HADAMARD_BLOCK_64
-                                && moe
-                                    .shared_gate_up_proj
-                                    .as_ref()
-                                    .is_some_and(LinearProj::can_fuse_h64_from_producer)))
+                            || (moe.routed_input_hadamard > 0
+                                && h_dim.is_multiple_of(moe.routed_input_hadamard)
+                                && moe.shared_gate_up_proj.as_ref().is_some_and(|p| {
+                                    p.can_fuse_hadamard_from_producer(moe.routed_input_hadamard)
+                                })))
                 }
                 Self::Dense { .. } => false,
             };
@@ -944,13 +988,14 @@ impl FfnBlockWeights {
             },
             "warp34_moe_topk_router_f16",
         )?;
-        let fuse_shared_and_routed_in_h64 = !input_prerotated
-            && moe.routed_input_hadamard == HADAMARD_BLOCK_64
+        let fuse_shared_and_routed_in_hadamard = !input_prerotated
+            && moe.routed_input_hadamard > 0
+            && h_dim.is_multiple_of(moe.routed_input_hadamard)
             && moe
                 .shared_gate_up_proj
                 .as_ref()
-                .is_some_and(LinearProj::can_fuse_h64_from_producer);
-        if fuse_shared_and_routed_in_h64 {
+                .is_some_and(|p| p.can_fuse_hadamard_from_producer(moe.routed_input_hadamard));
+        if fuse_shared_and_routed_in_hadamard {
             check_rc(
                 // SAFETY: `normed_buf` holds `num_tokens * h_dim` FP16 elements.
                 unsafe {
@@ -959,7 +1004,7 @@ impl FfnBlockWeights {
                         normed_buf as *mut c_void,
                         num_tokens as i32,
                         h_dim as i32,
-                        HADAMARD_BLOCK_64 as i32,
+                        moe.routed_input_hadamard as i32,
                     )
                 },
                 "warp34_block_hadamard_inplace_f16 (moe shared+routed input)",
@@ -984,7 +1029,7 @@ impl FfnBlockWeights {
             tiered_moe.ok_or_else(|| loader_err("missing RankTieredMoe for tiered MoE layer"))?;
         let mut run_shared = |_s: &CudaStream| -> Result<()> {
             if let (Some(sh_gu), Some(sh_dn)) = (&moe.shared_gate_up_proj, &moe.shared_down_proj) {
-                if input_prerotated || fuse_shared_and_routed_in_h64 {
+                if input_prerotated || fuse_shared_and_routed_in_hadamard {
                     sh_gu.forward_prerotated(
                         ex,
                         cublas,
@@ -1006,8 +1051,11 @@ impl FfnBlockWeights {
                     )?;
                 }
                 let fuse_sh_down_h64 = sh_dn.can_fuse_h64_from_producer();
+                let fuse_sh_down_h512 = !fuse_sh_down_h64 && sh_dn.can_fuse_h512_from_producer();
                 let sh_silu_fn = if fuse_sh_down_h64 {
                     ffi::warp34_silu_and_mul_hadamard_f16
+                } else if fuse_sh_down_h512 {
+                    ffi::warp34_silu_and_mul_hadamard512_f16
                 } else {
                     ffi::warp34_silu_and_mul_f16
                 };
@@ -1025,7 +1073,7 @@ impl FfnBlockWeights {
                     },
                     "warp34_silu_and_mul_f16 (shared_expert)",
                 )?;
-                if fuse_sh_down_h64 {
+                if fuse_sh_down_h64 || fuse_sh_down_h512 {
                     sh_dn.forward_prerotated(
                         ex,
                         cublas,

@@ -1614,3 +1614,149 @@ fn quantize_f16_to_u8b128_lm_head_marlin_gemm_matches_fp16_logits() {
         assert!(rel_l2 < 0.006, "M={m}: rel_l2={rel_l2} >= 0.006");
     }
 }
+
+#[test]
+fn marlin_w2a8_prefill_matches_w2a16_for_u2b2_and_u2b2sym() {
+    let _guard = GPU_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let dev = CudaDevice::set_current(0).unwrap();
+    let props = dev.props().unwrap();
+    let stream = CudaStream::new(0).unwrap();
+    let arena = DeviceBuffer::alloc(0, 8 * 1024 * 1024).unwrap();
+    let workspace = DeviceBuffer::alloc(0, 65536 * 4).unwrap();
+    let ex0 = stream.exec(0, 0);
+    let mut ex_allow = stream.exec(arena.addr(), arena.len_bytes);
+    ex_allow.flags = ffi::WARP34_EXEC_FLAG_ALLOW_W4A8_PREFILL;
+
+    for &(n, k, group, m) in &[
+        (256usize, 256usize, 128usize, 128usize),
+        (512usize, 512usize, 128usize, 192usize),
+        (256usize, 256usize, 64usize, 128usize),
+        (256usize, 256usize, 256usize, 128usize),
+    ] {
+        let group_blocks = if group == k { -1 } else { (group / 16) as i32 };
+        let a: Vec<u16> = (0..m * k)
+            .map(|i| f32_to_f16((((i * 29 + 11) % 97) as f32 / 48.0) - 1.0))
+            .collect();
+        let d_a = upload(&a, &stream);
+        let d_ref = DeviceBuffer::alloc(0, m * n * 2).unwrap();
+        let d_got = DeviceBuffer::alloc(0, m * n * 2).unwrap();
+
+        let w = weights(n, k, group, 2, false, 19);
+        let d_packed = upload(&w.packed, &stream);
+        let d_repacked = DeviceBuffer::alloc(0, w.packed.len() * 4).unwrap();
+        let d_scales = upload(
+            &marlin_permute_scales_from_n_major(&w.scales, k, n, group),
+            &stream,
+        );
+        assert_eq!(
+            // SAFETY: valid device buffers sized for `k * n / 16` uint32 words.
+            unsafe {
+                ffi::warp34_marlin_repack_int2(
+                    &ex0,
+                    d_packed.addr() as *const u32,
+                    d_repacked.addr() as *mut u32,
+                    k as i64,
+                    n as i64,
+                )
+            },
+            0
+        );
+
+        for sym in [false, true] {
+            workspace.zero_async(&stream).unwrap();
+            // SAFETY: valid device buffers sized for `[m, k]`, `[k, n]`, and `[m, n]`.
+            let rc_ref = unsafe {
+                if sym {
+                    ffi::warp34_marlin_gemm_f16u2_sym(
+                        &ex0,
+                        d_a.addr() as *const c_void,
+                        d_repacked.addr() as *const c_void,
+                        d_scales.addr() as *const c_void,
+                        d_ref.addr() as *mut c_void,
+                        workspace.addr() as *mut i32,
+                        m as i64,
+                        n as i64,
+                        k as i64,
+                        65536,
+                        group_blocks,
+                    )
+                } else {
+                    ffi::warp34_marlin_gemm_f16u2(
+                        &ex0,
+                        d_a.addr() as *const c_void,
+                        d_repacked.addr() as *const c_void,
+                        d_scales.addr() as *const c_void,
+                        d_ref.addr() as *mut c_void,
+                        workspace.addr() as *mut i32,
+                        m as i64,
+                        n as i64,
+                        k as i64,
+                        65536,
+                        group_blocks,
+                    )
+                }
+            };
+            assert_eq!(rc_ref, 0);
+
+            workspace.zero_async(&stream).unwrap();
+            // SAFETY: valid device buffers and scratch arena sized for W2A8 prefill.
+            let rc_got = unsafe {
+                if sym {
+                    ffi::warp34_marlin_gemm_f16u2_sym(
+                        &ex_allow,
+                        d_a.addr() as *const c_void,
+                        d_repacked.addr() as *const c_void,
+                        d_scales.addr() as *const c_void,
+                        d_got.addr() as *mut c_void,
+                        workspace.addr() as *mut i32,
+                        m as i64,
+                        n as i64,
+                        k as i64,
+                        65536,
+                        group_blocks,
+                    )
+                } else {
+                    ffi::warp34_marlin_gemm_f16u2(
+                        &ex_allow,
+                        d_a.addr() as *const c_void,
+                        d_repacked.addr() as *const c_void,
+                        d_scales.addr() as *const c_void,
+                        d_got.addr() as *mut c_void,
+                        workspace.addr() as *mut i32,
+                        m as i64,
+                        n as i64,
+                        k as i64,
+                        65536,
+                        group_blocks,
+                    )
+                }
+            };
+            assert_eq!(rc_got, 0);
+
+            let mut ref_h = vec![0u16; m * n];
+            let mut got_h = vec![0u16; m * n];
+            d_ref.copy_to_host(&mut ref_h, &stream).unwrap();
+            d_got.copy_to_host(&mut got_h, &stream).unwrap();
+            stream.synchronize().unwrap();
+
+            let mut err_sq = 0.0f64;
+            let mut ref_sq = 0.0f64;
+            for (&r, &g) in ref_h.iter().zip(got_h.iter()) {
+                let rf = f16_to_f32(r) as f64;
+                let gf = f16_to_f32(g) as f64;
+                assert!(gf.is_finite(), "non-finite output for sym={sym}");
+                err_sq += (rf - gf) * (rf - gf);
+                ref_sq += rf * rf;
+            }
+            let rel_l2 = (err_sq / ref_sq.max(1e-12)).sqrt();
+            if props.compute_major == 8 && props.compute_minor >= 6 {
+                assert!(
+                    rel_l2 < 0.02,
+                    "W2A8 sym={sym} N={n} K={k} group={group} M={m}: rel_l2={rel_l2:.5}"
+                );
+            } else {
+                assert_eq!(got_h, ref_h);
+            }
+        }
+    }
+}

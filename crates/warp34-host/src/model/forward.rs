@@ -814,12 +814,17 @@ impl Qwen3_5ModelRank {
                 h_dim: h,
                 eps,
             };
-            let pre_attn_targets = layer.block.pre_attn_norm_targets(s.normed, ex, rows, h);
-            layer.residual.pre_attn_with_targets_ex(
+            let allow_h512_norm =
+                tp2.is_none() && layer.residual.single_stream_input_norm_ptr().is_some();
+            let (pre_attn_targets, pre_attn_had_block) = layer
+                .block
+                .pre_attn_norm_targets_with_block(s.normed, ex, rows, h, allow_h512_norm);
+            layer.residual.pre_attn_with_targets_block(
                 norm_layer_idx,
                 hc_pre_normed,
                 &hc_ctx,
                 pre_attn_targets,
+                pre_attn_had_block,
             )?;
             self.run_attention_block(
                 ex,
@@ -831,13 +836,21 @@ impl Qwen3_5ModelRank {
                 s,
                 pre_attn_targets,
             )?;
-            let pre_mlp_targets = layer.ffn.pre_mlp_norm_targets(s.normed, s.mlp, ex, rows, h);
-            layer.residual.post_attn_pre_mlp_with_targets(
+            let (pre_mlp_targets, pre_mlp_had_block) = layer.ffn.pre_mlp_norm_targets_with_block(
+                s.normed,
+                s.mlp,
+                ex,
+                rows,
+                h,
+                allow_h512_norm,
+            );
+            layer.residual.post_attn_pre_mlp_with_targets_block(
                 &hc_ctx,
                 tp2,
                 self.rank,
                 s.block,
                 pre_mlp_targets,
+                pre_mlp_had_block,
                 dump_out.is_some(),
             )?;
             if let Some(dump) = dump_out.as_deref_mut()
@@ -877,26 +890,32 @@ impl Qwen3_5ModelRank {
                 pre_mlp_targets[1],
             )?;
             let is_midloop_end = active_midloop.is_some_and(|(_, b, _, _)| layer_idx == b);
-            let [next_weight, next_out, next_had64] =
+            let ([next_weight, next_out, next_had64], next_had_block) =
                 if let Some(next) = self.layers.get(layer_idx + 1) {
                     if let Some(w) = next.residual.single_stream_input_norm_ptr() {
-                        let [no, nh] = if next.ple.is_some() {
-                            [s.normed, 0]
+                        let ([no, nh], hb) = if next.ple.is_some() {
+                            ([s.normed, 0], 0)
                         } else {
-                            next.block.pre_attn_norm_targets(s.normed, ex, rows, h)
+                            next.block.pre_attn_norm_targets_with_block(
+                                s.normed,
+                                ex,
+                                rows,
+                                h,
+                                allow_h512_norm,
+                            )
                         };
-                        [w, no, nh]
+                        ([w, no, nh], hb)
                     } else if tp2.is_none() && !is_midloop_end && next.ple.is_none() {
-                        [next.residual.hc_input_norm_ptr().unwrap_or(0), pa, 0]
+                        ([next.residual.hc_input_norm_ptr().unwrap_or(0), pa, 0], 0)
                     } else {
-                        [0, 0, 0]
+                        ([0, 0, 0], 0)
                     }
                 } else if let Some(w) = self.final_residual.single_stream_norm_ptr() {
-                    [w, final_out, 0]
+                    ([w, final_out, 0], 0)
                 } else if tp2.is_none() && !is_midloop_end {
-                    [self.final_residual.hc_norm_ptr().unwrap_or(0), pa, 0]
+                    ([self.final_residual.hc_norm_ptr().unwrap_or(0), pa, 0], 0)
                 } else {
-                    [0, 0, 0]
+                    ([0, 0, 0], 0)
                 };
             let is_final_midloop_pass =
                 active_midloop.is_none_or(|(_, _, passes, pass_idx)| pass_idx + 1 == passes);
@@ -905,18 +924,21 @@ impl Qwen3_5ModelRank {
             } else {
                 (0, 0, 0)
             };
-            self.layers[layer_idx].residual.post_mlp_with_targets(
-                &hc_ctx,
-                tp2,
-                self.rank,
-                s.mlp,
-                [next_weight, next_out, next_had64],
-                super::TapExport {
-                    dst,
-                    stride,
-                    offset,
-                },
-            )?;
+            self.layers[layer_idx]
+                .residual
+                .post_mlp_with_targets_block(
+                    &hc_ctx,
+                    tp2,
+                    self.rank,
+                    s.mlp,
+                    [next_weight, next_out, next_had64],
+                    next_had_block,
+                    super::TapExport {
+                        dst,
+                        stride,
+                        offset,
+                    },
+                )?;
             if let Some((a, b, passes, pass_idx)) = active_midloop
                 && layer_idx == b
             {
@@ -1159,6 +1181,7 @@ impl Qwen3_5ModelRank {
                     "warp34_kv_cache_write_strided",
                 )?;
                 let fuse_o_h64 = fa.o_proj.can_fuse_h64_from_producer();
+                let fuse_o_h512 = !fuse_o_h64 && fa.o_proj.can_fuse_h512_from_producer();
                 if let Some(indexer) = &fa.qsa_indexer {
                     fa.forward_qsa_attention(
                         indexer,
@@ -1199,6 +1222,8 @@ impl Qwen3_5ModelRank {
                     )?;
                     let gate_fn = if fuse_o_h64 {
                         ffi::warp34_apply_attn_output_gate_hadamard_f16
+                    } else if fuse_o_h512 {
+                        ffi::warp34_apply_attn_output_gate_hadamard512_f16
                     } else {
                         ffi::warp34_apply_attn_output_gate_f16
                     };
@@ -1218,7 +1243,7 @@ impl Qwen3_5ModelRank {
                         "warp34_apply_attn_output_gate_f16",
                     )?;
                 }
-                if fuse_o_h64 {
+                if fuse_o_h64 || fuse_o_h512 {
                     fa.o_proj
                         .forward_prerotated(ex, &self.cublas, mw, mi, gated, s.block, rows)?;
                 } else {

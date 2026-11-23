@@ -500,28 +500,35 @@ static int warmup_all_specializations_impl(int max_shared_mem);
 
 #define MARLIN_CASES_15(BTYPE, GBX) MARLIN_CASES_15_ATYPE(marlin::kF16, BTYPE, GBX)
 
-#define MARLIN_CASE_S8U4_SHARED(T_K, T_N, THR, M_BLOCKS, GBX)                   \
+#define MARLIN_CASE_S8_SHARED(BTYPE, T_K, T_N, THR, M_BLOCKS, GBX)              \
     if (th_config.thread_k == (T_K) && th_config.thread_n == (T_N) &&           \
         th_config.num_threads == (THR) && thread_m_blocks == (M_BLOCKS) &&      \
         !m_block_size_8) {                                                      \
-        return &Marlin<marlin::kS8, marlin::kU4B8, marlin::kF16, marlin::kF16,  \
+        return &Marlin<marlin::kS8, (BTYPE), marlin::kF16, marlin::kF16,        \
                        (THR), (M_BLOCKS), (T_N) / 16, (T_K) / 16, false, 4,     \
                        (GBX), false, true>;                                     \
     }
 
 #define MARLIN_CASES_12_S8U4_SHARED(GBX)                                        \
-    MARLIN_CASE_S8U4_SHARED(128, 128, 256, 1, GBX)                              \
-    MARLIN_CASE_S8U4_SHARED(64, 128, 128, 1, GBX)                               \
-    MARLIN_CASE_S8U4_SHARED(128, 64, 128, 1, GBX)                               \
-    MARLIN_CASE_S8U4_SHARED(64, 256, 256, 2, GBX)                               \
-    MARLIN_CASE_S8U4_SHARED(64, 128, 128, 2, GBX)                               \
-    MARLIN_CASE_S8U4_SHARED(128, 64, 128, 2, GBX)                               \
-    MARLIN_CASE_S8U4_SHARED(64, 256, 256, 3, GBX)                               \
-    MARLIN_CASE_S8U4_SHARED(64, 128, 128, 3, GBX)                               \
-    MARLIN_CASE_S8U4_SHARED(128, 64, 128, 3, GBX)                               \
-    MARLIN_CASE_S8U4_SHARED(64, 256, 256, 4, GBX)                               \
-    MARLIN_CASE_S8U4_SHARED(64, 128, 128, 4, GBX)                               \
-    MARLIN_CASE_S8U4_SHARED(128, 64, 128, 4, GBX)
+    MARLIN_CASE_S8_SHARED(marlin::kU4B8, 128, 128, 256, 1, GBX)                 \
+    MARLIN_CASE_S8_SHARED(marlin::kU4B8, 64, 128, 128, 1, GBX)                  \
+    MARLIN_CASE_S8_SHARED(marlin::kU4B8, 128, 64, 128, 1, GBX)                  \
+    MARLIN_CASE_S8_SHARED(marlin::kU4B8, 64, 256, 256, 2, GBX)                  \
+    MARLIN_CASE_S8_SHARED(marlin::kU4B8, 64, 128, 128, 2, GBX)                  \
+    MARLIN_CASE_S8_SHARED(marlin::kU4B8, 128, 64, 128, 2, GBX)                  \
+    MARLIN_CASE_S8_SHARED(marlin::kU4B8, 64, 256, 256, 3, GBX)                  \
+    MARLIN_CASE_S8_SHARED(marlin::kU4B8, 64, 128, 128, 3, GBX)                  \
+    MARLIN_CASE_S8_SHARED(marlin::kU4B8, 128, 64, 128, 3, GBX)                  \
+    MARLIN_CASE_S8_SHARED(marlin::kU4B8, 64, 256, 256, 4, GBX)                  \
+    MARLIN_CASE_S8_SHARED(marlin::kU4B8, 64, 128, 128, 4, GBX)                  \
+    MARLIN_CASE_S8_SHARED(marlin::kU4B8, 128, 64, 128, 4, GBX)
+
+// Prefill (`M >= 128`) chunks in multiples of 64 (`thread_m_blocks == 4`), so W2A8
+// only needs the 3 `M_BLOCKS = 4` tiles per `(BTYPE, GBX)` — minimal compile/fatbin cost.
+#define MARLIN_CASES_3_S8U2_SHARED(BTYPE, GBX)                                  \
+    MARLIN_CASE_S8_SHARED(BTYPE, 64, 256, 256, 4, GBX)                          \
+    MARLIN_CASE_S8_SHARED(BTYPE, 64, 128, 128, 4, GBX)                          \
+    MARLIN_CASE_S8_SHARED(BTYPE, 128, 64, 128, 4, GBX)
 
 static MarlinFuncPtr get_marlin_kernel_s8u4_shared(thread_config_t const& th_config,
                                                    int thread_m_blocks,
@@ -544,6 +551,54 @@ static MarlinFuncPtr get_marlin_kernel_s8u4_shared(thread_config_t const& th_con
         return nullptr;
     }
     return nullptr;
+}
+
+static MarlinFuncPtr get_marlin_kernel_s8u2_shared(thread_config_t const& th_config,
+                                                   int thread_m_blocks,
+                                                   bool m_block_size_8,
+                                                   int group_blocks,
+                                                   bool u2_sym) {
+    if (u2_sym) {
+        if (group_blocks == -1) {
+            MARLIN_CASES_3_S8U2_SHARED(marlin::kU2B2Sym, -1)
+            return nullptr;
+        }
+        if (group_blocks == 4) {
+            MARLIN_CASES_3_S8U2_SHARED(marlin::kU2B2Sym, 4)
+            return nullptr;
+        }
+        if (group_blocks == 8) {
+            MARLIN_CASES_3_S8U2_SHARED(marlin::kU2B2Sym, 8)
+            return nullptr;
+        }
+        return nullptr;
+    }
+    if (group_blocks == -1) {
+        MARLIN_CASES_3_S8U2_SHARED(marlin::kU2B2, -1)
+        return nullptr;
+    }
+    if (group_blocks == 4) {
+        MARLIN_CASES_3_S8U2_SHARED(marlin::kU2B2, 4)
+        return nullptr;
+    }
+    if (group_blocks == 8) {
+        MARLIN_CASES_3_S8U2_SHARED(marlin::kU2B2, 8)
+        return nullptr;
+    }
+    return nullptr;
+}
+
+static MarlinFuncPtr get_marlin_kernel_s8_shared(thread_config_t const& th_config,
+                                                 int num_bits,
+                                                 bool u2_sym,
+                                                 int thread_m_blocks,
+                                                 bool m_block_size_8,
+                                                 int group_blocks) {
+    if (num_bits == 2) {
+        return get_marlin_kernel_s8u2_shared(
+            th_config, thread_m_blocks, m_block_size_8, group_blocks, u2_sym);
+    }
+    return get_marlin_kernel_s8u4_shared(th_config, thread_m_blocks, m_block_size_8, group_blocks);
 }
 
 static MarlinFuncPtr get_marlin_kernel_bf16u4(thread_config_t const& th_config,
@@ -708,15 +763,16 @@ static thread_config_t choose_thread_config(int prob_m, int prob_n, int prob_k,
                                             int group_blocks, int num_bits, bool has_zp,
                                             int stages, int max_shared_mem,
                                             int sms, bool is_bf16 = false,
-                                            bool is_s8_shared = false) {
+                                            bool is_s8_shared = false,
+                                            bool u2_sym = false) {
     thread_config_t* table = thread_m_blocks > 1 ? large_batch_thread_configs : small_batch_thread_configs;
     int groupsize = (group_blocks == -1) ? -1 : (group_blocks * 16);
     auto has_kernel = [&](const thread_config_t& cfg) {
         if (is_s8_shared) {
-            return get_marlin_kernel_s8u4_shared(cfg, thread_m_blocks, m_block_size_8, group_blocks) != nullptr;
+            return get_marlin_kernel_s8_shared(cfg, num_bits, u2_sym, thread_m_blocks, m_block_size_8, group_blocks) != nullptr;
         }
         return is_bf16 ? (get_marlin_kernel_bf16u4(cfg, thread_m_blocks, m_block_size_8, group_blocks) != nullptr)
-                       : (get_marlin_kernel_f16(cfg, num_bits, has_zp, thread_m_blocks, m_block_size_8, group_blocks) != nullptr);
+                       : (get_marlin_kernel_f16(cfg, num_bits, has_zp, thread_m_blocks, m_block_size_8, group_blocks, u2_sym) != nullptr);
     };
     if (thread_m_blocks > 1) {
         const int m_tiles = div_ceil(prob_m, thread_m_blocks * 16);
@@ -819,9 +875,20 @@ static int marlin_gemm_impl(const warp34_exec* ex, const void* A, const void* B,
     // across 84-SM (3090 Ti) and 128-SM (4090) GPUs while unlocking `N = 3072, K >= 2560`
     // (e.g. 9B TP=2 `qkv` / `in_z` on 128 SMs).
     const bool keep_2560_1slice = !is_bf16 && (prob_n == 2560 && prob_k <= 4096);
+    // Both 2-bit (`25 KiB` smem, `80` regs) and 4-bit (`33 KiB` smem, `96` regs) fit `>= 3`
+    // CTAs/SM in `{128, 64, 128}` on `sm_80`/`sm_86`/`sm_89`, so `mn_tiles <= sms` at 1 CTA/SM
+    // (e.g. `down_proj`/`o_proj`/`out_proj` N=5120 -> 80 CTAs = 48 idle SMs on 4090, 4 warps/SM
+    // on 3090 Ti) is severely MLP-starved. Deterministic 2-slice Split-K (`blocks = mn_tiles * 2
+    // <= 2 * sms`) doubles residency while staying below the 3-CTA/SM hardware limit
+    // (deadlock-free) and preserving 0-ULP M=1..16 invariance.
+    const bool sub_sm_wants_2x_split_k =
+        !is_bf16 && (num_bits <= 4) && (group_blocks > 0) &&
+        (prob_n >= 2048) && ((prob_n / 64) <= sms) && ((prob_n / 64) <= workspace_ints) &&
+        (prob_k >= 4096);
     const bool shape_wants_m_invariant_split_k =
         (group_blocks > 0) && !keep_2560_1slice &&
-        ((is_bf16 && ((prob_n / 64) * 2 <= sms) && (prob_k >= 1024)) ||
+        (sub_sm_wants_2x_split_k ||
+         (is_bf16 && ((prob_n / 64) * 2 <= sms) && (prob_k >= 1024)) ||
          ((prob_n >= 2048) && ((prob_n / 64) * 2 <= sms) && (prob_k >= 4608)) ||
          ((prob_n == 3072) && ((prob_n / 64) * 2 <= sms) && (prob_k >= 2560)) ||
          ((prob_n >= 512) && (prob_n <= 2048) && (prob_k >= 1024) && (prob_k <= 2048)));
@@ -841,8 +908,12 @@ static int marlin_gemm_impl(const warp34_exec* ex, const void* A, const void* B,
     // W4A16 when transient workspace is absent or too small.
     const bool arch_wants_s8_prefill =
         (dev_props.compute_major == 8 && dev_props.compute_minor >= 6);
+    const bool s8_supported_for_weight =
+        (num_bits == 4 && !has_zp) ||
+        (num_bits == 2 && !has_zp &&
+         (group_blocks == -1 || group_blocks == 4 || group_blocks == 8));
     const bool want_auto_s8 =
-        !force_s8_shared && !is_bf16 && num_bits == 4 && !has_zp &&
+        !force_s8_shared && !is_bf16 && s8_supported_for_weight &&
         ((ex->flags & WARP34_EXEC_FLAG_ALLOW_W4A8_PREFILL) != 0u) &&
         arch_wants_s8_prefill && (prob_m >= 128);
     if (force_s8_shared && (is_bf16 || num_bits != 4 || has_zp || prob_m <= 8)) {
@@ -907,7 +978,7 @@ static int marlin_gemm_impl(const warp34_exec* ex, const void* A, const void* B,
 
         thread_config_t th_cfg = choose_thread_config(
             prob_m_split, prob_n, prob_k, thread_m_blocks, m_block_size_8,
-            group_blocks, num_bits, has_zp, stages, max_shared_mem, sms, is_bf16, chunk_s8);
+            group_blocks, num_bits, has_zp, stages, max_shared_mem, sms, is_bf16, chunk_s8, u2_sym);
         if (th_cfg.thread_n != -1) {
             const int cur_mn_tiles =
                 (prob_n / th_cfg.thread_n) * div_ceil(prob_m_split, thread_m_blocks * 16);
@@ -916,10 +987,10 @@ static int marlin_gemm_impl(const warp34_exec* ex, const void* A, const void* B,
                 cur_mn_tiles * 4 <= sms) {
                 thread_config_t cfg128 = {128, 64, 128};
                 const bool cfg128_has_kernel = chunk_s8
-                    ? (get_marlin_kernel_s8u4_shared(cfg128, thread_m_blocks, m_block_size_8, group_blocks) != nullptr)
+                    ? (get_marlin_kernel_s8_shared(cfg128, num_bits, u2_sym, thread_m_blocks, m_block_size_8, group_blocks) != nullptr)
                     : (is_bf16
                         ? (get_marlin_kernel_bf16u4(cfg128, thread_m_blocks, m_block_size_8, group_blocks) != nullptr)
-                        : (get_marlin_kernel_f16(cfg128, num_bits, has_zp, thread_m_blocks, m_block_size_8, group_blocks) != nullptr));
+                        : (get_marlin_kernel_f16(cfg128, num_bits, has_zp, thread_m_blocks, m_block_size_8, group_blocks, u2_sym) != nullptr));
                 if (is_valid_config(cfg128, thread_m_blocks, prob_m_split, prob_n, prob_k,
                                     num_bits, groupsize, has_zp, stages, max_shared_mem, chunk_s8) &&
                     cfg128_has_kernel) {
@@ -937,27 +1008,38 @@ static int marlin_gemm_impl(const warp34_exec* ex, const void* A, const void* B,
         // workspace_ints >= sms is checked above. Callers supply zero-initialized locks,
         // serialize reuse on one stream (aux GEMMs have separate locks), and the donor's
         // final slice resets each lock. A failed CUDA execution invalidates that context.
+        const int tile_smem = get_kernel_cache_size(
+            th_cfg, thread_m_blocks, num_bits, groupsize, has_zp, stages, chunk_s8);
+
         int blocks = sms;
         if (split_m_invariant_split_k && th_cfg.thread_k == 128 && th_cfg.thread_n == 64 && mn_tiles > 0) {
             int cap_splits = (mn_tiles <= 20) ? 4 : 2;
-            int max_k_splits = std::min(sms / mn_tiles, k_tiles / 4);
+            // `{128, 64, 128}` uses `<= 34 KiB` smem and `<= 96` regs (`>= 3` CTAs/SM resident
+            // on `sm_80`/`sm_86`/`sm_89`), so 2-bit and 4-bit can safely resident-oversubscribe
+            // up to `2 * sms` CTAs without deadlock risk in `barrier_acquire`.
+            int max_resident_blocks =
+                (num_bits <= 4 && !is_bf16 && mn_tiles <= workspace_ints && tile_smem * 2 <= max_shared_mem)
+                    ? (sms * 2)
+                    : sms;
+            int max_k_splits = std::min(max_resident_blocks / mn_tiles, k_tiles / 4);
             if (max_k_splits > cap_splits) max_k_splits = cap_splits;
             if (max_k_splits < 1) max_k_splits = 1;
             blocks = mn_tiles * max_k_splits;
         } else if (prob_m_split <= 16) {
-            // Preserve 1-slice M=1..16 decode/verify invariance outside explicit Split-K shapes,
-            // including on GPUs where `mn_tiles > sms` (1-slice CTAs have `slice_count == 1` and
-            // never touch `locks`).
-            blocks = mn_tiles;
-            // Whole-tile persistent CTAs can reuse the launch without changing the
-            // reduction tree: an exact divisor leaves one full K tile per tail stripe.
-            if (mn_tiles > sms) {
-                for (int candidate = sms; candidate >= (sms + 1) / 2; --candidate) {
-                    if (mn_tiles % candidate == 0) {
-                        blocks = candidate;
-                        break;
-                    }
-                }
+            // For wide projections (`mn_tiles > sms`, e.g. `gate_up_proj` 272 or 136 tiles on
+            // 84/128 SMs), launching `blocks = mn_tiles` creates a tail wave (e.g. 16 CTAs on
+            // wave 3 leaving 112 SMs idle on 4090). Launching `2 * sms` persistent CTAs (when
+            // `num_bits <= 4`, `tile_smem * 2 <= max_shared_mem`, and `mn_tiles <= workspace_ints`)
+            // fills 2 CTAs/SM across every SM with zero tail wave while keeping `blocks` fixed
+            // across `M=1..16` (0-ULP decode/verify invariance).
+            if (num_bits <= 4 && !is_bf16 && !has_zp &&
+                th_cfg.thread_k == 128 && th_cfg.thread_n == 128 && th_cfg.num_threads == 256 &&
+                mn_tiles > sms * 2 && mn_tiles <= 512 && mn_tiles <= workspace_ints &&
+                (mn_tiles % sms) != 0 && (sms * 2 <= mn_tiles * k_tiles) &&
+                (tile_smem * 2 <= max_shared_mem)) {
+                blocks = sms * 2;
+            } else {
+                blocks = mn_tiles;
             }
         } else if (blocks > mn_tiles * k_tiles) {
             blocks = mn_tiles * k_tiles;
@@ -965,7 +1047,7 @@ static int marlin_gemm_impl(const warp34_exec* ex, const void* A, const void* B,
         if (blocks < 1) blocks = 1;
 
         auto kernel = chunk_s8
-            ? get_marlin_kernel_s8u4_shared(th_cfg, thread_m_blocks, m_block_size_8, group_blocks)
+            ? get_marlin_kernel_s8_shared(th_cfg, num_bits, u2_sym, thread_m_blocks, m_block_size_8, group_blocks)
             : (is_bf16
                 ? get_marlin_kernel_bf16u4(th_cfg, thread_m_blocks, m_block_size_8, group_blocks)
                 : get_marlin_kernel_f16(
@@ -973,8 +1055,6 @@ static int marlin_gemm_impl(const warp34_exec* ex, const void* A, const void* B,
                       u2_sym));
         if (kernel == nullptr) return (int)cudaErrorInvalidValue;
 
-        const int tile_smem = get_kernel_cache_size(
-            th_cfg, thread_m_blocks, num_bits, groupsize, has_zp, stages, chunk_s8);
         if (tile_smem > 48 * 1024) {
             int cur_dev = -1;
             const bool already_warm =
@@ -1033,7 +1113,7 @@ static int warmup_all_specializations_impl(int max_shared_mem) {
     static constexpr int kGroups[4] = {-1, 2, 4, 8};
     for (int gb : kGroups) {
         for (const auto& sc : kCases) {
-            MarlinFuncPtr fns[7] = {
+            MarlinFuncPtr fns[9] = {
                 get_marlin_kernel_bf16u4(sc.cfg, sc.m_blocks, sc.m8, gb),
                 get_marlin_kernel_f16u2(sc.cfg, sc.m_blocks, sc.m8, gb),
                 get_marlin_kernel_f16u2_sym(sc.cfg, sc.m_blocks, sc.m8, gb),
@@ -1041,6 +1121,8 @@ static int warmup_all_specializations_impl(int max_shared_mem) {
                 get_marlin_kernel_f16u4_zp(sc.cfg, sc.m_blocks, sc.m8, gb),
                 get_marlin_kernel_f16u8(sc.cfg, sc.m_blocks, sc.m8, gb),
                 get_marlin_kernel_s8u4_shared(sc.cfg, sc.m_blocks, sc.m8, gb),
+                get_marlin_kernel_s8u2_shared(sc.cfg, sc.m_blocks, sc.m8, gb, false),
+                get_marlin_kernel_s8u2_shared(sc.cfg, sc.m_blocks, sc.m8, gb, true),
             };
             for (MarlinFuncPtr fn : fns) {
                 if (fn == nullptr) continue;
