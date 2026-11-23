@@ -1165,4 +1165,80 @@ mod tests {
         let err = validate_json_schema(&over_limit).unwrap_err();
         assert!(err.contains("maximum nesting depth"), "unexpected: {err}");
     }
+
+    #[test]
+    fn tool_call_trigger_constrains_immediately_after_tool_call_tag() {
+        let mut bytes: Vec<Vec<u8>> = (0..=255).map(|b| vec![b]).collect();
+        bytes.extend([
+            b"</s>".to_vec(),         // 256 (EOS / <|im_end|>)
+            b"<tool_call>".to_vec(),  // 257
+            b"<|im_start|>".to_vec(), // 258
+        ]);
+        let vocab_size = bytes.len();
+        let info = TokenizerInfo::new_from_bytes(
+            &bytes,
+            xgrammar::VocabType::Raw,
+            Some(vocab_size as i32),
+            Some(vec![256]),
+            false,
+        )
+        .unwrap();
+        let mut mask = vec![0u32; vocab_size.div_ceil(32)];
+        for id in 0..vocab_size {
+            mask[id / 32] |= 1 << (id % 32);
+        }
+        let f = ConstraintFactory {
+            compiler: Arc::new(GrammarCompiler::new(info, 1, true, 1024 * 1024)),
+            bytes: Arc::new(bytes),
+            valid_mask: Arc::new(mask),
+            vocab_size,
+            eos_ids: vec![256],
+        };
+        let tools = json!([{
+            "type": "function",
+            "function": {
+                "name": "bash",
+                "parameters": {
+                    "type": "object",
+                    "properties": { "command": { "type": "string" } },
+                    "required": ["command"]
+                }
+            }
+        }]);
+        let mut c = f
+            .tools_with_parallel(
+                &tools,
+                &crate::tool_constraints::ToolChoice::Auto,
+                false,
+                true,
+            )
+            .unwrap();
+        // Before `<tool_call>`, free prose and EOS are allowed.
+        assert!(c.is_token_allowed(b'A' as i32));
+        assert!(c.is_token_allowed(256));
+        // Emit `<tool_call>` — grammar must trigger immediately so premature EOS and
+        // `<|im_start|>` corruption cannot slip through before `<function=`.
+        c.advance(257).unwrap();
+        assert!(
+            !c.is_token_allowed(256),
+            "EOS must be masked immediately after <tool_call>"
+        );
+        assert!(
+            !c.is_token_allowed(258),
+            "<|im_start|> must be masked immediately after <tool_call>"
+        );
+        assert!(
+            c.is_token_allowed(b'\n' as i32),
+            "newline must be allowed immediately after <tool_call>"
+        );
+        c.advance(b'\n' as i32).unwrap();
+        assert!(
+            !c.is_token_allowed(258),
+            "<|im_start|> must be masked after <tool_call>\\n"
+        );
+        assert!(
+            c.is_token_allowed(b'<' as i32),
+            "'<' must be allowed after <tool_call>\\n to start <function=bash>"
+        );
+    }
 }

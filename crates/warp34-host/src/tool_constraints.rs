@@ -82,7 +82,7 @@ pub fn tool_structural_tag_with_parallel(
     let body = match choice {
         ToolChoice::Named(_) => tags.remove(0),
         _ => json!({
-            "type":"triggered_tags", "triggers":["<tool_call>\n<function="],
+            "type":"triggered_tags", "triggers":["<tool_call>"],
             "tags":tags, "at_least_one":*choice == ToolChoice::Required,
             "stop_after_first":!parallel, "excludes":["<think>","</think>"]
         }),

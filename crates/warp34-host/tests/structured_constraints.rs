@@ -664,9 +664,14 @@ fn copilot_compact_auto_text_is_not_executable() {
         "<tool_call>\n<function = echo>\n<parameter=value>forbidden</parameter>\n</function>\n</tool_call>",
         "<tool_call> <function=echo>\n<parameter=value>forbidden</parameter>\n</function>\n</tool_call>",
     ] {
+        // Triggering on `<tool_call>` rejects malformed tool-call envelopes in the grammar itself
+        // (preventing `<tool_call>\n<|im_start|>function=...` or bare `<tool_call>` slips).
         let mut c = factory.tools(&tools, &ToolChoice::Auto, false).unwrap();
-        feed(&mut c, &tok, text).unwrap();
-        assert!(c.is_token_allowed(EOS));
+        assert!(
+            feed(&mut c, &tok, text).is_err(),
+            "grammar must reject malformed <tool_call> envelope: {text:?}"
+        );
+        // Defense-in-depth: even if such text reaches the parser, it is never executed.
         for split in 0..=text.len() {
             let mut p = Qwen3Parser::with_tools(false, tools.as_array().unwrap()).unwrap();
             p.push_str(&text[..split]);
