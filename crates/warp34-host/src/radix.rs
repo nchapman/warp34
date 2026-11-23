@@ -17,6 +17,14 @@
 
 use std::collections::BTreeMap;
 
+/// Maximum uncheckpointed KV page span (`512` pages = `8,192` tokens at `page_size = 16`)
+/// allowed when tombstoning a superseded linear internal node at Priority 1, or when
+/// recycling a request's own intermediate prefill checkpoint in-place across chunked prefill
+/// slices. Preserving sparse anchor checkpoints every ~8K tokens bounds
+/// `delete_leaf_and_cleanup_tombstones` to trimming at most one ~8K tail segment per leaf
+/// eviction instead of cascading an entire 40K-110K multi-turn chain back to `ROOT`.
+pub const ANCHOR_CHECKPOINT_STRIDE_PAGES: usize = 512;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct RadixNodeId(pub usize);
 
@@ -785,23 +793,70 @@ impl MambaRadixCache {
         false
     }
 
+    /// Number of KV pages along `[nid .. ancestor_checkpoint)` from `nid`'s nearest
+    /// ancestor with `mamba_value.is_some()` (or `ROOT` if none) down to `nid` (inclusive).
+    pub fn pages_since_parent_checkpoint(&self, nid: RadixNodeId) -> usize {
+        let mut cur = nid;
+        let mut pages = 0usize;
+        while cur != RadixNodeId::ROOT {
+            pages += self.nodes[cur.0].value.len();
+            let parent = self.nodes[cur.0].parent.unwrap_or(RadixNodeId::ROOT);
+            if parent == RadixNodeId::ROOT || self.nodes[parent.0].mamba_value.is_some() {
+                break;
+            }
+            cur = parent;
+        }
+        pages
+    }
+
+    /// If `nid` has a unique non-decode-tail descendant path to the next live non-decode
+    /// checkpoint descendant (without branching along intermediate tombstones), returns
+    /// the number of KV pages along `(nid .. descendant_checkpoint]`.
+    fn pages_to_next_non_decode_checkpoint_descendant(&self, nid: RadixNodeId) -> Option<usize> {
+        let mut cur = nid;
+        let mut down_pages = 0usize;
+        loop {
+            let n = &self.nodes[cur.0];
+            let mut next_child = None;
+            for &cid in n.children.values() {
+                let c = &self.nodes[cid.0];
+                if c.children.is_empty() && c.is_decode_tail {
+                    continue;
+                }
+                if next_child.is_some() {
+                    return None;
+                }
+                next_child = Some(cid);
+            }
+            let cid = next_child?;
+            let c = &self.nodes[cid.0];
+            down_pages += c.value.len();
+            if c.mamba_value.is_some() && !c.is_decode_tail {
+                return Some(down_pages);
+            }
+            cur = cid;
+        }
+    }
+
     fn is_superseded_linear_internal(&self, nid: RadixNodeId) -> bool {
         let n = &self.nodes[nid.0];
-        if n.mamba_lock_ref > 0
-            || n.children.is_empty()
-            || !self.has_non_decode_mamba_descendant(nid)
-        {
+        n.mamba_lock_ref == 0
+            && !n.children.is_empty()
+            && self
+                .pages_to_next_non_decode_checkpoint_descendant(nid)
+                .is_some()
+    }
+
+    fn is_superseded_linear_internal_within_anchor_stride(&self, nid: RadixNodeId) -> bool {
+        let n = &self.nodes[nid.0];
+        if n.mamba_lock_ref > 0 || n.children.is_empty() {
             return false;
         }
-        let non_decode_children = n
-            .children
-            .values()
-            .filter(|&&cid| {
-                let c = &self.nodes[cid.0];
-                !(c.children.is_empty() && c.is_decode_tail)
-            })
-            .count();
-        non_decode_children == 1
+        let Some(down_pages) = self.pages_to_next_non_decode_checkpoint_descendant(nid) else {
+            return false;
+        };
+        let up_pages = self.pages_since_parent_checkpoint(nid);
+        up_pages.saturating_add(down_pages) <= ANCHOR_CHECKPOINT_STRIDE_PAGES
     }
 
     fn is_reclaimable_decode_tail_leaf(&self, nid: RadixNodeId) -> bool {
@@ -840,6 +895,29 @@ impl MambaRadixCache {
             && self.nodes[nid.0]
                 .mamba_value
                 .is_some_and(crate::cache::is_checkpoint_pool_slot)
+    }
+
+    /// Returns true if `nid` holds a locked checkpoint-pool slot with no competing non-decode
+    /// branches and recycling it into a child extension of `added_pages` keeps the uncheckpointed
+    /// span from the nearest live ancestor checkpoint within `ANCHOR_CHECKPOINT_STRIDE_PAGES`.
+    pub fn can_recycle_locked_checkpoint_mamba_within_stride(
+        &self,
+        nid: RadixNodeId,
+        added_pages: usize,
+    ) -> bool {
+        if !self.can_recycle_locked_checkpoint_mamba(nid) {
+            return false;
+        }
+        let n = &self.nodes[nid.0];
+        let has_non_decode_child = n.children.values().any(|&cid| {
+            let c = &self.nodes[cid.0];
+            !(c.children.is_empty() && c.is_decode_tail)
+        });
+        !has_non_decode_child
+            && self
+                .pages_since_parent_checkpoint(nid)
+                .saturating_add(added_pages)
+                <= ANCHOR_CHECKPOINT_STRIDE_PAGES
     }
 
     /// Tombstones or deletes any live node currently holding `mamba_value == Some(slot)`,
@@ -905,22 +983,31 @@ impl MambaRadixCache {
         }
 
         while out.freed_mamba_slots.len() < num_mamba_slots {
-            // Priority 1: Superseded linear internal nodes that have a non-decode-tail
-            // Mamba descendant (`is_superseded_linear_internal`), freeing 0 KV pages while
-            // never tombstoning a prompt frontier whose only child is an unverified decode tail.
+            // Priority 1: Superseded linear internal nodes within `ANCHOR_CHECKPOINT_STRIDE_PAGES`
+            // (`is_superseded_linear_internal_within_anchor_stride`), freeing 0 KV pages while
+            // preserving sparse ~8,192-token anchor checkpoints along long multi-turn chains
+            // and never tombstoning a prompt frontier whose only child is an unverified decode tail.
             // Priority 2: Unverified decode-tail leaf nodes (`is_reclaimable_decode_tail_leaf`)
             // whose ancestor prompt frontier still holds a live Mamba snapshot.
-            // Priority 3: Standard `mamba_lru` order.
+            // Priority 3: Any remaining superseded linear internal node (`is_superseded_linear_internal`)
+            // before falling back to deleting live session leaves.
+            // Priority 4: Standard `mamba_lru` order.
             let candidate = self
                 .mamba_lru
                 .iter()
                 .copied()
-                .find(|&nid| self.is_superseded_linear_internal(nid))
+                .find(|&nid| self.is_superseded_linear_internal_within_anchor_stride(nid))
                 .or_else(|| {
                     self.mamba_lru
                         .iter()
                         .copied()
                         .find(|&nid| self.is_reclaimable_decode_tail_leaf(nid))
+                })
+                .or_else(|| {
+                    self.mamba_lru
+                        .iter()
+                        .copied()
+                        .find(|&nid| self.is_superseded_linear_internal(nid))
                 })
                 .or_else(|| {
                     self.mamba_lru.iter().copied().find(|&nid| {
@@ -1080,6 +1167,8 @@ pub struct ReqRadixState {
     pub protected_pages: usize,
     /// Currently locked node in `MambaRadixCache` (`RadixNodeId::ROOT` if none).
     pub last_locked_node: RadixNodeId,
+    /// Node locked at initial `restore_prefix_hit` (preserved across intermediate prefill chunks).
+    pub initial_locked_node: RadixNodeId,
     /// Private working `StateBundle` slot for this request.
     pub active_state_slot: i32,
     /// When restored from a `MambaRadixCache` prefix hit, holds the cached `StateBundle` slot
@@ -1115,6 +1204,7 @@ impl ReqRadixState {
             draft_pages: Vec::new(),
             protected_pages: 0,
             last_locked_node: RadixNodeId::ROOT,
+            initial_locked_node: RadixNodeId::ROOT,
             active_state_slot,
             cow_src_state_slot: None,
             pending_unpack_ckpt_slot: None,
@@ -1146,6 +1236,7 @@ impl ReqRadixState {
         self.draft_pages.clone_from(&match_res.draft_pages);
         self.protected_pages = self.kv_pages.len();
         self.last_locked_node = match_res.last_node;
+        self.initial_locked_node = match_res.last_node;
         if crate::cache::is_checkpoint_pool_slot(slot) {
             self.cow_src_state_slot = None;
             self.pending_unpack_ckpt_slot = Some(slot);
@@ -1167,6 +1258,37 @@ impl ReqRadixState {
                 && cache_len.is_multiple_of(self.page_size)
                 && self.ping_pong_slots[keep_idx] >= 0
         })
+    }
+
+    /// Returns the number of committed checkpointed tokens beyond `protected_pages`
+    /// currently waiting to be donated into `MambaRadixCache`.
+    #[inline]
+    pub fn uncommitted_donatable_tokens(&self) -> usize {
+        self.last_track_seqlen
+            .unwrap_or(0)
+            .saturating_sub(self.protected_pages * self.page_size)
+    }
+
+    /// Returns `true` when an in-flight request (`finish_req == false`) has already donated
+    /// at least one intermediate prefill chunk beyond its restored prefix (`last_locked_node !=
+    /// initial_locked_node`) and can recycle `last_locked_node`'s checkpoint-pool slot in-place
+    /// without exceeding `ANCHOR_CHECKPOINT_STRIDE_PAGES` (`512` pages = `8,192` tokens) from
+    /// the nearest live ancestor checkpoint.
+    pub fn can_recycle_prefill_checkpoint(&self, radix: &MambaRadixCache) -> bool {
+        if self.last_locked_node == RadixNodeId::ROOT
+            || self.last_locked_node == self.initial_locked_node
+        {
+            return false;
+        }
+        let Some(cache_len) = self.last_track_seqlen else {
+            return false;
+        };
+        let cache_pages = cache_len / self.page_size;
+        if cache_pages <= self.protected_pages {
+            return false;
+        }
+        let added_pages = cache_pages - self.protected_pages;
+        radix.can_recycle_locked_checkpoint_mamba_within_stride(self.last_locked_node, added_pages)
     }
 
     /// Returns the `state_in_slot` for the next forward/verify launch (`cow_src_state_slot` if set,
@@ -1737,6 +1859,74 @@ mod tests {
         let inv = radix.invalidate_mamba_slot(ckpt0);
         assert_eq!(inv.freed_kv_pages, vec![5, 6, 7, 8, 1, 2, 3, 4]);
         assert_eq!(radix.match_prefix(&turn1).matched_tokens, 0);
+        assert!(radix.sanity_check().is_ok());
+    }
+
+    #[test]
+    fn test_evict_mamba_preserves_sparse_anchor_checkpoints_and_prevents_full_chain_cascade() {
+        let mut radix = MambaRadixCache::new(16, 64);
+
+        // Two sessions share a 432-token (27-page, non-64-aligned) system prompt prefix so
+        // `split_node` creates a 432-token internal branch node with `mamba_value = None`.
+        let shared_432: Vec<i32> = (0..432).collect();
+        let mut peer_branch = shared_432.clone();
+        peer_branch.extend(900_000..900_000 + (2048 - 432));
+        let peer_pages: Vec<i32> = (50_000..50_128).collect();
+        let peer_ins = radix.insert(&peer_branch, &peer_pages, &[], 900, 0);
+        // Keep peer locked so evictions target Session A's unlocked multi-turn chain.
+        radix.inc_lock_ref(peer_ins.terminal_node);
+
+        // Session A advances through 20 turns of 2,048 tokens (128 pages) each up to 40,960 tokens
+        // (2,560 pages). Each turn donates a checkpoint slot 1..=20.
+        let total_turns = 20usize;
+        let turn_tokens = 2048usize;
+        let turn_pages = turn_tokens / 16;
+        let full_tokens: Vec<i32> = shared_432
+            .iter()
+            .copied()
+            .chain(10_000..10_000 + (total_turns * turn_tokens - 432) as i32)
+            .collect();
+        let full_pages: Vec<i32> = (0..(total_turns * turn_pages) as i32).collect();
+        for t in 1..=total_turns {
+            let tok_end = t * turn_tokens;
+            let page_end = t * turn_pages;
+            let prev_pages = (t - 1) * turn_pages;
+            radix.insert(
+                &full_tokens[..tok_end],
+                &full_pages[..page_end],
+                &[],
+                t as i32,
+                prev_pages,
+            );
+        }
+        assert_eq!(radix.mamba_evictable_slots(), total_turns);
+
+        // Evicting 15 Mamba slots (leaving 5 live checkpoints along Session A's 40,960-token chain:
+        // sparse 8,192-token anchors at 8192/16384/24576/32768 + the 40,960-token tip leaf) must
+        // tombstone only fine-grained intermediate turns (`Priority 1`) without freeing any KV pages.
+        let ev_mamba = radix.evict_mamba(15);
+        assert_eq!(ev_mamba.freed_mamba_slots.len(), 15);
+        assert!(ev_mamba.freed_kv_pages.is_empty());
+        assert_eq!(radix.mamba_evictable_slots(), 5);
+        assert!(radix.sanity_check().is_ok());
+
+        // Now simulate KV page pressure requesting 128 pages (2,048 tokens).
+        // `evict_full_pages(128)` must stop at the nearest preserved ~8,192-token anchor
+        // checkpoint (at 32,768 tokens) instead of cascading all 40,960 tokens back to the
+        // 432-token non-checkpointed branch point (GitHub Issue #23).
+        let ev_kv = radix.evict_full_pages(128);
+        assert!(
+            ev_kv.freed_kv_pages.len() <= ANCHOR_CHECKPOINT_STRIDE_PAGES,
+            "leaf eviction must stop at the nearest anchor checkpoint (<= {} pages), got {}",
+            ANCHOR_CHECKPOINT_STRIDE_PAGES,
+            ev_kv.freed_kv_pages.len()
+        );
+        let hit_after = radix.match_prefix(&full_tokens);
+        assert_eq!(hit_after.matched_tokens, 32_768);
+        assert!(hit_after.mamba_slot.is_some());
+        assert!(radix.sanity_check().is_ok());
+
+        radix.dec_lock_ref(peer_ins.terminal_node);
         assert!(radix.sanity_check().is_ok());
     }
 }

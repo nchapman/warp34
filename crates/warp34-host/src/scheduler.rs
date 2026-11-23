@@ -812,10 +812,21 @@ impl SchedulerV1 {
         } else if slice.is_prefill_chunk
             && seq.prefix_bidir_len.is_none()
             && seq.radix_state.has_donatable_checkpoint()
+            && (slice.is_final_prefill_chunk
+                || seq.radix_state.uncommitted_donatable_tokens() >= self.cfg.chunk_prefill_size)
         {
             // Donate intermediate or completed prefill checkpoint so concurrent
-            // requests and retries can hit the warm prompt prefix.
-            let rep = alloc_replacement_slot(&mut self.radix);
+            // requests and retries can hit the warm prompt prefix. Within an
+            // 8,192-token (`ANCHOR_CHECKPOINT_STRIDE_PAGES`) window, recycle this
+            // request's own intermediate prefill checkpoint slot in-place rather
+            // than allocating a fresh checkpoint slot on every prefill chunk.
+            let recycle_in_place = self.use_checkpoint_pool
+                && seq.radix_state.can_recycle_prefill_checkpoint(&self.radix);
+            let rep = if recycle_in_place {
+                None
+            } else {
+                alloc_replacement_slot(&mut self.radix)
+            };
             let can_recycle = if self.use_checkpoint_pool {
                 self.radix
                     .can_recycle_locked_checkpoint_mamba(seq.radix_state.last_locked_node)
@@ -1665,5 +1676,50 @@ mod tests {
         );
         assert_eq!(lookup.reason, "admission_filter");
         assert_eq!(sched.active[0].radix_state.cow_src_state_slot, Some(10));
+    }
+
+    #[test]
+    fn test_chunked_prefill_recycles_intermediate_checkpoint_within_anchor_stride() {
+        let mut sched = SchedulerV1::new(SchedulerConfig::default());
+        sched.use_checkpoint_pool = true;
+
+        // Submit a 20,480-token prompt (10 chunks of 2,048 tokens = 1,280 pages).
+        let prompt: Vec<i32> = (0..20_480).collect();
+        sched.submit_request(prompt.clone(), 4, Vec::new());
+        sched.admit_waiting(|_| Some((1, [2, 3])));
+        sched.active[0].radix_state.kv_pages = (0..1285).collect();
+
+        let mut next_ckpt_idx = 0usize;
+        let mut allocated_ckpts = Vec::new();
+        for chunk_idx in 0..10 {
+            let slices = sched.schedule_step();
+            assert_eq!(slices.len(), 1);
+            assert!(slices[0].is_prefill_chunk);
+            assert_eq!(slices[0].is_final_prefill_chunk, chunk_idx == 9);
+            let emitted = (chunk_idx == 9).then_some(42);
+            let don = sched.commit_slice_with_radix(&slices[0], emitted, |_| {
+                let slot = crate::cache::encode_checkpoint_pool_slot(next_ckpt_idx);
+                next_ckpt_idx += 1;
+                allocated_ckpts.push(slot);
+                Some(slot)
+            });
+            assert!(don.is_some());
+        }
+
+        // Across 10 chunks of 2,048 tokens (20,480 tokens):
+        // - Chunks 0..=3 (2,048 -> 8,192 tokens = 512 pages) allocate 1 slot and recycle it to 8,192.
+        // - Chunks 4..=7 (10,240 -> 16,384 tokens = 512 pages) allocate a 2nd slot and recycle it to 16,384.
+        // - Chunks 8..=9 (18,432 -> 20,480 tokens = 256 pages) allocate a 3rd slot and recycle it to 20,480.
+        assert_eq!(allocated_ckpts.len(), 3);
+        assert_eq!(
+            sched.radix.match_prefix(&prompt[..8192]).matched_tokens,
+            8192
+        );
+        assert_eq!(
+            sched.radix.match_prefix(&prompt[..16_384]).matched_tokens,
+            16_384
+        );
+        assert_eq!(sched.radix.match_prefix(&prompt).matched_tokens, 20_480);
+        assert!(sched.radix.sanity_check().is_ok());
     }
 }

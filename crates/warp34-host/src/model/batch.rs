@@ -312,7 +312,8 @@ impl Qwen3_5Engine {
         if self.has_checkpoint_pool() {
             let can_recycle_ckpt =
                 radix.can_recycle_locked_checkpoint_mamba(req_state.last_locked_node);
-            let ckpt = if req_state.has_donatable_checkpoint() {
+            let recycle_in_place = !finish_req && req_state.can_recycle_prefill_checkpoint(radix);
+            let ckpt = if req_state.has_donatable_checkpoint() && !recycle_in_place {
                 self.alloc_checkpoint_slot_from(radix)
             } else {
                 None
