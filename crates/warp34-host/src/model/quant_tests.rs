@@ -66,6 +66,7 @@ fn ct(bits: usize, group_size: usize, symmetric: bool) -> QuantScheme {
         num_bits: bits,
         group_size,
         symmetric,
+        code_offset_half: false,
         ignore: vec![],
         rules: None,
     }

@@ -24,7 +24,8 @@ __global__ __launch_bounds__(128, 4) void moe_sparse_vec4_kernel(
     __half * __restrict__ intermediate,
     __half * __restrict__ down,
     int top_k, int N, int K,
-    const int32_t * __restrict__ active_count = nullptr) {
+    const int32_t * __restrict__ active_count = nullptr,
+    uint32_t u2_add_bits = 0xdc08dc08u) {
     static_assert(BITS == 2 || BITS == 4, "BITS must be 2 or 4");
     static_assert(GROUP_SIZE == 64 || GROUP_SIZE == 128, "GROUP_SIZE must be 64 or 128");
     static_assert(!APPLY_HAD64 || GATE, "APPLY_HAD64 is only valid for GATE=true");
@@ -118,12 +119,12 @@ __global__ __launch_bounds__(128, 4) void moe_sparse_vec4_kernel(
                                 const float x0 = __low2float(xh2[p]);
                                 const float x1 = __high2float(xh2[p]);
                                 const __half2 gd = (BITS == 2)
-                                    ? unpack_u2b2_pair_scaled_h2(gw_v, ((word_i & 1) << 2) + p, gs_h2)
+                                    ? unpack_u2b2_pair_scaled_h2(gw_v, ((word_i & 1) << 2) + p, gs_h2, u2_add_bits)
                                     : unpack_u4b8_pair_scaled_h2(gw_v, p, gs_h2);
                                 g_r[ri] += __low2float(gd) * x0 + __high2float(gd) * x1;
                                 if (GATE) {
                                     const __half2 ud = (BITS == 2)
-                                        ? unpack_u2b2_pair_scaled_h2(uw_v, ((word_i & 1) << 2) + p, us_h2)
+                                        ? unpack_u2b2_pair_scaled_h2(uw_v, ((word_i & 1) << 2) + p, us_h2, u2_add_bits)
                                         : unpack_u4b8_pair_scaled_h2(uw_v, p, us_h2);
                                     u_r[ri] += __low2float(ud) * x0 + __high2float(ud) * x1;
                                 }
@@ -217,11 +218,11 @@ __global__ __launch_bounds__(128, 4) void moe_sparse_vec4_kernel(
 #pragma unroll
                     for (int p = 0; p < 4; ++p) {
                         gd_h2[p] = (BITS == 2)
-                            ? unpack_u2b2_pair_scaled_h2(gw_v, ((word_i & 1) << 2) + p, gs_h2)
+                            ? unpack_u2b2_pair_scaled_h2(gw_v, ((word_i & 1) << 2) + p, gs_h2, u2_add_bits)
                             : unpack_u4b8_pair_scaled_h2(gw_v, p, gs_h2);
                         if (GATE) {
                             ud_h2[p] = (BITS == 2)
-                                ? unpack_u2b2_pair_scaled_h2(uw_v, ((word_i & 1) << 2) + p, us_h2)
+                                ? unpack_u2b2_pair_scaled_h2(uw_v, ((word_i & 1) << 2) + p, us_h2, u2_add_bits)
                                 : unpack_u4b8_pair_scaled_h2(uw_v, p, us_h2);
                         }
                     }
@@ -372,7 +373,8 @@ __global__ void moe_sparse_mma_kernel(
     const float * __restrict__ tw,
     __half * __restrict__ intermediate,
     __half * __restrict__ down,
-    int top_k, int N, int K) {
+    int top_k, int N, int K,
+    uint32_t u2_add_bits = 0xdc08dc08u) {
     static_assert(BITS == 2 || BITS == 4, "BITS must be 2 or 4");
     static_assert(GROUP_SIZE == 64 || GROUP_SIZE == 128, "GROUP_SIZE must be 64 or 128");
     static_assert(!APPLY_HAD64 || GATE, "APPLY_HAD64 is only valid for GATE=true");
@@ -444,13 +446,13 @@ __global__ void moe_sparse_mma_kernel(
                         av[j] = unpack_u2b2_pair_scaled(
                             __shfl_sync(0xffffffffu, gv, (lane & ~3) + word16 / 2),
                             ((j >> 1) << 2) + c,
-                            gs_h2[j & 1][sg]);
+                            gs_h2[j & 1][sg], u2_add_bits);
                         if (GATE) {
                             const uint32_t uvv = reinterpret_cast<uint32_t *>(&uw[j & 1])[word16 % 2];
                             uv[j] = unpack_u2b2_pair_scaled(
                                 __shfl_sync(0xffffffffu, uvv, (lane & ~3) + word16 / 2),
                                 ((j >> 1) << 2) + c,
-                                us_h2[j & 1][sg]);
+                                us_h2[j & 1][sg], u2_add_bits);
                         }
                     } else {
                         const int word = kk / 8 + (j >> 1);

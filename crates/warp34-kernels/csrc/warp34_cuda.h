@@ -326,6 +326,10 @@ int warp34_marlin_gemm_f16u2(const warp34_exec* ex, const void* a, const void* b
                           const void* scales, void* c, int32_t* workspace,
                           int64_t m, int64_t n, int64_t k,
                           int64_t workspace_ints, int group_blocks);
+int warp34_marlin_gemm_f16u2_sym(const warp34_exec* ex, const void* a, const void* b,
+                              const void* scales, void* c, int32_t* workspace,
+                              int64_t m, int64_t n, int64_t k,
+                              int64_t workspace_ints, int group_blocks);
 int warp34_marlin_gemm_f16u4(const warp34_exec* ex, const void* a, const void* b,
                           const void* scales, void* c, int32_t* workspace,
                           int64_t m, int64_t n, int64_t k,
@@ -739,6 +743,16 @@ int warp34_moe_w2a16_mlp_ex_f16(const warp34_exec* ex, const void* x,
                              int num_tokens, int top_k, int num_experts,
                              int n_interm, int k_hidden, int group_size,
                              int down_hadamard_block_size);
+int warp34_moe_w2a16_sym_mlp_ex_f16(const warp34_exec* ex, const void* x,
+                                 const uint32_t* gate_up_packed, const void* gate_up_scales,
+                                 const uint32_t* down_packed, const void* down_scales,
+                                 const int32_t* topk_ids, const float* topk_weights,
+                                 const void* shared_expert_out,
+                                 const void* shared_expert_gate_logits,
+                                 void* interm_buf, void* out,
+                                 int num_tokens, int top_k, int num_experts,
+                                 int n_interm, int k_hidden, int group_size,
+                                 int down_hadamard_block_size);
 int warp34_moe_w4a16_mlp_zp_f16(const warp34_exec* ex, const void* x,
                              const uint32_t* gate_up_packed, const void* gate_up_scales,
                              const uint32_t* gate_up_qzeros,
@@ -976,6 +990,12 @@ int warp34_moe_w4a16_pulled_add_f16(
     void* interm_buf, void* out, int num_tokens, int top_k, int num_experts,
     int n_interm, int k_hidden, int group_size, int down_hadamard_block_size);
 int warp34_moe_w2a16_pulled_add_f16(
+    const warp34_exec* ex, const void* x, const uint32_t* gate_up_packed,
+    const void* gate_up_scales, const uint32_t* down_packed, const void* down_scales,
+    const int32_t* pulled_topk_ids, const float* topk_weights, const int32_t* active_count,
+    void* interm_buf, void* out, int num_tokens, int top_k, int num_experts,
+    int n_interm, int k_hidden, int group_size, int down_hadamard_block_size);
+int warp34_moe_w2a16_sym_pulled_add_f16(
     const warp34_exec* ex, const void* x, const uint32_t* gate_up_packed,
     const void* gate_up_scales, const uint32_t* down_packed, const void* down_scales,
     const int32_t* pulled_topk_ids, const float* topk_weights, const int32_t* active_count,

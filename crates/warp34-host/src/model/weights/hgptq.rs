@@ -131,24 +131,26 @@ impl RawLinearHost {
     }
 
     // Marlin accepts N multiples of 64 with K multiples of 128. Padding is in
-    // the rotated basis: nibble 8 is U4B8 zero (crumb 2 is U2B2 zero), not 0.
+    // the rotated basis: nibble 8 is U4B8 zero (crumb 2 is U2B2 zero), while
+    // code_offset=0.5 has no integer zero code so padded rows/groups use scale 0.
     #[cfg(any(feature = "cuda", test))]
     pub(super) fn pad_hadamard_weight(&self) -> Result<Self> {
-        let (packed, scales, n, k, group_size, is_u2) = match self {
+        let (packed, scales, n, k, group_size, is_u2, code_offset_half) = match self {
             Self::U2B2NMajor {
                 packed,
                 scales,
                 n,
                 k,
                 group_size,
-            } => (packed, scales, *n, *k, *group_size, true),
+                code_offset_half,
+            } => (packed, scales, *n, *k, *group_size, true, *code_offset_half),
             Self::U4B8NMajor {
                 packed,
                 scales,
                 n,
                 k,
                 group_size,
-            } => (packed, scales, *n, *k, *group_size, false),
+            } => (packed, scales, *n, *k, *group_size, false, false),
             _ => return Err(loader_err("HGPTQ padding expects symmetric W2/W4")),
         };
         let pn = n.div_ceil(MARLIN_TILE_N) * MARLIN_TILE_N;
@@ -156,6 +158,11 @@ impl RawLinearHost {
         let channelwise = group_size == k;
         if !channelwise && !matches!(group_size, 32 | 64 | 128) {
             return Err(loader_err("unsupported HGPTQ group size"));
+        }
+        if code_offset_half && pk != k && (channelwise || !k.is_multiple_of(group_size)) {
+            return Err(loader_err(
+                "code_offset=0.5 HGPTQ K-padding requires K divisible by group_size (no zero code inside a live group)",
+            ));
         }
         let groups = if channelwise { 1 } else { pk / group_size };
         let old_groups = k / group_size;
@@ -172,7 +179,12 @@ impl RawLinearHost {
         let words_pk = pk / pack_factor;
         let words_k = k / pack_factor;
         let mut padded = vec![zero_word; pn * words_pk];
-        let mut padded_scales = vec![f32_to_f16(1.0); pn * groups];
+        let pad_scale = if code_offset_half {
+            0u16
+        } else {
+            f32_to_f16(1.0)
+        };
+        let mut padded_scales = vec![pad_scale; pn * groups];
         for row in 0..n {
             padded[row * words_pk..row * words_pk + words_k]
                 .copy_from_slice(&packed[row * words_k..(row + 1) * words_k]);
@@ -187,6 +199,7 @@ impl RawLinearHost {
                 n: pn,
                 k: pk,
                 group_size: new_gs,
+                code_offset_half,
             })
         } else {
             Ok(Self::U4B8NMajor {

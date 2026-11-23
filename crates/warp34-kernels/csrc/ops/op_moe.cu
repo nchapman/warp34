@@ -61,27 +61,31 @@ __device__ __forceinline__ uint32_t unpack_u4b8_pair_scaled(
     return *reinterpret_cast<const uint32_t*>(&h2);
 }
 
-// Fast 0-ULP IEEE-754 binary16 magic-bias unpack of 2 consecutive U2B2 crumbs
-// (zero-point 2) from `packed_w` (pair `pair_idx` in 0..7), pre-multiplied in
-// FP16 by group `scale_h2` to match donor vLLM / Humming U2B2 dequantization.
+// Fast 0-ULP IEEE-754 binary16 magic-bias unpack of 2 consecutive 2-bit crumbs
+// from `packed_w` (pair `pair_idx` in 0..7), pre-multiplied in FP16 by group `scale_h2`:
+// - `u2_add_bits == 0xdc08dc08u` (`-258.0`): `q - 2.0` (`{-2, -1, 0, +1}`, `code_offset == 0.0`)
+// - `u2_add_bits == 0xdc06dc06u` (`-257.5`): `q - 1.5` (`{-1.5, -0.5, +0.5, +1.5}`, `code_offset == 0.5`)
 __device__ __forceinline__ __half2 unpack_u2b2_pair_scaled_h2(
     uint32_t packed_w,
     int pair_idx,
-    __half2 scale_h2) {
+    __half2 scale_h2,
+    uint32_t u2_add_bits = 0xdc08dc08u) {
     const uint32_t nib_v = (packed_w >> (pair_idx << 2)) & 0x0Fu;
-    const uint32_t h2_bits = ((nib_v & 0x03u) | ((nib_v & 0x0Cu) << 14)) | 0x64006400u;
-    const uint32_t bias_bits = 0x64026402u; // (1026.0, 1026.0) in FP16
-    const __half2 q_h2 = __hsub2(
+    const uint32_t h2_bits = (((nib_v & 0x03u) << 2) | ((nib_v & 0x0Cu) << 16)) | 0x64006400u;
+    const uint32_t mul_bits = 0x34003400u; // (0.25, 0.25) in FP16
+    const __half2 q_h2 = __hfma2(
         *reinterpret_cast<const __half2*>(&h2_bits),
-        *reinterpret_cast<const __half2*>(&bias_bits));
+        *reinterpret_cast<const __half2*>(&mul_bits),
+        *reinterpret_cast<const __half2*>(&u2_add_bits));
     return __hmul2(q_h2, scale_h2);
 }
 
 __device__ __forceinline__ uint32_t unpack_u2b2_pair_scaled(
     uint32_t packed_w,
     int pair_idx,
-    __half2 scale_h2) {
-    const __half2 h2 = unpack_u2b2_pair_scaled_h2(packed_w, pair_idx, scale_h2);
+    __half2 scale_h2,
+    uint32_t u2_add_bits = 0xdc08dc08u) {
+    const __half2 h2 = unpack_u2b2_pair_scaled_h2(packed_w, pair_idx, scale_h2, u2_add_bits);
     return *reinterpret_cast<const uint32_t*>(&h2);
 }
 
@@ -152,7 +156,8 @@ __global__ void __launch_bounds__(128, APPLY_HAD64 ? 4 : 8) moe_w4a16_gate_up_si
     int num_experts,
     int n_interm,
     int k_hidden,
-    int group_size) {
+    int group_size,
+    uint32_t u2_add_bits = 0xdc08dc08u) {
     static_assert(BITS == 2 || BITS == 4, "BITS must be 2 or 4");
     static_assert(!HAS_ZP || BITS == 4, "HAS_ZP requires BITS == 4");
     using w_vec_t = typename std::conditional<BITS == 2, uint2, uint4>::type;
@@ -219,7 +224,7 @@ __global__ void __launch_bounds__(128, APPLY_HAD64 ? 4 : 8) moe_w4a16_gate_up_si
                         const float x_hi = __high2float(xh2);
 
                         const __half2 gwh2 = (BITS == 2)
-                            ? unpack_u2b2_pair_scaled_h2(gw, p_base + p, gs_h2)
+                            ? unpack_u2b2_pair_scaled_h2(gw, p_base + p, gs_h2, u2_add_bits)
                             : (HAS_ZP
                                 ? unpack_u4_zp_pair_scaled_h2(gw, p, g_zp, gs_h2)
                                 : unpack_u4b8_pair_scaled_h2(gw, p, gs_h2));
@@ -227,7 +232,7 @@ __global__ void __launch_bounds__(128, APPLY_HAD64 ? 4 : 8) moe_w4a16_gate_up_si
                         gate_acc[ri] += __high2float(gwh2) * x_hi;
 
                         const __half2 uwh2 = (BITS == 2)
-                            ? unpack_u2b2_pair_scaled_h2(uw, p_base + p, us_h2)
+                            ? unpack_u2b2_pair_scaled_h2(uw, p_base + p, us_h2, u2_add_bits)
                             : (HAS_ZP
                                 ? unpack_u4_zp_pair_scaled_h2(uw, p, u_zp, us_h2)
                                 : unpack_u4b8_pair_scaled_h2(uw, p, us_h2));
@@ -296,10 +301,10 @@ __global__ void __launch_bounds__(128, APPLY_HAD64 ? 4 : 8) moe_w4a16_gate_up_si
                         const float x0 = __low2float(xh2[p]);
                         const float x1 = __high2float(xh2[p]);
                         const __half2 gd = (BITS == 2)
-                            ? unpack_u2b2_pair_scaled_h2(gw_v, ((word_i & 1) << 2) + p, gs_h2)
+                            ? unpack_u2b2_pair_scaled_h2(gw_v, ((word_i & 1) << 2) + p, gs_h2, u2_add_bits)
                             : unpack_u4b8_pair_scaled_h2(gw_v, p, gs_h2);
                         const __half2 ud = (BITS == 2)
-                            ? unpack_u2b2_pair_scaled_h2(uw_v, ((word_i & 1) << 2) + p, us_h2)
+                            ? unpack_u2b2_pair_scaled_h2(uw_v, ((word_i & 1) << 2) + p, us_h2, u2_add_bits)
                             : unpack_u4b8_pair_scaled_h2(uw_v, p, us_h2);
                         gate_acc += __low2float(gd) * x0 + __high2float(gd) * x1;
                         up_acc += __low2float(ud) * x0 + __high2float(ud) * x1;
@@ -337,7 +342,7 @@ __global__ void __launch_bounds__(128, APPLY_HAD64 ? 4 : 8) moe_w4a16_gate_up_si
                 const float x_hi = __high2float(xh2);
 
                 const __half2 gwh2 = (BITS == 2)
-                    ? unpack_u2b2_pair_scaled_h2(gw, p_base + p, gs_h2)
+                    ? unpack_u2b2_pair_scaled_h2(gw, p_base + p, gs_h2, u2_add_bits)
                     : (HAS_ZP
                         ? unpack_u4_zp_pair_scaled_h2(gw, p, g_zp, gs_h2)
                         : unpack_u4b8_pair_scaled_h2(gw, p, gs_h2));
@@ -345,7 +350,7 @@ __global__ void __launch_bounds__(128, APPLY_HAD64 ? 4 : 8) moe_w4a16_gate_up_si
                 gate_acc += __high2float(gwh2) * x_hi;
 
                 const __half2 uwh2 = (BITS == 2)
-                    ? unpack_u2b2_pair_scaled_h2(uw, p_base + p, us_h2)
+                    ? unpack_u2b2_pair_scaled_h2(uw, p_base + p, us_h2, u2_add_bits)
                     : (HAS_ZP
                         ? unpack_u4_zp_pair_scaled_h2(uw, p, u_zp, us_h2)
                         : unpack_u4b8_pair_scaled_h2(uw, p, us_h2));
@@ -386,7 +391,8 @@ __global__ void __launch_bounds__(128, 8) moe_w4a16_down_accum_f16_kernel(
     int k_hidden,
     int n_interm,
     int group_size,
-    bool subwarp_vec = false) {
+    bool subwarp_vec = false,
+    uint32_t u2_add_bits = 0xdc08dc08u) {
     static_assert(BITS == 2 || BITS == 4, "BITS must be 2 or 4");
     static_assert(!HAS_ZP || BITS == 4, "HAS_ZP requires BITS == 4");
     using w_vec_t = typename std::conditional<BITS == 2, uint2, uint4>::type;
@@ -446,7 +452,7 @@ __global__ void __launch_bounds__(128, 8) moe_w4a16_down_accum_f16_kernel(
 #pragma unroll
                     for (int p = 0; p < 4; ++p) {
                         const __half2 dwh2 = (BITS == 2)
-                            ? unpack_u2b2_pair_scaled_h2(dw, ((word_i & 1) << 2) + p, ds_h2)
+                            ? unpack_u2b2_pair_scaled_h2(dw, ((word_i & 1) << 2) + p, ds_h2, u2_add_bits)
                             : unpack_u4b8_pair_scaled_h2(dw, p, ds_h2);
                         dot += __low2float(dwh2) * __low2float(xh2[p]) +
                                __high2float(dwh2) * __high2float(xh2[p]);
@@ -518,7 +524,7 @@ __global__ void __launch_bounds__(128, 8) moe_w4a16_down_accum_f16_kernel(
                     for (int p = 0; p < 4; ++p) {
                         const __half2 xh2 = *reinterpret_cast<const __half2*>(&x2[p]);
                         const __half2 dwh2 = (BITS == 2)
-                            ? unpack_u2b2_pair_scaled_h2(dw, p_base + p, ds_h2)
+                            ? unpack_u2b2_pair_scaled_h2(dw, p_base + p, ds_h2, u2_add_bits)
                             : (HAS_ZP
                                 ? unpack_u4_zp_pair_scaled_h2(dw, p, d_zp, ds_h2)
                                 : unpack_u4b8_pair_scaled_h2(dw, p, ds_h2));
@@ -563,7 +569,7 @@ __global__ void __launch_bounds__(128, 8) moe_w4a16_down_accum_f16_kernel(
 #pragma unroll
                         for (int p = 0; p < 4; ++p) {
                             const __half2 dwh2 = (BITS == 2)
-                                ? unpack_u2b2_pair_scaled_h2(dw, ((word_i & 1) << 2) + p, ds_h2)
+                                ? unpack_u2b2_pair_scaled_h2(dw, ((word_i & 1) << 2) + p, ds_h2, u2_add_bits)
                                 : unpack_u4b8_pair_scaled_h2(dw, p, ds_h2);
                             dot += __low2float(dwh2) * __low2float(xh2[p]) +
                                    __high2float(dwh2) * __high2float(xh2[p]);
@@ -609,7 +615,7 @@ __global__ void __launch_bounds__(128, 8) moe_w4a16_down_accum_f16_kernel(
                 for (int p = 0; p < 4; ++p) {
                     const __half2 xh2 = *reinterpret_cast<const __half2*>(&x2[p]);
                     const __half2 dwh2 = (BITS == 2)
-                        ? unpack_u2b2_pair_scaled_h2(dw, p_base + p, ds_h2)
+                        ? unpack_u2b2_pair_scaled_h2(dw, p_base + p, ds_h2, u2_add_bits)
                         : (HAS_ZP
                             ? unpack_u4_zp_pair_scaled_h2(dw, p, d_zp, ds_h2)
                             : unpack_u4b8_pair_scaled_h2(dw, p, ds_h2));
@@ -749,7 +755,8 @@ __global__ void moe_w4a16_grouped_gate_up_silu_mma_f16_kernel(
     int top_k,
     int n_interm,
     int k_hidden,
-    int group_size) {
+    int group_size,
+    uint32_t u2_add_bits = 0xdc08dc08u) {
     static_assert(BITS == 2 || BITS == 4, "BITS must be 2 or 4");
     static_assert(!HAS_ZP || BITS == 4, "HAS_ZP requires BITS == 4");
     const int tile_idx = (int)blockIdx.y;
@@ -850,10 +857,10 @@ __global__ void moe_w4a16_grouped_gate_up_silu_mma_f16_kernel(
                         const int w_idx = col_base >> 4;
                         const uint32_t gw16 = gate_w_row[w_idx];
                         const uint32_t uw16 = up_w_row[w_idx];
-                        gb0 = unpack_u2b2_pair_scaled(gw16, tid_in_grp, gs_cur);
-                        gb1 = unpack_u2b2_pair_scaled(gw16, tid_in_grp + 4, gs_cur);
-                        ub0 = unpack_u2b2_pair_scaled(uw16, tid_in_grp, us_cur);
-                        ub1 = unpack_u2b2_pair_scaled(uw16, tid_in_grp + 4, us_cur);
+                        gb0 = unpack_u2b2_pair_scaled(gw16, tid_in_grp, gs_cur, u2_add_bits);
+                        gb1 = unpack_u2b2_pair_scaled(gw16, tid_in_grp + 4, gs_cur, u2_add_bits);
+                        ub0 = unpack_u2b2_pair_scaled(uw16, tid_in_grp, us_cur, u2_add_bits);
+                        ub1 = unpack_u2b2_pair_scaled(uw16, tid_in_grp + 4, us_cur, u2_add_bits);
                     } else if constexpr (HAS_ZP) {
                         const int w_idx = col_base >> 3;
                         const uint32_t g_zp = group_covers_ktile
@@ -951,7 +958,8 @@ __global__ void moe_w4a16_grouped_down_mma_f16_kernel(
     __half* __restrict__ stage2_pair_out,
     int k_hidden,
     int n_interm,
-    int group_size) {
+    int group_size,
+    uint32_t u2_add_bits = 0xdc08dc08u) {
     static_assert(BITS == 2 || BITS == 4, "BITS must be 2 or 4");
     static_assert(!HAS_ZP || BITS == 4, "HAS_ZP requires BITS == 4");
     const int tile_idx = (int)blockIdx.y;
@@ -1039,8 +1047,8 @@ __global__ void moe_w4a16_grouped_down_mma_f16_kernel(
                 if constexpr (BITS == 2) {
                     const int w_idx = col_base >> 4;
                     const uint32_t dwa16 = dw_a[w_idx];
-                    ba0 = unpack_u2b2_pair_scaled(dwa16, tid_in_grp, sa_cur);
-                    ba1 = unpack_u2b2_pair_scaled(dwa16, tid_in_grp + 4, sa_cur);
+                    ba0 = unpack_u2b2_pair_scaled(dwa16, tid_in_grp, sa_cur, u2_add_bits);
+                    ba1 = unpack_u2b2_pair_scaled(dwa16, tid_in_grp + 4, sa_cur, u2_add_bits);
                 } else if constexpr (HAS_ZP) {
                     const int w_idx = col_base >> 3;
                     const uint32_t za = group_covers_ktile
@@ -1061,8 +1069,8 @@ __global__ void moe_w4a16_grouped_down_mma_f16_kernel(
                 if constexpr (BITS == 2) {
                     const int w_idx = col_base >> 4;
                     const uint32_t dwb16 = dw_b[w_idx];
-                    bb0 = unpack_u2b2_pair_scaled(dwb16, tid_in_grp, sb_cur);
-                    bb1 = unpack_u2b2_pair_scaled(dwb16, tid_in_grp + 4, sb_cur);
+                    bb0 = unpack_u2b2_pair_scaled(dwb16, tid_in_grp, sb_cur, u2_add_bits);
+                    bb1 = unpack_u2b2_pair_scaled(dwb16, tid_in_grp + 4, sb_cur, u2_add_bits);
                 } else if constexpr (HAS_ZP) {
                     const int w_idx = col_base >> 3;
                     const uint32_t zb = group_covers_ktile
@@ -1372,7 +1380,8 @@ static int moe_wna16_down_accum_f16_impl(
     int num_experts,
     int k_hidden,
     int n_interm,
-    int group_size) {
+    int group_size,
+    uint32_t u2_add_bits = 0xdc08dc08u) {
     constexpr int kPackFactor = 32 / BITS;
     if (ex == nullptr || interm_in == nullptr || down_packed == nullptr || down_scales == nullptr ||
         topk_ids == nullptr || topk_weights == nullptr || out == nullptr || num_tokens < 0 ||
@@ -1418,7 +1427,7 @@ static int moe_wna16_down_accum_f16_impl(
             moe_w4a16_grouped_down_mma_f16_kernel<false, BITS><<<g_down, 128, 0, st>>>(
                 interm_chunk, down_packed, (const __half*)down_scales, nullptr,
                 sorted_pair_ids, tile_expert_ids, tw_chunk, stage2_pair_out,
-                k_hidden, n_interm, group_size);
+                k_hidden, n_interm, group_size, u2_add_bits);
             dim3 g_red((unsigned)((k_hidden + 511) / 512), (unsigned)chunk_m);
             moe_down_topk_reduce_f16_kernel<<<g_red, 128, 0, st>>>(
                 stage2_pair_out, ids_chunk, sh_out_chunk, sh_gate_chunk, out_chunk,
@@ -1440,41 +1449,41 @@ static int moe_wna16_down_accum_f16_impl(
             <<<grid, 128, 0, (cudaStream_t)ex->stream>>>(
                 (const __half*)interm_in, down_packed, (const __half*)down_scales, nullptr, topk_ids, topk_weights,
                 (const __half*)shared_expert_out, (const __half*)shared_expert_gate_logits, (__half*)out,
-                num_tokens, top_k, num_experts, k_hidden, n_interm, group_size, subwarp_vec);
+                num_tokens, top_k, num_experts, k_hidden, n_interm, group_size, subwarp_vec, u2_add_bits);
     } else if (n_interm == kMoeInterm512 && top_k == kMoeTopK8) {
         const dim3 grid = grid_for_cols(subwarp_vec ? 8 : 4);
         moe_w4a16_down_accum_f16_kernel<false, kWordsPerRow512, kMoeTopK8, BITS>
             <<<grid, 128, 0, (cudaStream_t)ex->stream>>>(
                 (const __half*)interm_in, down_packed, (const __half*)down_scales, nullptr, topk_ids, topk_weights,
                 (const __half*)shared_expert_out, (const __half*)shared_expert_gate_logits, (__half*)out,
-                num_tokens, top_k, num_experts, k_hidden, n_interm, group_size, subwarp_vec);
+                num_tokens, top_k, num_experts, k_hidden, n_interm, group_size, subwarp_vec, u2_add_bits);
     } else if (n_interm == kMoeInterm256 && top_k == kMoeTopK10) {
         const dim3 grid = grid_for_cols(subwarp_vec ? 16 : 4);
         moe_w4a16_down_accum_f16_kernel<false, kWordsPerRow256, kMoeTopK10, BITS>
             <<<grid, 128, 0, (cudaStream_t)ex->stream>>>(
                 (const __half*)interm_in, down_packed, (const __half*)down_scales, nullptr, topk_ids, topk_weights,
                 (const __half*)shared_expert_out, (const __half*)shared_expert_gate_logits, (__half*)out,
-                num_tokens, top_k, num_experts, k_hidden, n_interm, group_size, subwarp_vec);
+                num_tokens, top_k, num_experts, k_hidden, n_interm, group_size, subwarp_vec, u2_add_bits);
     } else if (n_interm == kMoeInterm512 && top_k == kMoeTopK10) {
         const dim3 grid = grid_for_cols(subwarp_vec ? 8 : 4);
         moe_w4a16_down_accum_f16_kernel<false, kWordsPerRow512, kMoeTopK10, BITS>
             <<<grid, 128, 0, (cudaStream_t)ex->stream>>>(
                 (const __half*)interm_in, down_packed, (const __half*)down_scales, nullptr, topk_ids, topk_weights,
                 (const __half*)shared_expert_out, (const __half*)shared_expert_gate_logits, (__half*)out,
-                num_tokens, top_k, num_experts, k_hidden, n_interm, group_size, subwarp_vec);
+                num_tokens, top_k, num_experts, k_hidden, n_interm, group_size, subwarp_vec, u2_add_bits);
     } else if (n_interm == kMoeInterm640 && top_k == kMoeTopK10) {
         const dim3 grid = grid_for_cols(subwarp_vec ? 8 : 4);
         moe_w4a16_down_accum_f16_kernel<false, kWordsPerRow640, kMoeTopK10, BITS>
             <<<grid, 128, 0, (cudaStream_t)ex->stream>>>(
                 (const __half*)interm_in, down_packed, (const __half*)down_scales, nullptr, topk_ids, topk_weights,
                 (const __half*)shared_expert_out, (const __half*)shared_expert_gate_logits, (__half*)out,
-                num_tokens, top_k, num_experts, k_hidden, n_interm, group_size, subwarp_vec);
+                num_tokens, top_k, num_experts, k_hidden, n_interm, group_size, subwarp_vec, u2_add_bits);
     } else {
         const dim3 grid = grid_for_cols(4);
         moe_w4a16_down_accum_f16_kernel<false, 0, 0, BITS><<<grid, 128, 0, (cudaStream_t)ex->stream>>>(
             (const __half*)interm_in, down_packed, (const __half*)down_scales, nullptr, topk_ids, topk_weights,
             (const __half*)shared_expert_out, (const __half*)shared_expert_gate_logits, (__half*)out,
-            num_tokens, top_k, num_experts, k_hidden, n_interm, group_size, false);
+            num_tokens, top_k, num_experts, k_hidden, n_interm, group_size, false, u2_add_bits);
     }
     return (int)cudaGetLastError();
 }
@@ -1499,7 +1508,8 @@ static int moe_wna16_mlp_ex_f16_impl(
     int n_interm,
     int k_hidden,
     int group_size,
-    int down_hadamard_block_size) {
+    int down_hadamard_block_size,
+    uint32_t u2_add_bits = 0xdc08dc08u) {
     constexpr int kPackFactor = 32 / BITS;
     if (ex == nullptr || x == nullptr || gate_up_packed == nullptr || gate_up_scales == nullptr ||
         down_packed == nullptr || down_scales == nullptr || topk_ids == nullptr ||
@@ -1508,7 +1518,8 @@ static int moe_wna16_mlp_ex_f16_impl(
         (k_hidden % kPackFactor) != 0 || (n_interm % kPackFactor) != 0 || group_size <= 0 ||
         (group_size % kPackFactor) != 0 ||
         (down_hadamard_block_size != 0 && down_hadamard_block_size != 16 &&
-         down_hadamard_block_size != 64) ||
+         down_hadamard_block_size != 64 && down_hadamard_block_size != 128 &&
+         down_hadamard_block_size != 512) ||
         (down_hadamard_block_size > 0 && (n_interm % down_hadamard_block_size) != 0)) {
         return (int)cudaErrorInvalidValue;
     }
@@ -1539,21 +1550,25 @@ static int moe_wna16_mlp_ex_f16_impl(
             if (group_size == 64) {
                 moe_sparse_vec4_kernel<true, 64, true, BITS><<<g_gu, 128, 0, st>>>(
                     (const __half *)x, gate_up_packed, (const __half *)gate_up_scales, pairs,
-                    experts, topk_weights, (__half *)interm_buf, down, top_k, n_interm, k_hidden);
+                    experts, topk_weights, (__half *)interm_buf, down, top_k, n_interm, k_hidden,
+                    nullptr, u2_add_bits);
             } else {
                 moe_sparse_vec4_kernel<true, 128, true, BITS><<<g_gu, 128, 0, st>>>(
                     (const __half *)x, gate_up_packed, (const __half *)gate_up_scales, pairs,
-                    experts, topk_weights, (__half *)interm_buf, down, top_k, n_interm, k_hidden);
+                    experts, topk_weights, (__half *)interm_buf, down, top_k, n_interm, k_hidden,
+                    nullptr, u2_add_bits);
             }
         } else {
             if (group_size == 64) {
                 moe_sparse_vec4_kernel<true, 64, false, BITS><<<g_gu, 128, 0, st>>>(
                     (const __half *)x, gate_up_packed, (const __half *)gate_up_scales, pairs,
-                    experts, topk_weights, (__half *)interm_buf, down, top_k, n_interm, k_hidden);
+                    experts, topk_weights, (__half *)interm_buf, down, top_k, n_interm, k_hidden,
+                    nullptr, u2_add_bits);
             } else {
                 moe_sparse_vec4_kernel<true, 128, false, BITS><<<g_gu, 128, 0, st>>>(
                     (const __half *)x, gate_up_packed, (const __half *)gate_up_scales, pairs,
-                    experts, topk_weights, (__half *)interm_buf, down, top_k, n_interm, k_hidden);
+                    experts, topk_weights, (__half *)interm_buf, down, top_k, n_interm, k_hidden,
+                    nullptr, u2_add_bits);
             }
             if (down_hadamard_block_size > 0) {
                 const int rc = warp34_block_hadamard_inplace_f16(
@@ -1564,11 +1579,13 @@ static int moe_wna16_mlp_ex_f16_impl(
         if (group_size == 64) {
             moe_sparse_vec4_kernel<false, 64, false, BITS><<<g_dn, 128, 0, st>>>(
                 (const __half *)interm_buf, down_packed, (const __half *)down_scales, pairs,
-                experts, topk_weights, (__half *)interm_buf, down, top_k, k_hidden, n_interm);
+                experts, topk_weights, (__half *)interm_buf, down, top_k, k_hidden, n_interm,
+                nullptr, u2_add_bits);
         } else {
             moe_sparse_vec4_kernel<false, 128, false, BITS><<<g_dn, 128, 0, st>>>(
                 (const __half *)interm_buf, down_packed, (const __half *)down_scales, pairs,
-                experts, topk_weights, (__half *)interm_buf, down, top_k, k_hidden, n_interm);
+                experts, topk_weights, (__half *)interm_buf, down, top_k, k_hidden, n_interm,
+                nullptr, u2_add_bits);
         }
         moe_down_topk_reduce_f16_kernel<<<dim3((k_hidden + 511) / 512, num_tokens),
                                           128, 0, st>>>(
@@ -1592,21 +1609,21 @@ static int moe_wna16_mlp_ex_f16_impl(
             if (group_size == 64) {
                 moe_sparse_mma_kernel<true, 64, true, BITS><<<dim3(n_interm / 64, nt), 128, 0, st>>>(
                     (const __half *)x, gate_up_packed, (const __half *)gate_up_scales, pairs, experts,
-                    topk_weights, (__half *)interm_buf, down, top_k, n_interm, k_hidden);
+                    topk_weights, (__half *)interm_buf, down, top_k, n_interm, k_hidden, u2_add_bits);
             } else {
                 moe_sparse_mma_kernel<true, 128, true, BITS><<<dim3(n_interm / 64, nt), 128, 0, st>>>(
                     (const __half *)x, gate_up_packed, (const __half *)gate_up_scales, pairs, experts,
-                    topk_weights, (__half *)interm_buf, down, top_k, n_interm, k_hidden);
+                    topk_weights, (__half *)interm_buf, down, top_k, n_interm, k_hidden, u2_add_bits);
             }
         } else {
             if (group_size == 64) {
                 moe_sparse_mma_kernel<true, 64, false, BITS><<<dim3(n_interm / 16, nt), 128, 0, st>>>(
                     (const __half *)x, gate_up_packed, (const __half *)gate_up_scales, pairs, experts,
-                    topk_weights, (__half *)interm_buf, down, top_k, n_interm, k_hidden);
+                    topk_weights, (__half *)interm_buf, down, top_k, n_interm, k_hidden, u2_add_bits);
             } else {
                 moe_sparse_mma_kernel<true, 128, false, BITS><<<dim3(n_interm / 16, nt), 128, 0, st>>>(
                     (const __half *)x, gate_up_packed, (const __half *)gate_up_scales, pairs, experts,
-                    topk_weights, (__half *)interm_buf, down, top_k, n_interm, k_hidden);
+                    topk_weights, (__half *)interm_buf, down, top_k, n_interm, k_hidden, u2_add_bits);
             }
             if (down_hadamard_block_size > 0) {
                 const int rc = warp34_block_hadamard_inplace_f16(
@@ -1617,11 +1634,11 @@ static int moe_wna16_mlp_ex_f16_impl(
         if (group_size == 64) {
             moe_sparse_mma_kernel<false, 64, false, BITS><<<dim3(k_hidden / 32, nt), 128, 0, st>>>(
                 (const __half *)interm_buf, down_packed, (const __half *)down_scales, pairs,
-                experts, topk_weights, (__half *)interm_buf, down, top_k, k_hidden, n_interm);
+                experts, topk_weights, (__half *)interm_buf, down, top_k, k_hidden, n_interm, u2_add_bits);
         } else {
             moe_sparse_mma_kernel<false, 128, false, BITS><<<dim3(k_hidden / 32, nt), 128, 0, st>>>(
                 (const __half *)interm_buf, down_packed, (const __half *)down_scales, pairs,
-                experts, topk_weights, (__half *)interm_buf, down, top_k, k_hidden, n_interm);
+                experts, topk_weights, (__half *)interm_buf, down, top_k, k_hidden, n_interm, u2_add_bits);
         }
         moe_down_topk_reduce_f16_kernel<<<dim3((k_hidden + 511) / 512, num_tokens),
                                           128, 0, st>>>(
@@ -1681,21 +1698,21 @@ static int moe_wna16_mlp_ex_f16_impl(
                         if (group_size == 64) {
                             moe_sparse_mma_kernel<true, 64, true, BITS><<<dim3(n_interm / 64, nt), 128, 0, st>>>(
                                 x_c, gate_up_packed, (const __half *)gate_up_scales, pairs, experts,
-                                tw_c, interm_c, down, top_k, n_interm, k_hidden);
+                                tw_c, interm_c, down, top_k, n_interm, k_hidden, u2_add_bits);
                         } else {
                             moe_sparse_mma_kernel<true, 128, true, BITS><<<dim3(n_interm / 64, nt), 128, 0, st>>>(
                                 x_c, gate_up_packed, (const __half *)gate_up_scales, pairs, experts,
-                                tw_c, interm_c, down, top_k, n_interm, k_hidden);
+                                tw_c, interm_c, down, top_k, n_interm, k_hidden, u2_add_bits);
                         }
                     } else {
                         if (group_size == 64) {
                             moe_sparse_mma_kernel<true, 64, false, BITS><<<dim3(n_interm / 16, nt), 128, 0, st>>>(
                                 x_c, gate_up_packed, (const __half *)gate_up_scales, pairs, experts,
-                                tw_c, interm_c, down, top_k, n_interm, k_hidden);
+                                tw_c, interm_c, down, top_k, n_interm, k_hidden, u2_add_bits);
                         } else {
                             moe_sparse_mma_kernel<true, 128, false, BITS><<<dim3(n_interm / 16, nt), 128, 0, st>>>(
                                 x_c, gate_up_packed, (const __half *)gate_up_scales, pairs, experts,
-                                tw_c, interm_c, down, top_k, n_interm, k_hidden);
+                                tw_c, interm_c, down, top_k, n_interm, k_hidden, u2_add_bits);
                         }
                         if (down_hadamard_block_size > 0) {
                             const int rc = warp34_block_hadamard_inplace_f16(
@@ -1706,11 +1723,11 @@ static int moe_wna16_mlp_ex_f16_impl(
                     if (group_size == 64) {
                         moe_sparse_mma_kernel<false, 64, false, BITS><<<dim3(k_hidden / 32, nt), 128, 0, st>>>(
                             interm_c, down_packed, (const __half *)down_scales, pairs, experts,
-                            tw_c, interm_c, down, top_k, k_hidden, n_interm);
+                            tw_c, interm_c, down, top_k, k_hidden, n_interm, u2_add_bits);
                     } else {
                         moe_sparse_mma_kernel<false, 128, false, BITS><<<dim3(k_hidden / 32, nt), 128, 0, st>>>(
                             interm_c, down_packed, (const __half *)down_scales, pairs, experts,
-                            tw_c, interm_c, down, top_k, k_hidden, n_interm);
+                            tw_c, interm_c, down, top_k, k_hidden, n_interm, u2_add_bits);
                     }
                     moe_down_topk_reduce_f16_kernel
                         <<<dim3((k_hidden + 511) / 512, cm), 128, 0, st>>>(
@@ -1757,13 +1774,13 @@ static int moe_wna16_mlp_ex_f16_impl(
                 moe_w4a16_grouped_gate_up_silu_mma_f16_kernel<false, true, BITS><<<g_gu, 128, 0, st>>>(
                     x_chunk, gate_up_packed, (const __half*)gate_up_scales, nullptr,
                     sorted_pair_ids, tile_expert_ids, interm_chunk,
-                    top_k, n_interm, k_hidden, group_size);
+                    top_k, n_interm, k_hidden, group_size, u2_add_bits);
             } else {
                 dim3 g_gu((unsigned)((n_interm + 31) / 32), (unsigned)max_tiles16);
                 moe_w4a16_grouped_gate_up_silu_mma_f16_kernel<false, false, BITS><<<g_gu, 128, 0, st>>>(
                     x_chunk, gate_up_packed, (const __half*)gate_up_scales, nullptr,
                     sorted_pair_ids, tile_expert_ids, interm_chunk,
-                    top_k, n_interm, k_hidden, group_size);
+                    top_k, n_interm, k_hidden, group_size, u2_add_bits);
                 if (down_hadamard_block_size > 0) {
                     const int rc = warp34_block_hadamard_inplace_f16(
                         ex, interm_chunk, chunk_pairs, n_interm, down_hadamard_block_size);
@@ -1774,7 +1791,7 @@ static int moe_wna16_mlp_ex_f16_impl(
             moe_w4a16_grouped_down_mma_f16_kernel<false, BITS><<<g_down, 128, 0, st>>>(
                 interm_chunk, down_packed, (const __half*)down_scales, nullptr,
                 sorted_pair_ids, tile_expert_ids, tw_chunk, stage2_pair_out,
-                k_hidden, n_interm, group_size);
+                k_hidden, n_interm, group_size, u2_add_bits);
             dim3 g_red((unsigned)((k_hidden + 511) / 512), (unsigned)chunk_m);
             moe_down_topk_reduce_f16_kernel<<<g_red, 128, 0, st>>>(
                 stage2_pair_out, ids_chunk, sh_out_chunk, sh_gate_chunk, out_chunk,
@@ -1789,12 +1806,14 @@ static int moe_wna16_mlp_ex_f16_impl(
         dim3 g1((unsigned)(n_interm / 64), (unsigned)(num_tokens * top_k));
         moe_w4a16_gate_up_silu_f16_kernel<false, true, BITS><<<g1, 128, 0, st>>>(
             (const __half*)x, gate_up_packed, (const __half*)gate_up_scales, nullptr, topk_ids,
-            (__half*)interm_buf, num_tokens, top_k, num_experts, n_interm, k_hidden, group_size);
+            (__half*)interm_buf, num_tokens, top_k, num_experts, n_interm, k_hidden, group_size,
+            u2_add_bits);
     } else {
         dim3 g1((unsigned)((n_interm + 3) / 4), (unsigned)(num_tokens * top_k));
         moe_w4a16_gate_up_silu_f16_kernel<false, false, BITS><<<g1, 128, 0, st>>>(
             (const __half*)x, gate_up_packed, (const __half*)gate_up_scales, nullptr, topk_ids,
-            (__half*)interm_buf, num_tokens, top_k, num_experts, n_interm, k_hidden, group_size);
+            (__half*)interm_buf, num_tokens, top_k, num_experts, n_interm, k_hidden, group_size,
+            u2_add_bits);
         if (down_hadamard_block_size > 0) {
             const int rc = warp34_block_hadamard_inplace_f16(
                 ex, interm_buf, num_tokens * top_k, n_interm, down_hadamard_block_size);
@@ -1804,7 +1823,7 @@ static int moe_wna16_mlp_ex_f16_impl(
     return moe_wna16_down_accum_f16_impl<BITS>(
         ex, interm_buf, down_packed, down_scales, topk_ids, topk_weights,
         shared_expert_out, shared_expert_gate_logits, out,
-        num_tokens, top_k, num_experts, k_hidden, n_interm, group_size);
+        num_tokens, top_k, num_experts, k_hidden, n_interm, group_size, u2_add_bits);
 }
 
 } // namespace warp34_moe
@@ -1961,7 +1980,8 @@ static int moe_wxa16_pulled_add_f16_impl(
     int n_interm,
     int k_hidden,
     int group_size,
-    int down_hadamard_block_size) {
+    int down_hadamard_block_size,
+    uint32_t u2_add_bits = 0xdc08dc08u) {
     using namespace warp34_moe;
     if (ex == nullptr) return (int)cudaErrorInvalidValue;
     if (num_tokens < 0 || top_k <= 0 || num_experts <= 0 || num_experts > 1024 ||
@@ -2004,11 +2024,13 @@ static int moe_wxa16_pulled_add_f16_impl(
     if (group_size == 64) {
         moe_sparse_vec4_kernel<true, 64, false, BITS><<<g_gu, 128, 0, st>>>(
             (const __half*)x, gate_up_packed, (const __half*)gate_up_scales, pairs, experts,
-            topk_weights, (__half*)interm_buf, down, top_k, n_interm, k_hidden, active_count);
+            topk_weights, (__half*)interm_buf, down, top_k, n_interm, k_hidden, active_count,
+            u2_add_bits);
     } else {
         moe_sparse_vec4_kernel<true, 128, false, BITS><<<g_gu, 128, 0, st>>>(
             (const __half*)x, gate_up_packed, (const __half*)gate_up_scales, pairs, experts,
-            topk_weights, (__half*)interm_buf, down, top_k, n_interm, k_hidden, active_count);
+            topk_weights, (__half*)interm_buf, down, top_k, n_interm, k_hidden, active_count,
+            u2_add_bits);
     }
     if (down_hadamard_block_size == 64 && (n_interm % 64) == 0 && ((uintptr_t)interm_buf & 7u) == 0u) {
         const dim3 g_had(((n_interm / 64) + 1) / 2, np);
@@ -2022,11 +2044,13 @@ static int moe_wxa16_pulled_add_f16_impl(
     if (group_size == 64) {
         moe_sparse_vec4_kernel<false, 64, false, BITS><<<g_dn, 128, 0, st>>>(
             (const __half*)interm_buf, down_packed, (const __half*)down_scales, pairs, experts,
-            topk_weights, (__half*)interm_buf, down, top_k, k_hidden, n_interm, active_count);
+            topk_weights, (__half*)interm_buf, down, top_k, k_hidden, n_interm, active_count,
+            u2_add_bits);
     } else {
         moe_sparse_vec4_kernel<false, 128, false, BITS><<<g_dn, 128, 0, st>>>(
             (const __half*)interm_buf, down_packed, (const __half*)down_scales, pairs, experts,
-            topk_weights, (__half*)interm_buf, down, top_k, k_hidden, n_interm, active_count);
+            topk_weights, (__half*)interm_buf, down, top_k, k_hidden, n_interm, active_count,
+            u2_add_bits);
     }
     moe_down_topk_reduce_f16_kernel<<<dim3((k_hidden + 511) / 512, num_tokens), 128, 0, st>>>(
         down, pulled_topk_ids, (const __half*)out, nullptr, (__half*)out, num_tokens, top_k,
@@ -2081,7 +2105,32 @@ extern "C" int warp34_moe_w2a16_pulled_add_f16(
     return moe_wxa16_pulled_add_f16_impl<2>(
         ex, x, gate_up_packed, gate_up_scales, down_packed, down_scales, pulled_topk_ids,
         topk_weights, active_count, interm_buf, out, num_tokens, top_k, num_experts, n_interm,
-        k_hidden, group_size, down_hadamard_block_size);
+        k_hidden, group_size, down_hadamard_block_size, 0xdc08dc08u);
+}
+
+extern "C" int warp34_moe_w2a16_sym_pulled_add_f16(
+    const warp34_exec* ex,
+    const void* x,
+    const uint32_t* gate_up_packed,
+    const void* gate_up_scales,
+    const uint32_t* down_packed,
+    const void* down_scales,
+    const int32_t* pulled_topk_ids,
+    const float* topk_weights,
+    const int32_t* active_count,
+    void* interm_buf,
+    void* out,
+    int num_tokens,
+    int top_k,
+    int num_experts,
+    int n_interm,
+    int k_hidden,
+    int group_size,
+    int down_hadamard_block_size) {
+    return moe_wxa16_pulled_add_f16_impl<2>(
+        ex, x, gate_up_packed, gate_up_scales, down_packed, down_scales, pulled_topk_ids,
+        topk_weights, active_count, interm_buf, out, num_tokens, top_k, num_experts, n_interm,
+        k_hidden, group_size, down_hadamard_block_size, 0xdc06dc06u);
 }
 
 extern "C" int warp34_moe_w4a16_mlp_ex_f16(
@@ -2158,7 +2207,33 @@ extern "C" int warp34_moe_w2a16_mlp_ex_f16(
     return warp34_moe::moe_wna16_mlp_ex_f16_impl<2>(
         ex, x, gate_up_packed, gate_up_scales, down_packed, down_scales, topk_ids, topk_weights,
         shared_expert_out, shared_expert_gate_logits, interm_buf, out, num_tokens, top_k,
-        num_experts, n_interm, k_hidden, group_size, down_hadamard_block_size);
+        num_experts, n_interm, k_hidden, group_size, down_hadamard_block_size, 0xdc08dc08u);
+}
+
+extern "C" int warp34_moe_w2a16_sym_mlp_ex_f16(
+    const warp34_exec* ex,
+    const void* x,
+    const uint32_t* gate_up_packed,
+    const void* gate_up_scales,
+    const uint32_t* down_packed,
+    const void* down_scales,
+    const int32_t* topk_ids,
+    const float* topk_weights,
+    const void* shared_expert_out,
+    const void* shared_expert_gate_logits,
+    void* interm_buf,
+    void* out,
+    int num_tokens,
+    int top_k,
+    int num_experts,
+    int n_interm,
+    int k_hidden,
+    int group_size,
+    int down_hadamard_block_size) {
+    return warp34_moe::moe_wna16_mlp_ex_f16_impl<2>(
+        ex, x, gate_up_packed, gate_up_scales, down_packed, down_scales, topk_ids, topk_weights,
+        shared_expert_out, shared_expert_gate_logits, interm_buf, out, num_tokens, top_k,
+        num_experts, n_interm, k_hidden, group_size, down_hadamard_block_size, 0xdc06dc06u);
 }
 
 extern "C" int warp34_moe_w2a16_mlp_f16(
@@ -2216,7 +2291,8 @@ extern "C" int warp34_moe_w4a16_mlp_zp_ex_f16(
         (n_interm % 8) != 0 || group_size <= 0 || (group_size % 8) != 0 ||
         (k_hidden % group_size) != 0 || (n_interm % group_size) != 0 ||
         (down_hadamard_block_size != 0 && down_hadamard_block_size != 16 &&
-         down_hadamard_block_size != 64) ||
+         down_hadamard_block_size != 64 && down_hadamard_block_size != 128 &&
+         down_hadamard_block_size != 512) ||
         (down_hadamard_block_size > 0 && (n_interm % down_hadamard_block_size) != 0)) {
         return (int)cudaErrorInvalidValue;
     }

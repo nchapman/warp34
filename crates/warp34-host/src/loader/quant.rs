@@ -86,8 +86,34 @@ pub fn repack_u2b2_to_u4b8(packed_u2: &[u32]) -> Vec<u32> {
     out
 }
 
+/// Losslessly dilates N-major half-integer symmetric 2-bit packed words (`code_offset == 0.5`,
+/// `q = u2 - 1.5 in {-1.5, -0.5, +0.5, +1.5}`) into N-major 4-bit `uint4b8` packed words
+/// (`u4 = 2 * u2 + 5 in {5, 7, 9, 11}`); caller must pair with [`halve_f16_scales`].
+pub fn repack_u2b2_sym_to_u4b8(packed_u2: &[u32]) -> Vec<u32> {
+    let mut out = Vec::with_capacity(packed_u2.len() * 2);
+    for &w in packed_u2 {
+        for half in [w & 0xFFFF, w >> 16] {
+            let mut x = half;
+            x = (x | (x << 8)) & 0x00FF_00FF;
+            x = (x | (x << 4)) & 0x0F0F_0F0F;
+            x = (x | (x << 2)) & 0x3333_3333;
+            x = (x << 1).wrapping_add(0x5555_5555);
+            out.push(x);
+        }
+    }
+    out
+}
+
+/// Halves FP16 scale values (`s * 0.5`) when dilating `code_offset == 0.5` 2-bit weights to `U4B8`.
+pub fn halve_f16_scales(scales: &[u16]) -> Vec<u16> {
+    scales
+        .iter()
+        .map(|&bits| f32_to_f16(f16_to_f32(bits) * 0.5))
+        .collect()
+}
+
 /// Dequantizes an N-major `[N, K/16]` `U2B2` weight + `[N, K/group_size]` `FP16` scale tensor
-/// into an N-major `[N, K]` `FP16` matrix.
+/// into an N-major `[N, K]` `FP16` matrix (`code_offset == 0.0`).
 pub fn dequant_u2b2_n_major_to_f16(
     packed_n_by_k16: &[u32],
     scales_n_by_kg: &[u16],
@@ -95,12 +121,33 @@ pub fn dequant_u2b2_n_major_to_f16(
     size_k: usize,
     group_size: usize,
 ) -> Vec<u16> {
+    dequant_u2b2_n_major_to_f16_with_offset(
+        packed_n_by_k16,
+        scales_n_by_kg,
+        size_n,
+        size_k,
+        group_size,
+        false,
+    )
+}
+
+/// Dequantizes an N-major `[N, K/16]` 2-bit weight + `[N, K/group_size]` `FP16` scale tensor
+/// into an N-major `[N, K]` `FP16` matrix with optional half-integer `code_offset == 0.5`.
+pub fn dequant_u2b2_n_major_to_f16_with_offset(
+    packed_n_by_k16: &[u32],
+    scales_n_by_kg: &[u16],
+    size_n: usize,
+    size_k: usize,
+    group_size: usize,
+    code_offset_half: bool,
+) -> Vec<u16> {
     let eff_gs = if group_size == 0 { size_k } else { group_size };
     let words_per_row = size_k / 16;
     let groups_per_row = size_k / eff_gs;
     assert_eq!(packed_n_by_k16.len(), size_n * words_per_row);
     assert_eq!(scales_n_by_kg.len(), size_n * groups_per_row);
     let mut out = vec![0u16; size_n * size_k];
+    let zp = if code_offset_half { 1.5f32 } else { 2.0f32 };
     let dequant_rows = |row_start: usize, dst_rows: &mut [u16]| {
         for (rel_n, dst_row) in dst_rows.chunks_exact_mut(size_k).enumerate() {
             let n = row_start + rel_n;
@@ -110,12 +157,21 @@ pub fn dequant_u2b2_n_major_to_f16(
                 let words_per_group = eff_gs / 16;
                 for (g, &sc_bits) in row_scales.iter().enumerate() {
                     let scale = f16_to_f32(sc_bits);
-                    let lut = [
-                        f32_to_f16(-2.0 * scale),
-                        f32_to_f16(-scale),
-                        0u16,
-                        f32_to_f16(scale),
-                    ];
+                    let lut = if code_offset_half {
+                        [
+                            f32_to_f16(-1.5 * scale),
+                            f32_to_f16(-0.5 * scale),
+                            f32_to_f16(0.5 * scale),
+                            f32_to_f16(1.5 * scale),
+                        ]
+                    } else {
+                        [
+                            f32_to_f16(-2.0 * scale),
+                            f32_to_f16(-scale),
+                            0u16,
+                            f32_to_f16(scale),
+                        ]
+                    };
                     let g_words = &row_words[g * words_per_group..(g + 1) * words_per_group];
                     let g_dst = &mut dst_row[g * eff_gs..(g + 1) * eff_gs];
                     for (w_idx, &word) in g_words.iter().enumerate() {
@@ -129,9 +185,9 @@ pub fn dequant_u2b2_n_major_to_f16(
                 for (w_idx, &word) in row_words.iter().enumerate() {
                     for b in 0..16 {
                         let k = w_idx * 16 + b;
-                        let crumb = ((word >> (b * 2)) & 0x3) as i32 - 2;
+                        let crumb = ((word >> (b * 2)) & 0x3) as f32 - zp;
                         let scale = f16_to_f32(row_scales[k / eff_gs]);
-                        dst_row[k] = f32_to_f16((crumb as f32) * scale);
+                        dst_row[k] = f32_to_f16(crumb * scale);
                     }
                 }
             }

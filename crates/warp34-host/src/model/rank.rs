@@ -881,6 +881,7 @@ impl Qwen3_5ModelRank {
                         num_bits: 8,
                         group_size: cfg.quant.raw_group_size(),
                         symmetric: true,
+                        code_offset_half: false,
                         ignore: Vec::new(),
                         rules: None,
                     };
@@ -889,6 +890,7 @@ impl Qwen3_5ModelRank {
                         num_bits: 4,
                         group_size: cfg.quant.raw_group_size(),
                         symmetric: !has_zp,
+                        code_offset_half: false,
                         ignore: Vec::new(),
                         rules: None,
                     };

@@ -505,7 +505,15 @@ impl HostExpertStore {
                                         wp_info.shape, ws_info.shape
                                     ),
                                 )?;
+                                let mut u2_dilated_half_offset = false;
                                 if is_u2 && layout_ref.bits == 4 {
+                                    key_buf.clear();
+                                    let _ = write!(
+                                        key_buf,
+                                        "{resolved_prefix_ref}.{expert_id}.{proj_name}"
+                                    );
+                                    u2_dilated_half_offset =
+                                        quant.for_linear(&key_buf)?.u2_code_offset_half();
                                     let u2_len = w_range.len() / 2;
                                     if raw_qw_bytes.len() < u2_len {
                                         raw_qw_bytes.resize(u2_len, 0);
@@ -525,7 +533,11 @@ impl HostExpertStore {
                                             x = (x | (x << 8)) & 0x00FF_00FF;
                                             x = (x | (x << 4)) & 0x0F0F_0F0F;
                                             x = (x | (x << 2)) & 0x3333_3333;
-                                            x = x.wrapping_add(0x6666_6666);
+                                            x = if u2_dilated_half_offset {
+                                                (x << 1).wrapping_add(0x5555_5555)
+                                            } else {
+                                                x.wrapping_add(0x6666_6666)
+                                            };
                                             // SAFETY: `word_idx * 8 + half_idx * 4 + 4 <= w_range.len()` inside `dst_w_ptr`.
                                             unsafe {
                                                 core::ptr::copy_nonoverlapping(
@@ -550,6 +562,13 @@ impl HostExpertStore {
                                 // `weight_scale` is already N-major `[n_exp, num_groups]`.
                                 let sc_words = &mut raw_sc_words[..n_exp * num_groups];
                                 archive.read_f16_bits_info_into(ws_info, sc_words)?;
+                                if u2_dilated_half_offset {
+                                    for s in sc_words.iter_mut() {
+                                        *s = crate::cuda::f32_to_f16(
+                                            crate::cuda::f16_to_f32(*s) * 0.5,
+                                        );
+                                    }
+                                }
                                 #[cfg(target_endian = "little")]
                                 // SAFETY: `sc_words` has `s_range.len() / 2` `u16` elements (`s_range.len()` LE bytes),
                                 // and `s_range` lies within `0..stride` of `pack_ptr`.
@@ -1027,10 +1046,17 @@ impl DeviceExpertSlotTable {
             i32,
         ) -> i32;
         let (mlp_fn, label): (MoeMlpExFn, &str) = if self.layout.bits == 2 {
-            (
-                warp34_kernels::ffi::warp34_moe_w2a16_mlp_ex_f16,
-                "warp34_moe_w2a16_mlp_ex_f16 (tiered)",
-            )
+            if self.layout.u2_code_offset_half {
+                (
+                    warp34_kernels::ffi::warp34_moe_w2a16_sym_mlp_ex_f16,
+                    "warp34_moe_w2a16_sym_mlp_ex_f16 (tiered)",
+                )
+            } else {
+                (
+                    warp34_kernels::ffi::warp34_moe_w2a16_mlp_ex_f16,
+                    "warp34_moe_w2a16_mlp_ex_f16 (tiered)",
+                )
+            }
         } else {
             (
                 warp34_kernels::ffi::warp34_moe_w4a16_mlp_ex_f16,
@@ -1080,10 +1106,41 @@ impl DeviceExpertSlotTable {
         top_k: usize,
     ) -> crate::cuda::Result<()> {
         let (rc, label) = if self.layout.bits == 2 {
+            type MoePulledAddFn = unsafe extern "C" fn(
+                *const warp34_kernels::ffi::Warp34Exec,
+                *const core::ffi::c_void,
+                *const u32,
+                *const core::ffi::c_void,
+                *const u32,
+                *const core::ffi::c_void,
+                *const i32,
+                *const f32,
+                *const i32,
+                *mut core::ffi::c_void,
+                *mut core::ffi::c_void,
+                i32,
+                i32,
+                i32,
+                i32,
+                i32,
+                i32,
+                i32,
+            ) -> i32;
+            let (pulled_fn, label): (MoePulledAddFn, &str) = if self.layout.u2_code_offset_half {
+                (
+                    warp34_kernels::ffi::warp34_moe_w2a16_sym_pulled_add_f16,
+                    "warp34_moe_w2a16_sym_pulled_add_f16",
+                )
+            } else {
+                (
+                    warp34_kernels::ffi::warp34_moe_w2a16_pulled_add_f16,
+                    "warp34_moe_w2a16_pulled_add_f16",
+                )
+            };
             (
                 // SAFETY: all device addresses are valid for `num_tokens` and `top_k`.
                 unsafe {
-                    warp34_kernels::ffi::warp34_moe_w2a16_pulled_add_f16(
+                    pulled_fn(
                         ex,
                         x_addr as *const core::ffi::c_void,
                         self.gate_up_packed.addr() as *const u32,
@@ -1104,7 +1161,7 @@ impl DeviceExpertSlotTable {
                         self.layout.down_hadamard_block_size as i32,
                     )
                 },
-                "warp34_moe_w2a16_pulled_add_f16",
+                label,
             )
         } else {
             (

@@ -664,6 +664,19 @@ unsafe extern "C" {
         workspace_ints: i64,
         group_blocks: i32,
     ) -> i32;
+    pub fn warp34_marlin_gemm_f16u2_sym(
+        ex: *const Warp34Exec,
+        a: *const c_void,
+        b: *const c_void,
+        scales: *const c_void,
+        c: *mut c_void,
+        workspace: *mut i32,
+        m: i64,
+        n: i64,
+        k: i64,
+        workspace_ints: i64,
+        group_blocks: i32,
+    ) -> i32;
     pub fn warp34_marlin_gemm_f16u4(
         ex: *const Warp34Exec,
         a: *const c_void,

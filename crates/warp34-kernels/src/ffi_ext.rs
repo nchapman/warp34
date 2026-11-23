@@ -229,6 +229,28 @@ unsafe extern "C" {
         down_hadamard_block_size: i32,
     ) -> i32;
 
+    pub fn warp34_moe_w2a16_sym_mlp_ex_f16(
+        ex: *const Warp34Exec,
+        x: *const c_void,
+        gate_up_packed: *const u32,
+        gate_up_scales: *const c_void,
+        down_packed: *const u32,
+        down_scales: *const c_void,
+        topk_ids: *const i32,
+        topk_weights: *const f32,
+        shared_expert_out: *const c_void,
+        shared_expert_gate_logits: *const c_void,
+        interm_buf: *mut c_void,
+        out: *mut c_void,
+        num_tokens: i32,
+        top_k: i32,
+        num_experts: i32,
+        n_interm: i32,
+        k_hidden: i32,
+        group_size: i32,
+        down_hadamard_block_size: i32,
+    ) -> i32;
+
     pub fn warp34_moe_w4a16_mlp_zp_f16(
         ex: *const Warp34Exec,
         x: *const c_void,
@@ -723,6 +745,27 @@ unsafe extern "C" {
     ) -> i32;
 
     pub fn warp34_moe_w2a16_pulled_add_f16(
+        ex: *const Warp34Exec,
+        x: *const c_void,
+        gate_up_packed: *const u32,
+        gate_up_scales: *const c_void,
+        down_packed: *const u32,
+        down_scales: *const c_void,
+        pulled_topk_ids: *const i32,
+        topk_weights: *const f32,
+        active_count: *const i32,
+        interm_buf: *mut c_void,
+        out: *mut c_void,
+        num_tokens: i32,
+        top_k: i32,
+        num_experts: i32,
+        n_interm: i32,
+        k_hidden: i32,
+        group_size: i32,
+        down_hadamard_block_size: i32,
+    ) -> i32;
+
+    pub fn warp34_moe_w2a16_sym_pulled_add_f16(
         ex: *const Warp34Exec,
         x: *const c_void,
         gate_up_packed: *const u32,

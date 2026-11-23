@@ -4,18 +4,27 @@ use fancy_regex::{Regex, RegexBuilder};
 
 pub const HADAMARD_BLOCK_16: usize = 16;
 pub const HADAMARD_BLOCK_64: usize = 64;
-pub const SUPPORTED_HADAMARD_BLOCKS: [usize; 2] = [HADAMARD_BLOCK_16, HADAMARD_BLOCK_64];
+pub const HADAMARD_BLOCK_128: usize = 128;
+pub const HADAMARD_BLOCK_512: usize = 512;
+pub const SUPPORTED_HADAMARD_BLOCKS: [usize; 4] = [
+    HADAMARD_BLOCK_16,
+    HADAMARD_BLOCK_64,
+    HADAMARD_BLOCK_128,
+    HADAMARD_BLOCK_512,
+];
 pub const SUPPORTED_MARLIN_U2_GROUP_SIZES: [usize; 4] = [0, 32, 64, 128];
 pub const SUPPORTED_MARLIN_U4_GROUP_SIZES: [usize; 4] = [0, 32, 64, 128];
 pub const SUPPORTED_MARLIN_U8_GROUP_SIZES: [usize; 4] = [0, 32, 64, 128];
 
 /// Returns `true` when `block` is either disabled (`0`) or a supported Hadamard block size
-/// (`HADAMARD_BLOCK_16` or `HADAMARD_BLOCK_64`) that evenly divides non-zero `dim`.
+/// (`16`, `64`, `128`, or `512`) that evenly divides non-zero `dim`.
 #[inline]
 pub const fn is_valid_hadamard_block_for_dim(block: usize, dim: usize) -> bool {
     match block {
         0 => true,
-        HADAMARD_BLOCK_16 | HADAMARD_BLOCK_64 => dim != 0 && dim.is_multiple_of(block),
+        HADAMARD_BLOCK_16 | HADAMARD_BLOCK_64 | HADAMARD_BLOCK_128 | HADAMARD_BLOCK_512 => {
+            dim != 0 && dim.is_multiple_of(block)
+        }
         _ => false,
     }
 }
@@ -29,12 +38,14 @@ const COMPRESSED_TENSORS_U2_BITS: usize = 2;
 const COMPRESSED_TENSORS_U4_BITS: usize = 4;
 const COMPRESSED_TENSORS_U8_BITS: usize = 8;
 
+type MoeExpertQuantInfo = (usize, usize, bool, bool);
+
 #[derive(Clone, Debug)]
 pub struct CompressedTensorRules {
     ignore: Vec<CompiledPattern>,
     groups: Vec<QuantRule>,
     transforms: Vec<TransformRule>,
-    moe_expert_layer_cache: std::sync::OnceLock<Vec<Option<(usize, usize, bool)>>>,
+    moe_expert_layer_cache: std::sync::OnceLock<Vec<Option<MoeExpertQuantInfo>>>,
 }
 
 impl PartialEq for CompressedTensorRules {
@@ -71,6 +82,7 @@ struct QuantRule {
     bits: usize,
     group_size: usize,
     symmetric: bool,
+    code_offset_half: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -263,7 +275,7 @@ impl CompressedTensorRules {
             ));
         }
         for (key, group) in quant_map {
-            let (bits, group_size, symmetric, is_embedding_only) =
+            let (bits, group_size, symmetric, code_offset_half, is_embedding_only) =
                 ModelConfig::parse_compressed_tensors_group(key, group)?;
             if is_embedding_only {
                 continue;
@@ -291,6 +303,7 @@ impl CompressedTensorRules {
                 bits,
                 group_size,
                 symmetric,
+                code_offset_half,
             });
         }
         Ok(Some(Self {
@@ -301,7 +314,10 @@ impl CompressedTensorRules {
         }))
     }
 
-    pub(super) fn resolve_moe_layer_expert(&self, layer_id: usize) -> Option<(usize, usize, bool)> {
+    pub(super) fn resolve_moe_layer_expert(
+        &self,
+        layer_id: usize,
+    ) -> Option<(usize, usize, bool, bool)> {
         const MAX_CACHED_MOE_LAYERS: usize = 128;
         if layer_id < MAX_CACHED_MOE_LAYERS {
             let cache = self.moe_expert_layer_cache.get_or_init(|| {
@@ -314,14 +330,17 @@ impl CompressedTensorRules {
         self.resolve_moe_layer_expert_uncached(layer_id)
     }
 
-    fn resolve_moe_layer_expert_uncached(&self, layer_id: usize) -> Option<(usize, usize, bool)> {
+    fn resolve_moe_layer_expert_uncached(
+        &self,
+        layer_id: usize,
+    ) -> Option<(usize, usize, bool, bool)> {
         for candidate in [
             format!("model.layers.{layer_id}.mlp.experts.0.gate_proj"),
             format!("model.language_model.layers.{layer_id}.mlp.experts.0.gate_proj"),
             format!("layers.{layer_id}.mlp.experts.0.gate_proj"),
         ] {
             if let Ok((Some(g), _)) = self.resolve(&candidate) {
-                return Some((g.bits, g.group_size, g.symmetric));
+                return Some((g.bits, g.group_size, g.symmetric, g.code_offset_half));
             }
         }
         None
@@ -335,8 +354,17 @@ impl CompressedTensorRules {
         for group in &self.groups {
             if matches(&group.targets, name)? {
                 if selected.is_some_and(|old| {
-                    (old.bits, old.group_size, old.symmetric)
-                        != (group.bits, group.group_size, group.symmetric)
+                    (
+                        old.bits,
+                        old.group_size,
+                        old.symmetric,
+                        old.code_offset_half,
+                    ) != (
+                        group.bits,
+                        group.group_size,
+                        group.symmetric,
+                        group.code_offset_half,
+                    )
                 }) {
                     return Err(invalid(format!(
                         "conflicting quantization rules for {name}"
@@ -397,6 +425,7 @@ impl QuantScheme {
                     num_bits: g.bits,
                     group_size: g.group_size,
                     symmetric: g.symmetric,
+                    code_offset_half: g.code_offset_half,
                     ignore: ignore.clone(),
                     rules: Some(rules.clone()),
                 },

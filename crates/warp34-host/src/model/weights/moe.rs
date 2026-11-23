@@ -8,6 +8,7 @@ pub enum MoeExpertStorage {
         down_packed_ptr: u64,
         down_scales_ptr: u64,
         group_size: usize,
+        code_offset_half: bool,
     },
     W4A16 {
         gate_up_packed_ptr: u64,
@@ -519,36 +520,71 @@ impl FfnBlockWeights {
                         down_packed_ptr,
                         down_scales_ptr,
                         group_size,
-                    } => check_rc(
-                        // SAFETY: loader stores expert-major packed U2B2 weights and
-                        // FP16 scales with the loaded group size. Top-k buffers were
-                        // produced above; model scratch reserves routed intermediate
-                        // and output rows. Shared inputs are null when absent.
-                        unsafe {
-                            ffi::warp34_moe_w2a16_mlp_ex_f16(
-                                ex,
-                                rotated_input_buf as *const c_void,
-                                *gate_up_packed_ptr as *const u32,
-                                *gate_up_scales_ptr as *const c_void,
-                                *down_packed_ptr as *const u32,
-                                *down_scales_ptr as *const c_void,
-                                moe_topk_ids_buf as *const i32,
-                                moe_topk_weights_buf as *const f32,
-                                sh_out_ptr,
-                                sh_gate_ptr,
-                                moe_interm_buf as *mut c_void,
-                                mlp_out_buf as *mut c_void,
-                                num_tokens as i32,
-                                moe.top_k as i32,
-                                moe.num_experts as i32,
-                                moe.local_moe_interm as i32,
-                                h_dim as i32,
-                                *group_size as i32,
-                                moe.routed_down_hadamard as i32,
+                        code_offset_half,
+                    } => {
+                        type MoeW2MlpExFn = unsafe extern "C" fn(
+                            *const ffi::Warp34Exec,
+                            *const c_void,
+                            *const u32,
+                            *const c_void,
+                            *const u32,
+                            *const c_void,
+                            *const i32,
+                            *const f32,
+                            *const c_void,
+                            *const c_void,
+                            *mut c_void,
+                            *mut c_void,
+                            i32,
+                            i32,
+                            i32,
+                            i32,
+                            i32,
+                            i32,
+                            i32,
+                        ) -> i32;
+                        let (moe_fn, label): (MoeW2MlpExFn, &str) = if *code_offset_half {
+                            (
+                                ffi::warp34_moe_w2a16_sym_mlp_ex_f16,
+                                "warp34_moe_w2a16_sym_mlp_ex_f16",
                             )
-                        },
-                        "warp34_moe_w2a16_mlp_ex_f16",
-                    ),
+                        } else {
+                            (
+                                ffi::warp34_moe_w2a16_mlp_ex_f16,
+                                "warp34_moe_w2a16_mlp_ex_f16",
+                            )
+                        };
+                        check_rc(
+                            // SAFETY: loader stores expert-major packed U2B2 weights and
+                            // FP16 scales with the loaded group size. Top-k buffers were
+                            // produced above; model scratch reserves routed intermediate
+                            // and output rows. Shared inputs are null when absent.
+                            unsafe {
+                                moe_fn(
+                                    ex,
+                                    rotated_input_buf as *const c_void,
+                                    *gate_up_packed_ptr as *const u32,
+                                    *gate_up_scales_ptr as *const c_void,
+                                    *down_packed_ptr as *const u32,
+                                    *down_scales_ptr as *const c_void,
+                                    moe_topk_ids_buf as *const i32,
+                                    moe_topk_weights_buf as *const f32,
+                                    sh_out_ptr,
+                                    sh_gate_ptr,
+                                    moe_interm_buf as *mut c_void,
+                                    mlp_out_buf as *mut c_void,
+                                    num_tokens as i32,
+                                    moe.top_k as i32,
+                                    moe.num_experts as i32,
+                                    moe.local_moe_interm as i32,
+                                    h_dim as i32,
+                                    *group_size as i32,
+                                    moe.routed_down_hadamard as i32,
+                                )
+                            },
+                            label,
+                        )
+                    }
                     MoeExpertStorage::W4A16 {
                         gate_up_packed_ptr,
                         gate_up_scales_ptr,
@@ -1648,7 +1684,11 @@ pub(crate) fn load_moe_layer_weights(
                     exp0_dn_had,
                 )
             }
-            RawLinearHost::U2B2NMajor { group_size, .. } => {
+            RawLinearHost::U2B2NMajor {
+                group_size,
+                code_offset_half,
+                ..
+            } => {
                 if !h.is_multiple_of(16)
                     || !local_moe_interm.is_multiple_of(16)
                     || !h.is_multiple_of(group_size)
@@ -1690,9 +1730,11 @@ pub(crate) fn load_moe_layer_weights(
                                     packed,
                                     scales,
                                     group_size: gs,
+                                    code_offset_half: co,
                                     ..
                                 } = gu
                                     && gs == group_size
+                                    && co == code_offset_half
                                 {
                                     gu_pk_ch[rel * gu_words_per_exp..(rel + 1) * gu_words_per_exp]
                                         .copy_from_slice(&packed);
@@ -1701,16 +1743,18 @@ pub(crate) fn load_moe_layer_weights(
                                         .copy_from_slice(&scales);
                                 } else {
                                     return Err(loader_err_msg(format!(
-                                        "inconsistent MoE expert quantization at '{epfx}' (expected symmetric W2A16 group_size={group_size})"
+                                        "inconsistent MoE expert quantization at '{epfx}' (expected symmetric W2A16 group_size={group_size}, code_offset_half={code_offset_half})"
                                     )));
                                 }
                                 if let RawLinearHost::U2B2NMajor {
                                     packed,
                                     scales,
                                     group_size: gs,
+                                    code_offset_half: co,
                                     ..
                                 } = rd
                                     && gs == group_size
+                                    && co == code_offset_half
                                 {
                                     dn_pk_ch[rel * dn_words_per_exp..(rel + 1) * dn_words_per_exp]
                                         .copy_from_slice(&packed);
@@ -1719,7 +1763,7 @@ pub(crate) fn load_moe_layer_weights(
                                         .copy_from_slice(&scales);
                                 } else {
                                     return Err(loader_err_msg(format!(
-                                        "inconsistent MoE down_proj quantization at '{epfx}' (expected symmetric W2A16 group_size={group_size})"
+                                        "inconsistent MoE down_proj quantization at '{epfx}' (expected symmetric W2A16 group_size={group_size}, code_offset_half={code_offset_half})"
                                     )));
                                 }
                             }
@@ -1749,6 +1793,7 @@ pub(crate) fn load_moe_layer_weights(
                         down_packed_ptr,
                         down_scales_ptr,
                         group_size,
+                        code_offset_half,
                     },
                     exp0_in_had,
                     exp0_dn_had,

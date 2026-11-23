@@ -354,8 +354,8 @@ __global__ void Marlin(
   constexpr bool has_zp = b_type == vllm::kU4 || b_type == vllm::kU8;
   constexpr bool is_int_type = b_type == vllm::kU4 || b_type == vllm::kU8 ||
                                b_type == vllm::kS4 || b_type == vllm::kS8 ||
-                               b_type == vllm::kU2B2 || b_type == vllm::kU4B8 ||
-                               b_type == vllm::kU8B128;
+                               b_type == vllm::kU2B2 || b_type == vllm::kU2B2Sym ||
+                               b_type == vllm::kU4B8 || b_type == vllm::kU8B128;
   // see comments of dequant.h for more details
   constexpr bool dequant_skip_flop =
       is_a_8bit || (b_type == vllm::kFE4M3fn && !(s_type == vllm::kFE8M0fnu)) ||

@@ -253,6 +253,30 @@ pub(super) fn warmup_vision_moe_and_qwen4(
                 "warmup warp34_moe_w2a16_mlp_ex_f16"
             )?;
             warmup_ffi!(
+                ffi::warp34_moe_w2a16_sym_mlp_ex_f16(
+                    &ex_moe,
+                    buf_a as *const c_void,
+                    buf_b as *const u32,
+                    buf_a as *const c_void,
+                    buf_b as *const u32,
+                    buf_a as *const c_void,
+                    moe_ids_m4 as *const i32,
+                    moe_w_m4 as *const f32,
+                    buf_a as *const c_void,
+                    buf_a as *const c_void,
+                    buf_c as *mut c_void,
+                    buf_d as *mut c_void,
+                    m_tok,
+                    1,
+                    n_exp,
+                    64,
+                    64,
+                    64,
+                    down_had,
+                ),
+                "warmup warp34_moe_w2a16_sym_mlp_ex_f16"
+            )?;
+            warmup_ffi!(
                 ffi::warp34_moe_w4a16_mlp_zp_ex_f16(
                     &ex_moe,
                     buf_a as *const c_void,
@@ -797,6 +821,7 @@ pub(super) fn warmup_vision_moe_and_qwen4(
         for pulled_fn in [
             ffi::warp34_moe_w4a16_pulled_add_f16,
             ffi::warp34_moe_w2a16_pulled_add_f16,
+            ffi::warp34_moe_w2a16_sym_pulled_add_f16,
         ] {
             warmup_ffi!(
                 pulled_fn(

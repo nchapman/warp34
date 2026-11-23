@@ -860,6 +860,7 @@ impl Qwen3_5MtpRank {
                         num_bits: 4,
                         group_size: gs,
                         symmetric: true,
+                        code_offset_half: false,
                         ignore,
                         rules,
                     },

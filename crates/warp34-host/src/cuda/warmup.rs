@@ -106,7 +106,9 @@ pub fn prepare_execution_plan(device_id: i32) -> Result<()> {
 
     // HGPTQ input transforms are independent of GEMM and must be resident before
     // any rank enters graph capture or a collective warmup barrier.
-    for block_size in [16, 64] {
+    for block_size in [16, 64, 128, 512] {
+        let k_warm = 512;
+        let padded_k_warm = 1024;
         for had_fn in [
             ffi::warp34_block_hadamard_f16,
             ffi::warp34_block_hadamard_bf16,
@@ -117,15 +119,21 @@ pub fn prepare_execution_plan(device_id: i32) -> Result<()> {
                     buf_a as *const c_void,
                     buf_b as *mut c_void,
                     2,
-                    128,
-                    192,
+                    k_warm,
+                    padded_k_warm,
                     block_size,
                 ),
                 "warmup warp34_block_hadamard"
             )?;
         }
         warmup_ffi!(
-            ffi::warp34_block_hadamard_inplace_f16(&ex, buf_b as *mut c_void, 2, 128, block_size),
+            ffi::warp34_block_hadamard_inplace_f16(
+                &ex,
+                buf_b as *mut c_void,
+                2,
+                k_warm,
+                block_size
+            ),
             "warmup warp34_block_hadamard_inplace_f16"
         )?;
     }
@@ -339,6 +347,10 @@ pub fn prepare_execution_plan(device_id: i32) -> Result<()> {
                 (
                     ffi::warp34_marlin_gemm_f16u2 as MarlinGemmFn,
                     "warmup warp34_marlin_gemm_f16u2",
+                ),
+                (
+                    ffi::warp34_marlin_gemm_f16u2_sym as MarlinGemmFn,
+                    "warmup warp34_marlin_gemm_f16u2_sym",
                 ),
                 (
                     ffi::warp34_marlin_gemm_f16u4 as MarlinGemmFn,

@@ -288,6 +288,7 @@ fn test_parse_quant_supported_schemes() {
                     num_bits: 4,
                     group_size: gs,
                     symmetric: sym,
+                    code_offset_half: false,
                     ignore: vec!["lm_head".into()],
                     rules: None,
                 }
@@ -1317,4 +1318,135 @@ fn test_indexed_parallel_open_ple_detection_and_subslice_reads() {
         .read_f16_bits_subslice("model.layers.1.f32", 2, 2)
         .unwrap();
     assert_eq!(row1_f32, vec![f32_to_f16(3.5), f32_to_f16(-4.5)]);
+}
+
+#[test]
+fn compressed_tensors_hgptq_code_offset_half_and_h128_h512_rules() {
+    let q = cfg_with_quant(serde_json::json!({
+        "quant_method": "compressed-tensors",
+        "format": "pack-quantized",
+        "config_groups": {
+            "w4_g64_sym": {
+                "targets": [
+                    "re:.*mlp\\.gate_proj$",
+                    "re:.*visual\\.blocks\\.\\d+\\.mlp\\.linear_fc1$"
+                ],
+                "weights": {
+                    "num_bits": 4,
+                    "type": "int",
+                    "symmetric": true,
+                    "strategy": "group",
+                    "group_size": 64,
+                    "dynamic": false
+                }
+            },
+            "w2_g128_sym": {
+                "targets": ["re:.*mlp\\.down_proj$"],
+                "weights": {
+                    "num_bits": 2,
+                    "type": "int",
+                    "symmetric": true,
+                    "strategy": "group",
+                    "group_size": 128,
+                    "dynamic": false,
+                    "observer_kwargs": { "code_offset": 0.5 }
+                }
+            }
+        },
+        "transform_config": {
+            "config_groups": {
+                "v": {
+                    "type": "hadamard",
+                    "head_dim": 512,
+                    "randomize": false,
+                    "apply": [
+                        { "location": "input", "inverse": false, "targets": ["re:.*mlp\\.(gate|down)_proj$"] },
+                        { "location": "weight_input", "inverse": true, "targets": ["re:.*mlp\\.(gate|down)_proj$"] }
+                    ]
+                },
+                "v_vision": {
+                    "type": "hadamard",
+                    "head_dim": 128,
+                    "randomize": false,
+                    "apply": [
+                        { "location": "input", "inverse": false, "targets": ["re:.*visual\\.blocks\\.\\d+\\.mlp\\.linear_fc1$"] },
+                        { "location": "weight_input", "inverse": true, "targets": ["re:.*visual\\.blocks\\.\\d+\\.mlp\\.linear_fc1$"] }
+                    ]
+                }
+            }
+        },
+        "ignore": ["lm_head"]
+    }))
+    .unwrap();
+
+    let gate = q
+        .for_linear("model.language_model.layers.0.mlp.gate_proj")
+        .unwrap();
+    assert_eq!(gate.bits(), 4);
+    assert_eq!(gate.raw_group_size(), 64);
+    assert!(!gate.u2_code_offset_half());
+    assert_eq!(
+        q.input_hadamard("model.language_model.layers.0.mlp.gate_proj")
+            .unwrap(),
+        Some(512)
+    );
+
+    let down = q
+        .for_linear("model.language_model.layers.0.mlp.down_proj")
+        .unwrap();
+    assert_eq!(down.bits(), 2);
+    assert_eq!(down.raw_group_size(), 128);
+    assert!(down.u2_code_offset_half());
+    assert_eq!(
+        q.input_hadamard("model.language_model.layers.0.mlp.down_proj")
+            .unwrap(),
+        Some(512)
+    );
+    assert_eq!(
+        q.input_hadamard("model.visual.blocks.0.mlp.linear_fc1")
+            .unwrap(),
+        Some(128)
+    );
+
+    // Reject code_offset=0.5 on 4-bit weights.
+    let bad_w4 = cfg_with_quant(serde_json::json!({
+        "quant_method": "compressed-tensors",
+        "format": "pack-quantized",
+        "config_groups": {
+            "g0": {
+                "targets": ["Linear"],
+                "weights": {
+                    "num_bits": 4,
+                    "type": "int",
+                    "symmetric": true,
+                    "strategy": "group",
+                    "group_size": 128,
+                    "dynamic": false,
+                    "observer_kwargs": { "code_offset": 0.5 }
+                }
+            }
+        }
+    }));
+    assert!(bad_w4.is_err());
+
+    // Reject unknown code_offset values.
+    let bad_val = cfg_with_quant(serde_json::json!({
+        "quant_method": "compressed-tensors",
+        "format": "pack-quantized",
+        "config_groups": {
+            "g0": {
+                "targets": ["Linear"],
+                "weights": {
+                    "num_bits": 2,
+                    "type": "int",
+                    "symmetric": true,
+                    "strategy": "group",
+                    "group_size": 128,
+                    "dynamic": false,
+                    "observer_kwargs": { "code_offset": 0.25 }
+                }
+            }
+        }
+    }));
+    assert!(bad_val.is_err());
 }

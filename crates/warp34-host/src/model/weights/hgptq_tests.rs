@@ -755,6 +755,7 @@ fn marlin_w2a16_and_hadamard_w2a16_match_dilated_w4a16_zero_ulp() {
             n,
             k,
             group_size: group,
+            code_offset_half: false,
         };
         let raw_u4 = raw_u2.slice_rows(0, n).into_u4b8_if_u2b2();
         assert_eq!(raw_u2.to_f16_vec(), raw_u4.to_f16_vec());
@@ -808,6 +809,7 @@ fn marlin_w2a16_and_hadamard_w2a16_match_dilated_w4a16_zero_ulp() {
         n,
         k,
         group_size: group,
+        code_offset_half: false,
     };
     let raw_u4 = raw_u2.slice_rows(0, n).into_u4b8_if_u2b2();
     let had_u2 = RawLinearHost::Hadamard {
@@ -890,6 +892,7 @@ fn marlin_w2a16_and_hadamard_w2a16_match_dilated_w4a16_zero_ulp() {
             n: 2 * n_interm,
             k: h_dim,
             group_size,
+            code_offset_half: false,
         };
         let gu_u4 = gu_u2.slice_rows(0, 2 * n_interm).into_u4b8_if_u2b2();
         let dn_u2 = RawLinearHost::U2B2NMajor {
@@ -904,6 +907,7 @@ fn marlin_w2a16_and_hadamard_w2a16_match_dilated_w4a16_zero_ulp() {
             n: h_dim,
             k: n_interm,
             group_size,
+            code_offset_half: false,
         };
         let dn_u4 = dn_u2.slice_rows(0, h_dim).into_u4b8_if_u2b2();
         if let (
@@ -965,6 +969,7 @@ fn marlin_w2a16_and_hadamard_w2a16_match_dilated_w4a16_zero_ulp() {
         down_packed_ptr: dn_p_u2_ptr,
         down_scales_ptr: dn_s_ptr,
         group_size,
+        code_offset_half: false,
     });
     let ffn_u4 = make_moe(MoeExpertStorage::W4A16 {
         gate_up_packed_ptr: gu_p_u4_ptr,
@@ -1056,5 +1061,391 @@ fn marlin_w2a16_and_hadamard_w2a16_match_dilated_w4a16_zero_ulp() {
             out_u2, out_u4,
             "0-ULP mismatch between MoeExpertStorage::W2A16 and W4A16 at m={m}"
         );
+    }
+}
+
+#[cfg(feature = "cuda")]
+#[test]
+fn block_hadamard_f16_128_and_512_match_cpu_reference() {
+    let stream = CudaStream::new(0).unwrap();
+    for (block_size, dim, rows) in [
+        (128usize, 128usize, 1usize),
+        (128, 384, 5),
+        (128, 1152, 3),
+        (512, 512, 1),
+        (512, 1536, 4),
+        (512, 5120, 3),
+    ] {
+        let input: Vec<u16> = (0..rows * dim)
+            .map(|i| f32_to_f16((((i * 37 + 13) % 97) as f32 - 48.0) / 32.0))
+            .collect();
+        let mut expected = vec![0u16; rows * dim];
+        let inv_sqrt = 1.0f32 / (block_size as f32).sqrt();
+        for r in 0..rows {
+            for g in 0..(dim / block_size) {
+                let base = r * dim + g * block_size;
+                let mut v: Vec<f32> = input[base..base + block_size]
+                    .iter()
+                    .map(|&b| f16_to_f32(b))
+                    .collect();
+                let mut step = 1usize;
+                while step < block_size {
+                    for off in (0..block_size).step_by(2 * step) {
+                        for j in 0..step {
+                            let a = v[off + j];
+                            let b = v[off + j + step];
+                            v[off + j] = a + b;
+                            v[off + j + step] = a - b;
+                        }
+                    }
+                    step *= 2;
+                }
+                for j in 0..block_size {
+                    expected[base + j] = f32_to_f16(v[j] * inv_sqrt);
+                }
+            }
+        }
+
+        let d_in = DeviceBuffer::alloc(0, input.len() * 2).unwrap();
+        let d_out = DeviceBuffer::alloc(0, input.len() * 2).unwrap();
+        d_in.copy_from_host(&input, &stream).unwrap();
+        let ex = stream.exec(0, 0);
+        check_rc(
+            // SAFETY: `d_in` and `d_out` are disjoint device allocations sized for `rows * dim` FP16 elements.
+            unsafe {
+                ffi::warp34_block_hadamard_f16(
+                    &ex,
+                    d_in.addr() as *const _,
+                    d_out.addr() as *mut _,
+                    rows as i32,
+                    dim as i32,
+                    dim as i32,
+                    block_size as i32,
+                )
+            },
+            "warp34_block_hadamard_f16 out-of-place",
+        )
+        .unwrap();
+        let mut got = vec![0u16; rows * dim];
+        d_out.copy_to_host(&mut got, &stream).unwrap();
+        assert_eq!(
+            got, expected,
+            "0-ULP mismatch for out-of-place block_hadamard_f16 B={block_size}, dim={dim}, rows={rows}"
+        );
+
+        // Overlapping src == dst must be rejected by the public entrypoint.
+        // SAFETY: `d_in` is a valid device allocation; the entrypoint validates aliasing before launch.
+        let rc_overlap = unsafe {
+            ffi::warp34_block_hadamard_f16(
+                &ex,
+                d_in.addr() as *const _,
+                d_in.addr() as *mut _,
+                rows as i32,
+                dim as i32,
+                dim as i32,
+                block_size as i32,
+            )
+        };
+        assert_ne!(
+            rc_overlap, 0,
+            "overlapping src == dst must be rejected for B={block_size}"
+        );
+    }
+}
+
+#[cfg(feature = "cuda")]
+#[test]
+fn marlin_w2a16_sym_half_offset_matches_dilated_w4a16_zero_ulp() {
+    let stream = CudaStream::new(0).unwrap();
+    let cublas = CublasHandle::new(&stream).unwrap();
+    let staging = DeviceBuffer::alloc(0, 16 * 1024 * 1024).unwrap();
+    let locks = DeviceBuffer::alloc(0, 65536 * 4).unwrap();
+    locks.copy_from_host(&vec![0i32; 65536], &stream).unwrap();
+
+    for (n, k, group) in [
+        (128usize, 128usize, 32usize),
+        (128, 256, 64),
+        (256, 512, 128),
+        (128, 512, 512),
+    ] {
+        let words_per_row = k / 16;
+        let groups_per_row = k / group;
+        let packed_u2: Vec<u32> = (0..n * words_per_row)
+            .map(|i| {
+                let s = (i as u32).wrapping_mul(0x9E37_79B9) ^ 0xA55A_5AA5;
+                s.rotate_left((i % 29) as u32)
+            })
+            .collect();
+        let scales: Vec<u16> = (0..n * groups_per_row)
+            .map(|i| f32_to_f16(((i % 19) as f32 + 1.0) / 16.0))
+            .collect();
+        let raw_u2 = RawLinearHost::U2B2NMajor {
+            packed: packed_u2,
+            scales,
+            n,
+            k,
+            group_size: group,
+            code_offset_half: true,
+        };
+        let raw_u4 = raw_u2.slice_rows(0, n).into_u4b8_if_u2b2();
+        assert_eq!(raw_u2.to_f16_vec(), raw_u4.to_f16_vec());
+
+        let mut arena = DeviceArena::new(0, 16 * 1024 * 1024).unwrap();
+        let proj_u2 = raw_u2.upload(&mut arena, &stream, &staging).unwrap();
+        let proj_u4 = raw_u4.upload(&mut arena, &stream, &staging).unwrap();
+        assert!(matches!(
+            proj_u2,
+            LinearProj::MarlinW2A16 {
+                code_offset_half: true,
+                ..
+            }
+        ));
+        assert!(matches!(proj_u4, LinearProj::MarlinW4A16 { .. }));
+
+        for m in [1, 4, 16, 64] {
+            let input: Vec<u16> = (0..m * k)
+                .map(|i| f32_to_f16(((i * 11) % 53) as f32 / 16.0 - 1.5))
+                .collect();
+            let x = DeviceBuffer::alloc(0, input.len() * 2).unwrap();
+            x.copy_from_host(&input, &stream).unwrap();
+            let y_u2 = DeviceBuffer::alloc(0, m * n * 2).unwrap();
+            let y_u4 = DeviceBuffer::alloc(0, m * n * 2).unwrap();
+            let ex = stream.exec(0, 0);
+            proj_u2
+                .forward(&ex, &cublas, locks.addr(), 65536, x.addr(), y_u2.addr(), m)
+                .unwrap();
+            proj_u4
+                .forward(&ex, &cublas, locks.addr(), 65536, x.addr(), y_u4.addr(), m)
+                .unwrap();
+            let mut out_u2 = vec![0u16; m * n];
+            let mut out_u4 = vec![0u16; m * n];
+            y_u2.copy_to_host(&mut out_u2, &stream).unwrap();
+            y_u4.copy_to_host(&mut out_u4, &stream).unwrap();
+            assert_eq!(
+                out_u2, out_u4,
+                "0-ULP mismatch for MarlinW2A16(code_offset=0.5) vs dilated MarlinW4A16 at M={m}, N={n}, K={k}, group={group}"
+            );
+        }
+    }
+}
+
+#[cfg(feature = "cuda")]
+#[test]
+fn moe_w2a16_sym_half_offset_matches_dilated_w4a16_zero_ulp() {
+    let stream = CudaStream::new(0).unwrap();
+    let cublas = CublasHandle::new(&stream).unwrap();
+    let locks = DeviceBuffer::alloc(0, 65536 * 4).unwrap();
+    locks.copy_from_host(&vec![0i32; 65536], &stream).unwrap();
+    let (num_experts, top_k, h_dim, n_interm, group_size) =
+        (4usize, 2usize, 512usize, 512usize, 128usize);
+
+    let mut arena = DeviceArena::new(0, 64 * 1024 * 1024).unwrap();
+    let router_w: Vec<u16> = (0..num_experts * h_dim)
+        .map(|i| f32_to_f16(((i * 7) % 19) as f32 / 32.0 - 0.3))
+        .collect();
+    let router_ptr = arena.upload_slice(&router_w, &stream).unwrap();
+
+    let mut gu_p_u2 = Vec::new();
+    let mut gu_p_u4 = Vec::new();
+    let mut gu_s_u2 = Vec::new();
+    let mut gu_s_u4 = Vec::new();
+    let mut dn_p_u2 = Vec::new();
+    let mut dn_p_u4 = Vec::new();
+    let mut dn_s_u2 = Vec::new();
+    let mut dn_s_u4 = Vec::new();
+    for e in 0..num_experts {
+        let gu_u2 = RawLinearHost::U2B2NMajor {
+            packed: (0..(2 * n_interm * h_dim / 16))
+                .map(|i| {
+                    0x936c_936cu32.wrapping_add(((e * 31 + i) as u32).wrapping_mul(0x0101_0101))
+                })
+                .collect(),
+            scales: (0..(2 * n_interm * h_dim / group_size))
+                .map(|i| f32_to_f16(((e * 7 + i) % 13 + 1) as f32 / 16.0))
+                .collect(),
+            n: 2 * n_interm,
+            k: h_dim,
+            group_size,
+            code_offset_half: true,
+        };
+        let gu_u4 = gu_u2.slice_rows(0, 2 * n_interm).into_u4b8_if_u2b2();
+        let dn_u2 = RawLinearHost::U2B2NMajor {
+            packed: (0..(h_dim * n_interm / 16))
+                .map(|i| {
+                    0x39c6_39c6u32.wrapping_add(((e * 17 + i) as u32).wrapping_mul(0x0101_0101))
+                })
+                .collect(),
+            scales: (0..(h_dim * n_interm / group_size))
+                .map(|i| f32_to_f16(((e * 5 + i) % 11 + 1) as f32 / 16.0))
+                .collect(),
+            n: h_dim,
+            k: n_interm,
+            group_size,
+            code_offset_half: true,
+        };
+        let dn_u4 = dn_u2.slice_rows(0, h_dim).into_u4b8_if_u2b2();
+        if let (
+            RawLinearHost::U2B2NMajor {
+                packed: gp2,
+                scales: gs2,
+                ..
+            },
+            RawLinearHost::U4B8NMajor {
+                packed: gp4,
+                scales: gs4,
+                ..
+            },
+            RawLinearHost::U2B2NMajor {
+                packed: dp2,
+                scales: ds2,
+                ..
+            },
+            RawLinearHost::U4B8NMajor {
+                packed: dp4,
+                scales: ds4,
+                ..
+            },
+        ) = (gu_u2, gu_u4, dn_u2, dn_u4)
+        {
+            gu_p_u2.extend_from_slice(&gp2);
+            gu_p_u4.extend_from_slice(&gp4);
+            gu_s_u2.extend_from_slice(&gs2);
+            gu_s_u4.extend_from_slice(&gs4);
+            dn_p_u2.extend_from_slice(&dp2);
+            dn_p_u4.extend_from_slice(&dp4);
+            dn_s_u2.extend_from_slice(&ds2);
+            dn_s_u4.extend_from_slice(&ds4);
+        }
+    }
+    let gu_p_u2_ptr = arena.upload_slice(&gu_p_u2, &stream).unwrap();
+    let gu_p_u4_ptr = arena.upload_slice(&gu_p_u4, &stream).unwrap();
+    let gu_s_u2_ptr = arena.upload_slice(&gu_s_u2, &stream).unwrap();
+    let gu_s_u4_ptr = arena.upload_slice(&gu_s_u4, &stream).unwrap();
+    let dn_p_u2_ptr = arena.upload_slice(&dn_p_u2, &stream).unwrap();
+    let dn_p_u4_ptr = arena.upload_slice(&dn_p_u4, &stream).unwrap();
+    let dn_s_u2_ptr = arena.upload_slice(&dn_s_u2, &stream).unwrap();
+    let dn_s_u4_ptr = arena.upload_slice(&dn_s_u4, &stream).unwrap();
+
+    for down_had in [128usize, 512usize] {
+        let make_moe = |experts: MoeExpertStorage| {
+            FfnBlockWeights::Moe(Box::new(MoeLayerWeights {
+                router_gate: LinearProj::DenseF16 {
+                    weight_ptr: router_ptr,
+                    size_n: num_experts,
+                    size_k: h_dim,
+                },
+                experts,
+                num_experts,
+                top_k,
+                norm_topk_prob: true,
+                scoring_func: 0,
+                local_moe_interm: n_interm,
+                routed_input_hadamard: 512,
+                routed_down_hadamard: down_had,
+                shared_gate_up_proj: None,
+                shared_down_proj: None,
+                shared_expert_gate: None,
+                local_shared_interm: 0,
+            }))
+        };
+        let ffn_u2 = make_moe(MoeExpertStorage::W2A16 {
+            gate_up_packed_ptr: gu_p_u2_ptr,
+            gate_up_scales_ptr: gu_s_u2_ptr,
+            down_packed_ptr: dn_p_u2_ptr,
+            down_scales_ptr: dn_s_u2_ptr,
+            group_size,
+            code_offset_half: true,
+        });
+        let ffn_u4 = make_moe(MoeExpertStorage::W4A16 {
+            gate_up_packed_ptr: gu_p_u4_ptr,
+            gate_up_scales_ptr: gu_s_u4_ptr,
+            down_packed_ptr: dn_p_u4_ptr,
+            down_scales_ptr: dn_s_u4_ptr,
+            group_size,
+        });
+
+        for m in [1usize, 4] {
+            let h_x: Vec<u16> = (0..m * h_dim)
+                .map(|i| f32_to_f16(((i * 13) % 37) as f32 / 16.0 - 1.1))
+                .collect();
+            let d_x_u2 = arena.upload_slice(&h_x, &stream).unwrap();
+            let d_x_u4 = arena.upload_slice(&h_x, &stream).unwrap();
+            let d_out_u2 = arena.alloc_aligned(m * h_dim * 2).unwrap();
+            let d_out_u4 = arena.alloc_aligned(m * h_dim * 2).unwrap();
+            let d_router_logits = arena.alloc_aligned(m * num_experts * 2).unwrap();
+            let d_topk_w = arena.alloc_aligned(m * top_k * 4).unwrap();
+            let d_topk_i = arena.alloc_aligned(m * top_k * 4).unwrap();
+            let d_interm = arena.alloc_aligned(m * top_k * n_interm * 2).unwrap();
+            let d_ws = arena.alloc_aligned(512 * 1024).unwrap();
+            let ex = stream.exec(d_ws, 512 * 1024);
+            ffn_u2
+                .forward(
+                    &ex,
+                    &cublas,
+                    locks.addr(),
+                    65536,
+                    d_x_u2,
+                    d_out_u2,
+                    m,
+                    h_dim,
+                    n_interm,
+                    0,
+                    0,
+                    d_router_logits,
+                    d_topk_w,
+                    d_topk_i,
+                    d_interm,
+                    0,
+                    0,
+                    0,
+                    0,
+                )
+                .unwrap();
+            ffn_u4
+                .forward(
+                    &ex,
+                    &cublas,
+                    locks.addr(),
+                    65536,
+                    d_x_u4,
+                    d_out_u4,
+                    m,
+                    h_dim,
+                    n_interm,
+                    0,
+                    0,
+                    d_router_logits,
+                    d_topk_w,
+                    d_topk_i,
+                    d_interm,
+                    0,
+                    0,
+                    0,
+                    0,
+                )
+                .unwrap();
+            let mut out_u2 = vec![0u16; m * h_dim];
+            let mut out_u4 = vec![0u16; m * h_dim];
+            // SAFETY: `d_out_u2` and `d_out_u4` hold `m * h_dim` FP16 elements.
+            unsafe {
+                ffi::warp34_memcpy_d2h_async(
+                    out_u2.as_mut_ptr().cast(),
+                    d_out_u2 as *const _,
+                    m * h_dim * 2,
+                    stream.handle,
+                );
+                ffi::warp34_memcpy_d2h_async(
+                    out_u4.as_mut_ptr().cast(),
+                    d_out_u4 as *const _,
+                    m * h_dim * 2,
+                    stream.handle,
+                );
+            }
+            stream.synchronize().unwrap();
+            assert_eq!(
+                out_u2, out_u4,
+                "0-ULP mismatch between MoeExpertStorage::W2A16(code_offset=0.5) and W4A16 at m={m}, down_had={down_had}"
+            );
+        }
     }
 }

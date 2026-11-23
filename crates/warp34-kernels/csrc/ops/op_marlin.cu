@@ -16,6 +16,7 @@ static constexpr int kF16 = vllm::ST_ID_F16;
 static constexpr int kBF16 = vllm::ST_ID_BF16;
 static constexpr int kS8 = vllm::ST_ID_S8;
 static constexpr int kU2B2 = vllm::ST_ID_U2B2;
+static constexpr int kU2B2Sym = vllm::ST_ID_U2B2_SYM;
 static constexpr int kU4 = vllm::ST_ID_U4;
 static constexpr int kU4B8 = vllm::ST_ID_U4B8;
 static constexpr int kU8B128 = vllm::ST_ID_U8B128;
@@ -591,6 +592,29 @@ static MarlinFuncPtr get_marlin_kernel_f16u2(thread_config_t const& th_config,
     return nullptr;
 }
 
+static MarlinFuncPtr get_marlin_kernel_f16u2_sym(thread_config_t const& th_config,
+                                                 int thread_m_blocks,
+                                                 bool m_block_size_8,
+                                                 int group_blocks) {
+    if (group_blocks == -1) {
+        MARLIN_CASES_15(marlin::kU2B2Sym, -1)
+        return nullptr;
+    }
+    if (group_blocks == 2) {
+        MARLIN_CASES_15(marlin::kU2B2Sym, 2)
+        return nullptr;
+    }
+    if (group_blocks == 4) {
+        MARLIN_CASES_15(marlin::kU2B2Sym, 4)
+        return nullptr;
+    }
+    if (group_blocks == 8) {
+        MARLIN_CASES_15(marlin::kU2B2Sym, 8)
+        return nullptr;
+    }
+    return nullptr;
+}
+
 static MarlinFuncPtr get_marlin_kernel_f16u4(thread_config_t const& th_config,
                                              int thread_m_blocks,
                                              bool m_block_size_8,
@@ -661,10 +685,13 @@ static MarlinFuncPtr get_marlin_kernel_f16(thread_config_t const& th_config,
                                            bool has_zp,
                                            int thread_m_blocks,
                                            bool m_block_size_8,
-                                           int group_blocks) {
+                                           int group_blocks,
+                                           bool u2_sym = false) {
     if (num_bits == 2) {
         if (has_zp) return nullptr;
-        return get_marlin_kernel_f16u2(th_config, thread_m_blocks, m_block_size_8, group_blocks);
+        return u2_sym
+            ? get_marlin_kernel_f16u2_sym(th_config, thread_m_blocks, m_block_size_8, group_blocks)
+            : get_marlin_kernel_f16u2(th_config, thread_m_blocks, m_block_size_8, group_blocks);
     }
     if (num_bits == 8) {
         if (has_zp) return nullptr;
@@ -743,7 +770,8 @@ static int marlin_gemm_impl(const warp34_exec* ex, const void* A, const void* B,
                             int64_t m, int64_t n, int64_t k,
                             int64_t workspace_ints, int group_blocks, int num_bits,
                             bool has_zp, bool is_bf16 = false,
-                            bool force_s8_shared = false) {
+                            bool force_s8_shared = false,
+                            bool u2_sym = false) {
     if (ex == nullptr || A == nullptr || B == nullptr || S == nullptr ||
         C == nullptr || workspace == nullptr || (has_zp && ZP == nullptr)) {
         return (int)cudaErrorInvalidValue;
@@ -941,7 +969,8 @@ static int marlin_gemm_impl(const warp34_exec* ex, const void* A, const void* B,
             : (is_bf16
                 ? get_marlin_kernel_bf16u4(th_cfg, thread_m_blocks, m_block_size_8, group_blocks)
                 : get_marlin_kernel_f16(
-                      th_cfg, num_bits, has_zp, thread_m_blocks, m_block_size_8, group_blocks));
+                      th_cfg, num_bits, has_zp, thread_m_blocks, m_block_size_8, group_blocks,
+                      u2_sym));
         if (kernel == nullptr) return (int)cudaErrorInvalidValue;
 
         const int tile_smem = get_kernel_cache_size(
@@ -1004,9 +1033,10 @@ static int warmup_all_specializations_impl(int max_shared_mem) {
     static constexpr int kGroups[4] = {-1, 2, 4, 8};
     for (int gb : kGroups) {
         for (const auto& sc : kCases) {
-            MarlinFuncPtr fns[6] = {
+            MarlinFuncPtr fns[7] = {
                 get_marlin_kernel_bf16u4(sc.cfg, sc.m_blocks, sc.m8, gb),
                 get_marlin_kernel_f16u2(sc.cfg, sc.m_blocks, sc.m8, gb),
+                get_marlin_kernel_f16u2_sym(sc.cfg, sc.m_blocks, sc.m8, gb),
                 get_marlin_kernel_f16u4(sc.cfg, sc.m_blocks, sc.m8, gb),
                 get_marlin_kernel_f16u4_zp(sc.cfg, sc.m_blocks, sc.m8, gb),
                 get_marlin_kernel_f16u8(sc.cfg, sc.m_blocks, sc.m8, gb),
@@ -1139,6 +1169,15 @@ extern "C" int warp34_marlin_gemm_f16u2(const warp34_exec* ex, const void* a, co
                                      int64_t workspace_ints, int group_blocks) {
     return warp34_marlin::marlin_gemm_impl(
         ex, a, b, scales, nullptr, c, workspace, m, n, k, workspace_ints, group_blocks, 2, false, false);
+}
+
+extern "C" int warp34_marlin_gemm_f16u2_sym(const warp34_exec* ex, const void* a, const void* b,
+                                         const void* scales, void* c, int32_t* workspace,
+                                         int64_t m, int64_t n, int64_t k,
+                                         int64_t workspace_ints, int group_blocks) {
+    return warp34_marlin::marlin_gemm_impl(
+        ex, a, b, scales, nullptr, c, workspace, m, n, k, workspace_ints, group_blocks, 2, false,
+        false, false, true);
 }
 
 extern "C" int warp34_marlin_gemm_f16u4(const warp34_exec* ex, const void* a, const void* b,

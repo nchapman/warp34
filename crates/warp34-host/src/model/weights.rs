@@ -62,6 +62,7 @@ pub enum LinearProj {
         size_n: usize,
         size_k: usize,
         group_blocks: i32,
+        code_offset_half: bool,
     },
     MarlinW4A16 {
         b_q_weight_ptr: u64,
@@ -318,27 +319,51 @@ impl LinearProj {
                 size_n,
                 size_k,
                 group_blocks,
-            } => check_rc(
-                // SAFETY: model upload repacks U2B2 weights and permutes scales
-                // for this N/K/group geometry. X/output/workspace extents and
-                // stream ordering are supplied by the raw-address caller.
-                unsafe {
-                    ffi::warp34_marlin_gemm_f16u2(
-                        ex,
-                        x_ptr as *const c_void,
-                        b_q_weight_ptr as *const c_void,
-                        b_scales_ptr as *const c_void,
-                        out_ptr as *mut c_void,
-                        marlin_ws_ptr as *mut i32,
-                        m as i64,
-                        size_n as i64,
-                        size_k as i64,
-                        marlin_ws_ints as i64,
-                        group_blocks,
+                code_offset_half,
+            } => {
+                type MarlinU2GemmFn = unsafe extern "C" fn(
+                    *const ffi::Warp34Exec,
+                    *const c_void,
+                    *const c_void,
+                    *const c_void,
+                    *mut c_void,
+                    *mut i32,
+                    i64,
+                    i64,
+                    i64,
+                    i64,
+                    i32,
+                ) -> i32;
+                let (gemm_fn, label): (MarlinU2GemmFn, &str) = if code_offset_half {
+                    (
+                        ffi::warp34_marlin_gemm_f16u2_sym,
+                        "warp34_marlin_gemm_f16u2_sym",
                     )
-                },
-                "warp34_marlin_gemm_f16u2",
-            ),
+                } else {
+                    (ffi::warp34_marlin_gemm_f16u2, "warp34_marlin_gemm_f16u2")
+                };
+                check_rc(
+                    // SAFETY: model upload repacks U2B2 weights and permutes scales
+                    // for this N/K/group geometry. X/output/workspace extents and
+                    // stream ordering are supplied by the raw-address caller.
+                    unsafe {
+                        gemm_fn(
+                            ex,
+                            x_ptr as *const c_void,
+                            b_q_weight_ptr as *const c_void,
+                            b_scales_ptr as *const c_void,
+                            out_ptr as *mut c_void,
+                            marlin_ws_ptr as *mut i32,
+                            m as i64,
+                            size_n as i64,
+                            size_k as i64,
+                            marlin_ws_ints as i64,
+                            group_blocks,
+                        )
+                    },
+                    label,
+                )
+            }
             Self::MarlinW4A16 {
                 b_q_weight_ptr,
                 b_scales_ptr,
@@ -487,6 +512,7 @@ pub(crate) enum RawLinearHost {
         n: usize,
         k: usize,
         group_size: usize,
+        code_offset_half: bool,
     },
     U4B8NMajor {
         packed: Vec<u32>,
@@ -587,9 +613,18 @@ impl RawLinearHost {
                 n,
                 k,
                 group_size,
+                code_offset_half,
             } => Self::U4B8NMajor {
-                packed: repack_u2b2_to_u4b8(&packed),
-                scales,
+                packed: if code_offset_half {
+                    repack_u2b2_sym_to_u4b8(&packed)
+                } else {
+                    repack_u2b2_to_u4b8(&packed)
+                },
+                scales: if code_offset_half {
+                    halve_f16_scales(&scales)
+                } else {
+                    scales
+                },
                 n,
                 k,
                 group_size,
@@ -608,7 +643,15 @@ impl RawLinearHost {
                 n,
                 k,
                 group_size,
-            } => dequant_u2b2_n_major_to_f16(packed, scales, *n, *k, *group_size),
+                code_offset_half,
+            } => dequant_u2b2_n_major_to_f16_with_offset(
+                packed,
+                scales,
+                *n,
+                *k,
+                *group_size,
+                *code_offset_half,
+            ),
             Self::U4B8NMajor {
                 packed,
                 scales,
@@ -883,6 +926,7 @@ impl RawLinearHost {
                                         n: out_n,
                                         k,
                                         group_size,
+                                        code_offset_half: quant.u2_code_offset_half(),
                                     }
                                 } else {
                                     Self::U4B8NMajor {
@@ -1184,6 +1228,7 @@ impl RawLinearHost {
                     n,
                     k,
                     group_size,
+                    code_offset_half: quant.u2_code_offset_half(),
                 })
             } else {
                 Ok(Self::U4B8NMajor {
@@ -1526,6 +1571,7 @@ impl RawLinearHost {
                 scales,
                 k,
                 group_size,
+                code_offset_half,
                 ..
             } => {
                 let words_per_row = k / 16;
@@ -1536,6 +1582,7 @@ impl RawLinearHost {
                     n: out_n,
                     k: *k,
                     group_size: *group_size,
+                    code_offset_half: *code_offset_half,
                 }
             }
             Self::U4B8NMajor {
@@ -1639,6 +1686,7 @@ impl RawLinearHost {
                 n,
                 k,
                 group_size,
+                code_offset_half,
             } => {
                 let channelwise = *group_size == *k && *group_size > 128;
                 if !col_start.is_multiple_of(16)
@@ -1684,6 +1732,7 @@ impl RawLinearHost {
                     n: *n,
                     k: out_k,
                     group_size: if channelwise { out_k } else { *group_size },
+                    code_offset_half: *code_offset_half,
                 }
             }
             Self::U4B8NMajor {
@@ -1894,11 +1943,20 @@ impl RawLinearHost {
             }
         }
         if let Self::U2B2NMajor {
-            group_size: gs0, ..
+            group_size: gs0,
+            code_offset_half: co0,
+            ..
         } = &parts[0]
-            && parts
-                .iter()
-                .all(|p| matches!(p, Self::U2B2NMajor { group_size, .. } if group_size == gs0))
+            && parts.iter().all(|p| {
+                matches!(
+                    p,
+                    Self::U2B2NMajor {
+                        group_size,
+                        code_offset_half,
+                        ..
+                    } if group_size == gs0 && code_offset_half == co0
+                )
+            })
         {
             let cap_pk: usize = parts
                 .iter()
@@ -1936,6 +1994,7 @@ impl RawLinearHost {
                 n: total_n,
                 k,
                 group_size: *gs0,
+                code_offset_half: *co0,
             });
         }
 
@@ -2025,10 +2084,16 @@ impl RawLinearHost {
                         packed: pk,
                         scales: sc,
                         n,
+                        code_offset_half,
                         ..
                     } => {
-                        packed.extend_from_slice(&repack_u2b2_to_u4b8(pk));
-                        scales.extend_from_slice(sc);
+                        if *code_offset_half {
+                            packed.extend_from_slice(&repack_u2b2_sym_to_u4b8(pk));
+                            scales.extend_from_slice(&halve_f16_scales(sc));
+                        } else {
+                            packed.extend_from_slice(&repack_u2b2_to_u4b8(pk));
+                            scales.extend_from_slice(sc);
+                        }
                         total_n += *n;
                     }
                     Self::U4B8NMajor {
@@ -2310,6 +2375,7 @@ impl RawLinearHost {
                 n,
                 k,
                 group_size,
+                code_offset_half,
             } => {
                 let channelwise = *group_size == *k && *group_size > MARLIN_TILE_K_W4;
                 if marlin_geom_ok(*n, *k)
@@ -2335,9 +2401,17 @@ impl RawLinearHost {
                         } else {
                             (*group_size / MARLIN_GROUP_BLOCK_K) as i32
                         },
+                        code_offset_half: *code_offset_half,
                     })
                 } else {
-                    let f16_w = dequant_u2b2_n_major_to_f16(packed, scales, *n, *k, *group_size);
+                    let f16_w = dequant_u2b2_n_major_to_f16_with_offset(
+                        packed,
+                        scales,
+                        *n,
+                        *k,
+                        *group_size,
+                        *code_offset_half,
+                    );
                     let weight_ptr = staging.upload_slice(arena, &f16_w, stream)?;
                     Ok(LinearProj::DenseF16 {
                         weight_ptr,

@@ -11,6 +11,7 @@ pub struct ExpertPackLayout {
     pub hidden: usize,
     pub group_size: usize,
     pub bits: usize,
+    pub u2_code_offset_half: bool,
     pub down_hadamard_block_size: usize,
     pub gate_up_packed: Range<usize>,
     pub gate_up_scales: Range<usize>,
@@ -80,6 +81,7 @@ impl ExpertPackLayout {
             hidden,
             group_size,
             bits,
+            u2_code_offset_half: false,
             down_hadamard_block_size: 0,
             gate_up_packed: regions[0].clone(),
             gate_up_scales: regions[1].clone(),
@@ -89,7 +91,14 @@ impl ExpertPackLayout {
         })
     }
 
-    /// Configures the optional pre-`down_proj` Hadamard block size (`0`, `16`, or `64`).
+    /// Configures whether 2-bit experts use symmetric half-integer codes (`code_offset == 0.5`).
+    #[inline]
+    pub fn with_u2_code_offset_half(mut self, half: bool) -> Self {
+        self.u2_code_offset_half = self.bits == 2 && half;
+        self
+    }
+
+    /// Configures the optional pre-`down_proj` Hadamard block size (`0`, `16`, `64`, `128`, or `512`).
     pub fn with_down_hadamard(mut self, block_size: usize) -> io::Result<Self> {
         if !crate::loader::is_valid_hadamard_block_for_dim(block_size, self.intermediate) {
             return Err(io::Error::new(
@@ -104,7 +113,8 @@ impl ExpertPackLayout {
     /// Returns whether this expert pack geometry is supported by the SIMD CPU+GPU hybrid bridge.
     #[inline]
     pub fn supports_cpu_bridge(&self) -> bool {
-        self.hidden <= TIERED_MOE_CPU_BRIDGE_MAX_HIDDEN
+        !self.u2_code_offset_half
+            && self.hidden <= TIERED_MOE_CPU_BRIDGE_MAX_HIDDEN
             && self.intermediate <= TIERED_MOE_CPU_BRIDGE_MAX_INTERMEDIATE
             && self.hidden.is_multiple_of(128)
             && self.intermediate.is_multiple_of(128)
@@ -190,7 +200,11 @@ impl ExpertPackLayout {
 
         let pack_factor = 32 / self.bits;
         let mask = (1u32 << self.bits) - 1;
-        let bias = 1i32 << (self.bits - 1);
+        let bias = if self.bits == 2 && self.u2_code_offset_half {
+            1.5f32
+        } else {
+            (1i32 << (self.bits - 1)) as f32
+        };
         let words_per_k = self.hidden / pack_factor;
         let groups_per_k = self.hidden / self.group_size;
         let words_per_group_k = self.group_size / pack_factor;
@@ -235,10 +249,10 @@ impl ExpertPackLayout {
                     let k_base = w_idx * pack_factor;
                     for b in 0..pack_factor {
                         let x_val = f16_to_f32(x_f16[k_base + b]);
-                        let gnib = ((gw >> (b * self.bits)) & mask) as i32 - bias;
-                        let unib = ((uw >> (b * self.bits)) & mask) as i32 - bias;
-                        let gw_h = f16_to_f32(f32_to_f16((gnib as f32) * gs));
-                        let uw_h = f16_to_f32(f32_to_f16((unib as f32) * us));
+                        let gnib = ((gw >> (b * self.bits)) & mask) as f32 - bias;
+                        let unib = ((uw >> (b * self.bits)) & mask) as f32 - bias;
+                        let gw_h = f16_to_f32(f32_to_f16(gnib * gs));
+                        let uw_h = f16_to_f32(f32_to_f16(unib * us));
                         gate_acc += gw_h * x_val;
                         up_acc += uw_h * x_val;
                     }
@@ -302,8 +316,8 @@ impl ExpertPackLayout {
                     let k_base = w_idx * pack_factor;
                     for b in 0..pack_factor {
                         let x_val = f16_to_f32(interm_f16[k_base + b]);
-                        let dnib = ((dw >> (b * self.bits)) & mask) as i32 - bias;
-                        let dw_h = f16_to_f32(f32_to_f16((dnib as f32) * ds));
+                        let dnib = ((dw >> (b * self.bits)) & mask) as f32 - bias;
+                        let dw_h = f16_to_f32(f32_to_f16(dnib * ds));
                         down_acc += dw_h * x_val;
                     }
                 }
