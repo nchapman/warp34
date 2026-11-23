@@ -453,15 +453,48 @@ impl NativeProposer {
         }
     }
 
+    pub(crate) fn batch_slot_capacity_for(&self, slot: usize) -> usize {
+        match &self.ranks {
+            Ranks::Mtp(rs) => rs.first().map_or(0, |r| r.slot_capacity(slot)),
+            Ranks::DFlash(rs) => rs.first().map_or(0, |r| r.batch_slot_capacity()),
+        }
+    }
+
+    pub(crate) fn fits_mtp_batch_slot(&self, slot: usize, current_len: usize) -> bool {
+        let slot_cap = self.batch_slot_capacity_for(slot);
+        slot_cap >= 32 && current_len.saturating_add(self.k + 2) <= slot_cap
+    }
+
+    pub(crate) fn fits_free_mtp_batch_slot<T>(
+        &self,
+        active: &[Option<T>],
+        current_len: usize,
+    ) -> bool {
+        match &self.ranks {
+            Ranks::Mtp(_) => {
+                let slot_count = self
+                    .batch_slot_count()
+                    .min(self.mtp_batch_slots.len())
+                    .min(active.len());
+                (0..slot_count).any(|slot| {
+                    active[slot].is_none() && self.fits_mtp_batch_slot(slot, current_len)
+                })
+            }
+            Ranks::DFlash(_) => self.fits_mtp_batch_slot_capacity(current_len),
+        }
+    }
+
     pub(crate) fn fits_mtp_batch_slot_capacity(&self, current_len: usize) -> bool {
-        let slot_cap = match &self.ranks {
-            Ranks::Mtp(rs) => rs.first().map_or(0, |r| r.batch_slot_capacity()),
+        let max_slot_cap = match &self.ranks {
+            Ranks::Mtp(rs) => rs
+                .first()
+                .map_or(0, |r| r.max_slot_page_count().saturating_mul(16)),
             Ranks::DFlash(rs) => rs.first().map_or(0, |r| r.batch_slot_capacity()),
         };
-        if slot_cap < 32 {
+        if max_slot_cap < 32 {
             return false;
         }
-        current_len.saturating_add(self.k + 2) <= slot_cap
+        current_len.saturating_add(self.k + 2) <= max_slot_cap
     }
 
     pub(crate) fn set_mtp_batch_mode(&mut self, enable: bool) -> Result<()> {
@@ -603,6 +636,7 @@ impl NativeProposer {
             }
         }
         if slot == self.mtp_batch_active_slot {
+            self.capacity = self.batch_slot_capacity_for(slot);
             return Ok(());
         }
         let prev = self.mtp_batch_active_slot;
@@ -637,6 +671,7 @@ impl NativeProposer {
         self.processed = self.mtp_batch_slots[slot].processed;
         self.batch_slot_tick_counter += 1;
         self.active_slot_last_used_tick = self.batch_slot_tick_counter;
+        self.capacity = self.batch_slot_capacity_for(slot);
         Ok(())
     }
 
@@ -672,7 +707,7 @@ impl NativeProposer {
             .min(active.len());
         let mut best: Option<(usize, (u8, usize, u64))> = None;
         for (slot, entry) in active.iter().enumerate().take(slot_count) {
-            if entry.is_some() {
+            if entry.is_some() || !self.fits_mtp_batch_slot(slot, prompt.len()) {
                 continue;
             }
             let res = self.batch_slot_resident_tokens(slot);
@@ -827,17 +862,135 @@ impl NativeProposer {
         Ok(())
     }
 
-    /// Dynamically adapts the MTP batch slot partition (`16 <-> 8 <-> 4 <-> 2`) so sequences
-    /// exceeding `16,384` tokens (up to `65,536` tokens across 4 slots or `131,072` tokens across
-    /// 2 slots on a `262,144`-token pool) remain in batched `MTP-3` without dropping to `1 tok/step`.
-    pub(crate) fn adapt_mtp_batch_slot_count<T>(
+    fn compact_mtp_batch_slots_to<T>(
         &mut self,
         engine: &Qwen3_5Engine,
         active: &mut [Option<T>],
-        desired_slots: usize,
-        max_seq_len: usize,
+        slot_lens: &mut [usize; crate::mtp::MAX_PROPOSER_BATCH_SLOTS],
+        cur_slots: usize,
+        target_slots: usize,
+    ) -> Result<()> {
+        if !self.is_mtp_batch_mode() || target_slots >= cur_slots {
+            return Ok(());
+        }
+        self.select_mtp_batch_slot(0)?;
+        for src in target_slots..cur_slots.min(active.len()) {
+            if active[src].is_none() {
+                continue;
+            }
+            let dst = (0..target_slots)
+                .filter(|&d| active[d].is_none())
+                .min_by_key(|&d| {
+                    (
+                        !self.batch_slot_resident_tokens(d).is_empty(),
+                        self.batch_slot_last_used_tick(d),
+                    )
+                })
+                .ok_or_else(|| loader_err("no free MTP batch slot for compaction"))?;
+            self.move_mtp_batch_slot_state(engine, active, src, dst)?;
+            if src < slot_lens.len() && dst < slot_lens.len() {
+                slot_lens[dst] = std::mem::take(&mut slot_lens[src]);
+            }
+        }
+        for src in target_slots..cur_slots.min(self.mtp_batch_slots.len()) {
+            if self.batch_slot_resident_tokens(src).is_empty() {
+                continue;
+            }
+            if let Some(dst) = (0..target_slots).find(|&d| {
+                active.get(d).is_none_or(|e| e.is_none())
+                    && self.batch_slot_resident_tokens(d).is_empty()
+            }) {
+                self.move_mtp_batch_slot_state(engine, active, src, dst)?;
+            } else {
+                self.reset_mtp_batch_slot(src)?;
+            }
+        }
+        self.select_mtp_batch_slot(0)
+    }
+
+    fn build_mtp_batch_slot_page_plan(
+        &self,
+        total_pages: usize,
+        target_slots: usize,
+        sim_occupied: &[bool; crate::mtp::MAX_MTP_BATCH_SLOTS],
+        hard_pages: &[usize; crate::mtp::MAX_MTP_BATCH_SLOTS],
+    ) -> Vec<usize> {
+        let uniform_pages = total_pages / target_slots;
+        if hard_pages[..target_slots]
+            .iter()
+            .all(|&p| p <= uniform_pages)
+        {
+            return vec![uniform_pages; target_slots];
+        }
+        let mut pages = hard_pages[..target_slots].to_vec();
+        let hard_sum: usize = pages.iter().sum();
+        let mut rem = total_pages.saturating_sub(hard_sum);
+        let quantum = (total_pages / (target_slots * 8)).max(1);
+        for (&occ, p) in sim_occupied.iter().zip(pages.iter_mut()).take(target_slots) {
+            if occ && rem > 0 {
+                let target_q = (*p + quantum / 2).div_ceil(quantum) * quantum;
+                let add = target_q.saturating_sub(*p).min(rem);
+                *p += add;
+                rem -= add;
+            }
+        }
+        let mut warm_idle: Vec<usize> = (0..target_slots)
+            .filter(|&s| !sim_occupied[s] && !self.batch_slot_resident_tokens(s).is_empty())
+            .collect();
+        warm_idle.sort_by_key(|&s| std::cmp::Reverse(self.batch_slot_last_used_tick(s)));
+        for s in warm_idle {
+            if rem == 0 {
+                break;
+            }
+            let warm_need = self
+                .batch_slot_resident_tokens(s)
+                .len()
+                .saturating_add(self.k + 2)
+                .div_ceil(16)
+                .max(2);
+            let add = warm_need.saturating_sub(pages[s]).min(rem);
+            pages[s] += add;
+            rem -= add;
+        }
+        let occ_count = sim_occupied
+            .iter()
+            .take(target_slots)
+            .filter(|&&o| o)
+            .count();
+        if occ_count > 0 && rem > 0 {
+            let per_occ = rem / occ_count;
+            let mut extra = rem % occ_count;
+            for (&occ, p) in sim_occupied.iter().zip(pages.iter_mut()).take(target_slots) {
+                if occ {
+                    *p += per_occ + usize::from(extra > 0);
+                    extra = extra.saturating_sub(1);
+                }
+            }
+        } else if rem > 0 {
+            let per_slot = rem / target_slots;
+            let mut extra = rem % target_slots;
+            for p in &mut pages {
+                *p += per_slot + usize::from(extra > 0);
+                extra = extra.saturating_sub(1);
+            }
+        }
+        pages
+    }
+
+    /// Dynamically adapts both the MTP batch slot count (`16 <-> 8 <-> 4 <-> 2`) and the
+    /// per-slot page partition (`reconfigure_batch_slot_pages`) based on each active slot's
+    /// sequence length and any incoming waiting prompts. When one or more workers exceed the
+    /// uniform per-slot ceiling (e.g. `> 65,536` tokens with 4 active workers), unused pages
+    /// from shorter slots are assigned to the longer slots so all workers remain in batched
+    /// `MTP-3` as long as their combined page demand fits in the `262,144`-token MTP KV pool.
+    pub(crate) fn adapt_mtp_batch_slot_layout<T>(
+        &mut self,
+        engine: &Qwen3_5Engine,
+        active: &mut [Option<T>],
+        active_slot_lens: &[usize],
+        waiting_prompts: &[&[i32]],
     ) -> Result<bool> {
-        let (cur_slots, max_slots, cur_cap) = match &self.ranks {
+        let (cur_slots, max_slots, total_pages) = match &self.ranks {
             Ranks::Mtp(rs) => {
                 let Some(r0) = rs.first() else {
                     return Ok(false);
@@ -845,90 +998,140 @@ impl NativeProposer {
                 (
                     r0.batch_slot_count(),
                     r0.max_batch_slot_count(),
-                    r0.batch_slot_capacity(),
+                    r0.kv_pool().num_pages,
                 )
             }
-            Ranks::DFlash(_) => return Ok(self.fits_mtp_batch_slot_capacity(max_seq_len)),
+            Ranks::DFlash(_) => {
+                let max_len = active_slot_lens
+                    .iter()
+                    .copied()
+                    .chain(waiting_prompts.iter().map(|p| p.len()))
+                    .max()
+                    .unwrap_or(0);
+                return Ok(self.fits_mtp_batch_slot_capacity(max_len));
+            }
         };
+        let mut slot_lens = [0usize; crate::mtp::MAX_PROPOSER_BATCH_SLOTS];
+        for (i, &len) in active_slot_lens.iter().enumerate().take(slot_lens.len()) {
+            slot_lens[i] = len;
+        }
         let active_count = active.iter().filter(|s| s.is_some()).count();
+        let desired_slots = (active_count + waiting_prompts.len()).max(1);
         let min_slots = desired_slots
             .max(active_count)
             .clamp(2, max_slots)
             .next_power_of_two()
             .min(max_slots);
-        let required_tokens = max_seq_len.saturating_add(self.k + 2);
-        let target_slots = if required_tokens > cur_cap {
-            // Shrink slot count (e.g. 16 -> 8 -> 4 -> 2) to increase per-slot capacity.
+        let max_seq_len = active
+            .iter()
+            .enumerate()
+            .filter_map(|(i, a)| a.as_ref().map(|_| slot_lens.get(i).copied().unwrap_or(0)))
+            .chain(waiting_prompts.iter().map(|p| p.len()))
+            .max()
+            .unwrap_or(0);
+        let max_req_tokens = max_seq_len.saturating_add(self.k + 2);
+        let target_slots = {
             let Ranks::Mtp(rs) = &self.ranks else {
                 unreachable!()
             };
-            let mut candidate = cur_slots;
-            while candidate > min_slots
-                && rs[0].batch_slot_capacity_for_slots(candidate) < required_tokens
+            if cur_slots >= min_slots
+                && rs[0].batch_slot_capacity_for_slots(cur_slots) >= max_req_tokens
             {
-                candidate /= 2;
-            }
-            if rs[0].batch_slot_capacity_for_slots(candidate) < required_tokens {
-                return Ok(false);
-            }
-            candidate
-        } else if min_slots > cur_slots {
-            // Expand slot count (e.g. 4 -> 8 -> 16) when concurrency rises and all sequences fit.
-            let Ranks::Mtp(rs) = &self.ranks else {
-                unreachable!()
-            };
-            if rs[0].batch_slot_capacity_for_slots(min_slots) >= required_tokens {
+                cur_slots
+            } else if min_slots > cur_slots
+                && rs[0].batch_slot_capacity_for_slots(min_slots) >= max_req_tokens
+            {
                 min_slots
             } else {
-                return Ok(false);
+                let mut candidate = cur_slots.max(min_slots);
+                while candidate > min_slots
+                    && rs[0].batch_slot_capacity_for_slots(candidate) < max_req_tokens
+                {
+                    candidate /= 2;
+                }
+                candidate
             }
-        } else {
-            return Ok(true);
         };
+        let open_for_waiting = target_slots.saturating_sub(active_count);
+        let active_pages_need: usize = active
+            .iter()
+            .enumerate()
+            .filter_map(|(i, a)| {
+                a.as_ref().map(|_| {
+                    slot_lens
+                        .get(i)
+                        .copied()
+                        .unwrap_or(0)
+                        .saturating_add(self.k + 2)
+                        .div_ceil(16)
+                        .max(2)
+                })
+            })
+            .sum();
+        let waiting_pages_need: usize = waiting_prompts
+            .iter()
+            .take(open_for_waiting)
+            .map(|p| p.len().saturating_add(self.k + 2).div_ceil(16).max(2))
+            .sum();
+        let used_slots = active_count + waiting_prompts.len().min(open_for_waiting);
+        let empty_pages_need = target_slots.saturating_sub(used_slots) * 2;
+        if active_pages_need + waiting_pages_need + empty_pages_need > total_pages {
+            return Ok(false);
+        }
 
-        if target_slots == cur_slots {
+        self.compact_mtp_batch_slots_to(engine, active, &mut slot_lens, cur_slots, target_slots)?;
+
+        let mut sim_occupied = [false; crate::mtp::MAX_MTP_BATCH_SLOTS];
+        let mut hard_pages = [2usize; crate::mtp::MAX_MTP_BATCH_SLOTS];
+        for s in 0..target_slots {
+            if active.get(s).is_some_and(|e| e.is_some()) {
+                sim_occupied[s] = true;
+                hard_pages[s] = slot_lens[s].saturating_add(self.k + 2).div_ceil(16).max(2);
+            }
+        }
+        for &w_prompt in waiting_prompts.iter().take(open_for_waiting) {
+            let best = (0..target_slots)
+                .filter(|&s| !sim_occupied[s])
+                .max_by_key(|&s| {
+                    rank_batch_slot_candidate(
+                        self.batch_slot_resident_tokens(s),
+                        w_prompt,
+                        self.batch_slot_last_used_tick(s),
+                    )
+                });
+            if let Some(s) = best {
+                sim_occupied[s] = true;
+                hard_pages[s] = hard_pages[s].max(
+                    w_prompt
+                        .len()
+                        .saturating_add(self.k + 2)
+                        .div_ceil(16)
+                        .max(2),
+                );
+            }
+        }
+
+        let already_fits = match &self.ranks {
+            Ranks::Mtp(rs) => {
+                target_slots == cur_slots
+                    && (0..target_slots).all(|s| rs[0].slot_page_count(s) >= hard_pages[s])
+            }
+            Ranks::DFlash(_) => unreachable!(),
+        };
+        if already_fits {
             return Ok(true);
         }
 
-        if self.is_mtp_batch_mode() && target_slots < cur_slots {
-            self.select_mtp_batch_slot(0)?;
-            // 1. Compact any occupied active slots from `target_slots..cur_slots` into `0..target_slots`.
-            for src in target_slots..cur_slots.min(active.len()) {
-                if active[src].is_none() {
-                    continue;
-                }
-                let dst = (0..target_slots)
-                    .filter(|&d| active[d].is_none())
-                    .min_by_key(|&d| {
-                        (
-                            !self.batch_slot_resident_tokens(d).is_empty(),
-                            self.batch_slot_last_used_tick(d),
-                        )
-                    })
-                    .ok_or_else(|| loader_err("no free MTP batch slot for compaction"))?;
-                self.move_mtp_batch_slot_state(engine, active, src, dst)?;
-            }
-            // 2. Relocate any warm unoccupied slots from `target_slots..cur_slots` into empty slots in `0..target_slots`.
-            for src in target_slots..cur_slots.min(self.mtp_batch_slots.len()) {
-                if self.batch_slot_resident_tokens(src).is_empty() {
-                    continue;
-                }
-                if let Some(dst) = (0..target_slots).find(|&d| {
-                    active.get(d).is_none_or(|e| e.is_none())
-                        && self.batch_slot_resident_tokens(d).is_empty()
-                }) {
-                    self.move_mtp_batch_slot_state(engine, active, src, dst)?;
-                } else {
-                    self.reset_mtp_batch_slot(src)?;
-                }
-            }
-            self.select_mtp_batch_slot(0)?;
-        } else if self.is_mtp_batch_mode() && target_slots > cur_slots {
-            let new_cap = match &self.ranks {
-                Ranks::Mtp(rs) => rs[0].batch_slot_capacity_for_slots(target_slots),
-                Ranks::DFlash(_) => unreachable!(),
-            };
+        let new_slot_pages = self.build_mtp_batch_slot_page_plan(
+            total_pages,
+            target_slots,
+            &sim_occupied,
+            &hard_pages,
+        );
+
+        if self.is_mtp_batch_mode() {
             for s in 0..cur_slots.min(self.mtp_batch_slots.len()) {
+                let new_cap = new_slot_pages.get(s).copied().unwrap_or(0) * 16;
                 if active.get(s).is_none_or(|e| e.is_none())
                     && self.batch_slot_resident_tokens(s).len() > new_cap
                 {
@@ -941,7 +1144,7 @@ impl NativeProposer {
         let new_cap = match &mut self.ranks {
             Ranks::Mtp(rs) => {
                 for (r, t) in rs.iter_mut().zip(&engine.ranks) {
-                    r.reconfigure_batch_slot_count(t, target_slots)?;
+                    r.reconfigure_batch_slot_pages(t, &new_slot_pages)?;
                 }
                 rs[0].batch_slot_capacity()
             }

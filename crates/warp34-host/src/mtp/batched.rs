@@ -17,14 +17,15 @@ pub(crate) struct MtpIngestSlice<'a> {
 impl Qwen3_5MtpRank {
     fn validate_distinct_batch_slots(&self, slots: &[usize], extra_tokens: &[usize]) -> Result<()> {
         let slot_count = self.batch_slot_count();
-        let slot_cap = self.batch_slot_capacity();
         if !self.batch_mode || !self.supports_cuda_graph() || slots.len() != extra_tokens.len() {
             return Err(loader_err("invalid batched MTP slot configuration"));
         }
         let mut seen = 0u16;
         for (&slot, &extra) in slots.iter().zip(extra_tokens) {
+            let slot_cap = self.slot_capacity(slot);
             if slot >= slot_count
                 || slot >= 16
+                || slot_cap < 32
                 || (seen & (1u16 << slot)) != 0
                 || self.slot_len(slot) != self.slot_committed(slot)
                 || self.slot_len(slot).saturating_add(extra) > slot_cap
@@ -100,8 +101,7 @@ impl Qwen3_5MtpRank {
             .scratch
             .alloc_aligned(total_tokens * (local_q_heads * head_dim) * 2)?;
 
-        let slot_count = self.batch_slot_count();
-        let slot_pages = self.all_pages.len() / slot_count;
+        let slot_pages = self.max_slot_page_count();
         let num_reqs = nonempty.len();
         let mut meta = Vec::with_capacity(3 * total_tokens + 3 * num_reqs + 1);
         for s in &nonempty {
@@ -113,7 +113,7 @@ impl Qwen3_5MtpRank {
         }
         for s in &nonempty {
             let start = self.slot_len(s.slot);
-            let page_base = s.slot * slot_pages;
+            let page_base = self.slot_page_start(s.slot);
             meta.extend(
                 (start..start + s.tokens.len())
                     .map(|p| self.all_pages[page_base + p / 16] * 16 + (p % 16) as i32),
@@ -342,7 +342,7 @@ impl Qwen3_5MtpRank {
         let local_interm = t.cfg.intermediate_size / t.tp_size;
         let q_gate_dim = local_q_heads * head_dim * 2;
         let kv_dim = local_kv_heads * head_dim;
-        let slot_pages = self.all_pages.len() / self.batch_slot_count();
+        let slot_pages = self.max_slot_page_count();
         let slot_cap = slot_pages * 16;
 
         let arena = &mut self.graph_io.propose_arena;
@@ -1110,12 +1110,14 @@ impl Qwen3_5MtpRank {
         }
 
         target.device.make_current()?;
-        let slot_pages = self.all_pages.len() / self.batch_slot_count();
+        let stride_pages = self.max_slot_page_count();
         if self.graph_io.batched.cached_slots.as_slice() != slots {
-            let mut bt_host = Vec::with_capacity(b_reqs * slot_pages);
-            for &slot in slots {
-                bt_host
-                    .extend_from_slice(&self.all_pages[slot * slot_pages..(slot + 1) * slot_pages]);
+            let mut bt_host = vec![0i32; b_reqs * stride_pages];
+            for (b, &slot) in slots.iter().enumerate() {
+                let start = self.slot_page_start(slot);
+                let end = self.slot_page_end(slot);
+                bt_host[b * stride_pages..b * stride_pages + (end - start)]
+                    .copy_from_slice(&self.all_pages[start..end]);
             }
             self.graph_io
                 .batched
@@ -1134,9 +1136,9 @@ impl Qwen3_5MtpRank {
             let after_base = (3 + 3 * step) * MAX_MTP_BATCH_SLOTS;
             for (b, &slot) in slots.iter().enumerate() {
                 let p = self.slot_len(slot) + s_clamped;
+                let page_base = self.slot_page_start(slot);
                 meta[pos_base + b] = p as i32;
-                meta[ws_base + b] =
-                    self.all_pages[slot * slot_pages + p / 16] * 16 + (p % 16) as i32;
+                meta[ws_base + b] = self.all_pages[page_base + p / 16] * 16 + (p % 16) as i32;
                 meta[after_base + b] = (p + 1) as i32;
             }
         }

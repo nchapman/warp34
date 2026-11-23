@@ -329,6 +329,7 @@ pub struct Qwen3_5MtpRank {
     committed: usize,
     active_slot: usize,
     active_batch_slots: usize,
+    slot_page_offsets: [usize; MAX_MTP_BATCH_SLOTS + 1],
     batch_mode: bool,
     slot_state: [(usize, usize); MAX_MTP_BATCH_SLOTS],
     input_fusion: MtpInputFusion,
@@ -809,7 +810,8 @@ impl Qwen3_5MtpRank {
             .and_then(|n| n.checked_mul(arena_rows))
             .and_then(|n| n.checked_add(MTP_SCRATCH_SLACK))
             .ok_or_else(|| loader_err("MTP propose arena overflow"))?;
-        let batched_bt_bytes = mtp_capacity.div_ceil(16).max(MAX_MTP_BATCH_SLOTS) * 4;
+        let batched_bt_bytes =
+            (MAX_MTP_BATCH_SLOTS * mtp_capacity.div_ceil(16)).max(MAX_MTP_BATCH_SLOTS) * 4;
         let graph_io = MtpGraphIo {
             propose_graphs: std::array::from_fn(|_| None),
             batched: BatchedMtpProposeIo {
@@ -1026,6 +1028,8 @@ impl Qwen3_5MtpRank {
         target.stream.synchronize()?;
         let all_pages = pages.clone();
         let active_batch_slots = Self::default_batch_slot_count(all_pages.len());
+        let slot_page_offsets =
+            Self::uniform_slot_page_offsets(all_pages.len(), active_batch_slots);
         Ok(Self {
             use_cuda_graph: !uses_hc && !is_tiered_moe_mtp && qsa.is_none(),
             target_embedding: target.embed_tokens_ptr,
@@ -1044,6 +1048,7 @@ impl Qwen3_5MtpRank {
             committed: 0,
             active_slot: 0,
             active_batch_slots,
+            slot_page_offsets,
             batch_mode: false,
             slot_state: [(0, 0); MAX_MTP_BATCH_SLOTS],
             input_fusion,
@@ -1086,24 +1091,64 @@ impl Qwen3_5MtpRank {
             4
         }
     }
+    pub const fn uniform_slot_page_offsets(
+        total_pages: usize,
+        slot_count: usize,
+    ) -> [usize; MAX_MTP_BATCH_SLOTS + 1] {
+        let count = if slot_count == 0 { 1 } else { slot_count };
+        let slot_pages = total_pages / count;
+        let mut offsets = [count * slot_pages; MAX_MTP_BATCH_SLOTS + 1];
+        let mut s = 0;
+        while s < count && s <= MAX_MTP_BATCH_SLOTS {
+            offsets[s] = s * slot_pages;
+            s += 1;
+        }
+        offsets
+    }
     pub fn max_batch_slot_count(&self) -> usize {
         Self::default_batch_slot_count(self.all_pages.len())
     }
     pub fn reset_batch_slot_count(&mut self) {
         self.active_batch_slots = self.max_batch_slot_count();
+        self.slot_page_offsets =
+            Self::uniform_slot_page_offsets(self.all_pages.len(), self.active_batch_slots);
     }
     pub fn batch_slot_count(&self) -> usize {
         self.active_batch_slots
     }
+    #[inline]
+    pub fn slot_page_start(&self, slot: usize) -> usize {
+        self.slot_page_offsets[slot.min(self.active_batch_slots)]
+    }
+    #[inline]
+    pub fn slot_page_end(&self, slot: usize) -> usize {
+        self.slot_page_offsets[(slot + 1).min(self.active_batch_slots)]
+    }
+    #[inline]
+    pub fn slot_page_count(&self, slot: usize) -> usize {
+        self.slot_page_end(slot)
+            .saturating_sub(self.slot_page_start(slot))
+    }
+    #[inline]
+    pub fn slot_capacity(&self, slot: usize) -> usize {
+        self.slot_page_count(slot) * 16
+    }
+    #[inline]
+    pub fn max_slot_page_count(&self) -> usize {
+        (0..self.active_batch_slots)
+            .map(|s| self.slot_page_count(s))
+            .max()
+            .unwrap_or(0)
+    }
     pub fn batch_slot_capacity(&self) -> usize {
-        (self.all_pages.len() / self.batch_slot_count()) * 16
+        self.slot_capacity(self.active_slot)
     }
     pub fn batch_slot_capacity_for_slots(&self, slots: usize) -> usize {
         let max_slots = self.max_batch_slot_count();
         let clamped = slots.clamp(2, max_slots).next_power_of_two().min(max_slots);
         (self.all_pages.len() / clamped) * 16
     }
-    fn copy_page_range_d2d(
+    fn copy_disjoint_page_range_d2d(
         &self,
         target: &Qwen3_5ModelRank,
         src_page_start: usize,
@@ -1183,10 +1228,134 @@ impl Qwen3_5MtpRank {
         }
         Ok(())
     }
-    /// Dynamically adjusts `active_batch_slots` (`16 <-> 8 <-> 4 <-> 2`) so per-slot capacity
-    /// scales up to `total_capacity / new_slot_count` (`65,536` tokens/slot at 4 slots,
-    /// `131,072` tokens/slot at 2 slots on a `262,144`-token pool) while relocating resident
-    /// KV pages for slots `0..min(old, new)` in-place on device without overlap.
+    fn copy_page_range_d2d(
+        &self,
+        target: &Qwen3_5ModelRank,
+        src_page_start: usize,
+        dst_page_start: usize,
+        pages_to_copy: usize,
+    ) -> Result<()> {
+        if src_page_start == dst_page_start || pages_to_copy == 0 {
+            return Ok(());
+        }
+        if dst_page_start < src_page_start {
+            let step = src_page_start - dst_page_start;
+            let mut off = 0;
+            while off < pages_to_copy {
+                let chunk = step.min(pages_to_copy - off);
+                self.copy_disjoint_page_range_d2d(
+                    target,
+                    src_page_start + off,
+                    dst_page_start + off,
+                    chunk,
+                )?;
+                off += chunk;
+            }
+        } else {
+            let step = dst_page_start - src_page_start;
+            let mut end = pages_to_copy;
+            while end > 0 {
+                let chunk = step.min(end);
+                let off = end - chunk;
+                self.copy_disjoint_page_range_d2d(
+                    target,
+                    src_page_start + off,
+                    dst_page_start + off,
+                    chunk,
+                )?;
+                end = off;
+            }
+        }
+        Ok(())
+    }
+    /// Dynamically reconfigures the per-slot page partition across `new_slot_pages.len()` slots
+    /// (supporting both uniform power-of-two partitions and demand-sized asymmetric partitions)
+    /// while relocating resident KV pages in-place on device in 2 conflict-free passes.
+    pub fn reconfigure_batch_slot_pages(
+        &mut self,
+        target: &Qwen3_5ModelRank,
+        new_slot_pages: &[usize],
+    ) -> Result<()> {
+        let max_slots = self.max_batch_slot_count();
+        let new_slot_count = new_slot_pages.len();
+        if !(2..=max_slots).contains(&new_slot_count) || !new_slot_count.is_power_of_two() {
+            return Err(loader_err("invalid MTP batch slot count"));
+        }
+        let total_pages: usize = new_slot_pages.iter().sum();
+        if total_pages > self.all_pages.len() || new_slot_pages.iter().any(|&p| p * 16 < 32) {
+            return Err(loader_err("insufficient MTP KV pages for batched slots"));
+        }
+        let mut new_offsets = [total_pages; MAX_MTP_BATCH_SLOTS + 1];
+        let mut acc = 0usize;
+        for (s, &p) in new_slot_pages.iter().enumerate() {
+            new_offsets[s] = acc;
+            acc += p;
+        }
+        let old_slot_count = self.active_batch_slots;
+        if new_slot_count == old_slot_count && new_offsets == self.slot_page_offsets {
+            return Ok(());
+        }
+        if !self.batch_mode {
+            self.active_batch_slots = new_slot_count;
+            self.slot_page_offsets = new_offsets;
+            return Ok(());
+        }
+        self.slot_state[self.active_slot] = (self.len, self.committed);
+        let old_offsets = self.slot_page_offsets;
+        let copy_slots = old_slot_count.min(new_slot_count);
+        for (s, &new_pages) in new_slot_pages.iter().enumerate().take(copy_slots) {
+            let max_toks = new_pages * 16;
+            let (len, comm) = self.slot_state[s];
+            let clamped = len.min(max_toks);
+            self.slot_state[s] = (clamped, comm.min(clamped));
+        }
+        for s in copy_slots..MAX_MTP_BATCH_SLOTS {
+            self.slot_state[s] = (0, 0);
+        }
+        // Pass 1: left-movers (`new_start < old_start`) in ascending slot order.
+        for s in 0..copy_slots {
+            let old_start = old_offsets[s];
+            let new_start = new_offsets[s];
+            if new_start < old_start {
+                let old_pages = old_offsets[s + 1] - old_start;
+                let new_pages = new_offsets[s + 1] - new_start;
+                let pages = self.slot_state[s]
+                    .0
+                    .div_ceil(16)
+                    .min(old_pages)
+                    .min(new_pages);
+                self.copy_page_range_d2d(target, old_start, new_start, pages)?;
+            }
+        }
+        // Pass 2: right-movers (`new_start > old_start`) in descending slot order.
+        for s in (0..copy_slots).rev() {
+            let old_start = old_offsets[s];
+            let new_start = new_offsets[s];
+            if new_start > old_start {
+                let old_pages = old_offsets[s + 1] - old_start;
+                let new_pages = new_offsets[s + 1] - new_start;
+                let pages = self.slot_state[s]
+                    .0
+                    .div_ceil(16)
+                    .min(old_pages)
+                    .min(new_pages);
+                self.copy_page_range_d2d(target, old_start, new_start, pages)?;
+            }
+        }
+        self.clear_all_propose_graphs();
+        self.active_batch_slots = new_slot_count;
+        self.slot_page_offsets = new_offsets;
+        self.active_slot = self.active_slot.min(new_slot_count - 1);
+        (self.len, self.committed) = self.slot_state[self.active_slot];
+        let start = self.slot_page_start(self.active_slot);
+        let end = self.slot_page_end(self.active_slot);
+        self.pages = self.all_pages[start..end].to_vec();
+        self.pages_dev = self.all_pages_dev + (start * 4) as u64;
+        self.capacity = (end - start) * 16;
+        Ok(())
+    }
+    /// Dynamically adjusts `active_batch_slots` (`16 <-> 8 <-> 4 <-> 2`) to a uniform
+    /// per-slot partition `total_capacity / new_slot_count`.
     pub fn reconfigure_batch_slot_count(
         &mut self,
         target: &Qwen3_5ModelRank,
@@ -1197,63 +1366,14 @@ impl Qwen3_5MtpRank {
             return Err(loader_err("invalid MTP batch slot count"));
         }
         let new_slot_pages = self.all_pages.len() / new_slot_count;
-        if new_slot_pages * 16 < 32 {
-            return Err(loader_err("insufficient MTP KV pages for batched slots"));
-        }
-        let old_slot_count = self.active_batch_slots;
-        if new_slot_count == old_slot_count {
-            return Ok(());
-        }
-        if !self.batch_mode {
-            self.active_batch_slots = new_slot_count;
-            return Ok(());
-        }
-        self.slot_state[self.active_slot] = (self.len, self.committed);
-        let old_slot_pages = self.all_pages.len() / old_slot_count;
-        if new_slot_pages > old_slot_pages {
-            // Shrinking slot count (e.g. 16 -> 8 -> 4 -> 2): copy in descending slot order
-            // so `s * old_slot_pages -> s * new_slot_pages` never overwrites an uncopied source slot.
-            for s in (1..new_slot_count).rev() {
-                let (len, _) = self.slot_state[s];
-                let pages = len.div_ceil(16).min(old_slot_pages).min(new_slot_pages);
-                self.copy_page_range_d2d(target, s * old_slot_pages, s * new_slot_pages, pages)?;
-            }
-            for s in new_slot_count..MAX_MTP_BATCH_SLOTS {
-                self.slot_state[s] = (0, 0);
-            }
-        } else {
-            // Expanding slot count (e.g. 2 -> 4 -> 8 -> 16): clamp slot 0 to `new_slot_pages * 16`
-            // and copy slots `1..old_slot_count` in ascending slot order so
-            // `s * old_slot_pages -> s * new_slot_pages` never overwrites an uncopied source slot.
-            let (len0, comm0) = self.slot_state[0];
-            let clamped0 = len0.min(new_slot_pages * 16);
-            self.slot_state[0] = (clamped0, comm0.min(clamped0));
-            for s in 1..old_slot_count {
-                let (len, comm) = self.slot_state[s];
-                let clamped_len = len.min(new_slot_pages * 16);
-                let pages = clamped_len.div_ceil(16).min(new_slot_pages);
-                self.copy_page_range_d2d(target, s * old_slot_pages, s * new_slot_pages, pages)?;
-                self.slot_state[s] = (clamped_len, comm.min(clamped_len));
-            }
-            for s in old_slot_count..MAX_MTP_BATCH_SLOTS {
-                self.slot_state[s] = (0, 0);
-            }
-        }
-        self.clear_all_propose_graphs();
-        self.active_batch_slots = new_slot_count;
-        self.active_slot = self.active_slot.min(new_slot_count - 1);
-        (self.len, self.committed) = self.slot_state[self.active_slot];
-        let base = self.active_slot * new_slot_pages;
-        self.pages = self.all_pages[base..base + new_slot_pages].to_vec();
-        self.pages_dev = self.all_pages_dev + (base * 4) as u64;
-        self.capacity = new_slot_pages * 16;
-        Ok(())
+        let pages = vec![new_slot_pages; new_slot_count];
+        self.reconfigure_batch_slot_pages(target, &pages)
     }
     pub fn is_batch_mode(&self) -> bool {
         self.batch_mode
     }
     pub fn set_batch_mode(&mut self, batch_mode: bool) -> Result<()> {
-        if batch_mode && self.batch_slot_capacity() < 32 {
+        if batch_mode && self.slot_capacity(0) < 32 {
             return Err(loader_err("insufficient MTP KV pages for batched slots"));
         }
         if self.batch_mode != batch_mode {
@@ -1267,10 +1387,11 @@ impl Qwen3_5MtpRank {
         self.len = 0;
         self.committed = 0;
         if batch_mode {
-            let slot_pages = self.all_pages.len() / self.batch_slot_count();
-            self.pages = self.all_pages[..slot_pages].to_vec();
-            self.pages_dev = self.all_pages_dev;
-            self.capacity = slot_pages * 16;
+            let start = self.slot_page_start(0);
+            let end = self.slot_page_end(0);
+            self.pages = self.all_pages[start..end].to_vec();
+            self.pages_dev = self.all_pages_dev + (start * 4) as u64;
+            self.capacity = (end - start) * 16;
         } else {
             self.pages = self.all_pages.clone();
             self.pages_dev = self.all_pages_dev;
@@ -1279,7 +1400,7 @@ impl Qwen3_5MtpRank {
         Ok(())
     }
     pub fn promote_single_to_batch_slot0(&mut self) -> Result<()> {
-        let slot_cap = self.batch_slot_capacity();
+        let slot_cap = self.slot_capacity(0);
         if slot_cap < 32 || self.len > slot_cap {
             return Err(loader_err(
                 "single-slot MTP state exceeds batch slot 0 capacity",
@@ -1294,9 +1415,10 @@ impl Qwen3_5MtpRank {
         self.slot_state = [(0, 0); MAX_MTP_BATCH_SLOTS];
         self.slot_state[0] = (self.len, self.committed);
         self.active_slot = 0;
-        let slot_pages = self.all_pages.len() / self.batch_slot_count();
-        self.pages = self.all_pages[..slot_pages].to_vec();
-        self.pages_dev = self.all_pages_dev;
+        let start = self.slot_page_start(0);
+        let end = self.slot_page_end(0);
+        self.pages = self.all_pages[start..end].to_vec();
+        self.pages_dev = self.all_pages_dev + (start * 4) as u64;
         self.capacity = slot_cap;
         Ok(())
     }
@@ -1344,10 +1466,11 @@ impl Qwen3_5MtpRank {
         self.slot_state[self.active_slot] = (self.len, self.committed);
         self.active_slot = slot;
         (self.len, self.committed) = self.slot_state[slot];
-        let slot_pages = self.all_pages.len() / slot_count;
-        self.pages = self.all_pages[slot * slot_pages..(slot + 1) * slot_pages].to_vec();
-        self.pages_dev = self.all_pages_dev + (slot * slot_pages * 4) as u64;
-        self.capacity = slot_pages * 16;
+        let start = self.slot_page_start(slot);
+        let end = self.slot_page_end(slot);
+        self.pages = self.all_pages[start..end].to_vec();
+        self.pages_dev = self.all_pages_dev + (start * 4) as u64;
+        self.capacity = (end - start) * 16;
         Ok(())
     }
     /// Discard provisional suffix. Stale bytes remain unreachable and are overwritten.
@@ -1369,13 +1492,13 @@ impl Qwen3_5MtpRank {
         dst_slot: usize,
         tokens: usize,
     ) -> Result<()> {
-        let slot_count = self.batch_slot_count();
-        let slot_pages = self.all_pages.len() / slot_count;
-        let pages_to_copy = tokens.div_ceil(16).min(slot_pages);
+        let src_pages = self.slot_page_count(src_slot);
+        let dst_pages = self.slot_page_count(dst_slot);
+        let pages_to_copy = tokens.div_ceil(16).min(src_pages).min(dst_pages);
         self.copy_page_range_d2d(
             target,
-            src_slot * slot_pages,
-            dst_slot * slot_pages,
+            self.slot_page_start(src_slot),
+            self.slot_page_start(dst_slot),
             pages_to_copy,
         )?;
         self.slot_state[dst_slot] = (tokens, tokens);

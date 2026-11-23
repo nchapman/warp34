@@ -957,6 +957,41 @@ fn verify_qwen4_mtp_dynamic_slot_reconfigure(
         &comp_host[4 * comp_stride..6 * comp_stride],
         comp_slot0_expected
     );
+    // Asymmetric 4-slot layout: slot 0 gets 2 pages (32 tokens), slot 1 gets 8 pages (128 tokens),
+    // slots 2 & 3 get 3 pages each (48 tokens), relocating slot 1's 2 live pages from 4..6 -> 2..4.
+    mtp_rank
+        .reconfigure_batch_slot_pages(target_rank, &[2, 8, 3, 3])
+        .expect("reconfigure MTP batch slots to asymmetric [2, 8, 3, 3]");
+    assert_eq!(mtp_rank.batch_slot_count(), 4);
+    assert_eq!(mtp_rank.slot_capacity(0), 32);
+    assert_eq!(mtp_rank.slot_capacity(1), 128);
+    assert_eq!(mtp_rank.slot_capacity(2), 48);
+    assert_eq!(mtp_rank.slot_capacity(3), 48);
+    assert_eq!((mtp_rank.slot_len(0), mtp_rank.slot_committed(0)), (32, 32));
+    {
+        let kv_layer = &mtp_rank.kv_pool().layers[0];
+        kv_layer
+            .qsa_raw_k_buf
+            .as_ref()
+            .unwrap()
+            .copy_to_host(&mut raw_host, &target_rank.stream)
+            .unwrap();
+        kv_layer
+            .qsa_comp_k_buf
+            .as_ref()
+            .unwrap()
+            .copy_to_host(&mut comp_host, &target_rank.stream)
+            .unwrap();
+        target_rank.stream.synchronize().unwrap();
+    }
+    assert_eq!(
+        &raw_host[2 * raw_stride..4 * raw_stride],
+        raw_slot0_expected
+    );
+    assert_eq!(
+        &comp_host[2 * comp_stride..4 * comp_stride],
+        comp_slot0_expected
+    );
 }
 
 fn verify_qwen4_mtp_engine_worker_and_capacity(
