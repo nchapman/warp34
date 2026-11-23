@@ -713,20 +713,18 @@ impl TokenBitmaskConstraint {
         let mut used = false;
         if let Some(prefix) = &self.gate {
             if self.eos_ids.contains(&id) {
-                self.terminal = true;
-            } else {
-                let (next, answer) =
-                    gate_token(prefix, &self.bytes[id as usize], self.implicit_tool);
-                if let Some(answer) = answer
-                    && !answer.is_empty()
-                {
-                    if !self.matcher.as_mut().unwrap().accept_bytes(&answer) {
-                        return Err("reasoning boundary suffix violates grammar".into());
-                    }
-                    used = true;
-                }
-                self.gate = next;
+                return Err("EOS token is not allowed inside reasoning gate".into());
             }
+            let (next, answer) = gate_token(prefix, &self.bytes[id as usize], self.implicit_tool);
+            if let Some(answer) = answer
+                && !answer.is_empty()
+            {
+                if !self.matcher.as_mut().unwrap().accept_bytes(&answer) {
+                    return Err("reasoning boundary suffix violates grammar".into());
+                }
+                used = true;
+            }
+            self.gate = next;
         } else if let Some(m) = &mut self.matcher {
             if !m.accept_token(id) {
                 return Err(format!("native matcher rejected token {id}"));
@@ -770,6 +768,14 @@ impl TokenBitmaskConstraint {
             if let Some(saved) = cached.get(prefix) {
                 self.mask.clone_from(saved);
                 return Ok(());
+            }
+            // Mask EOS/stop tokens while inside `<think>` so the model must emit
+            // `</think>` (or an implicit `<tool_call>`) before terminating, matching
+            // upstream xgrammar/vLLM `_build_reasoning_prefix`.
+            for &eos in &self.eos_ids {
+                if eos >= 0 && (eos as usize) < self.vocab_size {
+                    mask[eos as usize / 32] &= !(1 << (eos as usize % 32));
+                }
             }
             // Only tokens that cross a boundary need a matcher fork. Ordinary
             // reasoning tokens never clone the growing grammar parser.
@@ -1239,6 +1245,62 @@ mod tests {
         assert!(
             c.is_token_allowed(b'<' as i32),
             "'<' must be allowed after <tool_call>\\n to start <function=bash>"
+        );
+    }
+
+    #[test]
+    fn eos_is_masked_inside_reasoning_gate() {
+        let f = factory();
+        // 1. JSON schema with thinking=true: EOS must be masked until </think> + valid JSON.
+        let mut c = f.json_object(true).unwrap();
+        assert!(c.in_reasoning_gate());
+        assert!(
+            !c.is_token_allowed(256),
+            "EOS must be masked while inside <think> reasoning gate"
+        );
+        assert!(c.advance(256).is_err());
+        // Reasoning text stays inside the gate and keeps EOS masked.
+        c.advance(b'a' as i32).unwrap();
+        assert!(c.in_reasoning_gate());
+        assert!(!c.is_token_allowed(256));
+        // Close `</think>` byte-by-byte; still need valid JSON object before EOS.
+        for &b in b"</think>" {
+            c.advance(b as i32).unwrap();
+        }
+        assert!(!c.in_reasoning_gate());
+        assert!(!c.is_token_allowed(256));
+        c.advance(b'{' as i32).unwrap();
+        c.advance(b'}' as i32).unwrap();
+        assert!(c.is_token_allowed(256));
+
+        // 2. Tools with thinking=true (Auto): EOS must be masked inside <think>, allowed after </think>.
+        let tools = json!([{
+            "type": "function",
+            "function": {
+                "name": "ping",
+                "parameters": { "type": "object", "properties": {} }
+            }
+        }]);
+        let mut t = f
+            .tools_with_parallel(
+                &tools,
+                &crate::tool_constraints::ToolChoice::Auto,
+                true,
+                true,
+            )
+            .unwrap();
+        assert!(t.in_reasoning_gate());
+        assert!(
+            !t.is_token_allowed(256),
+            "EOS must be masked inside <think> for tools(Auto)"
+        );
+        for &b in b"</think>" {
+            t.advance(b as i32).unwrap();
+        }
+        assert!(!t.in_reasoning_gate());
+        assert!(
+            t.is_token_allowed(256),
+            "EOS must be allowed after </think> for tools(Auto)"
         );
     }
 }
