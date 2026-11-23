@@ -1251,22 +1251,23 @@ impl Qwen3_5Engine {
                     break;
                 }
 
-                for seq in &mut sched.active {
-                    self.materialize_pending_checkpoint(&mut seq.radix_state)?;
-                    let total_len = seq
+                for idx in 0..sched.active.len() {
+                    self.materialize_pending_checkpoint(&mut sched.active[idx].radix_state)?;
+                    let total_len = sched.active[idx]
                         .prompt_tokens
                         .len()
-                        .checked_add(seq.max_new_tokens)
+                        .checked_add(sched.active[idx].max_new_tokens)
                         .and_then(|v| v.checked_add(4))
                         .ok_or_else(|| loader_err("token length overflow in scheduler"))?;
                     let needed = total_len.div_ceil(16);
                     if !self.reserve_kv_pages_from(
                         &mut sched.radix,
-                        &mut seq.radix_state.kv_pages,
+                        &mut sched.active[idx].radix_state.kv_pages,
                         needed,
                     ) {
                         return Err(loader_err("KvPool out of pages in scheduler"));
                     }
+                    sched.resolve_promoted_host_kv_pages();
                 }
 
                 let step_slices = sched.schedule_step();

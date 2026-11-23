@@ -547,6 +547,21 @@ impl SchedulerV1 {
         evictions
     }
 
+    /// Propagates any L2 Host -> L1 VRAM page promotions recorded in `self.radix` across all
+    /// active sequences so sibling requests admitted in the same tick never reference a freed
+    /// L2 `host_pid` that could be reused by a subsequent swap-out (`ABA` prevention).
+    pub fn resolve_promoted_host_kv_pages(&mut self) {
+        for peer in &mut self.active {
+            for pid in &mut peer.radix_state.kv_pages {
+                if crate::cache::is_host_kv_page(*pid)
+                    && let Some(vram_pid) = self.radix.get_promoted_vram_page(*pid)
+                {
+                    *pid = vram_pid;
+                }
+            }
+        }
+    }
+
     /// Schedules the next batch of decode steps and chunk-aligned prefill slices within
     /// `cfg.max_num_batched_tokens`.
     pub fn schedule_step(&self) -> Vec<ScheduledReqSlice> {

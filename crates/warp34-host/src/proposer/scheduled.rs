@@ -740,6 +740,219 @@ impl NativeProposer {
         Ok(())
     }
 
+    fn move_mtp_batch_slot_state<T>(
+        &mut self,
+        engine: &Qwen3_5Engine,
+        active: &mut [Option<T>],
+        src: usize,
+        dst: usize,
+    ) -> Result<()> {
+        if src == dst {
+            return Ok(());
+        }
+        self.select_mtp_batch_slot(0)?;
+        if let Ranks::Mtp(rs) = &mut self.ranks {
+            for (r, t) in rs.iter_mut().zip(&engine.ranks) {
+                let len = r.slot_len(src);
+                let comm = r.slot_committed(src);
+                r.copy_kv_from_slot(t, src, dst, len)?;
+                r.set_slot_state(dst, len, comm);
+                r.set_slot_state(src, 0, 0);
+            }
+        }
+        if dst == 0 {
+            self.commit_current_memo();
+            std::mem::swap(&mut self.tail, &mut self.mtp_batch_slots[src].tail);
+            std::mem::swap(
+                &mut self.resident_tokens,
+                &mut self.mtp_batch_slots[src].resident_tokens,
+            );
+            std::mem::swap(
+                &mut self.resident_valid_from,
+                &mut self.mtp_batch_slots[src].resident_valid_from,
+            );
+            std::mem::swap(&mut self.current, &mut self.mtp_batch_slots[src].current);
+            self.processed = self.mtp_batch_slots[src].processed;
+            self.active_slot_last_used_tick = self.mtp_batch_slots[src].last_used_tick;
+            let (left, right) = self.mtp_batch_slots.split_at_mut(src);
+            std::mem::swap(
+                &mut left[0].captured_verify_hidden,
+                &mut right[0].captured_verify_hidden,
+            );
+            self.mtp_batch_slots[src].resident_tokens.clear();
+            self.mtp_batch_slots[src].resident_valid_from = 0;
+            self.mtp_batch_slots[src].processed = 0;
+            self.mtp_batch_slots[src].current = None;
+            self.mtp_batch_slots[src].last_used_tick = 0;
+        } else if src == 0 {
+            if let Some(memo) = self.mtp_batch_slots[dst].current.take() {
+                super::push_mtp_memo(&mut self.memos, memo);
+            }
+            std::mem::swap(&mut self.tail, &mut self.mtp_batch_slots[dst].tail);
+            std::mem::swap(
+                &mut self.resident_tokens,
+                &mut self.mtp_batch_slots[dst].resident_tokens,
+            );
+            std::mem::swap(
+                &mut self.resident_valid_from,
+                &mut self.mtp_batch_slots[dst].resident_valid_from,
+            );
+            std::mem::swap(&mut self.current, &mut self.mtp_batch_slots[dst].current);
+            self.mtp_batch_slots[dst].processed = self.processed;
+            self.mtp_batch_slots[dst].last_used_tick = self.active_slot_last_used_tick;
+            let (left, right) = self.mtp_batch_slots.split_at_mut(dst);
+            std::mem::swap(
+                &mut left[0].captured_verify_hidden,
+                &mut right[0].captured_verify_hidden,
+            );
+            self.resident_tokens.clear();
+            self.resident_valid_from = 0;
+            self.processed = 0;
+            self.current = None;
+            self.active_slot_last_used_tick = 0;
+        } else {
+            if let Some(memo) = self.mtp_batch_slots[dst].current.take() {
+                super::push_mtp_memo(&mut self.memos, memo);
+            }
+            self.mtp_batch_slots.swap(src, dst);
+            self.mtp_batch_slots[src].resident_tokens.clear();
+            self.mtp_batch_slots[src].resident_valid_from = 0;
+            self.mtp_batch_slots[src].processed = 0;
+            self.mtp_batch_slots[src].current = None;
+            self.mtp_batch_slots[src].last_used_tick = 0;
+        }
+        if src < active.len() && dst < active.len() {
+            active[dst] = active[src].take();
+        }
+        Ok(())
+    }
+
+    /// Dynamically adapts the MTP batch slot partition (`16 <-> 8 <-> 4 <-> 2`) so sequences
+    /// exceeding `16,384` tokens (up to `65,536` tokens across 4 slots or `131,072` tokens across
+    /// 2 slots on a `262,144`-token pool) remain in batched `MTP-3` without dropping to `1 tok/step`.
+    pub(crate) fn adapt_mtp_batch_slot_count<T>(
+        &mut self,
+        engine: &Qwen3_5Engine,
+        active: &mut [Option<T>],
+        desired_slots: usize,
+        max_seq_len: usize,
+    ) -> Result<bool> {
+        let (cur_slots, max_slots, cur_cap) = match &self.ranks {
+            Ranks::Mtp(rs) => {
+                let Some(r0) = rs.first() else {
+                    return Ok(false);
+                };
+                (
+                    r0.batch_slot_count(),
+                    r0.max_batch_slot_count(),
+                    r0.batch_slot_capacity(),
+                )
+            }
+            Ranks::DFlash(_) => return Ok(self.fits_mtp_batch_slot_capacity(max_seq_len)),
+        };
+        let active_count = active.iter().filter(|s| s.is_some()).count();
+        let min_slots = desired_slots
+            .max(active_count)
+            .clamp(2, max_slots)
+            .next_power_of_two()
+            .min(max_slots);
+        let required_tokens = max_seq_len.saturating_add(self.k + 2);
+        let target_slots = if required_tokens > cur_cap {
+            // Shrink slot count (e.g. 16 -> 8 -> 4 -> 2) to increase per-slot capacity.
+            let Ranks::Mtp(rs) = &self.ranks else {
+                unreachable!()
+            };
+            let mut candidate = cur_slots;
+            while candidate > min_slots
+                && rs[0].batch_slot_capacity_for_slots(candidate) < required_tokens
+            {
+                candidate /= 2;
+            }
+            if rs[0].batch_slot_capacity_for_slots(candidate) < required_tokens {
+                return Ok(false);
+            }
+            candidate
+        } else if min_slots > cur_slots {
+            // Expand slot count (e.g. 4 -> 8 -> 16) when concurrency rises and all sequences fit.
+            let Ranks::Mtp(rs) = &self.ranks else {
+                unreachable!()
+            };
+            if rs[0].batch_slot_capacity_for_slots(min_slots) >= required_tokens {
+                min_slots
+            } else {
+                return Ok(false);
+            }
+        } else {
+            return Ok(true);
+        };
+
+        if target_slots == cur_slots {
+            return Ok(true);
+        }
+
+        if self.is_mtp_batch_mode() && target_slots < cur_slots {
+            self.select_mtp_batch_slot(0)?;
+            // 1. Compact any occupied active slots from `target_slots..cur_slots` into `0..target_slots`.
+            for src in target_slots..cur_slots.min(active.len()) {
+                if active[src].is_none() {
+                    continue;
+                }
+                let dst = (0..target_slots)
+                    .filter(|&d| active[d].is_none())
+                    .min_by_key(|&d| {
+                        (
+                            !self.batch_slot_resident_tokens(d).is_empty(),
+                            self.batch_slot_last_used_tick(d),
+                        )
+                    })
+                    .ok_or_else(|| loader_err("no free MTP batch slot for compaction"))?;
+                self.move_mtp_batch_slot_state(engine, active, src, dst)?;
+            }
+            // 2. Relocate any warm unoccupied slots from `target_slots..cur_slots` into empty slots in `0..target_slots`.
+            for src in target_slots..cur_slots.min(self.mtp_batch_slots.len()) {
+                if self.batch_slot_resident_tokens(src).is_empty() {
+                    continue;
+                }
+                if let Some(dst) = (0..target_slots).find(|&d| {
+                    active.get(d).is_none_or(|e| e.is_none())
+                        && self.batch_slot_resident_tokens(d).is_empty()
+                }) {
+                    self.move_mtp_batch_slot_state(engine, active, src, dst)?;
+                } else {
+                    self.reset_mtp_batch_slot(src)?;
+                }
+            }
+            self.select_mtp_batch_slot(0)?;
+        } else if self.is_mtp_batch_mode() && target_slots > cur_slots {
+            let new_cap = match &self.ranks {
+                Ranks::Mtp(rs) => rs[0].batch_slot_capacity_for_slots(target_slots),
+                Ranks::DFlash(_) => unreachable!(),
+            };
+            for s in 0..cur_slots.min(self.mtp_batch_slots.len()) {
+                if active.get(s).is_none_or(|e| e.is_none())
+                    && self.batch_slot_resident_tokens(s).len() > new_cap
+                {
+                    self.reset_mtp_batch_slot(s)?;
+                }
+            }
+            self.select_mtp_batch_slot(0)?;
+        }
+
+        let new_cap = match &mut self.ranks {
+            Ranks::Mtp(rs) => {
+                for (r, t) in rs.iter_mut().zip(&engine.ranks) {
+                    r.reconfigure_batch_slot_count(t, target_slots)?;
+                }
+                rs[0].batch_slot_capacity()
+            }
+            Ranks::DFlash(_) => unreachable!(),
+        };
+        if self.is_mtp_batch_mode() {
+            self.capacity = new_cap;
+        }
+        Ok(true)
+    }
+
     /// Execute one batched `B = 2..=4` greedy MTP propose + shared target verification round.
     /// Each active slot runs its fast single-layer MTP draft graph (`k = 1..3`), then all
     /// `B` sequences verify together in a single target `step_batch_slices` pass (`M = sum(1 + k_b)`).

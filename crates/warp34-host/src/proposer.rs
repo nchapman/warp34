@@ -456,6 +456,12 @@ impl NativeProposer {
         })
     }
     pub(crate) fn clear_all_caches(&mut self) -> Result<()> {
+        let _ = self.set_mtp_batch_mode(false);
+        if let Ranks::Mtp(rs) = &mut self.ranks {
+            for r in rs {
+                r.reset_batch_slot_count();
+            }
+        }
         self.abort_scheduled();
         self.memos.clear();
         self.current = None;
@@ -2473,9 +2479,12 @@ impl NativeProposer {
         };
         let cached = hit.matched_tokens;
         self.restore(engine, &radix_prompt[..cached])?;
-        let (active, pp) = engine
-            .alloc_three_state_slots()
-            .ok_or_else(|| loader_err("no speculative request state slots"))?;
+        engine.radix.inc_lock_ref(hit.last_node);
+        let Some((active, pp)) = engine.alloc_three_state_slots() else {
+            engine.radix.dec_lock_ref(hit.last_node);
+            return Err(loader_err("no speculative request state slots"));
+        };
+        engine.radix.dec_lock_ref(hit.last_node);
         let mut req = ReqRadixState::new(16, 64, active, pp);
         req.restore_prefix_hit(&mut engine.radix, &radix_prompt, &hit);
         let mut tx = StateTx::new(active);

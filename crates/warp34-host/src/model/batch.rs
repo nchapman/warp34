@@ -31,7 +31,99 @@ impl Qwen3_5Engine {
         out
     }
 
+    /// Frees at least `needed_vram` L1 GPU VRAM pages by first non-destructively demoting
+    /// unlocked `MambaRadixCache` KV pages to L2 Host RAM (`HostKvSwapPool`), evicting the
+    /// coldest L2-backed leaves if `HostKvSwapPool` is full, and falling back to destructive
+    /// L1 leaf eviction (`evict_full_pages`) only when L2 Host swap is disabled or exhausted.
+    fn reclaim_vram_kv_pages_from(&mut self, radix: &mut MambaRadixCache, needed_vram: usize) {
+        let avail = self.ranks[0].kv_pool.free_count();
+        if avail >= needed_vram {
+            return;
+        }
+        let deficit = needed_vram - avail;
+        let max_host_pages = self
+            .ranks
+            .iter()
+            .map(|r| r.kv_pool.host_swap.as_ref().map_or(0, |h| h.max_pages))
+            .min()
+            .unwrap_or(0);
+        if max_host_pages > 0 {
+            let desired_swap = deficit.max(64).min(max_host_pages);
+            let mut targets = radix.collect_swappable_vram_pages(desired_swap);
+            let mut host_free = self
+                .ranks
+                .iter()
+                .map(|r| r.kv_pool.host_free_count())
+                .min()
+                .unwrap_or(0);
+            if !targets.is_empty() && host_free < targets.len() {
+                let ev_host = radix.evict_host_pages(targets.len() - host_free);
+                if !ev_host.freed_kv_pages.is_empty() || !ev_host.freed_mamba_slots.is_empty() {
+                    self.free_kv_pages(&ev_host.freed_kv_pages);
+                    self.free_state_slots(&ev_host.freed_mamba_slots);
+                }
+                host_free = self
+                    .ranks
+                    .iter()
+                    .map(|r| r.kv_pool.host_free_count())
+                    .min()
+                    .unwrap_or(0);
+                targets = radix.collect_swappable_vram_pages(desired_swap.min(host_free));
+            }
+            if !targets.is_empty() && host_free >= targets.len() {
+                let vram_pages: Vec<i32> = targets.iter().map(|&(_, _, pid)| pid).collect();
+                let mut per_rank_host: Vec<Vec<i32>> = Vec::with_capacity(self.ranks.len());
+                let mut ok = true;
+                for r in &mut self.ranks {
+                    let res = r
+                        .kv_pool
+                        .host_swap
+                        .as_mut()
+                        .expect("max_host_pages > 0")
+                        .swap_out_pages(
+                            &r.kv_pool.layers,
+                            r.kv_pool.num_pages,
+                            &vram_pages,
+                            &r.stream,
+                        );
+                    match res {
+                        Ok(hp) => per_rank_host.push(hp),
+                        Err(_) => {
+                            ok = false;
+                            break;
+                        }
+                    }
+                }
+                if ok && per_rank_host.windows(2).all(|w| w[0] == w[1]) {
+                    for r in &mut self.ranks {
+                        for &vp in &vram_pages {
+                            r.kv_pool.free_page(vp);
+                        }
+                    }
+                    radix.apply_swapped_out_pages(&targets, &per_rank_host[0]);
+                } else {
+                    // Roll back allocated L2 host slots on any rank that succeeded; L1 VRAM
+                    // pages were only read (not freed yet), so TP=2 PageBitmaps stay in lockstep.
+                    for (r, hp) in self.ranks.iter_mut().zip(per_rank_host) {
+                        for h_pid in hp {
+                            r.kv_pool.free_page(h_pid);
+                        }
+                    }
+                }
+            }
+        }
+        let avail_after_swap = self.ranks[0].kv_pool.free_count();
+        if avail_after_swap < needed_vram {
+            let ev = radix.evict_full_pages(needed_vram - avail_after_swap);
+            if !ev.freed_kv_pages.is_empty() || !ev.freed_mamba_slots.is_empty() {
+                self.free_kv_pages(&ev.freed_kv_pages);
+                self.free_state_slots(&ev.freed_mamba_slots);
+            }
+        }
+    }
+
     pub fn alloc_kv_page_from(&mut self, radix: &mut MambaRadixCache) -> Option<i32> {
+        self.reclaim_vram_kv_pages_from(radix, 1);
         if let Some(p0) = self.ranks[0].kv_pool.alloc_page() {
             for r in &mut self.ranks[1..] {
                 let p_peer = r.kv_pool.alloc_page();
@@ -39,43 +131,81 @@ impl Qwen3_5Engine {
             }
             return Some(p0);
         }
-        let ev = radix.evict_full_pages(1);
-        if !ev.freed_kv_pages.is_empty() || !ev.freed_mamba_slots.is_empty() {
-            self.free_kv_pages(&ev.freed_kv_pages);
-            self.free_state_slots(&ev.freed_mamba_slots);
-            if let Some(p0) = self.ranks[0].kv_pool.alloc_page() {
-                for r in &mut self.ranks[1..] {
-                    let p_peer = r.kv_pool.alloc_page();
-                    debug_assert_eq!(Some(p0), p_peer);
-                }
-                return Some(p0);
-            }
-        }
         None
     }
 
-    /// Evicts any deficit pages from `radix` in a single batch before allocating `target_pages`
-    /// from the ascending `KvPool` bitmap, preserving physical page contiguity across evictions.
+    /// Promotes any L2 Host-RAM KV pages in `dst` back to L1 GPU VRAM and allocates up to
+    /// `target_pages` total L1 VRAM pages, non-destructively demoting unlocked `radix` pages
+    /// to L2 Host RAM before falling back to leaf eviction.
     pub fn reserve_kv_pages_from(
         &mut self,
         radix: &mut MambaRadixCache,
         dst: &mut Vec<i32>,
         target_pages: usize,
     ) -> bool {
-        if dst.len() >= target_pages {
-            return true;
-        }
-        let missing = target_pages - dst.len();
-        let avail = self.ranks[0].kv_pool.free_count();
-        if avail < missing {
-            let ev = radix.evict_full_pages(missing - avail);
-            if !ev.freed_kv_pages.is_empty() || !ev.freed_mamba_slots.is_empty() {
-                self.free_kv_pages(&ev.freed_kv_pages);
-                self.free_state_slots(&ev.freed_mamba_slots);
+        for pid in dst.iter_mut() {
+            if crate::cache::is_host_kv_page(*pid)
+                && let Some(already_vram) = radix.get_promoted_vram_page(*pid)
+            {
+                *pid = already_vram;
             }
         }
-        if self.ranks[0].kv_pool.free_count() < missing {
+        let host_positions: Vec<(usize, i32)> = dst
+            .iter()
+            .copied()
+            .enumerate()
+            .filter(|&(_, pid)| crate::cache::is_host_kv_page(pid))
+            .collect();
+        let missing = target_pages.saturating_sub(dst.len());
+        let total_vram_needed = host_positions.len() + missing;
+        if total_vram_needed == 0 {
+            return true;
+        }
+        self.reclaim_vram_kv_pages_from(radix, total_vram_needed);
+        if self.ranks[0].kv_pool.free_count() < total_vram_needed {
             return false;
+        }
+        if !host_positions.is_empty() {
+            let mut promoted_vram = Vec::with_capacity(host_positions.len());
+            for _ in 0..host_positions.len() {
+                let p0 = self.ranks[0]
+                    .kv_pool
+                    .alloc_page()
+                    .expect("free_count verified before host page promotion");
+                for r in &mut self.ranks[1..] {
+                    let p_peer = r.kv_pool.alloc_page();
+                    debug_assert_eq!(Some(p0), p_peer);
+                }
+                promoted_vram.push(p0);
+            }
+            let host_pages: Vec<i32> = host_positions.iter().map(|&(_, h)| h).collect();
+            let mut swap_in_ok = true;
+            for r in &mut self.ranks {
+                if r.kv_pool
+                    .swap_in_pages_from_host(&host_pages, &promoted_vram, false, &r.stream)
+                    .is_err()
+                {
+                    swap_in_ok = false;
+                    break;
+                }
+            }
+            if !swap_in_ok {
+                for r in &mut self.ranks {
+                    for &vp in &promoted_vram {
+                        r.kv_pool.free_page(vp);
+                    }
+                }
+                return false;
+            }
+            for r in &mut self.ranks {
+                for &hp in &host_pages {
+                    r.kv_pool.free_page(hp);
+                }
+            }
+            for (&(idx, _), &vram_pid) in host_positions.iter().zip(promoted_vram.iter()) {
+                dst[idx] = vram_pid;
+            }
+            radix.record_host_page_promotions(&host_pages, &promoted_vram);
         }
         dst.reserve(missing);
         for _ in 0..missing {

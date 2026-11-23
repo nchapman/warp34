@@ -887,6 +887,78 @@ fn test_qwen4_exp_synthetic_2layer_tp1_tp2_radix_and_cuda_graph() {
     let _ = fs::remove_dir_all(&dir);
 }
 
+fn verify_qwen4_mtp_dynamic_slot_reconfigure(
+    mtp_rank: &mut warp34_host::mtp::Qwen3_5MtpRank,
+    target_rank: &warp34_host::model::Qwen3_5ModelRank,
+    raw_stride: usize,
+    comp_stride: usize,
+    raw_slot0_expected: &[u8],
+    comp_slot0_expected: &[u8],
+) {
+    mtp_rank
+        .reconfigure_batch_slot_count(target_rank, 2)
+        .expect("shrink MTP batch slots 4 -> 2");
+    assert_eq!(mtp_rank.batch_slot_count(), 2);
+    assert_eq!(mtp_rank.batch_slot_capacity(), 128);
+    let mut raw_host = vec![0u8; 16 * raw_stride];
+    let mut comp_host = vec![0u8; 16 * comp_stride];
+    {
+        let kv_layer = &mtp_rank.kv_pool().layers[0];
+        kv_layer
+            .qsa_raw_k_buf
+            .as_ref()
+            .unwrap()
+            .copy_to_host(&mut raw_host, &target_rank.stream)
+            .unwrap();
+        kv_layer
+            .qsa_comp_k_buf
+            .as_ref()
+            .unwrap()
+            .copy_to_host(&mut comp_host, &target_rank.stream)
+            .unwrap();
+        target_rank.stream.synchronize().unwrap();
+    }
+    assert_eq!(
+        &raw_host[8 * raw_stride..10 * raw_stride],
+        raw_slot0_expected
+    );
+    assert_eq!(
+        &comp_host[8 * comp_stride..10 * comp_stride],
+        comp_slot0_expected
+    );
+    mtp_rank.set_slot_state(0, 96, 96);
+    mtp_rank
+        .reconfigure_batch_slot_count(target_rank, 4)
+        .expect("expand MTP batch slots 2 -> 4");
+    assert_eq!(mtp_rank.batch_slot_count(), 4);
+    assert_eq!(mtp_rank.batch_slot_capacity(), 64);
+    assert_eq!((mtp_rank.slot_len(0), mtp_rank.slot_committed(0)), (64, 64));
+    {
+        let kv_layer = &mtp_rank.kv_pool().layers[0];
+        kv_layer
+            .qsa_raw_k_buf
+            .as_ref()
+            .unwrap()
+            .copy_to_host(&mut raw_host, &target_rank.stream)
+            .unwrap();
+        kv_layer
+            .qsa_comp_k_buf
+            .as_ref()
+            .unwrap()
+            .copy_to_host(&mut comp_host, &target_rank.stream)
+            .unwrap();
+        target_rank.stream.synchronize().unwrap();
+    }
+    assert_eq!(
+        &raw_host[4 * raw_stride..6 * raw_stride],
+        raw_slot0_expected
+    );
+    assert_eq!(
+        &comp_host[4 * comp_stride..6 * comp_stride],
+        comp_slot0_expected
+    );
+}
+
 fn verify_qwen4_mtp_engine_worker_and_capacity(
     dir: &Path,
     prompt: &[i32],
@@ -1156,6 +1228,16 @@ fn verify_qwen4_mtp_engine_worker_and_capacity(
         assert_eq!(
             comp_slot1, comp_slot0,
             "copy_kv_from_slot must copy qsa_comp_k_buf from slot 0 to slot 1"
+        );
+        let raw_slot0_expected = raw_slot0.to_vec();
+        let comp_slot0_expected = comp_slot0.to_vec();
+        verify_qwen4_mtp_dynamic_slot_reconfigure(
+            &mut mtp_rank,
+            &target_ref.ranks[0],
+            raw_stride,
+            comp_stride,
+            &raw_slot0_expected,
+            &comp_slot0_expected,
         );
         drop(mtp_rank);
         c4_prompts

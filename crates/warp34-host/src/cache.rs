@@ -4,7 +4,9 @@
 #[cfg(feature = "cuda")]
 use crate::cuda::{DeviceBuffer, Result};
 mod checkpoint_pool;
+mod host_kv_swap;
 pub use checkpoint_pool::*;
+pub use host_kv_swap::*;
 use warp34_kernels::ffi::{
     WARP34_KV_FORMAT_BF16, WARP34_KV_FORMAT_FP8_E4M3, WARP34_KV_FORMAT_FP16, WARP34_KV_FORMAT_Q8_0,
     WARP34_KV_FORMAT_TQ4, WARP34_KV_TRANSFORM_IDENTITY, WARP34_KV_TRANSFORM_RADEMACHER_WHT256,
@@ -270,6 +272,7 @@ pub struct KvPool {
     pub num_pages: usize,
     pub block_size: usize,
     pub layers: Vec<KvLayerBuffer>,
+    pub host_swap: Option<HostKvSwapPool>,
     free_pages: PageBitmap,
 }
 
@@ -347,8 +350,37 @@ impl KvPool {
             num_pages,
             block_size,
             layers,
+            host_swap: None,
             free_pages,
         })
+    }
+
+    /// Total bytes across all full-attention layers for a single 16-token KV page on this rank.
+    pub fn page_bundle_bytes(&self) -> usize {
+        let vram_pages = self.num_pages.max(1);
+        self.layers
+            .iter()
+            .map(|l| {
+                let k = l.layout.k_page_stride_bytes as usize;
+                let v = l.layout.v_page_stride_bytes as usize;
+                let raw = l
+                    .qsa_raw_k_buf
+                    .as_ref()
+                    .map_or(0, |b| b.len_bytes / vram_pages);
+                let comp = l
+                    .qsa_comp_k_buf
+                    .as_ref()
+                    .map_or(0, |b| b.len_bytes / vram_pages);
+                k + v + raw + comp
+            })
+            .sum()
+    }
+
+    /// Enables lazy-allocated L2 Host-RAM virtual memory swap capacity (`max_host_pages` pages).
+    pub fn enable_host_swap(&mut self, max_host_pages: usize) {
+        self.host_swap = (max_host_pages > 0 && !self.layers.is_empty()).then(|| {
+            HostKvSwapPool::new(self.device_id, &self.layers, self.num_pages, max_host_pages)
+        });
     }
 
     /// Allocates QSA indexer raw (`[num_pages * block_size, indexer_head_dim]`) and compressed
@@ -364,6 +396,9 @@ impl KvPool {
         for layer in &mut self.layers {
             layer.qsa_raw_k_buf = Some(DeviceBuffer::alloc(self.device_id, raw_bytes)?);
             layer.qsa_comp_k_buf = Some(DeviceBuffer::alloc(self.device_id, comp_bytes)?);
+        }
+        if let Some(max_host_pages) = self.host_swap.as_ref().map(|h| h.max_pages) {
+            self.enable_host_swap(max_host_pages);
         }
         Ok(())
     }
@@ -393,16 +428,78 @@ impl KvPool {
         self.free_pages.free_count()
     }
 
+    pub fn host_free_count(&self) -> usize {
+        self.host_swap.as_ref().map_or(0, |h| h.free_count())
+    }
+
     pub fn alloc_page(&mut self) -> Option<i32> {
         self.free_pages.alloc()
     }
 
     pub fn free_page(&mut self, page_id: i32) {
-        self.free_pages.free(page_id);
+        if is_host_kv_page(page_id) {
+            if let Some(host_swap) = &mut self.host_swap {
+                host_swap.free_host_page(page_id);
+            }
+        } else {
+            self.free_pages.free(page_id);
+        }
     }
 
     pub fn reset_all_pages(&mut self) {
         self.free_pages.reset();
+        if let Some(host_swap) = &mut self.host_swap {
+            host_swap.reset_all_pages();
+        }
+    }
+
+    /// Swaps `vram_pages` (`0..num_pages`) out to L2 Host RAM on `stream`, releases the
+    /// source L1 VRAM pages back to `self.free_pages`, and returns the allocated tagged
+    /// `host_page_id`s (`>= HOST_KV_PAGE_BASE`).
+    pub fn swap_out_pages_to_host(
+        &mut self,
+        vram_pages: &[i32],
+        stream: &crate::cuda::CudaStream,
+    ) -> Result<Vec<i32>> {
+        let Some(host_swap) = &mut self.host_swap else {
+            return Err(crate::cuda::CudaError::with_detail(
+                -2,
+                "HostKvSwapPool not enabled on KvPool",
+                "enable_host_swap was not called",
+            ));
+        };
+        let host_pages =
+            host_swap.swap_out_pages(&self.layers, self.num_pages, vram_pages, stream)?;
+        for &vram_pid in vram_pages {
+            self.free_pages.free(vram_pid);
+        }
+        Ok(host_pages)
+    }
+
+    /// Swaps `host_pages` (`>= HOST_KV_PAGE_BASE`) from L2 Host RAM into `vram_pages`
+    /// (`0..num_pages`) on `stream`, optionally releasing `host_pages` back to the L2 pool.
+    pub fn swap_in_pages_from_host(
+        &mut self,
+        host_pages: &[i32],
+        vram_pages: &[i32],
+        free_host_after_copy: bool,
+        stream: &crate::cuda::CudaStream,
+    ) -> Result<()> {
+        let Some(host_swap) = &mut self.host_swap else {
+            return Err(crate::cuda::CudaError::with_detail(
+                -2,
+                "HostKvSwapPool not enabled on KvPool",
+                "enable_host_swap was not called",
+            ));
+        };
+        host_swap.swap_in_pages(
+            &self.layers,
+            self.num_pages,
+            host_pages,
+            vram_pages,
+            free_host_after_copy,
+            stream,
+        )
     }
 
     /// Clamps logical page capacity downward so `TP=2` ranks operate in lockstep even when
@@ -411,6 +508,9 @@ impl KvPool {
         if max_pages < self.num_pages {
             self.num_pages = max_pages;
             self.free_pages = PageBitmap::new(max_pages);
+            if let Some(max_host_pages) = self.host_swap.as_ref().map(|h| h.max_pages) {
+                self.enable_host_swap(max_host_pages);
+            }
         }
     }
 }

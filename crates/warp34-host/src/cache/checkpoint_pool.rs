@@ -21,11 +21,11 @@ use warp34_kernels::ffi;
 /// from active `FP32` [`super::StateBundlePool`] indices (`0 .. total_slots`).
 pub const CHECKPOINT_POOL_SLOT_BASE: i32 = 1_000_000;
 
-/// Default process-wide L2 Host-RAM budget (`4 GiB`) across all tensor-parallel ranks.
-pub const DEFAULT_HOST_CHECKPOINT_BUDGET_BYTES: usize = 4 * 1024 * 1024 * 1024;
+/// Default process-wide L2 Host-RAM budget (`8 GiB`) across all tensor-parallel ranks.
+pub const DEFAULT_HOST_CHECKPOINT_BUDGET_BYTES: usize = 8 * 1024 * 1024 * 1024;
 
-/// Maximum automatically planned L2 Host-RAM checkpoint slots (`128` prefixes/turns).
-pub const MAX_AUTO_HOST_CHECKPOINT_SLOTS: usize = 128;
+/// Maximum automatically planned L2 Host-RAM checkpoint slots (`256` prefixes/turns).
+pub const MAX_AUTO_HOST_CHECKPOINT_SLOTS: usize = 256;
 
 /// Maximum automatically planned L1 VRAM checkpoint slots (`16` hot checkpoints).
 pub const MAX_AUTO_VRAM_CHECKPOINT_SLOTS: usize = 16;

@@ -2169,6 +2169,14 @@ impl PrePoolModelRank {
         if cfg.uses_qsa() {
             kv_pool.init_qsa_indexer_caches(cfg.indexer_head_dim, cfg.indexer_compress_ratio)?;
         }
+        if capacity.enable_checkpoint_pool {
+            let host_kv_pages = crate::cache::plan_auto_host_kv_swap_pages(
+                kv_pool.page_bundle_bytes(),
+                tp_size,
+                crate::cache::detect_available_host_ram_bytes(),
+            );
+            kv_pool.enable_host_swap(host_kv_pages);
+        }
 
         let checkpoint_pool = Self::build_rank_checkpoint_pool(
             &device,

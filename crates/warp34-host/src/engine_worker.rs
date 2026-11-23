@@ -1062,11 +1062,16 @@ fn publish_pools(
         ),
         None => (0, 0, None),
     };
+    let host_kv_used = rank
+        .kv_pool
+        .host_swap
+        .as_ref()
+        .map_or(0, |h| h.used_count());
     telemetry.publish_pools(Pools {
         kv: Pool::known(
             rank.kv_pool.num_pages,
             rank.kv_pool.free_count(),
-            radix.full_evictable_pages(),
+            radix.full_evictable_pages().saturating_sub(host_kv_used),
         ),
         gdn: Pool::known(
             rank.state_pool.total_slots.saturating_add(ckpt_total),

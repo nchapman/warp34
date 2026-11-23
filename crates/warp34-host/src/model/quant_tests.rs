@@ -323,6 +323,52 @@ fn compressed_tensors_weight_shape_validates_and_resolves_embed_tokens_bits() {
 }
 
 #[cfg(feature = "cuda")]
+fn verify_engine_l2_host_kv_swap_roundtrip(engine: &mut Qwen3_5Engine) {
+    engine.reset_all_states().unwrap();
+    for r in &mut engine.ranks {
+        r.kv_pool.enable_host_swap(64);
+    }
+    let s1_prompt: Vec<i32> = (0..65).map(|i| (i % 12) + 1).collect();
+    let s1_cold = engine.generate_tokens(&s1_prompt, 2, false).unwrap();
+    let _ = engine
+        .generate_with_radix_cache(&s1_prompt, 1, 64, false)
+        .unwrap();
+    assert_eq!(engine.radix.full_evictable_pages(), 4);
+
+    // Drain all remaining free L1 VRAM pages + 2 more pages so `reserve_kv_pages_from` must
+    // non-destructively swap out 2 of Session 1's unlocked radix KV pages to L2 Host RAM.
+    let drain_count = engine.ranks[0].kv_pool.free_count() + 2;
+    let mut drained = Vec::new();
+    let mut dummy_radix = crate::radix::MambaRadixCache::new(16, 64);
+    std::mem::swap(&mut engine.radix, &mut dummy_radix);
+    assert!(engine.reserve_kv_pages_from(&mut dummy_radix, &mut drained, drain_count));
+    std::mem::swap(&mut engine.radix, &mut dummy_radix);
+    assert!(
+        engine.radix.total_kv_swap_out_pages >= 2,
+        "expected >= 2 pages swapped out to L2 Host RAM, got {}",
+        engine.radix.total_kv_swap_out_pages
+    );
+    engine.free_kv_pages(&drained);
+
+    // Now run Session 1 again through `generate_with_radix_cache`: it hits the 64-token
+    // prefix in `engine.radix`, promotes the swapped-out L2 Host pages back to L1 VRAM in
+    // `reserve_kv_pages_from`, and produces the exact same greedy continuation tokens.
+    let s1_swapped_in = engine
+        .generate_with_radix_cache(&s1_prompt, 2, 64, false)
+        .unwrap();
+    assert!(
+        engine.radix.total_kv_swap_in_pages >= 2,
+        "expected >= 2 pages swapped in from L2 Host RAM, got {}",
+        engine.radix.total_kv_swap_in_pages
+    );
+    assert_eq!(s1_swapped_in.cached_prefix_tokens, 64);
+    assert_eq!(
+        s1_swapped_in.generated_token_ids,
+        s1_cold.generated_token_ids
+    );
+    engine.reset_all_states().unwrap();
+}
+
 #[test]
 fn synthetic_hybrid_engine_forward_generate_and_diagnostics() {
     let _gpu_guard = crate::LIB_GPU_ENGINE_LOCK
@@ -692,6 +738,7 @@ fn synthetic_hybrid_engine_forward_generate_and_diagnostics() {
         .generate_with_radix_cache(&[1, 2, 3, 4, 5, 6], 2, 64, false)
         .unwrap();
     assert_eq!(radix_warm.generated_token_ids.len(), 2);
+    verify_engine_l2_host_kv_swap_roundtrip(&mut engine);
 
     // Exercise `step_batch_slices` with `emit_all_query_tokens: true`, `read_selected_row_candidate_logits`,
     // `read_norm_hidden_row_f32`, and `sample_single_gpu_step`.

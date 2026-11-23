@@ -77,7 +77,10 @@ fn scratch_row_elements(c: &ModelConfig, tp: usize, ffn: usize) -> usize {
         + ffn
 }
 
-const MTP_SCRATCH_SLACK: usize = 2 * 1024 * 1024 + 131072;
+/// Extra headroom for MTP scratch and propose arenas (`4.5 MiB`), covering
+/// `op_paged_attn`'s 64-split long-context reduction workspace (`4.03 MiB` at `B=16`, `H=32`)
+/// on both `TP=1` and `TP=2`.
+const MTP_SCRATCH_SLACK: usize = 4 * 1024 * 1024 + 524288;
 
 /// Mandatory dense MTP allocation peak, excluding the opportunistic draft LM head.
 /// MoE/QSA retain their existing archive-dependent expert/cache contracts: this
@@ -325,6 +328,7 @@ pub struct Qwen3_5MtpRank {
     len: usize,
     committed: usize,
     active_slot: usize,
+    active_batch_slots: usize,
     batch_mode: bool,
     slot_state: [(usize, usize); MAX_MTP_BATCH_SLOTS],
     input_fusion: MtpInputFusion,
@@ -1021,6 +1025,7 @@ impl Qwen3_5MtpRank {
         };
         target.stream.synchronize()?;
         let all_pages = pages.clone();
+        let active_batch_slots = Self::default_batch_slot_count(all_pages.len());
         Ok(Self {
             use_cuda_graph: !uses_hc && !is_tiered_moe_mtp && qsa.is_none(),
             target_embedding: target.embed_tokens_ptr,
@@ -1038,6 +1043,7 @@ impl Qwen3_5MtpRank {
             len: 0,
             committed: 0,
             active_slot: 0,
+            active_batch_slots,
             batch_mode: false,
             slot_state: [(0, 0); MAX_MTP_BATCH_SLOTS],
             input_fusion,
@@ -1071,17 +1077,177 @@ impl Qwen3_5MtpRank {
     pub fn kv_pool(&self) -> &KvPool {
         &self.kv
     }
-    pub fn batch_slot_count(&self) -> usize {
-        if self.all_pages.len() >= 16384 {
+    pub const fn default_batch_slot_count(num_pages: usize) -> usize {
+        if num_pages >= 16384 {
             MAX_MTP_BATCH_SLOTS
-        } else if self.all_pages.len() >= 512 {
+        } else if num_pages >= 512 {
             8
         } else {
             4
         }
     }
+    pub fn max_batch_slot_count(&self) -> usize {
+        Self::default_batch_slot_count(self.all_pages.len())
+    }
+    pub fn reset_batch_slot_count(&mut self) {
+        self.active_batch_slots = self.max_batch_slot_count();
+    }
+    pub fn batch_slot_count(&self) -> usize {
+        self.active_batch_slots
+    }
     pub fn batch_slot_capacity(&self) -> usize {
         (self.all_pages.len() / self.batch_slot_count()) * 16
+    }
+    pub fn batch_slot_capacity_for_slots(&self, slots: usize) -> usize {
+        let max_slots = self.max_batch_slot_count();
+        let clamped = slots.clamp(2, max_slots).next_power_of_two().min(max_slots);
+        (self.all_pages.len() / clamped) * 16
+    }
+    fn copy_page_range_d2d(
+        &self,
+        target: &Qwen3_5ModelRank,
+        src_page_start: usize,
+        dst_page_start: usize,
+        pages_to_copy: usize,
+    ) -> Result<()> {
+        if src_page_start == dst_page_start || pages_to_copy == 0 {
+            return Ok(());
+        }
+        target.device.make_current()?;
+        for layer in &self.kv.layers {
+            let k_stride = layer.layout.k_page_stride_bytes as usize;
+            let v_stride = layer.layout.v_page_stride_bytes as usize;
+            let k_src = layer.k_buf.addr() + (src_page_start * k_stride) as u64;
+            let k_dst = layer.k_buf.addr() + (dst_page_start * k_stride) as u64;
+            let v_src = layer.v_buf.addr() + (src_page_start * v_stride) as u64;
+            let v_dst = layer.v_buf.addr() + (dst_page_start * v_stride) as u64;
+            crate::cuda::check_rc(
+                // SAFETY: `k_src` and `k_dst` refer to disjoint slot page ranges within `layer.k_buf`.
+                unsafe {
+                    ffi::warp34_memcpy_d2d_async(
+                        k_dst as *mut _,
+                        k_src as *const _,
+                        pages_to_copy * k_stride,
+                        target.stream.handle,
+                    )
+                },
+                "MTP slot K copy",
+            )?;
+            crate::cuda::check_rc(
+                // SAFETY: `v_src` and `v_dst` refer to disjoint slot page ranges within `layer.v_buf`.
+                unsafe {
+                    ffi::warp34_memcpy_d2d_async(
+                        v_dst as *mut _,
+                        v_src as *const _,
+                        pages_to_copy * v_stride,
+                        target.stream.handle,
+                    )
+                },
+                "MTP slot V copy",
+            )?;
+            let total_pages = self.kv.num_pages.max(1);
+            if let Some(ref raw_buf) = layer.qsa_raw_k_buf {
+                let raw_stride = raw_buf.len_bytes / total_pages;
+                let r_src = raw_buf.addr() + (src_page_start * raw_stride) as u64;
+                let r_dst = raw_buf.addr() + (dst_page_start * raw_stride) as u64;
+                crate::cuda::check_rc(
+                    // SAFETY: `r_src` and `r_dst` refer to disjoint slot page ranges within `qsa_raw_k_buf`.
+                    unsafe {
+                        ffi::warp34_memcpy_d2d_async(
+                            r_dst as *mut _,
+                            r_src as *const _,
+                            pages_to_copy * raw_stride,
+                            target.stream.handle,
+                        )
+                    },
+                    "MTP slot QSA raw K copy",
+                )?;
+            }
+            if let Some(ref comp_buf) = layer.qsa_comp_k_buf {
+                let comp_stride = comp_buf.len_bytes / total_pages;
+                let c_src = comp_buf.addr() + (src_page_start * comp_stride) as u64;
+                let c_dst = comp_buf.addr() + (dst_page_start * comp_stride) as u64;
+                crate::cuda::check_rc(
+                    // SAFETY: `c_src` and `c_dst` refer to disjoint slot page ranges within `qsa_comp_k_buf`.
+                    unsafe {
+                        ffi::warp34_memcpy_d2d_async(
+                            c_dst as *mut _,
+                            c_src as *const _,
+                            pages_to_copy * comp_stride,
+                            target.stream.handle,
+                        )
+                    },
+                    "MTP slot QSA comp K copy",
+                )?;
+            }
+        }
+        Ok(())
+    }
+    /// Dynamically adjusts `active_batch_slots` (`16 <-> 8 <-> 4 <-> 2`) so per-slot capacity
+    /// scales up to `total_capacity / new_slot_count` (`65,536` tokens/slot at 4 slots,
+    /// `131,072` tokens/slot at 2 slots on a `262,144`-token pool) while relocating resident
+    /// KV pages for slots `0..min(old, new)` in-place on device without overlap.
+    pub fn reconfigure_batch_slot_count(
+        &mut self,
+        target: &Qwen3_5ModelRank,
+        new_slot_count: usize,
+    ) -> Result<()> {
+        let max_slots = self.max_batch_slot_count();
+        if !(2..=max_slots).contains(&new_slot_count) || !new_slot_count.is_power_of_two() {
+            return Err(loader_err("invalid MTP batch slot count"));
+        }
+        let new_slot_pages = self.all_pages.len() / new_slot_count;
+        if new_slot_pages * 16 < 32 {
+            return Err(loader_err("insufficient MTP KV pages for batched slots"));
+        }
+        let old_slot_count = self.active_batch_slots;
+        if new_slot_count == old_slot_count {
+            return Ok(());
+        }
+        if !self.batch_mode {
+            self.active_batch_slots = new_slot_count;
+            return Ok(());
+        }
+        self.slot_state[self.active_slot] = (self.len, self.committed);
+        let old_slot_pages = self.all_pages.len() / old_slot_count;
+        if new_slot_pages > old_slot_pages {
+            // Shrinking slot count (e.g. 16 -> 8 -> 4 -> 2): copy in descending slot order
+            // so `s * old_slot_pages -> s * new_slot_pages` never overwrites an uncopied source slot.
+            for s in (1..new_slot_count).rev() {
+                let (len, _) = self.slot_state[s];
+                let pages = len.div_ceil(16).min(old_slot_pages).min(new_slot_pages);
+                self.copy_page_range_d2d(target, s * old_slot_pages, s * new_slot_pages, pages)?;
+            }
+            for s in new_slot_count..MAX_MTP_BATCH_SLOTS {
+                self.slot_state[s] = (0, 0);
+            }
+        } else {
+            // Expanding slot count (e.g. 2 -> 4 -> 8 -> 16): clamp slot 0 to `new_slot_pages * 16`
+            // and copy slots `1..old_slot_count` in ascending slot order so
+            // `s * old_slot_pages -> s * new_slot_pages` never overwrites an uncopied source slot.
+            let (len0, comm0) = self.slot_state[0];
+            let clamped0 = len0.min(new_slot_pages * 16);
+            self.slot_state[0] = (clamped0, comm0.min(clamped0));
+            for s in 1..old_slot_count {
+                let (len, comm) = self.slot_state[s];
+                let clamped_len = len.min(new_slot_pages * 16);
+                let pages = clamped_len.div_ceil(16).min(new_slot_pages);
+                self.copy_page_range_d2d(target, s * old_slot_pages, s * new_slot_pages, pages)?;
+                self.slot_state[s] = (clamped_len, comm.min(clamped_len));
+            }
+            for s in old_slot_count..MAX_MTP_BATCH_SLOTS {
+                self.slot_state[s] = (0, 0);
+            }
+        }
+        self.clear_all_propose_graphs();
+        self.active_batch_slots = new_slot_count;
+        self.active_slot = self.active_slot.min(new_slot_count - 1);
+        (self.len, self.committed) = self.slot_state[self.active_slot];
+        let base = self.active_slot * new_slot_pages;
+        self.pages = self.all_pages[base..base + new_slot_pages].to_vec();
+        self.pages_dev = self.all_pages_dev + (base * 4) as u64;
+        self.capacity = new_slot_pages * 16;
+        Ok(())
     }
     pub fn is_batch_mode(&self) -> bool {
         self.batch_mode
@@ -1135,7 +1301,7 @@ impl Qwen3_5MtpRank {
         Ok(())
     }
     #[inline]
-    pub(crate) fn slot_len(&self, slot: usize) -> usize {
+    pub fn slot_len(&self, slot: usize) -> usize {
         if slot == self.active_slot {
             self.len
         } else {
@@ -1143,7 +1309,7 @@ impl Qwen3_5MtpRank {
         }
     }
     #[inline]
-    pub(crate) fn slot_committed(&self, slot: usize) -> usize {
+    pub fn slot_committed(&self, slot: usize) -> usize {
         if slot == self.active_slot {
             self.committed
         } else {
@@ -1151,7 +1317,7 @@ impl Qwen3_5MtpRank {
         }
     }
     #[inline]
-    pub(crate) fn set_slot_state(&mut self, slot: usize, len: usize, committed: usize) {
+    pub fn set_slot_state(&mut self, slot: usize, len: usize, committed: usize) {
         self.slot_state[slot] = (len, committed);
         if slot == self.active_slot {
             self.len = len;
@@ -1206,76 +1372,12 @@ impl Qwen3_5MtpRank {
         let slot_count = self.batch_slot_count();
         let slot_pages = self.all_pages.len() / slot_count;
         let pages_to_copy = tokens.div_ceil(16).min(slot_pages);
-        if src_slot != dst_slot && pages_to_copy > 0 {
-            target.device.make_current()?;
-            for layer in &self.kv.layers {
-                let k_stride = layer.layout.k_page_stride_bytes as usize;
-                let v_stride = layer.layout.v_page_stride_bytes as usize;
-                let k_src = layer.k_buf.addr() + (src_slot * slot_pages * k_stride) as u64;
-                let k_dst = layer.k_buf.addr() + (dst_slot * slot_pages * k_stride) as u64;
-                let v_src = layer.v_buf.addr() + (src_slot * slot_pages * v_stride) as u64;
-                let v_dst = layer.v_buf.addr() + (dst_slot * slot_pages * v_stride) as u64;
-                crate::cuda::check_rc(
-                    // SAFETY: Each slot owns a disjoint `slot_pages * stride` region inside `k_buf`.
-                    unsafe {
-                        ffi::warp34_memcpy_d2d_async(
-                            k_dst as *mut _,
-                            k_src as *const _,
-                            pages_to_copy * k_stride,
-                            target.stream.handle,
-                        )
-                    },
-                    "MTP slot K copy",
-                )?;
-                crate::cuda::check_rc(
-                    // SAFETY: Each slot owns a disjoint `slot_pages * stride` region inside `v_buf`.
-                    unsafe {
-                        ffi::warp34_memcpy_d2d_async(
-                            v_dst as *mut _,
-                            v_src as *const _,
-                            pages_to_copy * v_stride,
-                            target.stream.handle,
-                        )
-                    },
-                    "MTP slot V copy",
-                )?;
-                let total_pages = self.kv.num_pages.max(1);
-                if let Some(ref raw_buf) = layer.qsa_raw_k_buf {
-                    let raw_stride = raw_buf.len_bytes / total_pages;
-                    let r_src = raw_buf.addr() + (src_slot * slot_pages * raw_stride) as u64;
-                    let r_dst = raw_buf.addr() + (dst_slot * slot_pages * raw_stride) as u64;
-                    crate::cuda::check_rc(
-                        // SAFETY: Each slot owns a disjoint `slot_pages * raw_stride` region inside `qsa_raw_k_buf`.
-                        unsafe {
-                            ffi::warp34_memcpy_d2d_async(
-                                r_dst as *mut _,
-                                r_src as *const _,
-                                pages_to_copy * raw_stride,
-                                target.stream.handle,
-                            )
-                        },
-                        "MTP slot QSA raw K copy",
-                    )?;
-                }
-                if let Some(ref comp_buf) = layer.qsa_comp_k_buf {
-                    let comp_stride = comp_buf.len_bytes / total_pages;
-                    let c_src = comp_buf.addr() + (src_slot * slot_pages * comp_stride) as u64;
-                    let c_dst = comp_buf.addr() + (dst_slot * slot_pages * comp_stride) as u64;
-                    crate::cuda::check_rc(
-                        // SAFETY: Each slot owns a disjoint `slot_pages * comp_stride` region inside `qsa_comp_k_buf`.
-                        unsafe {
-                            ffi::warp34_memcpy_d2d_async(
-                                c_dst as *mut _,
-                                c_src as *const _,
-                                pages_to_copy * comp_stride,
-                                target.stream.handle,
-                            )
-                        },
-                        "MTP slot QSA comp K copy",
-                    )?;
-                }
-            }
-        }
+        self.copy_page_range_d2d(
+            target,
+            src_slot * slot_pages,
+            dst_slot * slot_pages,
+            pages_to_copy,
+        )?;
         self.slot_state[dst_slot] = (tokens, tokens);
         if self.active_slot == dst_slot {
             self.len = tokens;

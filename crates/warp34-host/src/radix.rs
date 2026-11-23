@@ -111,10 +111,13 @@ pub struct MambaRadixCache {
     full_protected_pages: usize,
     mamba_evictable_slots: usize,
     mamba_protected_slots: usize,
+    promoted_host_to_vram: std::collections::HashMap<i32, i32>,
     pub total_lookups: u64,
     pub total_lookup_tokens: u64,
     pub total_hit_tokens: u64,
     pub total_mamba_hits: u64,
+    pub total_kv_swap_out_pages: u64,
+    pub total_kv_swap_in_pages: u64,
 }
 
 impl MambaRadixCache {
@@ -138,10 +141,13 @@ impl MambaRadixCache {
             full_protected_pages: 0,
             mamba_evictable_slots: 0,
             mamba_protected_slots: 0,
+            promoted_host_to_vram: std::collections::HashMap::new(),
             total_lookups: 0,
             total_lookup_tokens: 0,
             total_hit_tokens: 0,
             total_mamba_hits: 0,
+            total_kv_swap_out_pages: 0,
+            total_kv_swap_in_pages: 0,
         };
         cache.reset();
         cache
@@ -162,6 +168,7 @@ impl MambaRadixCache {
         self.full_protected_pages = 0;
         self.mamba_evictable_slots = 0;
         self.mamba_protected_slots = 0;
+        self.promoted_host_to_vram.clear();
         self.nodes.push(RadixNode {
             id: RadixNodeId::ROOT,
             parent: None,
@@ -618,9 +625,19 @@ impl MambaRadixCache {
 
             if prev_protected_pages < page_offset + prefix_pages {
                 let start_page = prev_protected_pages.saturating_sub(page_offset);
-                freed_duplicate_kv_pages.extend_from_slice(
-                    &kv_pages[page_offset + start_page..page_offset + prefix_pages],
-                );
+                for i in start_page..prefix_pages {
+                    let new_pid = kv_pages[page_offset + i];
+                    let tree_pid = self.nodes[child_id.0].value[i];
+                    if crate::cache::is_host_kv_page(tree_pid)
+                        && !crate::cache::is_host_kv_page(new_pid)
+                    {
+                        self.nodes[child_id.0].value[i] = new_pid;
+                        self.promoted_host_to_vram.insert(tree_pid, new_pid);
+                        freed_duplicate_kv_pages.push(tree_pid);
+                    } else {
+                        freed_duplicate_kv_pages.push(new_pid);
+                    }
+                }
                 if !draft_pages.is_empty() {
                     freed_duplicate_draft_pages.extend_from_slice(
                         &draft_pages[page_offset + start_page..page_offset + prefix_pages],
@@ -713,6 +730,10 @@ impl MambaRadixCache {
         );
 
         let pages = self.nodes[leaf_id.0].value.len();
+        for &pid in &self.nodes[leaf_id.0].value {
+            self.promoted_host_to_vram.remove(&pid);
+            self.promoted_host_to_vram.retain(|_, &mut v| v != pid);
+        }
         out.freed_kv_pages
             .extend_from_slice(&self.nodes[leaf_id.0].value);
         out.freed_draft_pages
@@ -744,6 +765,10 @@ impl MambaRadixCache {
             }
             assert_eq!(self.nodes[cur_parent.0].mamba_lock_ref, 0);
             let p_pages = self.nodes[cur_parent.0].value.len();
+            for &pid in &self.nodes[cur_parent.0].value {
+                self.promoted_host_to_vram.remove(&pid);
+                self.promoted_host_to_vram.retain(|_, &mut v| v != pid);
+            }
             out.freed_kv_pages
                 .extend_from_slice(&self.nodes[cur_parent.0].value);
             out.freed_draft_pages
@@ -811,8 +836,11 @@ impl MambaRadixCache {
 
     /// If `nid` has a unique non-decode-tail descendant path to the next live non-decode
     /// checkpoint descendant (without branching along intermediate tombstones), returns
-    /// the number of KV pages along `(nid .. descendant_checkpoint]`.
-    fn pages_to_next_non_decode_checkpoint_descendant(&self, nid: RadixNodeId) -> Option<usize> {
+    /// `(descendant_node_id, down_pages)` along `(nid .. descendant_checkpoint]`.
+    fn next_non_decode_checkpoint_descendant(
+        &self,
+        nid: RadixNodeId,
+    ) -> Option<(RadixNodeId, usize)> {
         let mut cur = nid;
         let mut down_pages = 0usize;
         loop {
@@ -832,7 +860,7 @@ impl MambaRadixCache {
             let c = &self.nodes[cid.0];
             down_pages += c.value.len();
             if c.mamba_value.is_some() && !c.is_decode_tail {
-                return Some(down_pages);
+                return Some((cid, down_pages));
             }
             cur = cid;
         }
@@ -842,9 +870,26 @@ impl MambaRadixCache {
         let n = &self.nodes[nid.0];
         n.mamba_lock_ref == 0
             && !n.children.is_empty()
-            && self
-                .pages_to_next_non_decode_checkpoint_descendant(nid)
-                .is_some()
+            && self.next_non_decode_checkpoint_descendant(nid).is_some()
+    }
+
+    /// Returns `true` if `nid` is a superseded linear internal checkpoint whose next
+    /// non-decode checkpoint descendant *itself* has a further non-decode checkpoint
+    /// descendant, so tombstoning `nid` always leaves at least the tip checkpoint plus
+    /// one penultimate backup anchor (`<= 8,192` tokens behind the tip) alive on the chain.
+    fn is_superseded_linear_internal_preserving_penultimate_anchor(
+        &self,
+        nid: RadixNodeId,
+    ) -> bool {
+        let n = &self.nodes[nid.0];
+        if n.mamba_lock_ref > 0 || n.children.is_empty() {
+            return false;
+        }
+        let Some((desc_id, _)) = self.next_non_decode_checkpoint_descendant(nid) else {
+            return false;
+        };
+        self.next_non_decode_checkpoint_descendant(desc_id)
+            .is_some()
     }
 
     fn is_superseded_linear_internal_within_anchor_stride(&self, nid: RadixNodeId) -> bool {
@@ -852,7 +897,7 @@ impl MambaRadixCache {
         if n.mamba_lock_ref > 0 || n.children.is_empty() {
             return false;
         }
-        let Some(down_pages) = self.pages_to_next_non_decode_checkpoint_descendant(nid) else {
+        let Some((_, down_pages)) = self.next_non_decode_checkpoint_descendant(nid) else {
             return false;
         };
         let up_pages = self.pages_since_parent_checkpoint(nid);
@@ -989,8 +1034,9 @@ impl MambaRadixCache {
             // and never tombstoning a prompt frontier whose only child is an unverified decode tail.
             // Priority 2: Unverified decode-tail leaf nodes (`is_reclaimable_decode_tail_leaf`)
             // whose ancestor prompt frontier still holds a live Mamba snapshot.
-            // Priority 3: Any remaining superseded linear internal node (`is_superseded_linear_internal`)
-            // before falling back to deleting live session leaves.
+            // Priority 3: Older superseded linear internal anchors whose next checkpoint descendant
+            // also has a checkpoint descendant (`is_superseded_linear_internal_preserving_penultimate_anchor`),
+            // so every chain retains both its tip checkpoint and its penultimate backup anchor (`<= 8K` behind tip).
             // Priority 4: Standard `mamba_lru` order.
             let candidate = self
                 .mamba_lru
@@ -1004,10 +1050,9 @@ impl MambaRadixCache {
                         .find(|&nid| self.is_reclaimable_decode_tail_leaf(nid))
                 })
                 .or_else(|| {
-                    self.mamba_lru
-                        .iter()
-                        .copied()
-                        .find(|&nid| self.is_superseded_linear_internal(nid))
+                    self.mamba_lru.iter().copied().find(|&nid| {
+                        self.is_superseded_linear_internal_preserving_penultimate_anchor(nid)
+                    })
                 })
                 .or_else(|| {
                     self.mamba_lru.iter().copied().find(|&nid| {
@@ -1032,15 +1077,141 @@ impl MambaRadixCache {
         out
     }
 
-    /// Evicts unlocked leaf nodes in `full_lru` order until at least `num_pages` KV pages are freed
-    /// (`mamba_radix_cache.py:901-920`).
-    pub fn evict_full_pages(&mut self, num_pages: usize) -> RadixEvictResult {
+    /// Collects up to `max_pages` unlocked L1 VRAM KV pages (`!is_host_kv_page`) in `full_lru`
+    /// order (decode-tail leaves -> unlocked leaves -> unlocked internal nodes) for non-destructive
+    /// demotion to L2 Host RAM without deleting any radix node or GDN checkpoint.
+    pub fn collect_swappable_vram_pages(&self, max_pages: usize) -> Vec<(RadixNodeId, usize, i32)> {
+        if self.disable || max_pages == 0 {
+            return Vec::new();
+        }
+        let mut out = Vec::with_capacity(max_pages);
+        for tier in 0..3 {
+            for &nid in &self.full_lru {
+                if out.len() >= max_pages {
+                    return out;
+                }
+                let n = &self.nodes[nid.0];
+                if !n.alive || n.full_lock_ref > 0 {
+                    continue;
+                }
+                let matches_tier = match tier {
+                    0 => n.children.is_empty() && n.is_decode_tail,
+                    1 => n.children.is_empty() && !n.is_decode_tail,
+                    _ => !n.children.is_empty(),
+                };
+                if !matches_tier {
+                    continue;
+                }
+                let vram_positions: Vec<(usize, i32)> = n
+                    .value
+                    .iter()
+                    .copied()
+                    .enumerate()
+                    .filter(|&(_, pid)| !crate::cache::is_host_kv_page(pid))
+                    .collect();
+                if vram_positions.is_empty() {
+                    continue;
+                }
+                let rem = max_pages - out.len();
+                let start = vram_positions.len().saturating_sub(rem);
+                for &(idx, pid) in &vram_positions[start..] {
+                    out.push((nid, idx, pid));
+                }
+            }
+        }
+        out
+    }
+
+    /// Replaces unlocked L1 VRAM page IDs in `targets` with their newly swapped-out L2 `host_pages`.
+    pub fn apply_swapped_out_pages(
+        &mut self,
+        targets: &[(RadixNodeId, usize, i32)],
+        host_pages: &[i32],
+    ) {
+        assert_eq!(targets.len(), host_pages.len());
+        for (&(nid, idx, old_vram), &host_pid) in targets.iter().zip(host_pages.iter()) {
+            if self.nodes[nid.0].alive && self.nodes[nid.0].value.get(idx) == Some(&old_vram) {
+                self.nodes[nid.0].value[idx] = host_pid;
+            }
+            self.promoted_host_to_vram.remove(&host_pid);
+            self.promoted_host_to_vram.retain(|_, &mut v| v != old_vram);
+        }
+        self.total_kv_swap_out_pages += host_pages.len() as u64;
+    }
+
+    /// Looks up whether `host_pid` was already promoted to an L1 VRAM page by a concurrent request
+    /// sharing the same locked radix node.
+    #[inline]
+    pub fn get_promoted_vram_page(&self, host_pid: i32) -> Option<i32> {
+        self.promoted_host_to_vram.get(&host_pid).copied()
+    }
+
+    /// Replaces `host_pages` (`>= HOST_KV_PAGE_BASE`) with newly promoted L1 `vram_pages`
+    /// across all live radix nodes in-place.
+    pub fn record_host_page_promotions(&mut self, host_pages: &[i32], vram_pages: &[i32]) {
+        assert_eq!(host_pages.len(), vram_pages.len());
+        if host_pages.is_empty() {
+            return;
+        }
+        for (&host_pid, &vram_pid) in host_pages.iter().zip(vram_pages.iter()) {
+            self.promoted_host_to_vram.insert(host_pid, vram_pid);
+        }
+        for node in &mut self.nodes {
+            if !node.alive {
+                continue;
+            }
+            for pid in &mut node.value {
+                if crate::cache::is_host_kv_page(*pid)
+                    && let Some(&vram_pid) = self.promoted_host_to_vram.get(pid)
+                {
+                    *pid = vram_pid;
+                }
+            }
+        }
+        self.total_kv_swap_in_pages += host_pages.len() as u64;
+    }
+
+    /// Returns `true` if `leaf_id` or any unlocked tombstone ancestor that would be
+    /// cleaned up with `leaf_id` holds at least one L1 VRAM KV page (`!is_host_kv_page`).
+    fn unlocked_chain_has_vram_page(&self, leaf_id: RadixNodeId) -> bool {
+        let mut cur = leaf_id;
+        while cur != RadixNodeId::ROOT && self.nodes[cur.0].full_lock_ref == 0 {
+            if self.nodes[cur.0]
+                .value
+                .iter()
+                .any(|&p| !crate::cache::is_host_kv_page(p))
+            {
+                return true;
+            }
+            let Some(parent) = self.nodes[cur.0].parent else {
+                break;
+            };
+            if parent == RadixNodeId::ROOT
+                || self.nodes[parent.0].children.len() > 1
+                || self.nodes[parent.0].mamba_value.is_some()
+            {
+                break;
+            }
+            cur = parent;
+        }
+        false
+    }
+
+    /// Evicts the oldest unlocked L2 Host-RAM-backed leaf nodes in `full_lru` order until at least
+    /// `num_host_pages` L2 Host KV pages (`is_host_kv_page`) are freed.
+    pub fn evict_host_pages(&mut self, num_host_pages: usize) -> RadixEvictResult {
         let mut out = RadixEvictResult::default();
-        if self.disable || num_pages == 0 {
+        if self.disable || num_host_pages == 0 {
             return out;
         }
 
-        while out.freed_kv_pages.len() < num_pages {
+        while out
+            .freed_kv_pages
+            .iter()
+            .filter(|&&p| crate::cache::is_host_kv_page(p))
+            .count()
+            < num_host_pages
+        {
             let candidate = self
                 .full_lru
                 .iter()
@@ -1051,11 +1222,60 @@ impl MambaRadixCache {
                         && n.is_decode_tail
                         && n.full_lock_ref == 0
                         && n.mamba_lock_ref == 0
+                        && n.value.iter().any(|&p| crate::cache::is_host_kv_page(p))
                 })
                 .or_else(|| {
                     self.full_lru.iter().copied().find(|&nid| {
                         let n = &self.nodes[nid.0];
-                        n.children.is_empty() && n.full_lock_ref == 0 && n.mamba_lock_ref == 0
+                        n.children.is_empty()
+                            && n.full_lock_ref == 0
+                            && n.mamba_lock_ref == 0
+                            && n.value.iter().any(|&p| crate::cache::is_host_kv_page(p))
+                    })
+                });
+            let Some(nid) = candidate else {
+                break;
+            };
+            self.delete_leaf_and_cleanup_tombstones(nid, &mut out);
+        }
+        out
+    }
+
+    /// Evicts unlocked leaf nodes in `full_lru` order until at least `num_pages` L1 VRAM KV pages
+    /// are freed (`mamba_radix_cache.py:901-920`). Skips leaves whose KV pages have already been
+    /// completely demoted to L2 Host RAM so L2-backed prefixes are never wiped out for 0 L1 gain.
+    pub fn evict_full_pages(&mut self, num_pages: usize) -> RadixEvictResult {
+        let mut out = RadixEvictResult::default();
+        if self.disable || num_pages == 0 {
+            return out;
+        }
+
+        while out
+            .freed_kv_pages
+            .iter()
+            .filter(|&&p| !crate::cache::is_host_kv_page(p))
+            .count()
+            < num_pages
+        {
+            let candidate = self
+                .full_lru
+                .iter()
+                .copied()
+                .find(|&nid| {
+                    let n = &self.nodes[nid.0];
+                    n.children.is_empty()
+                        && n.is_decode_tail
+                        && n.full_lock_ref == 0
+                        && n.mamba_lock_ref == 0
+                        && self.unlocked_chain_has_vram_page(nid)
+                })
+                .or_else(|| {
+                    self.full_lru.iter().copied().find(|&nid| {
+                        let n = &self.nodes[nid.0];
+                        n.children.is_empty()
+                            && n.full_lock_ref == 0
+                            && n.mamba_lock_ref == 0
+                            && self.unlocked_chain_has_vram_page(nid)
                     })
                 });
             let Some(nid) = candidate else {
@@ -1926,7 +2146,92 @@ mod tests {
         assert!(hit_after.mamba_slot.is_some());
         assert!(radix.sanity_check().is_ok());
 
+        // Further `evict_mamba(2)` thins the older 8K and 16K interior anchors (Priority 3)
+        // while keeping both the 32,768-token tip leaf and the 24,576-token penultimate backup
+        // anchor alive, so even a subsequent `evict_full_pages(128)` leaf eviction on the 32K
+        // tip leaf still lands on the 24,576-token penultimate anchor instead of cascading to 0!
+        let ev_mamba_older = radix.evict_mamba(2);
+        assert_eq!(ev_mamba_older.freed_mamba_slots.len(), 2);
+        assert!(ev_mamba_older.freed_kv_pages.is_empty());
+        assert_eq!(radix.match_prefix(&full_tokens).matched_tokens, 32_768);
+        let ev_kv2 = radix.evict_full_pages(128);
+        assert!(!ev_kv2.freed_kv_pages.is_empty());
+        assert_eq!(radix.match_prefix(&full_tokens).matched_tokens, 24_576);
+        assert!(radix.sanity_check().is_ok());
+
         radix.dec_lock_ref(peer_ins.terminal_node);
+        assert!(radix.sanity_check().is_ok());
+    }
+
+    #[test]
+    fn test_radix_non_destructive_host_kv_swap_demotion_and_promotion() {
+        use crate::cache::{encode_host_kv_page, is_host_kv_page};
+
+        let mut radix = MambaRadixCache::new(16, 64);
+        let turn0: Vec<i32> = (0..64).collect();
+        radix.insert(&turn0, &[10, 11, 12, 13], &[], 7, 0);
+
+        // Demote 3 unlocked L1 VRAM pages from the tail of `turn0` to L2 Host RAM without
+        // deleting the radix node or its GDN checkpoint slot `7`.
+        let targets = radix.collect_swappable_vram_pages(3);
+        assert_eq!(targets.len(), 3);
+        let vram_pids: Vec<i32> = targets.iter().map(|&(_, _, p)| p).collect();
+        assert_eq!(vram_pids, vec![11, 12, 13]);
+        let host_pids = vec![
+            encode_host_kv_page(0),
+            encode_host_kv_page(1),
+            encode_host_kv_page(2),
+        ];
+        radix.apply_swapped_out_pages(&targets, &host_pids);
+        assert_eq!(radix.total_kv_swap_out_pages, 3);
+        assert!(radix.sanity_check().is_ok());
+
+        // Matching `turn0` still yields a full 64-token prefix + Mamba checkpoint hit,
+        // returning `[10, host(0), host(1), host(2)]`.
+        let hit = radix.match_prefix(&turn0);
+        assert_eq!(hit.matched_tokens, 64);
+        assert_eq!(hit.mamba_slot, Some(7));
+        assert_eq!(
+            hit.kv_pages,
+            vec![10, host_pids[0], host_pids[1], host_pids[2]]
+        );
+        assert_eq!(
+            hit.kv_pages.iter().filter(|&&p| is_host_kv_page(p)).count(),
+            3
+        );
+
+        // Promoting `[host(0), host(1)] -> [21, 22]` updates the radix node in-place and records
+        // the promotion map for any concurrent request sharing the locked prefix.
+        radix.record_host_page_promotions(&host_pids[..2], &[21, 22]);
+        assert_eq!(radix.get_promoted_vram_page(host_pids[0]), Some(21));
+        assert_eq!(radix.get_promoted_vram_page(host_pids[1]), Some(22));
+        assert_eq!(radix.total_kv_swap_in_pages, 2);
+
+        // Re-inserting `turn0` with freshly computed L1 VRAM pages `[10, 21, 22, 23]` must
+        // replace the remaining swapped-out `host(2)` in the tree with `23` and return `host(2)`
+        // in `freed_duplicate_kv_pages` so its L2 host slot is released.
+        let mut turn1 = turn0.clone();
+        turn1.extend(100..164);
+        let ins = radix.insert(&turn1, &[10, 21, 22, 23, 30, 31, 32, 33], &[], 8, 3);
+        assert_eq!(ins.freed_duplicate_kv_pages, vec![host_pids[2]]);
+        let hit2 = radix.match_prefix(&turn1);
+        assert_eq!(hit2.matched_tokens, 128);
+        assert_eq!(hit2.kv_pages, vec![10, 21, 22, 23, 30, 31, 32, 33]);
+        assert!(radix.sanity_check().is_ok());
+
+        // Demote all 8 pages of `turn1` to L2 Host RAM; `evict_full_pages(4)` must NOT delete
+        // the L2-only branch (since deleting it frees 0 L1 VRAM pages), while `evict_host_pages(4)`
+        // cleanly evicts the L2-backed leaf and clears stale `promoted_host_to_vram` entries.
+        let all_targets = radix.collect_swappable_vram_pages(8);
+        assert_eq!(all_targets.len(), 8);
+        let all_host: Vec<i32> = (10..18).map(encode_host_kv_page).collect();
+        radix.apply_swapped_out_pages(&all_targets, &all_host);
+        let ev_vram = radix.evict_full_pages(4);
+        assert!(ev_vram.freed_kv_pages.is_empty());
+        assert_eq!(radix.match_prefix(&turn1).matched_tokens, 128);
+        let ev_l2 = radix.evict_host_pages(4);
+        assert_eq!(ev_l2.freed_kv_pages.len(), 4);
+        assert_eq!(radix.match_prefix(&turn1).matched_tokens, 64);
         assert!(radix.sanity_check().is_ok());
     }
 }

@@ -613,6 +613,14 @@ impl Qwen3_5Engine {
                 r.kv_pool.truncate_pages(common_pages);
                 r.state_pool.truncate_slots(common_slots);
             }
+            let common_host_kv_pages = ranks
+                .iter()
+                .map(|r| r.kv_pool.host_swap.as_ref().map_or(0, |h| h.max_pages))
+                .min()
+                .unwrap_or(0);
+            for r in &mut ranks {
+                r.kv_pool.enable_host_swap(common_host_kv_pages);
+            }
             if ranks.iter().all(|r| r.checkpoint_pool.is_some()) {
                 let common_vram = ranks
                     .iter()
