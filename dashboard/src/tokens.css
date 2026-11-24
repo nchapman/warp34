@@ -1,37 +1,37 @@
 :root {
   --radius: 0.625rem;
-  --background: #0d0a16;
+  --background: #06050a;
   --foreground: #f4f1fa;
-  --card: #151024;
+  --card: #0c0a12;
   --card-foreground: #f4f1fa;
-  --popover: #151024;
+  --popover: #0c0a12;
   --popover-foreground: #f4f1fa;
   --primary: #f4f1fa;
-  --primary-foreground: #0d0a16;
-  --secondary: #1e1832;
+  --primary-foreground: #06050a;
+  --secondary: #14111d;
   --secondary-foreground: #f4f1fa;
-  --muted: #1e1832;
-  --muted-foreground: #9b91b3;
-  --accent: #1e1832;
+  --muted: #14111d;
+  --muted-foreground: #8d85a3;
+  --accent: #14111d;
   --accent-foreground: #f4f1fa;
   --destructive: #f87171;
-  --border: rgb(244 241 250 / 9%);
-  --input: rgb(244 241 250 / 14%);
+  --border: rgb(244 241 250 / 7%);
+  --input: rgb(244 241 250 / 11%);
   --ring: rgb(197 40 239 / 55%);
   --chart-1: #c528ef;
   --chart-2: #ffe529;
 
   /* Visualization signals stay separate from neutral control surfaces. */
-  --border-strong: rgb(244 241 250 / 19%);
-  --track: #221b36;
-  --track-border: #362b52;
+  --border-strong: rgb(244 241 250 / 15%);
+  --track: #171321;
+  --track-border: #262036;
   --brand: var(--chart-1);
   --accent-bright: #de72fa;
   --accent-deep: #8e1bb0;
   --aqua: var(--chart-2);
   --aqua-deep: #c9b014;
-  --indigo: #7c7294;
+  --indigo: #736b8a;
   --red: #f87171;
   --selection-bg: #ffe529;
-  --selection-text: #0d0a16;
+  --selection-text: #06050a;
 }
