@@ -1112,6 +1112,41 @@ pub(super) fn warmup_qwen_image_plan(
             }
         }
     }
+    {
+        let (rem_ws, rem_cap) = arena.remaining_workspace();
+        let s8_ex = stream.exec(rem_ws, rem_cap);
+        warmup_ffi!(
+            ffi::warp34_per_token_quant_i8(
+                &s8_ex,
+                buf_a as *const c_void,
+                buf_b as *mut c_void,
+                buf_c as *mut f32,
+                16,
+                128,
+            ),
+            "warmup warp34_per_token_quant_i8"
+        )?;
+        for m_warm in [16i64, 40, 64] {
+            for group_blocks in [8i32, 4, 2, -1] {
+                warmup_ffi!(
+                    ffi::warp34_marlin_gemm_s8u4_shared(
+                        &s8_ex,
+                        buf_a as *const c_void,
+                        buf_b as *const c_void,
+                        buf_c as *const c_void,
+                        buf_d as *mut c_void,
+                        buf_ws as *mut i32,
+                        m_warm,
+                        64,
+                        128,
+                        marlin_ws_ints,
+                        group_blocks,
+                    ),
+                    "warmup warp34_marlin_gemm_s8u4_shared"
+                )?;
+            }
+        }
+    }
     cublas.gemm_f16(buf_a, buf_b, buf_c, 1, 64, 128)?;
     cublas.gemm_f16_bias(buf_a, buf_b, buf_d, buf_c, 1, 64, 128)?;
     for m_warm in [1i32, 4, 20] {

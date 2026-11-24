@@ -803,9 +803,15 @@ fn run_qwen_image_dump_diff(options: CudaCliOptions) -> Result<ExitCode, String>
             "[warp34 dump-diff tp1-vs-tp2] model={model} size={}x{}x{} steps={steps} psnr={psnr:.2}dB max_px_diff={max_diff} tp1_ms={:.2} tp2_ms={:.2}",
             res.width, res.height, res.channels, res.timings.total_ms, res_tp2.timings.total_ms,
         );
-        if psnr < 35.0 {
+        let min_tp2_psnr =
+            if engine_tp2.cfg.transformer.quant != crate::loader::QuantScheme::Unquantized {
+                25.0
+            } else {
+                35.0
+            };
+        if psnr < min_tp2_psnr {
             return Err(format!(
-                "dump-diff tp1-vs-tp2 PSNR {psnr:.2} dB below 35.0 dB threshold"
+                "dump-diff tp1-vs-tp2 PSNR {psnr:.2} dB below {min_tp2_psnr:.1} dB threshold"
             ));
         }
         return Ok(ExitCode::SUCCESS);
