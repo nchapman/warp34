@@ -46,3 +46,7 @@ Third-Party Attributions & Architectural Donors
    - Files: `dashboard/node_modules/@fontsource/geist*` (bundled WOFF2 subsets in `dashboard/dist/assets/`)
    - Copyright Vercel, Inc.
    - License: SIL Open Font License 1.1 / MIT License
+
+9. NVIDIA CUDA 13 Runtime Libraries (binary distributions & container images)
+   - Files: `lib/libcudart.so.13`, `lib/libcublas.so.13`, `lib/libcublasLt.so.13`
+   - Redistributed under the NVIDIA CUDA Toolkit End User License Agreement (EULA).

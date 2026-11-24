@@ -154,7 +154,7 @@ main() {
 
   case ":${PATH}:" in
     *":${BIN_DIR}:"*)
-      say "Run: warp34 serve nchapman/Qwen3.8-27B-W4A16-HGPTQ"
+      say "Run: warp34 serve nchapman/Qwen3.8-27B-W4A16-HGPTQ  # 24 GB GPU (see README for 8-16 GB models)"
       ;;
     *)
       say ""

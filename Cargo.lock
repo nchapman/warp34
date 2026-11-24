@@ -3459,7 +3459,7 @@ dependencies = [
 
 [[package]]
 name = "warp34-host"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "async-stream",
  "axum",
@@ -3487,7 +3487,7 @@ dependencies = [
 
 [[package]]
 name = "warp34-kernels"
-version = "0.2.0"
+version = "0.2.1"
 
 [[package]]
 name = "wasi"

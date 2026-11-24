@@ -81,6 +81,7 @@ Subcommands:
   greedy-diff  [model] Token-level parity check against oracle golden JSON (--golden <dir|json>)
   dump-diff    [model] Layer-by-layer tensor parity check (--compare-tp2 | --golden <safetensors>)
   profile-diff         Nsight Systems SQLite kernel category comparison vs vLLM/SGLang
+  -V, --version        Print warp34 version and exit
 
 Model & Hub Options:
   <model>, -m, --model <id|path>      Hugging Face repo ID or local Safetensors directory
@@ -144,7 +145,7 @@ Benchmark Options (warp34 bench):
   --prompt-len <tokens>               Prompt length in tokens (default: 128; supports k/M suffixes)
   --gen-len <tokens>                  Generated output length in tokens (default: 128; supports k/M suffixes)
   --realistic-prompt, --realistic     Use realistic coding/systems prompt instead of synthetic repetition
-  --batch-size <1..1024>              Concurrent batch size for scheduler stage (default: 4)
+  --batch-size <1..1024>              Concurrent batch size for scheduler stage (default: 8)
   --out <path>                        Write benchmark JSON summary to file
 
 Examples:

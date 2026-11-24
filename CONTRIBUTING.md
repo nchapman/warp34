@@ -12,7 +12,7 @@ Include:
 - Context length, concurrency, cold/warm cache state, reproducibility frequency, and whether eager/graph or plain/speculative changes the outcome.
 - Sanitized logs, exact error, test output, and relevant latency/memory measurements. Distinguish expected overload rejection from unexpected failure.
 
-Never publish API keys, authorization headers, private prompts/images, model credentials, or unredacted user data. For a suspected exploitable security/isolation defect, use the repository's private vulnerability reporting channel if enabled; otherwise arrange a private channel with the maintainer before sharing exploit details publicly. This guide does not assert that GitHub private reporting has been configured.
+Never publish API keys, authorization headers, private prompts/images, model credentials, or unredacted user data. For a suspected security vulnerability, please report it privately via GitHub Security Advisories or contact the maintainer directly before sharing exploit details publicly.
 
 ## Pull requests
 

@@ -1,6 +1,6 @@
 # Serving deployment controls
 
-`warp34 serve` targets one Qwen model on one or two GPUs, not a general-purpose model
+`warp34 serve` targets one Qwen model on 1, 2, or 4 GPUs (`--tp 1|2|4`), not a general-purpose model
 gateway. Defaults remain loopback (`127.0.0.1:8000`), **no authentication**, 16 active
 sequences, automatic KV capacity, and the existing scheduler tuning. The Web UI
 is enabled by default; `--no-webui` disables its pages and assets without changing
@@ -8,7 +8,7 @@ API or metrics access.
 
 ```sh
 # Export WARP34_API_KEY securely through your deployment's secret manager first.
-CUDA_VISIBLE_DEVICES=0 ./target/release/warp34 serve \
+CUDA_VISIBLE_DEVICES=0 warp34 serve \
   nchapman/Qwen3.5-4B-W4A16-HGPTQ --offline \
   --alias coding-model \
   --api-key-env WARP34_API_KEY \
