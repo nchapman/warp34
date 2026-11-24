@@ -45,7 +45,7 @@ check_platform() {
 
 check_driver() {
   if ! command -v nvidia-smi >/dev/null 2>&1; then
-    say "Note: nvidia-smi not found. warp34 requires an NVIDIA RTX 30- or 40-series GPU with an R580+ driver."
+    say "Note: nvidia-smi not found. warp34 requires an NVIDIA RTX 30 or 40-series GPU with an R580+ driver."
     return
   fi
   drv="$(nvidia-smi --query-gpu=driver_version --format=csv,noheader 2>/dev/null | head -n 1 | tr -d '[:space:]')"

@@ -1,6 +1,6 @@
 # warp34
 
-A [fast](#performance) single-binary inference engine for **Qwen 3.5–3.8 & Flash-Next** on **RTX 30- and 40-series NVIDIA GPUs**—outperforming `vLLM`, `SGLang`, and `llama.cpp` across prefill, decode, continuous batching, and long-context coding agents.
+A [fast](#performance) single-binary inference engine for **Qwen 3.5–3.8 Flash-Next** on **NVIDIA RTX 30 and 40-series GPUs**—outperforming `vLLM`, `SGLang`, and `llama.cpp` across prefill, decode, continuous batching, and long-context coding agents.
 
 [![Release](https://img.shields.io/github/v/release/nchapman/warp34.svg)](https://github.com/nchapman/warp34/releases/latest)
 [![Docker](https://github.com/nchapman/warp34/actions/workflows/docker.yml/badge.svg)](https://github.com/nchapman/warp34/actions/workflows/docker.yml)
@@ -18,7 +18,7 @@ Written in Rust and CUDA with zero Python and zero NCCL. Built specifically for 
 
 ## Quickstart
 
-**Requirements:** Linux `x86_64` (AVX2/FMA), an NVIDIA RTX 30- or 40-series GPU, and a CUDA 13-capable driver (R580+).
+**Requirements:** Linux `x86_64` (AVX2/FMA), an NVIDIA RTX 30 or 40-series GPU, and a CUDA 13-capable driver (R580+).
 
 > The examples below use `Qwen3.8-27B-W4A16-HGPTQ` (24 GB GPU). On **8–16 GB GPUs**, swap in a smaller checkpoint from [Pick a Model for Your GPU](#pick-a-model-for-your-gpu).
 
