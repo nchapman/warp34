@@ -276,7 +276,8 @@ async fn check_route_auth(client: &reqwest::Client, base: &str, webui: bool) {
     ));
     let assets: Vec<_> = index
         .split('"')
-        .filter(|part| part.starts_with("/assets/"))
+        .filter(|part| part.starts_with("./assets/"))
+        .map(|part| part.trim_start_matches('.'))
         .collect();
     assert!(!assets.is_empty());
     for path in [

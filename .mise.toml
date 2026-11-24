@@ -151,7 +151,7 @@ run = """
 ./target/release/warp34 dump-diff --offline --model Qwen/Qwen3.5-4B --kv-format tq4 --compare-tp2
 ./target/release/warp34 dump-diff --offline --model Qwen/Qwen3.5-4B --kv-format tq4 --image rgb://https://warp34.test/sample.ppm --compare-tp2
 ./target/release/warp34 dump-diff --offline --model Qwen/Qwen3.5-4B --kv-format tq4 --speculative mtp --mtp-k 3 --compare-tp2
-./target/release/warp34 dump-diff --offline --model Qwen/Qwen3.5-4B --kv-format tq4 --speculative dflash2 --draft-model nchapman/Qwen3.5-4B-DFlash2 --compare-tp2
+./target/release/warp34 dump-diff --offline --model Qwen/Qwen3.5-4B --kv-format tq4 --speculative dflash2 --draft-model nchapman/Qwen3.5-4B-DFlash2 --prompt "$(printf '<|im_start|>user\nWhat is the capital of France?<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n')" --compare-tp2
 ./target/release/warp34 dump-diff --offline --model nchapman/Qwen3.6-35B-A3B-W4A16-HGPTQ --kv-format tq4 --kv-pages 64 --compare-tp2
 ./target/release/warp34 dump-diff --offline --model nchapman/Qwen3.6-35B-A3B-W4A16-HGPTQ --kv-format tq4 --kv-pages 64 --speculative mtp --mtp-k 3 --compare-tp2
 """
