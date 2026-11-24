@@ -1092,6 +1092,7 @@ pub(crate) fn run_serve(
         std::env::var("WARP34_HOST").ok().as_deref(),
     );
     let bind_addr = format!("{host}:{port}");
+    preflight_bind_addr(&bind_addr, port)?;
     let kv_mode_init = if explicit_kv_format {
         kv_format.clone()
     } else {
@@ -1628,6 +1629,23 @@ fn run_chat_repl(
 /// synonym greedy near-ties (e.g. "diagonal stripes" vs "diagonal bands").
 const COMPRESSED_VISION_MIN_PREFIX_TOKENS: usize = 6;
 
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+fn preflight_bind_addr(addr: &str, port: u16) -> Result<(), String> {
+    if port == 0 {
+        return Ok(());
+    }
+    match std::net::TcpListener::bind(addr) {
+        Ok(listener) => {
+            drop(listener);
+            Ok(())
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => Err(format!(
+            "cannot bind {addr}: {e} (is another server already running on port {port}?)"
+        )),
+        Err(e) => Err(format!("cannot bind {addr}: {e}")),
+    }
+}
+
 fn vision_warm_parity_ok(
     cold_ids: &[i32],
     warm_ids: &[i32],
@@ -1736,5 +1754,26 @@ mod tests {
 
         // Length mismatch always fails even when the shared prefix is >= 6 tokens.
         assert_eq!(vision_warm_parity_ok(&cold, &cold[..24], true), (false, 24));
+    }
+
+    #[test]
+    fn preflight_bind_addr_fails_fast_when_port_in_use() {
+        // Ephemeral port 0 is skipped so OS-assigned ports always pass.
+        assert!(preflight_bind_addr("127.0.0.1:0", 0).is_ok());
+
+        let occupied = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = occupied.local_addr().unwrap().port();
+        let addr = format!("127.0.0.1:{port}");
+
+        let err = preflight_bind_addr(&addr, port).unwrap_err();
+        assert!(
+            err.contains("already running on port") && err.contains(&port.to_string()),
+            "unexpected error: {err}"
+        );
+
+        // Once released, preflight succeeds and leaves the port free for the server.
+        drop(occupied);
+        assert!(preflight_bind_addr(&addr, port).is_ok());
+        assert!(std::net::TcpListener::bind(&addr).is_ok());
     }
 }
