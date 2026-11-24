@@ -453,8 +453,7 @@ impl QwenImage21TransformerConfig {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!(
-                    "axes_dims_rope {:?} must be even and sum to attention_head_dim={attention_head_dim}",
-                    axes_dims_rope
+                    "axes_dims_rope {axes_dims_rope:?} must be even and sum to attention_head_dim={attention_head_dim}"
                 ),
             ));
         }

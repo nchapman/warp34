@@ -1,3 +1,4 @@
+import userEvent from "@testing-library/user-event";
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { Dashboard } from "./App";
@@ -136,9 +137,12 @@ describe("playground wire helpers", () => {
 
     const respFrames = drainSseBuffer(
       [
+        'event: response.content_part.added\ndata: {"type":"response.content_part.added","part":{"type":"reasoning_text","text":""}}\n\n',
         'event: response.reasoning_text.delta\ndata: {"type":"response.reasoning_text.delta","delta":"thinking step "}\n\n',
+        'event: response.content_part.done\ndata: {"type":"response.content_part.done","part":{"type":"reasoning_text","text":"thinking step "}}\n\n',
         'event: response.output_text.delta\ndata: {"type":"response.output_text.delta","delta":"streamed text"}\n\n',
-        'event: response.completed\ndata: {"type":"response.completed","response":{"id":"resp_77","status":"completed","output":[{"type":"reasoning","summary":[],"content":[{"type":"reasoning_text","text":"thinking step "}]},{"type":"message","content":[{"type":"output_text","text":"streamed text"}]}],"usage":{"input_tokens":50,"output_tokens":12,"input_tokens_details":{"cached_tokens":32},"output_tokens_details":{"reasoning_tokens":4}}}}\n\n',
+        'event: response.output_item.added\ndata: {"type":"response.output_item.added","item":{"id":"fc_1","type":"function_call","call_id":"call_42","name":"query_gpu","arguments":""}}\n\n',
+        'event: response.function_call_arguments.delta\ndata: {"type":"response.function_call_arguments.delta","delta":"{\\"gpu\\":0}"}\n\n',
       ].join(""),
       0,
       15,
@@ -148,9 +152,28 @@ describe("playground wire helpers", () => {
     for (const f of respFrames) {
       respState = applySseFrameToResult("openai-responses", respState, f);
     }
+    expect(respState.reasoning).toBe("thinking step ");
+    expect(respState.content).toBe("streamed text");
+    expect(respState.toolCalls).toEqual([
+      { id: "call_42", name: "query_gpu", arguments: '{"gpu":0}' },
+    ]);
+
+    const completedFrame = drainSseBuffer(
+      'event: response.completed\ndata: {"type":"response.completed","response":{"id":"resp_77","status":"completed","output":[{"type":"reasoning","summary":[],"content":[{"type":"reasoning_text","text":"thinking step "}]},{"type":"message","content":[{"type":"output_text","text":"streamed text"}]},{"type":"function_call","call_id":"call_42","name":"query_gpu","arguments":"{\\"gpu\\":0}"}],"usage":{"input_tokens":50,"output_tokens":12,"input_tokens_details":{"cached_tokens":32},"output_tokens_details":{"reasoning_tokens":4}}}}\n\n',
+      respFrames.length,
+      20,
+    ).frames[0];
+    respState = applySseFrameToResult(
+      "openai-responses",
+      respState,
+      completedFrame,
+    );
     expect(respState.responseId).toBe("resp_77");
     expect(respState.reasoning).toBe("thinking step ");
     expect(respState.content).toBe("streamed text");
+    expect(respState.toolCalls).toEqual([
+      { id: "call_42", name: "query_gpu", arguments: '{"gpu":0}' },
+    ]);
     expect(respState.finishReason).toBe("completed");
     expect(respState.usage.cachedTokens).toBe(32);
     expect(respState.usage.reasoningTokens).toBe(4);
@@ -399,6 +422,114 @@ describe("playground wire helpers", () => {
 });
 
 describe("Playground UI integration", () => {
+  it("associates the preset hint without adding it to the selector name", async () => {
+    const user = userEvent.setup();
+    render(
+      <Dashboard
+        initialEntries={["/playground"]}
+        state={{ history: [], connection: "connecting", error: null }}
+      />,
+    );
+    const selector = screen.getByRole("combobox", {
+      name: "PRESET",
+    });
+    const presets = ENDPOINTS.find(
+      (endpoint) => endpoint.id === "chat-completions",
+    )!.presets;
+    expect(selector).toHaveAttribute("aria-describedby", "pg-preset-hint");
+    expect(selector).toHaveAccessibleDescription(presets[0].description);
+    await user.selectOptions(selector, presets[1].id);
+    expect(selector).toHaveAccessibleName("PRESET");
+    expect(selector).toHaveAccessibleDescription(presets[1].description);
+  });
+  it("offers manual cURL copying when clipboard access is unavailable", async () => {
+    const user = userEvent.setup();
+    vi.spyOn(navigator, "clipboard", "get").mockReturnValue(
+      undefined as unknown as Clipboard,
+    );
+    render(
+      <Dashboard
+        initialEntries={["/playground"]}
+        state={{ history: [], connection: "connecting", error: null }}
+      />,
+    );
+    await user.click(screen.getByRole("button", { name: "Copy cURL" }));
+    expect(
+      screen.queryByRole("button", { name: "Copied cURL" }),
+    ).not.toBeInTheDocument();
+    expect(screen.getByRole("alert")).toHaveTextContent("Could not copy");
+    expect(screen.getByRole("tabpanel", { name: "cURL" })).toBeVisible();
+  });
+  it("locks request controls while keeping the focused Send/Abort button", async () => {
+    const user = userEvent.setup();
+    window.history.replaceState(null, "", "/playground");
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(
+        (_url, init: RequestInit) =>
+          new Promise<Response>((_resolve, reject) => {
+            init.signal?.addEventListener("abort", () =>
+              reject(new DOMException("Aborted", "AbortError")),
+            );
+          }),
+      ),
+    );
+    render(
+      <Dashboard
+        state={{ history: [snapshot({})], connection: "live", error: null }}
+      />,
+    );
+    const send = screen.getByRole("button", { name: "Send Request" });
+    await user.click(send);
+    expect(screen.getByRole("button", { name: "Abort" })).toBe(send);
+    expect(send).toHaveFocus();
+    expect(screen.getByLabelText("Turn 2 content")).toBeDisabled();
+    expect(screen.getByRole("switch", { name: "Stream SSE" })).toBeDisabled();
+    expect(screen.getByRole("switch", { name: "Thinking" })).toBeDisabled();
+    expect(screen.getByLabelText(/PRESET/)).toBeDisabled();
+    expect(screen.getByLabelText("ENDPOINT")).toBeDisabled();
+    expect(screen.getByLabelText("API KEY")).toBeDisabled();
+    await user.click(send);
+    await waitFor(() => expect(send).toHaveTextContent("Send Request"));
+    expect(send).toHaveFocus();
+    expect(screen.getByLabelText("Turn 2 content")).toBeEnabled();
+  });
+  it("supports keyboard tab navigation and associated panels without losing edits", async () => {
+    const user = userEvent.setup();
+    window.history.replaceState(null, "", "/playground");
+    render(
+      <Dashboard
+        state={{ history: [snapshot({})], connection: "live", error: null }}
+      />,
+    );
+    const turn = screen.getByLabelText("Turn 2 content");
+    fireEvent.change(turn, { target: { value: "Keep this edit" } });
+    expect(screen.getByRole("switch", { name: "Stream SSE" })).toBeEnabled();
+    expect(screen.getByRole("switch", { name: "Thinking" })).toBeEnabled();
+    screen.getByRole("tab", { name: "Messages & Params" }).focus();
+    await user.keyboard("{ArrowRight}");
+    const jsonTab = screen.getByRole("tab", { name: "JSON Body" });
+    expect(jsonTab).toHaveFocus();
+    expect(jsonTab).toHaveAttribute("aria-selected", "true");
+    expect(screen.getByRole("tabpanel", { name: "JSON Body" })).toHaveAttribute(
+      "id",
+      jsonTab.getAttribute("aria-controls"),
+    );
+    const editor = screen.getByLabelText("Request JSON body");
+    expect(editor instanceof HTMLTextAreaElement && editor.value).toContain(
+      "Keep this edit",
+    );
+    await user.keyboard("{Home}");
+    expect(screen.getByLabelText("Turn 2 content")).toHaveValue(
+      "Keep this edit",
+    );
+    screen.getByRole("tab", { name: "Parsed" }).focus();
+    await user.keyboard("{End}");
+    expect(screen.getByRole("tab", { name: "cURL" })).toHaveFocus();
+    expect(screen.getByRole("tabpanel", { name: "cURL" })).toBeVisible();
+    await user.keyboard("{Home}{ArrowRight}");
+    expect(screen.getByRole("tabpanel", { name: "Raw JSON" })).toBeVisible();
+  });
   it("switches to Playground, syncs structured turns with raw JSON, and executes requests", async () => {
     const fetchMock = vi.fn().mockResolvedValue({
       ok: true,
@@ -447,7 +578,7 @@ describe("Playground UI integration", () => {
     const turn2 = screen.getByLabelText("Turn 2 content");
     fireEvent.change(turn2, { target: { value: "Custom kernel question" } });
 
-    fireEvent.click(screen.getByRole("tab", { name: "JSON Body" }));
+    await userEvent.click(screen.getByRole("tab", { name: "JSON Body" }));
     const rawEditor = screen.getByLabelText(
       "Request JSON body",
     ) as HTMLTextAreaElement;
@@ -534,7 +665,7 @@ describe("Playground UI integration", () => {
     });
 
     const sseTab = screen.getByRole("tab", { name: "SSE (3)" });
-    fireEvent.click(sseTab);
+    await userEvent.click(sseTab);
     expect(screen.getByText("[DONE]")).toBeVisible();
   });
 
@@ -565,7 +696,7 @@ describe("Playground UI integration", () => {
     fireEvent.click(screen.getByRole("link", { name: "Playground" }));
 
     // Switch to JSON Body and enter invalid JSON
-    fireEvent.click(screen.getByRole("tab", { name: "JSON Body" }));
+    await userEvent.click(screen.getByRole("tab", { name: "JSON Body" }));
     const rawEditor = screen.getByLabelText("Request JSON body");
     fireEvent.change(rawEditor, { target: { value: "{bad json" } });
     expect(screen.getByRole("alert")).toHaveTextContent(/JSON syntax error/);
@@ -736,7 +867,7 @@ describe("Playground UI integration", () => {
     );
 
     // Inject explicit width/height + cfg_scale alias in JSON tab, then verify structured controls normalize them
-    fireEvent.click(screen.getByRole("tab", { name: "JSON Body" }));
+    await userEvent.click(screen.getByRole("tab", { name: "JSON Body" }));
     const jsonEditor = screen.getByLabelText(
       "Request JSON body",
     ) as HTMLTextAreaElement;
@@ -753,7 +884,7 @@ describe("Playground UI integration", () => {
       target: { value: JSON.stringify(rawWithAliases, null, 2) },
     });
 
-    fireEvent.click(screen.getByRole("tab", { name: "Prompt & Params" }));
+    await userEvent.click(screen.getByRole("tab", { name: "Prompt & Params" }));
     expect(
       (screen.getByLabelText("Image size") as HTMLSelectElement).value,
     ).toBe("768x768");
@@ -769,7 +900,7 @@ describe("Playground UI integration", () => {
     fireEvent.change(screen.getByLabelText("Guidance scale"), {
       target: { value: "4" },
     });
-    fireEvent.click(screen.getByRole("tab", { name: "JSON Body" }));
+    await userEvent.click(screen.getByRole("tab", { name: "JSON Body" }));
     const normalized = JSON.parse(
       (screen.getByLabelText("Request JSON body") as HTMLTextAreaElement).value,
     ) as Record<string, unknown>;
@@ -815,5 +946,84 @@ describe("Playground UI integration", () => {
     expect(optionValues).toContain("chat-completions");
     expect(optionValues).not.toContain("images-generations");
     expect(optionValues).not.toContain("images-edits");
+  });
+
+  it("allows max_tokens above 4096 up to the active context limit", async () => {
+    render(
+      <Dashboard
+        state={{
+          history: [
+            snapshot({
+              model: "Qwen/Qwen3.5-4B",
+              config: {
+                tp_size: 1,
+                kv_format: "tq4",
+                speculation: "none",
+                max_model_len: 32768,
+              },
+            }),
+          ],
+          connection: "live",
+          error: null,
+        }}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole("link", { name: "Playground" }));
+    const maxTokensInput = screen.getByLabelText(
+      "MAX_TOKENS",
+    ) as HTMLInputElement;
+    expect(maxTokensInput.max).toBe("32768");
+
+    fireEvent.change(maxTokensInput, { target: { value: "16384" } });
+    expect(maxTokensInput.value).toBe("16384");
+
+    fireEvent.change(maxTokensInput, { target: { value: "65536" } });
+    expect(maxTokensInput.value).toBe("32768");
+
+    // Clearing MAX_TOKENS omits max_tokens ("auto") instead of pinning 256
+    fireEvent.change(maxTokensInput, { target: { value: "" } });
+    expect(maxTokensInput.value).toBe("");
+    expect(maxTokensInput.placeholder).toBe("auto");
+    await userEvent.click(screen.getByRole("tab", { name: "JSON Body" }));
+    const rawEditor = screen.getByLabelText(
+      "Request JSON body",
+    ) as HTMLTextAreaElement;
+    expect(JSON.parse(rawEditor.value).max_tokens).toBeUndefined();
+  });
+
+  it("lets users select loaded LoRA adapters in Playground and updates request model", async () => {
+    render(
+      <Dashboard
+        state={{
+          history: [
+            snapshot({
+              model: "Qwen/Qwen3.5-9B",
+              config: {
+                tp_size: 1,
+                kv_format: "tq4",
+                speculation: "none",
+                lora_adapters: ["sql-expert", "code-review"],
+              },
+            }),
+          ],
+          connection: "live",
+          error: null,
+        }}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole("link", { name: "Playground" }));
+    const modelSelect = screen.getByLabelText(
+      "MODEL / LORA",
+    ) as HTMLSelectElement;
+    expect(modelSelect.value).toBe("");
+
+    fireEvent.change(modelSelect, { target: { value: "sql-expert" } });
+    await userEvent.click(screen.getByRole("tab", { name: "JSON Body" }));
+    const rawEditor = screen.getByLabelText(
+      "Request JSON body",
+    ) as HTMLTextAreaElement;
+    expect(JSON.parse(rawEditor.value).model).toBe("sql-expert");
   });
 });

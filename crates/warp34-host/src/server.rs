@@ -10,6 +10,8 @@ mod http;
 #[cfg(feature = "cuda")]
 mod image_http;
 #[cfg(feature = "cuda")]
+mod request_log;
+#[cfg(feature = "cuda")]
 pub use http::*;
 #[cfg(feature = "cuda")]
 pub use image_http::*;
@@ -19,18 +21,95 @@ pub use image_http::*;
 #[derive(Clone)]
 pub struct ServeOptions {
     pub api_key: Option<crate::api_auth::ApiKey>,
+    /// Serve the unauthenticated dashboard; disabling it does not disable metrics or APIs.
+    pub webui: bool,
     pub max_num_seqs: usize,
     /// Optional total prompt + output admission ceiling, not a KV allocation size.
     pub max_model_len: Option<usize>,
+    /// Optional server-default `reasoning_effort` passed to the chat template when the
+    /// request omits `reasoning_effort` / `reasoning.effort` / `output_config.effort`.
+    pub reasoning_effort: Option<String>,
+    /// Optional server-default thinking token budget (`None` = unlimited or effort-derived, `Some(0)` = immediate close).
+    pub reasoning_budget: Option<usize>,
+    /// Optional transition message injected before `</think>` when the thinking budget is exhausted.
+    pub reasoning_budget_message: Option<String>,
+    /// Automatically derive a percentage-based thinking budget from `reasoning_effort` (OpenRouter ratios,
+    /// capped at `DEFAULT_MAX_REASONING_BUDGET_TOKENS = 32_768`) when no explicit token budget is specified.
+    /// Enabled by default; disable with `--no-reasoning-effort-budget`.
+    pub reasoning_effort_budget: bool,
 }
 
 impl Default for ServeOptions {
     fn default() -> Self {
         Self {
             api_key: None,
+            webui: true,
             max_num_seqs: crate::scheduler::SchedulerConfig::default().max_num_seqs,
             max_model_len: None,
+            reasoning_effort: None,
+            reasoning_budget: None,
+            reasoning_budget_message: None,
+            reasoning_effort_budget: true,
         }
+    }
+}
+
+/// Hard ceiling (32K tokens) applied when deriving a thinking budget from `reasoning_effort`
+/// percentages so omitted `max_tokens` on 262K contexts stays bounded and effort levels remain distinct.
+pub const DEFAULT_MAX_REASONING_BUDGET_TOKENS: usize = 32_768;
+
+/// Default transition line injected right before `</think>` when a thinking budget is exhausted.
+/// Overridable via `--reasoning-budget-message` (pass `""` for bare `</think>`).
+pub const DEFAULT_REASONING_BUDGET_MESSAGE: &str =
+    "\nI've hit my thinking limit. I'll move forward with the solution now.\n";
+
+/// OpenRouter-compatible `reasoning_effort` -> thinking budget fraction of `max_tokens`.
+pub fn reasoning_effort_budget_ratio(effort: &str) -> Option<f64> {
+    match effort {
+        "max" | "xhigh" => Some(0.95),
+        "high" => Some(0.80),
+        "medium" => Some(0.50),
+        "low" => Some(0.20),
+        "minimal" => Some(0.10),
+        "none" => Some(0.0),
+        _ => None,
+    }
+}
+
+/// Computes a percentage-based thinking token budget from `reasoning_effort` (defaulting to
+/// `"medium"` = 50% when omitted) and the request's effective `max_tokens`, capping the base at
+/// `DEFAULT_MAX_REASONING_BUDGET_TOKENS` (`32_768`) and clamping to `[1, max_tokens - 1]`.
+pub fn compute_effort_reasoning_budget(effort: Option<&str>, max_tokens: usize) -> Option<usize> {
+    let ratio = reasoning_effort_budget_ratio(effort.unwrap_or("medium"))?;
+    if ratio <= 0.0 || max_tokens <= 1 {
+        return None;
+    }
+    let base = max_tokens.min(DEFAULT_MAX_REASONING_BUDGET_TOKENS);
+    let raw = ((base as f64) * ratio).floor() as usize;
+    Some(raw.clamp(1, max_tokens.saturating_sub(1)))
+}
+
+/// Explicit vs default thinking-budget resolution for a chat request.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ResolvedReasoningBudget {
+    /// Explicit token limit from a per-request field (`thinking.budget_tokens`, `thinking_token_budget`, etc.).
+    PerRequestExplicit(usize),
+    /// Explicit server-default token limit from `--reasoning-budget <n>`.
+    ServerDefault(usize),
+    /// Request explicitly opted out of any thinking cap (`-1`).
+    Unlimited,
+    /// Neither request nor server specified an explicit token limit; caller may apply
+    /// effort-derived percentage budget when `reasoning_effort_budget` is enabled.
+    Default,
+}
+
+/// Validates a normalized `reasoning_effort` level shared across OpenAI, Anthropic, `vLLM`, and `llama.cpp`.
+pub fn validate_reasoning_effort(effort: &str) -> Result<(), String> {
+    match effort {
+        "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max" => Ok(()),
+        other => Err(format!(
+            "unsupported reasoning_effort '{other}' (expected none|minimal|low|medium|high|xhigh|max)"
+        )),
     }
 }
 
@@ -42,6 +121,9 @@ impl ServeOptions {
         }
         if self.max_model_len == Some(0) {
             return Err("--max-model-len must be positive".into());
+        }
+        if let Some(effort) = self.reasoning_effort.as_deref() {
+            validate_reasoning_effort(effort)?;
         }
         Ok(())
     }
@@ -56,6 +138,12 @@ impl ServeOptions {
 pub enum WorkerError {
     /// Client-fixable invalid request (`400 Bad Request`).
     InvalidRequest(String),
+    /// Request prompt + output exceeds the configured context window (`400 Bad Request`, `context_length_exceeded`).
+    ContextLengthExceeded {
+        prompt_tokens: usize,
+        output_tokens: usize,
+        limit: usize,
+    },
     /// Transient server capacity exhaustion (`429 Too Many Requests`).
     Overload(String),
     /// Graceful worker shutdown (`503 Service Unavailable`).
@@ -72,6 +160,19 @@ impl WorkerError {
     #[inline]
     pub fn invalid_request(msg: impl Into<String>) -> Self {
         Self::InvalidRequest(msg.into())
+    }
+
+    #[inline]
+    pub const fn context_length_exceeded(
+        prompt_tokens: usize,
+        output_tokens: usize,
+        limit: usize,
+    ) -> Self {
+        Self::ContextLengthExceeded {
+            prompt_tokens,
+            output_tokens,
+            limit,
+        }
     }
 
     #[inline]
@@ -109,7 +210,7 @@ impl WorkerError {
     #[inline]
     pub const fn http_status(&self) -> StatusCode {
         match self {
-            Self::InvalidRequest(_) => StatusCode::BAD_REQUEST,
+            Self::InvalidRequest(_) | Self::ContextLengthExceeded { .. } => StatusCode::BAD_REQUEST,
             Self::Overload(_) => StatusCode::TOO_MANY_REQUESTS,
             Self::WorkerStopped(_) => StatusCode::SERVICE_UNAVAILABLE,
             Self::WorkerPanicked(_) | Self::Cuda(_) | Self::Internal(_) => {
@@ -121,12 +222,20 @@ impl WorkerError {
     #[inline]
     pub const fn openai_error_type(&self) -> &'static str {
         match self {
-            Self::InvalidRequest(_) => "invalid_request_error",
+            Self::InvalidRequest(_) | Self::ContextLengthExceeded { .. } => "invalid_request_error",
             Self::Overload(_) => "rate_limit_error",
             Self::WorkerStopped(_)
             | Self::WorkerPanicked(_)
             | Self::Cuda(_)
             | Self::Internal(_) => "server_error",
+        }
+    }
+
+    #[inline]
+    pub const fn openai_error_code(&self) -> Option<&'static str> {
+        match self {
+            Self::ContextLengthExceeded { .. } => Some("context_length_exceeded"),
+            _ => None,
         }
     }
 }
@@ -138,6 +247,14 @@ impl fmt::Display for WorkerError {
             | Self::Overload(m)
             | Self::WorkerStopped(m)
             | Self::Internal(m) => f.write_str(m),
+            Self::ContextLengthExceeded {
+                prompt_tokens,
+                output_tokens,
+                limit,
+            } => write!(
+                f,
+                "This model's maximum context length is {limit} tokens (serving context limit). However, prompt ({prompt_tokens}) + output budget ({output_tokens}) exceeds {limit} tokens."
+            ),
             Self::WorkerPanicked(m) => write!(f, "engine worker terminated after panic: {m}"),
             Self::Cuda(err) => fmt::Display::fmt(err, f),
         }
@@ -165,6 +282,20 @@ pub fn completion_sampling_params(
     req: &serde_json::Value,
     max_tokens: usize,
 ) -> Result<crate::parser::SamplingParams, String> {
+    completion_sampling_params_with_defaults(
+        req,
+        max_tokens,
+        &crate::parser::SamplingParams::default(),
+    )
+}
+
+/// Endpoint-specific wire validation for `/v1/completions` using model-level default
+/// sampling parameters (e.g. from `generation_config.json`) when request fields are omitted.
+pub fn completion_sampling_params_with_defaults(
+    req: &serde_json::Value,
+    max_tokens: usize,
+    defaults: &crate::parser::SamplingParams,
+) -> Result<crate::parser::SamplingParams, String> {
     if !req.is_object() {
         return Err("completion request must be a JSON object".into());
     }
@@ -189,7 +320,7 @@ pub fn completion_sampling_params(
     }
     normalized["logprobs"] = serde_json::json!(count.is_some());
     normalized["top_logprobs"] = serde_json::json!(count.unwrap_or(0));
-    native_sampling_params(&normalized, max_tokens)
+    native_sampling_params_with_defaults(&normalized, max_tokens, defaults)
 }
 
 /// Convert token records to the legacy parallel-array wire shape. Offsets are
@@ -227,13 +358,30 @@ pub fn completion_logprobs(logs: &[serde_json::Value], offset: &mut usize) -> se
     json!({"tokens":tokens,"token_logprobs":probabilities,"top_logprobs":alternatives,"text_offset":offsets})
 }
 
+/// Maximum per-request output token budget (`1,048,576` tokens = `65,536` KV pages)
+/// accepted at the HTTP JSON validation boundary before per-engine `max_model_len` checks.
+pub const MAX_OUTPUT_TOKENS: usize = 65_536 * 16;
+
+/// Default output token budget (`256` tokens) for legacy `/v1/completions` when `max_tokens` is omitted.
+pub const DEFAULT_COMPLETION_MAX_TOKENS: usize = 256;
+
 pub fn native_sampling_params(
     req: &serde_json::Value,
     max_tokens: usize,
 ) -> Result<crate::parser::SamplingParams, String> {
+    native_sampling_params_with_defaults(req, max_tokens, &crate::parser::SamplingParams::default())
+}
+
+/// Parses OpenAI chat/completion sampling parameters from `req`, falling back to `defaults`
+/// (e.g. loaded from `<model_dir>/generation_config.json`) for omitted or `null` fields.
+pub fn native_sampling_params_with_defaults(
+    req: &serde_json::Value,
+    max_tokens: usize,
+    defaults: &crate::parser::SamplingParams,
+) -> Result<crate::parser::SamplingParams, String> {
     use crate::parser::SamplingParams;
-    if max_tokens == 0 || max_tokens > 4096 {
-        return Err("max_tokens must be in 1..=4096".into());
+    if max_tokens == 0 || max_tokens > MAX_OUTPUT_TOKENS {
+        return Err(format!("max_tokens must be in 1..={MAX_OUTPUT_TOKENS}"));
     }
     if req
         .get("stop_token_ids")
@@ -246,23 +394,28 @@ pub fn native_sampling_params(
     {
         return Err("stop_token_ids and logit_bias are limited to 256 entries each".into());
     }
-    let defaults = SamplingParams::default();
     let number = |name: &str, default: f32| -> Result<f32, String> {
-        req.get(name).map_or(Ok(default), |v| {
-            v.as_f64()
-                .map(|x| x as f32)
-                .ok_or_else(|| format!("invalid {name}"))
-        })
+        req.get(name)
+            .filter(|v| !v.is_null())
+            .map_or(Ok(default), |v| {
+                v.as_f64()
+                    .map(|x| x as f32)
+                    .ok_or_else(|| format!("invalid {name}"))
+            })
     };
     let boolean = |name: &str| -> Result<bool, String> {
-        req.get(name).map_or(Ok(false), |v| {
-            v.as_bool().ok_or_else(|| format!("invalid {name}"))
-        })
+        req.get(name)
+            .filter(|v| !v.is_null())
+            .map_or(Ok(false), |v| {
+                v.as_bool().ok_or_else(|| format!("invalid {name}"))
+            })
     };
     let unsigned = |name: &str, default: u64| -> Result<u64, String> {
-        req.get(name).map_or(Ok(default), |v| {
-            v.as_u64().ok_or_else(|| format!("invalid {name}"))
-        })
+        req.get(name)
+            .filter(|v| !v.is_null())
+            .map_or(Ok(default), |v| {
+                v.as_u64().ok_or_else(|| format!("invalid {name}"))
+            })
     };
     let stop_strings = match req.get("stop") {
         None | Some(serde_json::Value::Null) => Vec::new(),
@@ -304,11 +457,14 @@ pub fn native_sampling_params(
     }
     let params = SamplingParams {
         temperature: number("temperature", defaults.temperature)?,
-        top_k: req.get("top_k").map_or(Ok(defaults.top_k), |v| {
-            v.as_i64()
-                .and_then(|x| i32::try_from(x).ok())
-                .ok_or("invalid top_k")
-        })?,
+        top_k: req
+            .get("top_k")
+            .filter(|v| !v.is_null())
+            .map_or(Ok(defaults.top_k), |v| {
+                v.as_i64()
+                    .and_then(|x| i32::try_from(x).ok())
+                    .ok_or("invalid top_k")
+            })?,
         top_p: number("top_p", defaults.top_p)?,
         min_p: number("min_p", defaults.min_p)?,
         repetition_penalty: number("repetition_penalty", defaults.repetition_penalty)?,
@@ -325,7 +481,7 @@ pub fn native_sampling_params(
         logit_bias,
         stop_strings,
         stop_token_ids,
-        ..defaults
+        ..defaults.clone()
     };
     params.validate()?;
     if params.min_tokens > max_tokens {
@@ -337,26 +493,144 @@ pub fn native_sampling_params(
     Ok(params)
 }
 
-/// Resolves `enable_thinking` for chat requests from `chat_template_kwargs.enable_thinking`
-/// and top-level `reasoning_effort` (`vLLM` `ChatCompletionRequest.build_chat_params` parity).
-pub fn resolve_chat_enable_thinking(req: &serde_json::Value) -> Result<bool, String> {
-    let effort_thinking = match req.get("reasoning_effort").filter(|v| !v.is_null()) {
-        None => None,
-        Some(v) => match v.as_str().ok_or("reasoning_effort must be a string")? {
-            "none" | "minimal" => Some(false),
-            "low" | "medium" | "high" | "xhigh" | "max" => Some(true),
-            other => return Err(format!("unsupported reasoning_effort '{other}'")),
-        },
-    };
-    if let Some(kw) = req
+/// Extracts a per-request `reasoning_effort` if explicitly supplied by the caller
+/// (`reasoning_effort`, `reasoning.effort`, or `chat_template_kwargs.reasoning_effort`).
+pub fn request_explicit_reasoning_effort(
+    req: &serde_json::Value,
+) -> Result<Option<String>, String> {
+    if let Some(v) = req.get("reasoning_effort").filter(|v| !v.is_null()) {
+        Ok(Some(
+            v.as_str()
+                .ok_or("reasoning_effort must be a string")?
+                .to_owned(),
+        ))
+    } else if let Some(v) = req.pointer("/reasoning/effort").filter(|v| !v.is_null()) {
+        Ok(Some(
+            v.as_str()
+                .ok_or("reasoning.effort must be a string")?
+                .to_owned(),
+        ))
+    } else if let Some(v) = req
+        .pointer("/chat_template_kwargs/reasoning_effort")
+        .filter(|v| !v.is_null())
+    {
+        Ok(Some(
+            v.as_str()
+                .ok_or("chat_template_kwargs.reasoning_effort must be a string")?
+                .to_owned(),
+        ))
+    } else {
+        Ok(None)
+    }
+}
+
+/// Resolves `(enable_thinking, reasoning_effort)` for chat requests from
+/// `chat_template_kwargs`, top-level `reasoning_effort`, OpenRouter-style `reasoning.effort`,
+/// and an optional server default (`vLLM` `ChatCompletionRequest.build_chat_params` parity).
+///
+/// Guarantees template/parser consistency: when `enable_thinking` is explicitly `true` while
+/// effort resolved to `"none"` (e.g., server `--reasoning-effort none` + Anthropic
+/// `thinking: {"type": "adaptive"}`), `reasoning_effort` is cleared to `None` so Jinja does not
+/// close `<think>` while the parser expects open thinking; conversely, when `enable_thinking` is
+/// `false`, any non-`"none"` effort is cleared so custom templates cannot re-enable thinking.
+pub fn resolve_chat_reasoning_config(
+    req: &serde_json::Value,
+    default_effort: Option<&str>,
+) -> Result<(bool, Option<String>), String> {
+    let mut raw_effort =
+        request_explicit_reasoning_effort(req)?.or_else(|| default_effort.map(str::to_owned));
+
+    if let Some(ref eff) = raw_effort {
+        validate_reasoning_effort(eff)?;
+    }
+
+    let enable_thinking = if let Some(kw) = req
         .pointer("/chat_template_kwargs/enable_thinking")
         .filter(|v| !v.is_null())
     {
-        return kw
-            .as_bool()
-            .ok_or_else(|| "invalid chat_template_kwargs.enable_thinking".into());
+        kw.as_bool()
+            .ok_or_else(|| "invalid chat_template_kwargs.enable_thinking".to_string())?
+    } else {
+        raw_effort.as_deref() != Some("none")
+    };
+
+    if (enable_thinking && raw_effort.as_deref() == Some("none"))
+        || (!enable_thinking && raw_effort.as_deref() != Some("none"))
+    {
+        raw_effort = None;
     }
-    Ok(effort_thinking.unwrap_or(true))
+
+    Ok((enable_thinking, raw_effort))
+}
+
+/// Resolves `enable_thinking` for chat requests from `chat_template_kwargs.enable_thinking`
+/// and top-level `reasoning_effort` (`vLLM` `ChatCompletionRequest.build_chat_params` parity).
+pub fn resolve_chat_enable_thinking(req: &serde_json::Value) -> Result<bool, String> {
+    Ok(resolve_chat_reasoning_config(req, None)?.0)
+}
+
+/// Resolves an optional per-request thinking token budget and budget exhaustion message from
+/// OpenAI (`thinking_token_budget`, `reasoning_budget_tokens`, `thinking_budget_tokens`,
+/// `reasoning.max_tokens`) with fallback to server defaults.
+///
+/// Precedence is handled cleanly by returning `PerRequestExplicit` vs `ServerDefault` vs
+/// `Unlimited` vs `Default`. When `message` is `None`, callers fall back to
+/// [`DEFAULT_REASONING_BUDGET_MESSAGE`] (except when `budget == 0` or headroom is too tight).
+pub fn resolve_chat_reasoning_budget(
+    req: &serde_json::Value,
+    default_budget: Option<usize>,
+    default_message: Option<&str>,
+) -> Result<(ResolvedReasoningBudget, Option<String>), String> {
+    let budget_val = req
+        .get("thinking_token_budget")
+        .or_else(|| req.get("reasoning_budget_tokens"))
+        .or_else(|| req.get("thinking_budget_tokens"))
+        .or_else(|| req.pointer("/reasoning/max_tokens"))
+        .filter(|v| !v.is_null());
+
+    let budget = match budget_val {
+        None => match default_budget {
+            Some(n) => ResolvedReasoningBudget::ServerDefault(n),
+            None => ResolvedReasoningBudget::Default,
+        },
+        Some(v) => {
+            let n = v
+                .as_i64()
+                .ok_or("thinking_token_budget must be an integer")?;
+            if n < -1 {
+                return Err("thinking_token_budget must be >= -1".into());
+            }
+            if n == -1 {
+                ResolvedReasoningBudget::Unlimited
+            } else {
+                ResolvedReasoningBudget::PerRequestExplicit(
+                    usize::try_from(n).map_err(|_| "thinking_token_budget out of range")?,
+                )
+            }
+        }
+    };
+
+    let msg_val = req
+        .get("reasoning_budget_message")
+        .or_else(|| req.get("thinking_budget_message"))
+        .filter(|v| !v.is_null());
+    const MAX_REASONING_BUDGET_MESSAGE_BYTES: usize = 512;
+    let message = match msg_val {
+        None => default_message.map(str::to_owned),
+        Some(v) => {
+            let s = v
+                .as_str()
+                .ok_or("reasoning_budget_message must be a string")?;
+            if s.len() > MAX_REASONING_BUDGET_MESSAGE_BYTES {
+                return Err(format!(
+                    "reasoning_budget_message exceeds {MAX_REASONING_BUDGET_MESSAGE_BYTES} bytes"
+                ));
+            }
+            Some(s.to_owned())
+        }
+    };
+
+    Ok((budget, message))
 }
 
 pub fn parse_openai_messages_multimodal(
@@ -368,6 +642,18 @@ pub fn parse_openai_messages_multimodal(
 pub fn parse_openai_messages_with_image_policy(
     messages: &serde_json::Value,
     allow_remote_images: bool,
+) -> Result<(Vec<ChatMessage>, Vec<crate::vision::PreprocessedImage>), String> {
+    parse_openai_messages_with_vision_config(
+        messages,
+        allow_remote_images,
+        &crate::vision::VisionPreprocessorConfig::default(),
+    )
+}
+
+pub fn parse_openai_messages_with_vision_config(
+    messages: &serde_json::Value,
+    allow_remote_images: bool,
+    vision_preprocessor: &crate::vision::VisionPreprocessorConfig,
 ) -> Result<(Vec<ChatMessage>, Vec<crate::vision::PreprocessedImage>), String> {
     let arr = messages.as_array().ok_or("'messages' must be an array")?;
     if arr.is_empty() {
@@ -388,7 +674,7 @@ pub fn parse_openai_messages_with_image_policy(
     let deadline = std::time::Instant::now() + crate::remote_images::REMOTE_IMAGE_TIMEOUT;
     let mut out = Vec::with_capacity(arr.len());
     let mut images = Vec::new();
-    for (index, item) in arr.iter().enumerate() {
+    for item in arr {
         let raw_role = item
             .get("role")
             .and_then(|v| v.as_str())
@@ -398,9 +684,6 @@ pub fn parse_openai_messages_with_image_policy(
             "user" | "assistant" | "tool" => raw_role,
             other => return Err(format!("unsupported message role '{other}'")),
         };
-        if role == "system" && index != 0 {
-            return Err("system message must be at the beginning".into());
-        }
         let tool_calls = crate::chatml::parse_history_tools(item.get("tool_calls"))?;
         if role != "assistant" && !tool_calls.is_empty() {
             return Err("tool_calls are only valid on assistant messages".into());
@@ -440,18 +723,16 @@ pub fn parse_openai_messages_with_image_policy(
                             .map_err(|e| format!("invalid image_url: {e}"))?;
                             crate::vision::validate_image_aspect_ratio(h, w)
                                 .map_err(|e| format!("invalid image_url: {e}"))?;
-                            let prep = crate::vision::preprocess_rgb_image(
+                            let prep = crate::vision::preprocess_rgb_image_with_config(
                                 &rgb,
                                 h,
                                 w,
-                                16,
-                                2,
-                                2,
-                                32 * 32,
-                                1024 * 1024,
+                                vision_preprocessor,
                             );
                             text.push_str("<|vision_start|>");
-                            for _ in 0..prep.num_merged_tokens(2) {
+                            for _ in
+                                0..prep.num_merged_tokens(vision_preprocessor.spatial_merge_size)
+                            {
                                 text.push_str("<|image_pad|>");
                             }
                             text.push_str("<|vision_end|>");
@@ -541,10 +822,15 @@ mod tests {
 
     #[test]
     fn test_native_sampling_params_bounds() {
-        // max_tokens = 0 must fail
+        // max_tokens = 0 or > MAX_OUTPUT_TOKENS must fail
         assert!(native_sampling_params(&serde_json::json!({}), 0).is_err());
-        // max_tokens > 4096 must fail
-        assert!(native_sampling_params(&serde_json::json!({}), 5000).is_err());
+        assert!(native_sampling_params(&serde_json::json!({}), MAX_OUTPUT_TOKENS + 1).is_err());
+
+        // Large output budgets (> 4096) up to MAX_OUTPUT_TOKENS are allowed at the parser layer
+        for valid_max in [5000, 16_384, 32_768, 65_536, MAX_OUTPUT_TOKENS] {
+            let p = native_sampling_params(&serde_json::json!({}), valid_max).unwrap();
+            assert_eq!(p.max_tokens, valid_max);
+        }
 
         // Valid request
         let req = serde_json::json!({
@@ -565,22 +851,78 @@ mod tests {
             !resolve_chat_enable_thinking(&serde_json::json!({"reasoning_effort": "none"}))
                 .unwrap()
         );
-        assert!(
-            !resolve_chat_enable_thinking(&serde_json::json!({"reasoning_effort": "minimal"}))
-                .unwrap()
-        );
-        for eff in ["low", "medium", "high", "xhigh", "max"] {
+        for eff in ["minimal", "low", "medium", "high", "xhigh", "max"] {
             assert!(
                 resolve_chat_enable_thinking(&serde_json::json!({"reasoning_effort": eff}))
-                    .unwrap()
+                    .unwrap(),
+                "expected thinking enabled for effort={eff}"
             );
+            let (thinking, resolved_eff) =
+                resolve_chat_reasoning_config(&serde_json::json!({"reasoning_effort": eff}), None)
+                    .unwrap();
+            assert!(thinking);
+            assert_eq!(resolved_eff.as_deref(), Some(eff));
         }
-        assert!(
-            resolve_chat_enable_thinking(&serde_json::json!({
-                "reasoning_effort": "none",
-                "chat_template_kwargs": {"enable_thinking": true}
-            }))
-            .unwrap()
+        assert_eq!(
+            resolve_chat_reasoning_config(&serde_json::json!({}), Some("low")).unwrap(),
+            (true, Some("low".to_string()))
+        );
+        assert_eq!(
+            resolve_chat_reasoning_budget(
+                &serde_json::json!({"thinking_token_budget": 2048}),
+                Some(4096),
+                Some("Time is up.")
+            )
+            .unwrap(),
+            (
+                ResolvedReasoningBudget::PerRequestExplicit(2048),
+                Some("Time is up.".to_string())
+            )
+        );
+        assert_eq!(
+            resolve_chat_reasoning_budget(&serde_json::json!({}), Some(4096), None).unwrap(),
+            (ResolvedReasoningBudget::ServerDefault(4096), None)
+        );
+        assert_eq!(
+            resolve_chat_reasoning_budget(
+                &serde_json::json!({"reasoning_budget_tokens": -1}),
+                Some(4096),
+                None
+            )
+            .unwrap(),
+            (ResolvedReasoningBudget::Unlimited, None)
+        );
+        assert_eq!(
+            resolve_chat_reasoning_budget(&serde_json::json!({}), None, None).unwrap(),
+            (ResolvedReasoningBudget::Default, None)
+        );
+        // enable_thinking=true + effort="none" clears effort to None so Jinja & parser stay synced
+        assert_eq!(
+            resolve_chat_reasoning_config(
+                &serde_json::json!({
+                    "reasoning_effort": "none",
+                    "chat_template_kwargs": {"enable_thinking": true}
+                }),
+                None
+            )
+            .unwrap(),
+            (true, None)
+        );
+        assert_eq!(
+            resolve_chat_reasoning_config(
+                &serde_json::json!({"chat_template_kwargs": {"enable_thinking": true}}),
+                Some("none")
+            )
+            .unwrap(),
+            (true, None)
+        );
+        assert_eq!(
+            resolve_chat_reasoning_config(
+                &serde_json::json!({"chat_template_kwargs": {"enable_thinking": false}}),
+                Some("high")
+            )
+            .unwrap(),
+            (false, None)
         );
         assert!(
             resolve_chat_enable_thinking(&serde_json::json!({"reasoning_effort": "bogus"}))
@@ -631,5 +973,103 @@ mod tests {
             WorkerError::sampler_status(2).http_status(),
             StatusCode::INTERNAL_SERVER_ERROR
         );
+    }
+
+    #[test]
+    fn test_generation_config_default_sampling_params_inheritance_and_overrides() {
+        use crate::parser::SamplingParams;
+
+        let qwen_gen_cfg = SamplingParams::from_generation_config_json(
+            r#"{
+                "bos_token_id": 248044,
+                "eos_token_id": [248046, 248044],
+                "pad_token_id": 248044,
+                "temperature": 1.0,
+                "top_p": 0.95,
+                "top_k": 20,
+                "do_sample": true
+            }"#,
+        );
+        assert_eq!(qwen_gen_cfg.temperature, 1.0);
+        assert_eq!(qwen_gen_cfg.top_p, 0.95);
+        assert_eq!(qwen_gen_cfg.top_k, 20);
+
+        // `do_sample: false` forces greedy `temperature = 0.0` even if `temperature` is listed.
+        let greedy_gen_cfg = SamplingParams::from_generation_config_json(
+            r#"{"temperature": 0.7, "top_p": 0.9, "top_k": 0, "do_sample": false}"#,
+        );
+        assert_eq!(greedy_gen_cfg.temperature, 0.0);
+        assert_eq!(greedy_gen_cfg.top_p, 0.9);
+        assert_eq!(greedy_gen_cfg.top_k, -1);
+
+        // Omitted and explicit `null` sampling fields inherit model `generation_config.json` defaults.
+        for req in [
+            serde_json::json!({}),
+            serde_json::json!({"temperature": null, "top_p": null, "top_k": null, "seed": null}),
+        ] {
+            let chat_p = native_sampling_params_with_defaults(&req, 256, &qwen_gen_cfg).unwrap();
+            assert_eq!(chat_p.temperature, 1.0);
+            assert_eq!(chat_p.top_p, 0.95);
+            assert_eq!(chat_p.top_k, 20);
+            assert!(!chat_p.is_plain_greedy(false));
+
+            let comp_p =
+                completion_sampling_params_with_defaults(&req, 256, &qwen_gen_cfg).unwrap();
+            assert_eq!(comp_p.temperature, 1.0);
+            assert_eq!(comp_p.top_p, 0.95);
+            assert_eq!(comp_p.top_k, 20);
+        }
+
+        // Explicit `"temperature": 0.0` overrides `generation_config.json` and enters plain greedy.
+        let explicit_greedy = native_sampling_params_with_defaults(
+            &serde_json::json!({"temperature": 0.0}),
+            128,
+            &qwen_gen_cfg,
+        )
+        .unwrap();
+        assert_eq!(explicit_greedy.temperature, 0.0);
+        assert!(explicit_greedy.is_plain_greedy(false));
+    }
+
+    #[test]
+    fn test_reasoning_effort_budget_openrouter_ratios() {
+        assert!(ServeOptions::default().reasoning_effort_budget);
+        // OpenRouter effort ratios on explicit max_tokens=4000
+        let explicit_cases = [
+            (Some("minimal"), Some(400)),
+            (Some("low"), Some(800)),
+            (Some("medium"), Some(2000)),
+            (None, Some(2000)),
+            (Some("high"), Some(3200)),
+            (Some("xhigh"), Some(3800)),
+            (Some("max"), Some(3800)),
+            (Some("none"), None),
+        ];
+        for (effort, expected) in explicit_cases {
+            assert_eq!(
+                compute_effort_reasoning_budget(effort, 4000),
+                expected,
+                "effort={effort:?}"
+            );
+        }
+        // Omitted max_tokens on 262K context caps base at 32,768 so effort levels stay distinct
+        let capped_cases = [
+            (Some("minimal"), Some(3_276)),
+            (Some("low"), Some(6_553)),
+            (Some("medium"), Some(16_384)),
+            (Some("high"), Some(26_214)),
+            (Some("xhigh"), Some(31_129)),
+            (Some("max"), Some(31_129)),
+        ];
+        for (effort, expected) in capped_cases {
+            assert_eq!(
+                compute_effort_reasoning_budget(effort, 260_000),
+                expected,
+                "capped effort={effort:?}"
+            );
+        }
+        // Small max_tokens always leaves at least 1 token for visible output
+        assert_eq!(compute_effort_reasoning_budget(Some("max"), 2), Some(1));
+        assert_eq!(compute_effort_reasoning_budget(Some("medium"), 1), None);
     }
 }

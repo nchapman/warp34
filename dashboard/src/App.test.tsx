@@ -1,10 +1,11 @@
 import { fireEvent, render, screen } from "@testing-library/react";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
+import userEvent from "@testing-library/user-event";
 import { Dashboard } from "./App";
 import { histogram, snapshot } from "./fixtures";
 
 describe("dashboard states", () => {
-  it("shows an intentional connecting state without invented data", () => {
+  it("shows an intentional connecting state without invented data", async () => {
     render(
       <Dashboard
         state={{ history: [], connection: "connecting", error: null }}
@@ -13,9 +14,11 @@ describe("dashboard states", () => {
     expect(screen.getByRole("status")).toHaveTextContent("Connecting");
     expect(screen.getByText("Waiting for engine…")).toBeVisible();
     expect(screen.queryByText("0 ms")).not.toBeInTheDocument();
-    expect(screen.getAllByText("Collecting observations")).toHaveLength(3);
+    expect(await screen.findAllByText("Collecting observations")).toHaveLength(
+      3,
+    );
   });
-  it("shows real model, capacity and load with accessible chart descriptions", () => {
+  it("shows real model, capacity and load with accessible chart descriptions", async () => {
     render(
       <Dashboard
         state={{ history: [snapshot()], connection: "live", error: null }}
@@ -25,8 +28,8 @@ describe("dashboard states", () => {
     expect(
       screen
         .getByRole("link", { name: "warp34 home" })
-        .querySelectorAll("path"),
-    ).toHaveLength(3);
+        .querySelector("img.brand-logo"),
+    ).toHaveAttribute("alt", "warp34");
     expect(screen.getByText("test/model")).toBeVisible();
     expect(
       screen.getByRole("img", {
@@ -34,7 +37,7 @@ describe("dashboard states", () => {
       }),
     ).toBeVisible();
     expect(
-      screen.getByRole("img", { name: /Generation throughput/ }),
+      await screen.findByRole("img", { name: /Generation throughput/ }),
     ).toBeVisible();
     expect(screen.queryByText("Draft acceptance")).not.toBeInTheDocument();
   });
@@ -78,9 +81,10 @@ describe("dashboard states", () => {
       />,
     );
     expect(screen.getByText('<img src=x onerror="alert(1)">')).toBeVisible();
-    expect(document.querySelector("img")).toBeNull();
+    expect(document.querySelectorAll("img:not(.brand-logo)")).toHaveLength(0);
   });
-  it("provides a read-only connection guide and security warning", () => {
+  it("provides a read-only connection guide and security warning", async () => {
+    const user = userEvent.setup();
     render(
       <Dashboard
         state={{
@@ -108,21 +112,61 @@ describe("dashboard states", () => {
       screen.getByText(/CLAUDE_CODE_MAX_OUTPUT_TOKENS=2048/),
     ).toBeVisible();
     expect(screen.getByText(/claude --model "Qwen\/Qwen3.5-4B"/)).toBeVisible();
-    fireEvent.click(screen.getByRole("tab", { name: "Codex CLI" }));
+    await user.click(screen.getByRole("tab", { name: "Codex CLI" }));
     expect(screen.getByText(/model_context_window = 8192/)).toBeVisible();
     expect(screen.getByText(/\[model_providers\.warp34\]/)).toBeVisible();
-    fireEvent.click(screen.getByRole("tab", { name: "OpenCode" }));
+    await user.click(screen.getByRole("tab", { name: "OpenCode" }));
     expect(
       screen.getByText(/"model": "warp34\/Qwen\/Qwen3.5-4B"/),
     ).toBeVisible();
     expect(
       screen.getByText(/API-key authentication is optional/),
     ).toBeVisible();
+    expect(screen.getByText(/Use --no-webui to disable/)).toHaveTextContent(
+      /metrics and health remain available/,
+    );
     expect(screen.getByRole("link", { name: "/api/metrics" })).toHaveAttribute(
       "href",
       "/api/metrics",
     );
     window.history.replaceState(null, "", "/");
+  });
+  it("supports arrow-key integration tabs with associated panels", async () => {
+    const user = userEvent.setup();
+    render(
+      <Dashboard
+        initialEntries={["/connect"]}
+        state={{ history: [], connection: "connecting", error: null }}
+      />,
+    );
+    const first = screen.getByRole("tab", { name: "Claude Code" });
+    first.focus();
+    await user.keyboard("{ArrowRight}");
+    const codex = screen.getByRole("tab", { name: "Codex CLI" });
+    expect(codex).toHaveFocus();
+    expect(codex).toHaveAttribute("aria-selected", "true");
+    expect(screen.getByRole("tabpanel", { name: "Codex CLI" })).toHaveAttribute(
+      "id",
+      codex.getAttribute("aria-controls"),
+    );
+    await user.keyboard("{End}");
+    expect(screen.getByRole("tab", { name: "Python & cURL" })).toHaveFocus();
+  });
+  it("announces a failed clipboard write instead of silently ignoring it", async () => {
+    const user = userEvent.setup();
+    vi.spyOn(navigator.clipboard, "writeText").mockRejectedValue(
+      new Error("Denied"),
+    );
+    render(
+      <Dashboard
+        initialEntries={["/connect"]}
+        state={{ history: [], connection: "connecting", error: null }}
+      />,
+    );
+    await user.click(screen.getAllByRole("button", { name: /Copy/ })[0]);
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "Could not copy",
+    );
   });
   it("populates throughput and latency panels for zero-generated-token decision workloads", () => {
     const s1 = snapshot({
@@ -153,5 +197,109 @@ describe("dashboard states", () => {
     expect(screen.getByText("Prompt tokens")).toBeVisible();
     expect(screen.getByText("1,000")).toBeVisible();
     expect(screen.getByText("Mean decision E2E")).toBeVisible();
+  });
+  it("scales Connect output token budgets above 4096 for long-context servers", () => {
+    render(
+      <Dashboard
+        initialEntries={["/connect"]}
+        state={{
+          history: [
+            snapshot({
+              model: "Qwen/Qwen3.5-4B",
+              config: {
+                tp_size: 1,
+                kv_format: "tq4",
+                speculation: "mtp",
+                max_model_len: 65536,
+              },
+            }),
+          ],
+          connection: "live",
+          error: null,
+        }}
+      />,
+    );
+    expect(
+      screen.getByText(/CLAUDE_CODE_MAX_OUTPUT_TOKENS=16384/),
+    ).toBeVisible();
+  });
+  it("renders context badge, cached pool counts, tiered GDN checkpoint occupancy, and paused footer", () => {
+    render(
+      <Dashboard
+        state={{
+          history: [
+            snapshot({
+              config: {
+                tp_size: 2,
+                kv_format: "tq4",
+                speculation: "dflash2",
+                max_model_len: 262144,
+              },
+              pools: {
+                kv: { capacity: 16384, active: 64, cached: 512, free: 15808 },
+                gdn: { capacity: 179, active: 4, cached: 46, free: 129 },
+                gdn_checkpoints: {
+                  vram_capacity: 16,
+                  vram_used: 12,
+                  host_capacity: 99,
+                  host_used: 34,
+                },
+              },
+            }),
+          ],
+          connection: "paused",
+          error: null,
+        }}
+      />,
+    );
+    expect(screen.getByText("256k ctx")).toBeVisible();
+    expect(screen.getByText("512 cached · 15,808 free")).toBeVisible();
+    expect(screen.getByText("WHT128-Q8 checkpoints")).toBeVisible();
+    expect(screen.getByText("L1 12/16 VRAM · L2 34/99 RAM")).toBeVisible();
+    expect(screen.getByRole("contentinfo")).toHaveTextContent(
+      /Paused.*Read-only/,
+    );
+  });
+  it("shows subtle LoRA adapter indicators on Overview when adapters are loaded", () => {
+    const { rerender } = render(
+      <Dashboard
+        state={{
+          history: [
+            snapshot({
+              config: {
+                tp_size: 1,
+                kv_format: "tq4",
+                speculation: "none",
+                lora_adapters: ["sql-expert"],
+              },
+            }),
+          ],
+          connection: "live",
+          error: null,
+        }}
+      />,
+    );
+    expect(screen.getByText("LoRA: sql-expert")).toBeVisible();
+
+    rerender(
+      <Dashboard
+        state={{
+          history: [
+            snapshot({
+              config: {
+                tp_size: 1,
+                kv_format: "tq4",
+                speculation: "none",
+                lora_adapters: ["sql-expert", "code-review"],
+              },
+            }),
+          ],
+          connection: "live",
+          error: null,
+        }}
+      />,
+    );
+    expect(screen.getByText("2 LoRAs")).toBeVisible();
+    expect(screen.getByText("LoRA: sql-expert, code-review")).toBeVisible();
   });
 });

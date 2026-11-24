@@ -148,20 +148,20 @@ run = "python3 tools/oracle/needle_matrix.py"
 description = "Run warp34 dump-diff TP=1 vs TP=2 parity across plain, Vision, MTP, DFlash2, and 35B-A3B MoE"
 depends = ["build"]
 run = """
-./target/release/warp34 dump-diff --model Qwen/Qwen3.5-4B --kv-format tq4 --compare-tp2
-./target/release/warp34 dump-diff --model Qwen/Qwen3.5-4B --kv-format tq4 --image rgb://https://warp34.test/sample.ppm --compare-tp2
-./target/release/warp34 dump-diff --model Qwen/Qwen3.5-4B --kv-format tq4 --speculative mtp --mtp-k 3 --compare-tp2
-./target/release/warp34 dump-diff --model Qwen/Qwen3.5-4B --kv-format tq4 --speculative dflash2 --draft-model nchapman/Qwen3.5-4B-DFlash2 --compare-tp2
-./target/release/warp34 dump-diff --model nchapman/Qwen3.6-35B-A3B-W4A16-HGPTQ --kv-format tq4 --kv-pages 64 --compare-tp2
-./target/release/warp34 dump-diff --model nchapman/Qwen3.6-35B-A3B-W4A16-HGPTQ --kv-format tq4 --kv-pages 64 --speculative mtp --mtp-k 3 --compare-tp2
+./target/release/warp34 dump-diff --offline --model Qwen/Qwen3.5-4B --kv-format tq4 --compare-tp2
+./target/release/warp34 dump-diff --offline --model Qwen/Qwen3.5-4B --kv-format tq4 --image rgb://https://warp34.test/sample.ppm --compare-tp2
+./target/release/warp34 dump-diff --offline --model Qwen/Qwen3.5-4B --kv-format tq4 --speculative mtp --mtp-k 3 --compare-tp2
+./target/release/warp34 dump-diff --offline --model Qwen/Qwen3.5-4B --kv-format tq4 --speculative dflash2 --draft-model nchapman/Qwen3.5-4B-DFlash2 --prompt "$(printf '<|im_start|>user\nWhat is the capital of France?<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n')" --compare-tp2
+./target/release/warp34 dump-diff --offline --model nchapman/Qwen3.6-35B-A3B-W4A16-HGPTQ --kv-format tq4 --kv-pages 64 --compare-tp2
+./target/release/warp34 dump-diff --offline --model nchapman/Qwen3.6-35B-A3B-W4A16-HGPTQ --kv-format tq4 --kv-pages 64 --speculative mtp --mtp-k 3 --compare-tp2
 """
 
 [tasks."oracle-greedy"]
 description = "Run warp34 greedy-diff with boundary-anchored TQ4, lossless speculative, and warm radix verification"
 depends = ["build"]
 run = """
-./target/release/warp34 greedy-diff --model Qwen/Qwen3.5-4B --golden tools/oracle/goldens/4B --max-prompts 4 --max-tokens 32 --kv-format tq4 --speculative mtp --mtp-k 3 --verify-lossless --verify-radix-warm
-./target/release/warp34 greedy-diff --model Qwen/Qwen3.5-4B --golden tools/oracle/goldens/4B --max-prompts 4 --max-tokens 32 --kv-format tq4 --speculative dflash2 --draft-model nchapman/Qwen3.5-4B-DFlash2 --verify-lossless --verify-radix-warm
+./target/release/warp34 greedy-diff --offline --model Qwen/Qwen3.5-4B --golden tools/oracle/goldens/4B --max-prompts 4 --max-tokens 32 --kv-format tq4 --speculative mtp --mtp-k 3 --verify-lossless --verify-radix-warm
+./target/release/warp34 greedy-diff --offline --model Qwen/Qwen3.5-4B --golden tools/oracle/goldens/4B --max-prompts 4 --max-tokens 32 --kv-format tq4 --speculative dflash2 --draft-model nchapman/Qwen3.5-4B-DFlash2 --verify-lossless --verify-radix-warm
 """
 
 [tasks."bench-all"]
@@ -180,6 +180,16 @@ run = """
 ./target/release/warp34 bench --offline --model nchapman/Qwen3.8-Flash-Next-W4A16-HGPTQ --tp 2 --stage all --kv-format tq4 --kv-pages 512 --prompt-len 64 --gen-len 64 --batch-size 8 --speculative mtp --mtp-k 3
 ./target/release/warp34 bench --offline --model nchapman/Qwen3.8-Flash-Next-W4A16-HGPTQ --tp 2 --stage all --kv-format tq4 --kv-pages 512 --prompt-len 64 --gen-len 64 --batch-size 8 --speculative dflash2 --draft-model nchapman/Qwen3.8-Flash-Next-DFlash2-W4A16-HGPTQ
 """
+
+[tasks."bench-gate"]
+description = "Run 4B benchmark regression gate (Plain vs MTP-3 vs DFlash2, synthetic vs realistic prompts) and render Markdown comparison table"
+depends = ["build"]
+run = "python3 tools/check_bench_regressions.py --live --suite quick"
+
+[tasks."bench-gate-full"]
+description = "Run full benchmark regression gate across 4B, 9B+LoRA, 27B, 35B-A3B MoE, and Qwen3.8-Flash-Next"
+depends = ["build"]
+run = "python3 tools/check_bench_regressions.py --live --suite full"
 
 [tasks."profile-live"]
 description = "Capture live nsys SQLite profiles and render category scoreboards vs vLLM/SGLang"

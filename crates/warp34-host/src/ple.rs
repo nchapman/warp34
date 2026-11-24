@@ -13,6 +13,7 @@ use crate::loader::{LayerKind, ModelConfig, SafetensorsArchive};
 const PROT_READ: i32 = 0x1;
 const MAP_PRIVATE: i32 = 0x02;
 const MADV_RANDOM: i32 = 1;
+const MADV_SEQUENTIAL: i32 = 2;
 const MADV_WILLNEED: i32 = 3;
 
 unsafe extern "C" {
@@ -826,6 +827,69 @@ impl PleMmapTable {
             },
             gather_cache: std::sync::Mutex::new((Vec::new(), Vec::new())),
         })
+    }
+
+    /// Total byte span across all distinct memory-mapped PLE `.safetensors` files.
+    #[inline]
+    pub fn total_mapped_bytes(&self) -> usize {
+        self.mmaps.iter().map(|m| m.len).sum()
+    }
+
+    /// Sequentially prefaults all mapped PLE `.safetensors` pages into the OS page cache
+    /// when `avail_ram_bytes >= total_mapped_bytes() + safety_headroom_bytes`, eliminating
+    /// synchronous NVMe major page faults during serving while falling back to zero-RAM
+    /// `MADV_RANDOM` on memory-constrained hosts. Returns the number of bytes populated.
+    pub fn populate_into_page_cache_with_available_ram(
+        &self,
+        avail_ram_bytes: Option<usize>,
+        safety_headroom_bytes: usize,
+    ) -> usize {
+        let total = self.total_mapped_bytes();
+        if total == 0 {
+            return 0;
+        }
+        let Some(avail) = avail_ram_bytes else {
+            return 0;
+        };
+        if avail < total.saturating_add(safety_headroom_bytes) {
+            return 0;
+        }
+        std::thread::scope(|s| {
+            for region in &self.mmaps {
+                if region.len == 0 {
+                    continue;
+                }
+                s.spawn(move || {
+                    let base = region.ptr.as_ptr();
+                    let len = region.len;
+                    // SAFETY: `base..base + len` is a valid read-only `mmap` owned by `self`.
+                    unsafe {
+                        let _ = madvise(base.cast(), len, MADV_SEQUENTIAL);
+                        let _ = madvise(base.cast(), len, MADV_WILLNEED);
+                        let mut acc = 0u8;
+                        let mut off = 0usize;
+                        while off < len {
+                            acc ^= core::ptr::read_volatile(base.add(off));
+                            off += PLE_OS_PAGE_BYTES;
+                        }
+                        acc ^= core::ptr::read_volatile(base.add(len - 1));
+                        std::hint::black_box(acc);
+                        let _ = madvise(base.cast(), len, MADV_RANDOM);
+                    }
+                });
+            }
+        });
+        total
+    }
+
+    /// Queries cgroup-aware available host RAM (`crate::cache::detect_available_host_ram_bytes`,
+    /// capping `/proc/meminfo` `MemAvailable` by cgroup v2 `memory.max - memory.current`) and
+    /// prefaults all PLE `.safetensors` pages into RAM when headroom permits.
+    pub fn populate_into_page_cache_if_fits(&self, safety_headroom_bytes: usize) -> usize {
+        self.populate_into_page_cache_with_available_ram(
+            crate::cache::detect_available_host_ram_bytes(),
+            safety_headroom_bytes,
+        )
     }
 
     /// Number of staged bytes gathered per n-gram head lookup (`160 B` for `F8_E4M3`,

@@ -667,8 +667,7 @@ impl QwenImage21PipelineEngine {
             // and release it before `denoise_loop` so both ranks retain ~16 GiB free for 1024x1024+ TI2I KV caches.
             let gpu1_total_bytes = CudaDevice::set_current(1)
                 .and_then(|d| d.mem_info())
-                .map(|(_, total)| total)
-                .unwrap_or(0);
+                .map_or(0, |(_, total)| total);
             let need_ondemand_te = *tf_quant == crate::loader::QuantScheme::Unquantized
                 && *te_quant == crate::loader::QuantScheme::Unquantized
                 && gpu1_total_bytes < (32usize << 30);
@@ -812,7 +811,7 @@ impl QwenImage21PipelineEngine {
 
     #[cfg(all(test, feature = "cuda"))]
     pub(crate) fn force_ondemand_conditioning_for_test(&mut self) {
-        let device_id = if self.tp_size == 2 { 1 } else { 0 };
+        let device_id = i32::from(self.tp_size == 2);
         let archive = Arc::new(
             SafetensorsArchive::open(&self.cfg.text_encoder_dir)
                 .expect("open text_encoder archive"),
@@ -865,8 +864,9 @@ impl QwenImage21PipelineEngine {
             .text_encoder
             .vision_config
             .as_ref()
-            .map(|v| (v.spatial_merge_size, v.image_token_id))
-            .unwrap_or((2, IMAGE_PAD_TOKEN_ID));
+            .map_or((2, IMAGE_PAD_TOKEN_ID), |v| {
+                (v.spatial_merge_size, v.image_token_id)
+            });
         if images.is_empty() {
             return Ok(raw_ids
                 .iter()
@@ -1014,9 +1014,9 @@ impl QwenImage21PipelineEngine {
         let mut img_shapes = Vec::with_capacity(req.condition_images.len() + 1);
 
         let vis_cfg = self.cfg.text_encoder.vision_config.as_ref();
-        let patch_size = vis_cfg.map(|v| v.patch_size).unwrap_or(16);
-        let temporal_patch_size = vis_cfg.map(|v| v.temporal_patch_size).unwrap_or(2);
-        let spatial_merge_size = vis_cfg.map(|v| v.spatial_merge_size).unwrap_or(2);
+        let patch_size = vis_cfg.map_or(16, |v| v.patch_size);
+        let temporal_patch_size = vis_cfg.map_or(2, |v| v.temporal_patch_size);
+        let spatial_merge_size = vis_cfg.map_or(2, |v| v.spatial_merge_size);
 
         for cond_img in &req.condition_images {
             let (in_w, in_h) = calculate_dimensions(
@@ -1087,12 +1087,7 @@ impl QwenImage21PipelineEngine {
         let init_latents = pack_latents_chw_to_hwc(&init_chw, z_dim, latent_h, latent_w);
 
         // 4. Build FlowMatchEulerDiscreteScheduler schedule
-        let default_steps = self
-            .cfg
-            .sample_sigmas
-            .as_ref()
-            .map(|s| s.len())
-            .unwrap_or(40);
+        let default_steps = self.cfg.sample_sigmas.as_ref().map_or(40, Vec::len);
         let requested_steps = req.num_inference_steps.unwrap_or(default_steps);
         let sigmas_override = if let Some(s) = &req.sigmas {
             Some(s.as_slice())

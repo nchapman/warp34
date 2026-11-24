@@ -12,6 +12,84 @@ fn bf16_to_f32(bits: u16) -> f32 {
 }
 
 #[test]
+fn dflash_confidence_gate_truncates_low_prob_tail_and_cum_prob() {
+    // 1. Marginal drop at j = 2 truncates tail:
+    //    confs = [0.90, 0.85, 0.50, 0.95] -> cum = [0.90, 0.765, 0.382] -> keeps len = 2.
+    let mut path = vec![10, 20, 30, 40];
+    let confs = vec![0.90, 0.85, 0.50, 0.95];
+    DFlash2Rank::truncate_path_by_step_confidences(&mut path, &confs, 7, 0.70, 0.45, false);
+    assert_eq!(path, vec![10, 20]);
+
+    // 2. Low-confidence j = 0 (`0.27`) keeps j = 0 (`len = 1`) when `allow_zero_drafts = false`,
+    //    and drops all drafts (`len = 0`) when `allow_zero_drafts = true` (TP=1 offloaded MoE).
+    let mut uncertain_first = vec![10, 20, 30, 40];
+    let uncertain_confs = vec![0.27, 0.95, 0.95, 0.95];
+    DFlash2Rank::truncate_path_by_step_confidences(
+        &mut uncertain_first,
+        &uncertain_confs,
+        7,
+        0.70,
+        0.45,
+        false,
+    );
+    assert_eq!(uncertain_first, vec![10]);
+
+    let mut zero_draft = vec![10, 20, 30, 40];
+    DFlash2Rank::truncate_path_by_step_confidences(
+        &mut zero_draft,
+        &uncertain_confs,
+        7,
+        0.0,
+        0.70,
+        true,
+    );
+    assert!(zero_draft.is_empty());
+
+    let mut chain_draft = vec![10, 20, 30, 40];
+    let chain_confs = vec![0.92, 0.85, 0.85, 0.99];
+    // cum = [0.92, 0.782, 0.6647 (< 0.70)] -> keeps 2 drafts
+    DFlash2Rank::truncate_path_by_step_confidences(
+        &mut chain_draft,
+        &chain_confs,
+        7,
+        0.0,
+        0.70,
+        true,
+    );
+    assert_eq!(chain_draft, vec![10, 20]);
+
+    // AVX-512 TP=1 gate `(7, 0.35, 0.35, true)` drops uncertain j = 0 (`0.27 < 0.35`)
+    // while retaining multi-step confident chains (`cum = 0.658 >= 0.35`).
+    let mut avx512_zero = vec![10, 20, 30, 40];
+    DFlash2Rank::truncate_path_by_step_confidences(
+        &mut avx512_zero,
+        &uncertain_confs,
+        7,
+        0.35,
+        0.35,
+        true,
+    );
+    assert!(avx512_zero.is_empty());
+
+    let mut avx512_chain = vec![10, 20, 30, 40];
+    DFlash2Rank::truncate_path_by_step_confidences(
+        &mut avx512_chain,
+        &chain_confs,
+        7,
+        0.35,
+        0.35,
+        true,
+    );
+    assert_eq!(avx512_chain, vec![10, 20, 30, 40]);
+
+    // 3. When all positions remain above both step and cumulative floors, caps at `max_draft`.
+    let mut high = vec![10, 20, 30, 40, 50, 60, 70];
+    let high_confs = vec![0.99; 7];
+    DFlash2Rank::truncate_path_by_step_confidences(&mut high, &high_confs, 6, 0.70, 0.45, false);
+    assert_eq!(high.len(), 6);
+}
+
+#[test]
 fn bf16_marlin_u4b8_and_hadamard_match_reference() {
     let dev = CudaDevice::set_current(0).unwrap();
     let stream = CudaStream::new(0).unwrap();

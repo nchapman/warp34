@@ -14,7 +14,7 @@ pub use crate::server::WorkerError;
 use crate::{
     model::{EngineBatchSlice, PipelinedDecodeOutput, Qwen3_5Engine},
     parser::{SamplerV1, SamplingParams, StepLogprobs, TokenBitmaskConstraint},
-    scheduler::{ScheduledReqSlice, SchedulerConfig, SchedulerV1},
+    scheduler::{CacheLookup, ScheduledReqSlice, SchedulerConfig, SchedulerV1},
     telemetry::{Config as TelemetryConfig, Lifecycle, Outcome, Pool, Pools, Telemetry},
 };
 
@@ -34,6 +34,7 @@ pub enum GenerationEvent {
     Finished {
         cached_tokens: usize,
         generated_tokens: usize,
+        thinking_budget_exhausted: bool,
     },
     Error(WorkerError),
 }
@@ -76,11 +77,28 @@ fn generation_channel(capacity: usize) -> (Sender<GenerationEvent>, GenerationEv
 pub struct GenerationStream {
     pub events: GenerationEvents,
     pub cached_tokens: Arc<AtomicU64>,
+    pub cache_lookup: Arc<OnceLock<CacheLookup>>,
+    pub hit_limit: Arc<AtomicBool>,
     cancelled: Arc<AtomicBool>,
 }
 impl GenerationStream {
     pub fn cancel_handle(&self) -> Arc<AtomicBool> {
         self.cancelled.clone()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_channel(capacity: usize) -> (Sender<GenerationEvent>, Self) {
+        let (tx, events) = generation_channel(capacity);
+        (
+            tx,
+            Self {
+                events,
+                cached_tokens: Arc::new(AtomicU64::new(0)),
+                cache_lookup: Arc::default(),
+                hit_limit: Arc::new(AtomicBool::new(false)),
+                cancelled: Arc::new(AtomicBool::new(false)),
+            },
+        )
     }
 }
 impl Drop for GenerationStream {
@@ -135,7 +153,10 @@ struct Request {
     images: Vec<crate::vision::PreprocessedImage>,
     vision: Option<crate::scheduled_vision::ScheduledVision>,
     reserved_pages: usize,
+    soft_output_budget: bool,
     cached_tokens: Arc<AtomicU64>,
+    cache_lookup: Arc<OnceLock<CacheLookup>>,
+    hit_limit: Arc<AtomicBool>,
     sampler: SamplerV1,
     output: Sender<GenerationEvent>,
     terminal: Arc<OnceLock<GenerationEvent>>,
@@ -155,18 +176,19 @@ impl Request {
     }
 
     fn set_terminal(&self, event: GenerationEvent) {
+        let outcome = match &event {
+            GenerationEvent::Finished { .. } if self.cancelled.load(Ordering::Acquire) => {
+                Outcome::Cancelled
+            }
+            GenerationEvent::Finished { .. } => Outcome::Completed,
+            GenerationEvent::Error(_) => Outcome::Failed,
+            GenerationEvent::Token { .. } => Outcome::Failed,
+        };
         // First terminal result wins; in particular, unwinding must not replace an
         // already published result while dropping request-owned resources.
-        if self.terminal.set(event.clone()).is_ok()
+        if self.terminal.set(event).is_ok()
             && let Some(life) = &self.lifecycle
         {
-            let outcome = match event {
-                GenerationEvent::Finished { .. } if self.cancelled.load(Ordering::Acquire) => {
-                    Outcome::Cancelled
-                }
-                GenerationEvent::Finished { .. } => Outcome::Completed,
-                _ => Outcome::Failed,
-            };
             life.finish(outcome);
         }
     }
@@ -209,9 +231,7 @@ pub struct WorkerStats {
 
 fn validate_request_length(prompt: usize, output: usize, limit: usize) -> Result<(), WorkerError> {
     if prompt.checked_add(output).is_none_or(|total| total > limit) {
-        return Err(WorkerError::invalid_request(format!(
-            "prompt ({prompt}) + output budget ({output}) exceeds serving context limit ({limit} tokens)"
-        )));
+        return Err(WorkerError::context_length_exceeded(prompt, output, limit));
     }
     Ok(())
 }
@@ -227,11 +247,15 @@ pub struct EngineWorker {
     pub eos_token_ids: Vec<i32>,
     pub vocab_size: usize,
     pub default_preserve_thinking: bool,
+    pub chat_template: crate::chatml::ChatTemplate,
+    pub default_sampling_params: SamplingParams,
     pub decision_profile: crate::decision::DecisionModelProfile,
     pub vision_config: Option<crate::vision::VisionConfig>,
+    pub vision_preprocessor: crate::vision::VisionPreprocessorConfig,
     pub has_vision_weights: bool,
     pub hidden_size: usize,
     pub kv_token_capacity: usize,
+    pub max_position_embeddings: Option<usize>,
     pub unshareable_prefill: bool,
     pub lora_registry: crate::lora::LoraAdapterRegistry,
     max_model_len: Option<usize>,
@@ -283,6 +307,9 @@ impl EngineWorker {
             .spawn(move || match loader() {
                 Ok(engine) => {
                     let kv_token_capacity = engine.ranks[0].kv_pool.num_pages * 16;
+                    let max_position_embeddings = engine.cfg.max_position_embeddings;
+                    let default_max_model_len =
+                        kv_token_capacity.min(max_position_embeddings.unwrap_or(usize::MAX));
                     worker_stats.telemetry.initialize(
                         TelemetryConfig {
                             tp_size: engine.tp_size,
@@ -292,7 +319,13 @@ impl EngineWorker {
                                 .as_ref()
                                 .map_or("none", |p| if p.is_mtp() { "mtp" } else { "dflash2" })
                                 .into(),
-                            max_model_len: Some(kv_token_capacity),
+                            max_model_len: Some(default_max_model_len),
+                            lora_adapters: engine
+                                .lora_registry
+                                .entries()
+                                .iter()
+                                .map(|e| e.name.clone())
+                                .collect(),
                         },
                         engine
                             .model_dir
@@ -332,6 +365,10 @@ impl EngineWorker {
                     }
                     let default_preserve_thinking =
                         crate::chatml::detect_default_preserve_thinking(&engine.model_dir);
+                    let chat_template =
+                        crate::chatml::ChatTemplate::from_model_dir(&engine.model_dir);
+                    let default_sampling_params =
+                        SamplingParams::from_generation_config_dir(&engine.model_dir);
                     let unshareable_prefill = engine.cfg.noncausal_full_attention
                         || engine.cfg.midloop.iter().any(|&(_, _, passes)| passes > 1);
                     let info = (
@@ -339,11 +376,15 @@ impl EngineWorker {
                         engine.cfg.eos_token_ids.clone(),
                         engine.cfg.vocab_size,
                         default_preserve_thinking,
+                        chat_template,
+                        default_sampling_params,
                         engine.decision_profile.clone(),
                         engine.cfg.vision_config.clone(),
+                        engine.cfg.vision_preprocessor.clone(),
                         engine.has_vision_weights,
                         engine.cfg.hidden_size,
                         kv_token_capacity,
+                        max_position_embeddings,
                         unshareable_prefill,
                         engine.lora_registry.clone(),
                     );
@@ -369,11 +410,15 @@ impl EngineWorker {
             eos_token_ids,
             vocab_size,
             default_preserve_thinking,
+            chat_template,
+            default_sampling_params,
             decision_profile,
             vision_config,
+            vision_preprocessor,
             has_vision_weights,
             hidden_size,
             kv_token_capacity,
+            max_position_embeddings,
             unshareable_prefill,
             lora_registry,
         ) = match ready_rx.recv() {
@@ -398,11 +443,15 @@ impl EngineWorker {
             eos_token_ids,
             vocab_size,
             default_preserve_thinking,
+            chat_template,
+            default_sampling_params,
             decision_profile,
             vision_config,
+            vision_preprocessor,
             has_vision_weights,
             hidden_size,
             kv_token_capacity,
+            max_position_embeddings,
             unshareable_prefill,
             lora_registry,
             max_model_len: None,
@@ -418,6 +467,13 @@ impl EngineWorker {
                 self.kv_token_capacity
             ));
         }
+        if let (Some(n), Some(max_pos)) = (limit, self.max_position_embeddings)
+            && n > max_pos
+        {
+            eprintln!(
+                "[warp34] warning: --max-model-len ({n}) exceeds model max_position_embeddings ({max_pos}); RoPE quality may degrade beyond {max_pos} tokens"
+            );
+        }
         self.max_model_len = limit;
         self.stats
             .telemetry
@@ -426,7 +482,10 @@ impl EngineWorker {
     }
 
     pub fn max_model_len(&self) -> usize {
-        self.max_model_len.unwrap_or(self.kv_token_capacity)
+        self.max_model_len.unwrap_or_else(|| {
+            self.kv_token_capacity
+                .min(self.max_position_embeddings.unwrap_or(usize::MAX))
+        })
     }
 
     /// Shutdown is terminal for this worker; callers must stop admitting requests.
@@ -543,6 +602,20 @@ impl EngineWorker {
         constraint: Option<TokenBitmaskConstraint>,
         lora_id: i32,
     ) -> Result<GenerationStream, WorkerError> {
+        self.submit_with_images_lora_and_budget_mode(
+            prompt, images, params, constraint, lora_id, false,
+        )
+    }
+
+    pub fn submit_with_images_lora_and_budget_mode(
+        &self,
+        prompt: Vec<i32>,
+        images: Vec<crate::vision::PreprocessedImage>,
+        params: SamplingParams,
+        constraint: Option<TokenBitmaskConstraint>,
+        lora_id: i32,
+        soft_output_budget: bool,
+    ) -> Result<GenerationStream, WorkerError> {
         params.validate().map_err(WorkerError::invalid_request)?;
         if prompt.is_empty() || params.max_tokens == 0 {
             return Err(WorkerError::invalid_request(
@@ -550,7 +623,9 @@ impl EngineWorker {
             ));
         }
         let (output, events) = generation_channel(64);
+        let cache_lookup = Arc::new(OnceLock::new());
         let cached_tokens = Arc::new(AtomicU64::new(0));
+        let hit_limit = Arc::new(AtomicBool::new(false));
         let cancelled = Arc::new(AtomicBool::new(false));
         let sampler = SamplerV1::new(params, &prompt, constraint);
         self.enqueue_request(Request {
@@ -559,7 +634,10 @@ impl EngineWorker {
             images,
             vision: None,
             reserved_pages: 0,
+            soft_output_budget,
+            cache_lookup: cache_lookup.clone(),
             cached_tokens: cached_tokens.clone(),
+            hit_limit: hit_limit.clone(),
             sampler,
             output,
             terminal: events.terminal.clone(),
@@ -573,7 +651,9 @@ impl EngineWorker {
         Ok(GenerationStream {
             events,
             cancelled,
+            cache_lookup,
             cached_tokens,
+            hit_limit,
         })
     }
 
@@ -747,7 +827,9 @@ impl EngineWorker {
             ));
         }
         let (output, events) = generation_channel(8);
+        let cache_lookup = Arc::new(OnceLock::new());
         let cached_tokens = Arc::new(AtomicU64::new(0));
+        let hit_limit = Arc::new(AtomicBool::new(false));
         let cancelled = Arc::new(AtomicBool::new(false));
         let params = SamplingParams {
             temperature: 0.0,
@@ -764,7 +846,10 @@ impl EngineWorker {
             images,
             vision: None,
             reserved_pages: 0,
+            soft_output_budget: false,
+            cache_lookup: cache_lookup.clone(),
             cached_tokens: cached_tokens.clone(),
+            hit_limit: hit_limit.clone(),
             sampler,
             output,
             terminal: events.terminal.clone(),
@@ -778,7 +863,9 @@ impl EngineWorker {
         Ok(GenerationStream {
             events,
             cancelled,
+            cache_lookup,
             cached_tokens,
+            hit_limit,
         })
     }
 }
@@ -848,6 +935,7 @@ pub fn run_batch_in_place(
         for prompt in wave {
             let (output, events) = generation_channel(max_new_tokens.max(64) + 16);
             let cached_tokens = Arc::new(AtomicU64::new(0));
+            let hit_limit = Arc::new(AtomicBool::new(false));
             let cancelled = Arc::new(AtomicBool::new(false));
             let params = SamplingParams {
                 temperature: 0.0,
@@ -866,7 +954,10 @@ pub fn run_batch_in_place(
                     images: Vec::new(),
                     vision: None,
                     reserved_pages: 0,
+                    soft_output_budget: false,
+                    cache_lookup: Arc::default(),
                     cached_tokens: cached_tokens.clone(),
+                    hit_limit,
                     sampler,
                     output,
                     terminal: events.terminal.clone(),
@@ -958,25 +1049,54 @@ fn publish_pools(
 ) {
     // Logical allocation is replicated across ranks; summing TP would double count.
     let rank = &engine.ranks[0];
+    let (ckpt_total, ckpt_free, gdn_checkpoints) = match rank.checkpoint_pool.as_ref() {
+        Some(c) => (
+            c.total_slots,
+            c.free_count(),
+            Some(crate::telemetry::CheckpointPoolStats {
+                vram_capacity: c.vram_slots as u64,
+                vram_used: c.vram_used_slots() as u64,
+                host_capacity: c.host_slots as u64,
+                host_used: c.host_used_slots() as u64,
+            }),
+        ),
+        None => (0, 0, None),
+    };
+    let host_kv_used = rank
+        .kv_pool
+        .host_swap
+        .as_ref()
+        .map_or(0, |h| h.used_count());
     telemetry.publish_pools(Pools {
         kv: Pool::known(
             rank.kv_pool.num_pages,
             rank.kv_pool.free_count(),
-            radix.full_evictable_pages(),
+            radix.full_evictable_pages().saturating_sub(host_kv_used),
         ),
         gdn: Pool::known(
-            rank.state_pool.total_slots,
-            rank.state_pool.free_count(),
+            rank.state_pool.total_slots.saturating_add(ckpt_total),
+            rank.state_pool.free_count().saturating_add(ckpt_free),
             radix.mamba_evictable_slots(),
         ),
+        gdn_checkpoints,
     });
 }
 
 fn release(engine: &mut Qwen3_5Engine, donation: Option<crate::radix::RadixDonationOutcome>) {
-    if let Some(d) = donation {
-        engine.free_kv_pages(&d.freed_kv_pages);
-        engine.free_state_slots(&d.freed_mamba_slots);
+    if let Some(d) = donation
+        && let Err(e) = engine.apply_radix_donation(&d)
+    {
+        eprintln!("warning: failed to pack GDN checkpoint during radix donation: {e}");
     }
+}
+
+fn finish_early(engine: &mut Qwen3_5Engine, sched: &mut SchedulerV1, req_id: u64) {
+    let out = if engine.has_checkpoint_pool() {
+        sched.finish_request_early_with(req_id, |r| engine.alloc_checkpoint_slot_from(r))
+    } else {
+        sched.finish_request_early(req_id)
+    };
+    release(engine, out);
 }
 
 fn enqueue(
@@ -1068,8 +1188,14 @@ fn enqueue(
         request.set_terminal(GenerationEvent::Error(err));
         return;
     }
-    request.reserved_pages = (request.prompt.len() + p.max_tokens).div_ceil(16);
-    p.eos_token_ids = engine.cfg.eos_token_ids.clone();
+    const INITIAL_SOFT_OUTPUT_RESERVE_TOKENS: usize = 256;
+    let init_out = if request.soft_output_budget {
+        p.max_tokens.clamp(1, INITIAL_SOFT_OUTPUT_RESERVE_TOKENS)
+    } else {
+        p.max_tokens.max(1)
+    };
+    request.reserved_pages = (request.prompt.len() + init_out).div_ceil(16);
+    p.eos_token_ids.clone_from(&engine.cfg.eos_token_ids);
     if !request.images.is_empty() {
         match crate::scheduled_vision::ScheduledVision::new(
             engine,

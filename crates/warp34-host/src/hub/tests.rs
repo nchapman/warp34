@@ -288,6 +288,7 @@ struct MockState {
     requests: Arc<Mutex<Vec<RecordedRequest>>>,
     missing: Arc<Mutex<BTreeSet<String>>>,
     denied: Arc<Mutex<bool>>,
+    server_error: Arc<Mutex<bool>>,
     forbidden: Arc<Mutex<BTreeSet<String>>>,
 }
 struct HubServer {
@@ -303,6 +304,7 @@ impl HubServer {
             requests: Arc::default(),
             missing: Arc::default(),
             denied: Arc::default(),
+            server_error: Arc::default(),
             forbidden: Arc::default(),
         };
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -364,6 +366,9 @@ async fn handle(State(state): State<MockState>, request: Request<Body>) -> Respo
         .lock()
         .unwrap()
         .push((method.clone(), path.into(), auth));
+    if *state.server_error.lock().unwrap() {
+        return (StatusCode::SERVICE_UNAVAILABLE, "hub outage").into_response();
+    }
     if *state.denied.lock().unwrap() {
         return (StatusCode::FORBIDDEN, "private-body-do-not-log-token").into_response();
     }
@@ -440,11 +445,42 @@ fn downloads_pinned_selected_assets_reuses_cache_and_works_offline() {
             .all(|(_, path, _)| path.contains(SHA))
     );
     let count = server.gets("model.safetensors");
+    assert_eq!(count, 1);
+    server.state.requests.lock().unwrap().clear();
     assert_eq!(
         resolve_remote("test/model", &options, ModelRole::Target, &s).unwrap(),
         dir
     );
-    assert_eq!(server.gets("model.safetensors"), count);
+    assert_eq!(server.gets("model.safetensors"), 0);
+    let warm_requests = server.state.requests.lock().unwrap().clone();
+    assert_eq!(
+        warm_requests.len(),
+        1,
+        "warm mutable-revision lookup should only query /api/models/.../revision/... once: {warm_requests:?}"
+    );
+    assert!(
+        warm_requests[0]
+            .1
+            .contains("/api/models/test/model/revision/")
+    );
+    server.state.requests.lock().unwrap().clear();
+    assert_eq!(
+        resolve_remote(
+            "test/model",
+            &HubOptions {
+                revision: Some(SHA.into()),
+                offline: false,
+            },
+            ModelRole::Target,
+            &s
+        )
+        .unwrap(),
+        dir
+    );
+    assert!(
+        server.state.requests.lock().unwrap().is_empty(),
+        "warm immutable-SHA lookup with valid manifest should make zero HTTP requests"
+    );
     drop(server);
     assert_eq!(
         resolve_remote(
@@ -699,4 +735,202 @@ fn qwen_image_pipeline_hub_files_resolve_single_and_sharded_components() {
     };
     let offline_dir = resolve_remote("test/model", &offline_opts, ModelRole::Target, &s).unwrap();
     assert_eq!(offline_dir, dir);
+}
+
+#[test]
+fn transient_network_or_5xx_failures_fall_back_only_to_complete_cached_snapshots() {
+    let tmp = tempfile::tempdir().unwrap();
+    let unreachable = settings(tmp.path(), &[("HF_ENDPOINT", "http://127.0.0.1:1")]);
+
+    // Uncached: transient connection failure still surfaces the actionable Hub error.
+    let uncached_err = resolve_remote(
+        "test/model",
+        &HubOptions::default(),
+        ModelRole::Target,
+        &unreachable,
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(
+        uncached_err.contains("cannot connect to Hub") || uncached_err.contains("timed out"),
+        "{uncached_err}"
+    );
+
+    // Populate a complete verified snapshot via the mock server.
+    let server = HubServer::new(fixture_files());
+    let online = settings(tmp.path(), &[("HF_ENDPOINT", &server.endpoint)]);
+    let dir = resolve_remote(
+        "test/model",
+        &HubOptions::default(),
+        ModelRole::Target,
+        &online,
+    )
+    .unwrap();
+
+    // 1. HTTP 503 outage without --offline falls back to the verified cached snapshot.
+    *server.state.server_error.lock().unwrap() = true;
+    assert_eq!(
+        resolve_remote(
+            "test/model",
+            &HubOptions::default(),
+            ModelRole::Target,
+            &online,
+        )
+        .unwrap(),
+        dir
+    );
+    *server.state.server_error.lock().unwrap() = false;
+
+    // 2. Explicit 403 access denial is NOT treated as transient and still fails closed.
+    *server.state.denied.lock().unwrap() = true;
+    let denied_err = resolve_remote(
+        "test/model",
+        &HubOptions::default(),
+        ModelRole::Target,
+        &online,
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(denied_err.contains("HF_TOKEN"), "{denied_err}");
+    *server.state.denied.lock().unwrap() = false;
+
+    // 3. Unreachable endpoint without --offline falls back to the verified cached snapshot.
+    drop(server);
+    assert_eq!(
+        resolve_remote(
+            "test/model",
+            &HubOptions::default(),
+            ModelRole::Target,
+            &unreachable,
+        )
+        .unwrap(),
+        dir
+    );
+
+    // 4. Incomplete cached snapshot (missing weight shard required by manifest) must NOT fall back.
+    fs::remove_file(dir.join("model.safetensors")).unwrap();
+    let partial_err = resolve_remote(
+        "test/model",
+        &HubOptions::default(),
+        ModelRole::Target,
+        &unreachable,
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(
+        partial_err.contains("cannot connect to Hub") || partial_err.contains("timed out"),
+        "{partial_err}"
+    );
+}
+
+#[test]
+fn lora_validates_optional_readout_reuses_warm_cache_and_falls_back_on_outage() {
+    let tmp = tempfile::tempdir().unwrap();
+    let lora_files = BTreeMap::from([
+        (
+            "sub/adapter_config.json".into(),
+            br#"{"r":8,"lora_alpha":16.0}"#.to_vec(),
+        ),
+        ("sub/adapter_model.safetensors".into(), weights()),
+        (
+            "sub/decision_config.json".into(),
+            br#"{"hidden_size":2560}"#.to_vec(),
+        ),
+        ("sub/readout.safetensors".into(), weights()),
+    ]);
+    let server = HubServer::new(lora_files);
+    // Missing optional `readout.safetensors` advertised in `siblings` must fail closed.
+    server
+        .state
+        .missing
+        .lock()
+        .unwrap()
+        .insert("sub/readout.safetensors".into());
+    let online = settings(tmp.path(), &[("HF_ENDPOINT", &server.endpoint)]);
+    let mut spec = crate::lora::LoraModuleSpec {
+        name: "my-lora".into(),
+        path: "test/model/sub".into(),
+        revision: None,
+        resolved_dir: None,
+    };
+    let err = super::resolve_lora_remote(
+        &mut spec,
+        false,
+        HFClient::builder()
+            .cache_dir(&online.cache)
+            .endpoint(&online.endpoint)
+            .token(&online.token),
+        false,
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(err.contains("incomplete"), "{err}");
+
+    // Repair and resolve cleanly.
+    server.state.missing.lock().unwrap().clear();
+    let dir = super::resolve_lora_remote(
+        &mut spec,
+        false,
+        HFClient::builder()
+            .cache_dir(&online.cache)
+            .endpoint(&online.endpoint)
+            .token(&online.token),
+        false,
+    )
+    .unwrap();
+    assert!(dir.join("readout.safetensors").is_file());
+
+    // Warm mutable-ref lookup makes only 1 `repo.info()` call and 0 file fetches.
+    server.state.requests.lock().unwrap().clear();
+    assert_eq!(
+        super::resolve_lora_remote(
+            &mut spec,
+            false,
+            HFClient::builder()
+                .cache_dir(&online.cache)
+                .endpoint(&online.endpoint)
+                .token(&online.token),
+            false,
+        )
+        .unwrap(),
+        dir
+    );
+    assert_eq!(server.state.requests.lock().unwrap().len(), 1);
+
+    // Pinned 40-char SHA warm lookup makes 0 HTTP requests.
+    server.state.requests.lock().unwrap().clear();
+    let mut sha_spec = crate::lora::LoraModuleSpec {
+        revision: Some(SHA.into()),
+        ..spec.clone()
+    };
+    assert_eq!(
+        super::resolve_lora_remote(
+            &mut sha_spec,
+            false,
+            HFClient::builder()
+                .cache_dir(&online.cache)
+                .endpoint(&online.endpoint)
+                .token(&online.token),
+            false,
+        )
+        .unwrap(),
+        dir
+    );
+    assert!(server.state.requests.lock().unwrap().is_empty());
+
+    // HTTP 503 outage falls back to the verified cached LoRA snapshot.
+    *server.state.server_error.lock().unwrap() = true;
+    assert_eq!(
+        super::resolve_lora_remote(
+            &mut spec,
+            false,
+            HFClient::builder()
+                .cache_dir(&online.cache)
+                .endpoint(&online.endpoint)
+                .token(&online.token),
+            false,
+        )
+        .unwrap(),
+        dir
+    );
 }

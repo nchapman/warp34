@@ -10,12 +10,14 @@ use crate::cuda::{
     prepare_execution_plan,
 };
 use crate::loader::{
-    LayerKind, ModelConfig, QuantScheme, SafetensorsArchive, dequant_u2b2_n_major_to_f16,
-    dequant_u4_zp_n_major_to_f16, dequant_u4b8_n_major_to_f16, dequant_u8b128_n_major_to_f16,
+    LayerKind, ModelConfig, QuantScheme, SafetensorsArchive,
+    dequant_u2b2_n_major_to_f16_with_offset, dequant_u4_zp_n_major_to_f16,
+    dequant_u4b8_n_major_to_f16, dequant_u8b128_n_major_to_f16, halve_f16_scales,
     marlin_permute_scales_from_n_major, marlin_permute_zero_points_from_n_major,
-    repack_u2b2_to_u4b8, resolve_hf_model_dir, transpose_gptq_qweight_k4_n_to_n_major,
-    transpose_gptq_qweight_k8_n_to_n_major, unpack_awq_qweight_k_n8_to_n_major,
-    unpack_awq_qzeros_kg_n8_to_n_major, validate_static_gptq_g_idx,
+    repack_u2b2_sym_to_u4b8, repack_u2b2_to_u4b8, resolve_hf_model_dir,
+    transpose_gptq_qweight_k4_n_to_n_major, transpose_gptq_qweight_k8_n_to_n_major,
+    unpack_awq_qweight_k_n8_to_n_major, unpack_awq_qzeros_kg_n8_to_n_major,
+    validate_static_gptq_g_idx,
 };
 use crate::radix::{MambaRadixCache, PlannedCheckpoint, ReqRadixState};
 use crate::scheduler::{SchedulerConfig, SchedulerV1};
@@ -52,26 +54,31 @@ use rank_capacity::clamp_state_slots;
 #[cfg(any(test, feature = "cuda"))]
 use rank_capacity::serving_state_slots;
 pub use rank_capacity::{
-    AUTO_SERVING_KV_EXTRA_HEADROOM_BYTES, DEFAULT_SERVING_TARGET_KV_PAGES, DEFAULT_TARGET_KV_PAGES,
-    DEVICE_ARENA_TENSOR_ALIGNMENT_BYTES, EXTREME_LONGCTX_MIN_LAYERS, EXTREME_LONGCTX_MIN_PAGES,
+    AUTO_FIT_LIVE_ALLOC_MARGIN_BYTES, AUTO_SERVING_KV_EXTRA_HEADROOM_BYTES,
+    DEFAULT_SERVING_TARGET_KV_PAGES, DEFAULT_TARGET_KV_PAGES, DEVICE_ARENA_TENSOR_ALIGNMENT_BYTES,
+    EXTREME_LONGCTX_MIN_LAYERS, EXTREME_LONGCTX_MIN_PAGES,
     HOST_EMBED_GPU_RESIDENCY_MIN_SLACK_BYTES, LARGE_MODEL_WEIGHT_THRESHOLD_BYTES,
     LoraCapacityReserve, MIDLOOP_LORA_SCRATCH_ARENA_BYTES, MIN_BOOT_MARGIN_BYTES,
     MIN_WEIGHT_ARENA_BYTES, MTP_COMPACT_HOT_EXPERTS, MTP_FALLBACK_HOT_EXPERTS,
     MTP_FULL_RESIDENCY_HEADROOM_BYTES, MTP_MEDIUM_HOT_EXPERTS, MTP_MEDIUM_MIN_FREE_VRAM_BYTES,
     MTP_PARTIAL_CACHE_HEADROOM_BYTES, MTP_TP1_SERVING_HOT_EXPERTS,
     MTP_TP1_SERVING_MIN_FREE_VRAM_BYTES, MTP_TP1_STREAMED_PREFILL_MAX_HOT,
-    SINGLE_GPU_DFLASH2_MIN_STATE_SLOTS, TIERED_MOE_COMPACT_MAX_HOT_EXPERTS,
-    TIERED_MOE_COMPACT_STAGE_RESERVE_SLOTS, TIERED_MOE_COMPACT_VRAM_THRESHOLD_BYTES,
+    SINGLE_GPU_DFLASH2_MIN_STATE_SLOTS, ServingAutoFitPlan, TIERED_MOE_AUTO_FIT_FLOOR_KV_PAGES,
+    TIERED_MOE_AUTO_FIT_IDEAL_KV_PAGES, TIERED_MOE_AUTO_FIT_KNEE_DEN, TIERED_MOE_AUTO_FIT_KNEE_NUM,
+    TIERED_MOE_COMPACT_MAX_HOT_EXPERTS, TIERED_MOE_COMPACT_STAGE_RESERVE_SLOTS,
+    TIERED_MOE_COMPACT_VRAM_THRESHOLD_BYTES, TIERED_MOE_DYNAMIC_LRU_MIN_HOT_EXPERTS,
     TIERED_MOE_HOT_SLOT_ALIGNMENT, TIERED_MOE_MIN_MODEL_EXPERTS,
-    TIERED_MOE_MTP_AND_GRAPH_RESERVE_BYTES, TIERED_MOE_STAGE_CAPACITY_DEFAULT,
-    TIERED_MOE_STAGE_CAPACITY_TP4, TIERED_MOE_STAGE_RESERVE_SLOTS,
-    TIERED_MOE_SYNTHETIC_EXTRA_RESERVE_BYTES, TIERED_MOE_SYNTHETIC_LOCAL_EXPERTS_MAX,
-    TIERED_MOE_TP1_COMPACT_KV_DEFAULT_HOT, TIERED_MOE_TP1_COMPACT_KV_THRESHOLD_BYTES,
-    TIERED_MOE_TP1_MIN_HOT_EXPERTS, TIERED_MOE_TP1_SERVING_KV_DEFAULT_HOT,
-    TIERED_MOE_TP2_DEFAULT_HOT, TIERED_MOE_TP2_MIN_HOT_EXPERTS, TIERED_MOE_TP4_STAGE_RESERVE_SLOTS,
+    TIERED_MOE_MTP_AND_GRAPH_RESERVE_BYTES, TIERED_MOE_PLAIN_METADATA_RESERVE_BYTES,
+    TIERED_MOE_STAGE_CAPACITY_DEFAULT, TIERED_MOE_STAGE_CAPACITY_TP4,
+    TIERED_MOE_STAGE_RESERVE_SLOTS, TIERED_MOE_SYNTHETIC_EXTRA_RESERVE_BYTES,
+    TIERED_MOE_SYNTHETIC_LOCAL_EXPERTS_MAX, TIERED_MOE_TP1_COMPACT_KV_DEFAULT_HOT,
+    TIERED_MOE_TP1_COMPACT_KV_THRESHOLD_BYTES, TIERED_MOE_TP1_MIN_HOT_EXPERTS,
+    TIERED_MOE_TP1_SERVING_KV_DEFAULT_HOT, TIERED_MOE_TP2_DEFAULT_HOT,
+    TIERED_MOE_TP2_MIN_HOT_EXPERTS, TIERED_MOE_TP4_STAGE_RESERVE_SLOTS,
     WEIGHT_ARENA_ALIGNMENT_BYTES, default_tiered_moe_hot_ceiling, plan_host_embed_offload,
     plan_mtp_tiered_moe_hot_experts, plan_scratch_arena_bytes, plan_scratch_arena_bytes_with_lora,
     plan_target_kv_pages, plan_tiered_moe_hot_per_layer, plan_tiered_moe_hot_per_layer_with_dflash,
+    plan_tiered_moe_hot_per_layer_with_options,
 };
 #[cfg(feature = "cuda")]
 use rank_capacity::{PoolCapacity, SharedVocabHost};

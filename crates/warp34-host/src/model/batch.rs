@@ -31,7 +31,99 @@ impl Qwen3_5Engine {
         out
     }
 
+    /// Frees at least `needed_vram` L1 GPU VRAM pages by first non-destructively demoting
+    /// unlocked `MambaRadixCache` KV pages to L2 Host RAM (`HostKvSwapPool`), evicting the
+    /// coldest L2-backed leaves if `HostKvSwapPool` is full, and falling back to destructive
+    /// L1 leaf eviction (`evict_full_pages`) only when L2 Host swap is disabled or exhausted.
+    fn reclaim_vram_kv_pages_from(&mut self, radix: &mut MambaRadixCache, needed_vram: usize) {
+        let avail = self.ranks[0].kv_pool.free_count();
+        if avail >= needed_vram {
+            return;
+        }
+        let deficit = needed_vram - avail;
+        let max_host_pages = self
+            .ranks
+            .iter()
+            .map(|r| r.kv_pool.host_swap.as_ref().map_or(0, |h| h.max_pages))
+            .min()
+            .unwrap_or(0);
+        if max_host_pages > 0 {
+            let desired_swap = deficit.max(64).min(max_host_pages);
+            let mut targets = radix.collect_swappable_vram_pages(desired_swap);
+            let mut host_free = self
+                .ranks
+                .iter()
+                .map(|r| r.kv_pool.host_free_count())
+                .min()
+                .unwrap_or(0);
+            if !targets.is_empty() && host_free < targets.len() {
+                let ev_host = radix.evict_host_pages(targets.len() - host_free);
+                if !ev_host.freed_kv_pages.is_empty() || !ev_host.freed_mamba_slots.is_empty() {
+                    self.free_kv_pages(&ev_host.freed_kv_pages);
+                    self.free_state_slots(&ev_host.freed_mamba_slots);
+                }
+                host_free = self
+                    .ranks
+                    .iter()
+                    .map(|r| r.kv_pool.host_free_count())
+                    .min()
+                    .unwrap_or(0);
+                targets = radix.collect_swappable_vram_pages(desired_swap.min(host_free));
+            }
+            if !targets.is_empty() && host_free >= targets.len() {
+                let vram_pages: Vec<i32> = targets.iter().map(|&(_, _, pid)| pid).collect();
+                let mut per_rank_host: Vec<Vec<i32>> = Vec::with_capacity(self.ranks.len());
+                let mut ok = true;
+                for r in &mut self.ranks {
+                    let res = r
+                        .kv_pool
+                        .host_swap
+                        .as_mut()
+                        .expect("max_host_pages > 0")
+                        .swap_out_pages(
+                            &r.kv_pool.layers,
+                            r.kv_pool.num_pages,
+                            &vram_pages,
+                            &r.stream,
+                        );
+                    match res {
+                        Ok(hp) => per_rank_host.push(hp),
+                        Err(_) => {
+                            ok = false;
+                            break;
+                        }
+                    }
+                }
+                if ok && per_rank_host.windows(2).all(|w| w[0] == w[1]) {
+                    for r in &mut self.ranks {
+                        for &vp in &vram_pages {
+                            r.kv_pool.free_page(vp);
+                        }
+                    }
+                    radix.apply_swapped_out_pages(&targets, &per_rank_host[0]);
+                } else {
+                    // Roll back allocated L2 host slots on any rank that succeeded; L1 VRAM
+                    // pages were only read (not freed yet), so TP=2 PageBitmaps stay in lockstep.
+                    for (r, hp) in self.ranks.iter_mut().zip(per_rank_host) {
+                        for h_pid in hp {
+                            r.kv_pool.free_page(h_pid);
+                        }
+                    }
+                }
+            }
+        }
+        let avail_after_swap = self.ranks[0].kv_pool.free_count();
+        if avail_after_swap < needed_vram {
+            let ev = radix.evict_full_pages(needed_vram - avail_after_swap);
+            if !ev.freed_kv_pages.is_empty() || !ev.freed_mamba_slots.is_empty() {
+                self.free_kv_pages(&ev.freed_kv_pages);
+                self.free_state_slots(&ev.freed_mamba_slots);
+            }
+        }
+    }
+
     pub fn alloc_kv_page_from(&mut self, radix: &mut MambaRadixCache) -> Option<i32> {
+        self.reclaim_vram_kv_pages_from(radix, 1);
         if let Some(p0) = self.ranks[0].kv_pool.alloc_page() {
             for r in &mut self.ranks[1..] {
                 let p_peer = r.kv_pool.alloc_page();
@@ -39,43 +131,81 @@ impl Qwen3_5Engine {
             }
             return Some(p0);
         }
-        let ev = radix.evict_full_pages(1);
-        if !ev.freed_kv_pages.is_empty() || !ev.freed_mamba_slots.is_empty() {
-            self.free_kv_pages(&ev.freed_kv_pages);
-            self.free_state_slots(&ev.freed_mamba_slots);
-            if let Some(p0) = self.ranks[0].kv_pool.alloc_page() {
-                for r in &mut self.ranks[1..] {
-                    let p_peer = r.kv_pool.alloc_page();
-                    debug_assert_eq!(Some(p0), p_peer);
-                }
-                return Some(p0);
-            }
-        }
         None
     }
 
-    /// Evicts any deficit pages from `radix` in a single batch before allocating `target_pages`
-    /// from the ascending `KvPool` bitmap, preserving physical page contiguity across evictions.
+    /// Promotes any L2 Host-RAM KV pages in `dst` back to L1 GPU VRAM and allocates up to
+    /// `target_pages` total L1 VRAM pages, non-destructively demoting unlocked `radix` pages
+    /// to L2 Host RAM before falling back to leaf eviction.
     pub fn reserve_kv_pages_from(
         &mut self,
         radix: &mut MambaRadixCache,
         dst: &mut Vec<i32>,
         target_pages: usize,
     ) -> bool {
-        if dst.len() >= target_pages {
-            return true;
-        }
-        let missing = target_pages - dst.len();
-        let avail = self.ranks[0].kv_pool.free_count();
-        if avail < missing {
-            let ev = radix.evict_full_pages(missing - avail);
-            if !ev.freed_kv_pages.is_empty() || !ev.freed_mamba_slots.is_empty() {
-                self.free_kv_pages(&ev.freed_kv_pages);
-                self.free_state_slots(&ev.freed_mamba_slots);
+        for pid in dst.iter_mut() {
+            if crate::cache::is_host_kv_page(*pid)
+                && let Some(already_vram) = radix.get_promoted_vram_page(*pid)
+            {
+                *pid = already_vram;
             }
         }
-        if self.ranks[0].kv_pool.free_count() < missing {
+        let host_positions: Vec<(usize, i32)> = dst
+            .iter()
+            .copied()
+            .enumerate()
+            .filter(|&(_, pid)| crate::cache::is_host_kv_page(pid))
+            .collect();
+        let missing = target_pages.saturating_sub(dst.len());
+        let total_vram_needed = host_positions.len() + missing;
+        if total_vram_needed == 0 {
+            return true;
+        }
+        self.reclaim_vram_kv_pages_from(radix, total_vram_needed);
+        if self.ranks[0].kv_pool.free_count() < total_vram_needed {
             return false;
+        }
+        if !host_positions.is_empty() {
+            let mut promoted_vram = Vec::with_capacity(host_positions.len());
+            for _ in 0..host_positions.len() {
+                let p0 = self.ranks[0]
+                    .kv_pool
+                    .alloc_page()
+                    .expect("free_count verified before host page promotion");
+                for r in &mut self.ranks[1..] {
+                    let p_peer = r.kv_pool.alloc_page();
+                    debug_assert_eq!(Some(p0), p_peer);
+                }
+                promoted_vram.push(p0);
+            }
+            let host_pages: Vec<i32> = host_positions.iter().map(|&(_, h)| h).collect();
+            let mut swap_in_ok = true;
+            for r in &mut self.ranks {
+                if r.kv_pool
+                    .swap_in_pages_from_host(&host_pages, &promoted_vram, false, &r.stream)
+                    .is_err()
+                {
+                    swap_in_ok = false;
+                    break;
+                }
+            }
+            if !swap_in_ok {
+                for r in &mut self.ranks {
+                    for &vp in &promoted_vram {
+                        r.kv_pool.free_page(vp);
+                    }
+                }
+                return false;
+            }
+            for r in &mut self.ranks {
+                for &hp in &host_pages {
+                    r.kv_pool.free_page(hp);
+                }
+            }
+            for (&(idx, _), &vram_pid) in host_positions.iter().zip(promoted_vram.iter()) {
+                dst[idx] = vram_pid;
+            }
+            radix.record_host_page_promotions(&host_pages, &promoted_vram);
         }
         dst.reserve(missing);
         for _ in 0..missing {
@@ -109,6 +239,64 @@ impl Qwen3_5Engine {
         out
     }
 
+    #[inline]
+    pub fn has_checkpoint_pool(&self) -> bool {
+        self.ranks
+            .first()
+            .and_then(|r| r.checkpoint_pool.as_ref())
+            .is_some_and(|p| p.total_slots > 0)
+    }
+
+    fn try_alloc_lockstep_checkpoint_slot(&mut self) -> Option<i32> {
+        let c0 = self
+            .ranks
+            .first_mut()?
+            .checkpoint_pool
+            .as_mut()?
+            .alloc_slot()?;
+        let mut peer_slots = Vec::with_capacity(self.ranks.len().saturating_sub(1));
+        for r in &mut self.ranks[1..] {
+            match r.checkpoint_pool.as_mut().and_then(|c| c.alloc_slot()) {
+                Some(cp) if cp == c0 => peer_slots.push(cp),
+                other => {
+                    if let Some(cp) = other
+                        && let Some(ckpt) = &mut r.checkpoint_pool
+                    {
+                        ckpt.free_slot(cp);
+                    }
+                    if let Some(ckpt0) = &mut self.ranks[0].checkpoint_pool {
+                        ckpt0.free_slot(c0);
+                    }
+                    for (idx, cp) in peer_slots.into_iter().enumerate() {
+                        if let Some(ckpt) = &mut self.ranks[idx + 1].checkpoint_pool {
+                            ckpt.free_slot(cp);
+                        }
+                    }
+                    return None;
+                }
+            }
+        }
+        Some(c0)
+    }
+
+    pub fn alloc_checkpoint_slot_from(&mut self, radix: &mut MambaRadixCache) -> Option<i32> {
+        if !self.has_checkpoint_pool() {
+            return None;
+        }
+        if let Some(c0) = self.try_alloc_lockstep_checkpoint_slot() {
+            return Some(c0);
+        }
+        let ev = radix.evict_mamba(1);
+        if !ev.freed_kv_pages.is_empty() || !ev.freed_mamba_slots.is_empty() {
+            self.free_kv_pages(&ev.freed_kv_pages);
+            self.free_state_slots(&ev.freed_mamba_slots);
+            if let Some(c0) = self.try_alloc_lockstep_checkpoint_slot() {
+                return Some(c0);
+            }
+        }
+        None
+    }
+
     pub fn alloc_state_slot_from(&mut self, radix: &mut MambaRadixCache) -> Option<i32> {
         if let Some(s0) = self.ranks[0].state_pool.alloc_slot() {
             for r in &mut self.ranks[1..] {
@@ -116,6 +304,10 @@ impl Qwen3_5Engine {
                 debug_assert_eq!(Some(s0), s_peer);
             }
             return Some(s0);
+        }
+        if self.has_checkpoint_pool() {
+            // Checkpoints in `radix` live in `checkpoint_pool`, not `state_pool`.
+            return None;
         }
         let ev = radix.evict_mamba(1);
         if !ev.freed_kv_pages.is_empty() || !ev.freed_mamba_slots.is_empty() {
@@ -146,7 +338,7 @@ impl Qwen3_5Engine {
             }
             return Some(s0);
         }
-        if radix.has_evictable_internal_mamba() {
+        if !self.has_checkpoint_pool() && radix.has_evictable_internal_mamba() {
             return self.alloc_state_slot_from(radix);
         }
         None
@@ -155,10 +347,139 @@ impl Qwen3_5Engine {
     pub fn free_state_slots(&mut self, slots: &[i32]) {
         for r in &mut self.ranks {
             for &s in slots {
-                if s >= 0 {
+                if crate::cache::is_checkpoint_pool_slot(s) {
+                    if let Some(ckpt) = &mut r.checkpoint_pool {
+                        ckpt.free_slot(s);
+                    }
+                } else if s >= 0 {
                     r.state_pool.free_slot(s);
                 }
             }
+        }
+    }
+
+    pub fn pack_checkpoint_from_active(
+        &mut self,
+        src_active_slot: i32,
+        dst_ckpt_slot: i32,
+    ) -> Result<()> {
+        for r in &mut self.ranks {
+            let ckpt = r
+                .checkpoint_pool
+                .as_mut()
+                .ok_or_else(|| loader_err("GdnCheckpointPool is not enabled on rank"))?;
+            ckpt.pack_from_active(&r.state_pool, src_active_slot, dst_ckpt_slot, &r.stream)?;
+        }
+        Ok(())
+    }
+
+    pub fn unpack_checkpoint_to_active(
+        &mut self,
+        src_ckpt_slot: i32,
+        dst_active_slot: i32,
+    ) -> Result<()> {
+        for r in &mut self.ranks {
+            let ckpt = r
+                .checkpoint_pool
+                .as_mut()
+                .ok_or_else(|| loader_err("GdnCheckpointPool is not enabled on rank"))?;
+            ckpt.unpack_to_active(&mut r.state_pool, src_ckpt_slot, dst_active_slot, &r.stream)?;
+        }
+        Ok(())
+    }
+
+    #[inline]
+    pub fn materialize_pending_checkpoint(
+        &mut self,
+        req_state: &mut crate::radix::ReqRadixState,
+    ) -> Result<()> {
+        if let Some(ckpt_slot) = req_state.pending_unpack_ckpt_slot.take() {
+            self.unpack_checkpoint_to_active(ckpt_slot, req_state.active_state_slot)?;
+        }
+        Ok(())
+    }
+
+    pub fn apply_radix_donation(
+        &mut self,
+        donation: &crate::radix::RadixDonationOutcome,
+    ) -> Result<()> {
+        let pack_res = if let Some((src_active, dst_ckpt)) = donation.pending_checkpoint_pack {
+            let res = self.pack_checkpoint_from_active(src_active, dst_ckpt);
+            if res.is_err() {
+                self.free_state_slots(&[dst_ckpt]);
+            }
+            res
+        } else {
+            Ok(())
+        };
+        self.free_kv_pages(&donation.freed_kv_pages);
+        self.free_state_slots(&donation.freed_mamba_slots);
+        pack_res
+    }
+
+    pub fn apply_radix_donation_with_radix(
+        &mut self,
+        radix: &mut MambaRadixCache,
+        donation: &crate::radix::RadixDonationOutcome,
+    ) -> Result<()> {
+        let res = self.apply_radix_donation(donation);
+        if res.is_err()
+            && let Some((_, dst_ckpt)) = donation.pending_checkpoint_pack
+        {
+            let inv = radix.invalidate_mamba_slot(dst_ckpt);
+            self.free_kv_pages(&inv.freed_kv_pages);
+            self.free_state_slots(&inv.freed_mamba_slots);
+        }
+        res
+    }
+
+    pub fn donate_req_checkpoint(
+        &mut self,
+        radix: &mut MambaRadixCache,
+        req_state: &mut crate::radix::ReqRadixState,
+        finish_req: bool,
+    ) -> Result<crate::radix::RadixDonationOutcome> {
+        if self.has_checkpoint_pool() {
+            let can_recycle_ckpt =
+                radix.can_recycle_locked_checkpoint_mamba(req_state.last_locked_node);
+            let recycle_in_place = !finish_req && req_state.can_recycle_prefill_checkpoint(radix);
+            let ckpt = if req_state.has_donatable_checkpoint() && !recycle_in_place {
+                self.alloc_checkpoint_slot_from(radix)
+            } else {
+                None
+            };
+            let outcome =
+                if ckpt.is_none() && !can_recycle_ckpt && req_state.has_donatable_checkpoint() {
+                    if finish_req {
+                        // All checkpoint-pool slots are locked by other requests; release active
+                        // FP32 state back to `state_pool` rather than leaking it into `radix`.
+                        req_state.abort_and_release(radix)
+                    } else {
+                        crate::radix::RadixDonationOutcome::default()
+                    }
+                } else {
+                    req_state.donate_committed_checkpoint(radix, ckpt, finish_req)
+                };
+            self.apply_radix_donation_with_radix(radix, &outcome)?;
+            Ok(outcome)
+        } else {
+            let can_recycle = radix.can_recycle_locked_mamba(req_state.last_locked_node);
+            let rep = if finish_req || !req_state.has_donatable_checkpoint() {
+                None
+            } else {
+                self.alloc_state_slot_preserving_leaves(radix).or_else(|| {
+                    (!can_recycle)
+                        .then(|| self.alloc_state_slot_from(radix))
+                        .flatten()
+                })
+            };
+            let outcome = if finish_req || rep.is_some() || can_recycle {
+                req_state.donate_committed_checkpoint(radix, rep, finish_req)
+            } else {
+                crate::radix::RadixDonationOutcome::default()
+            };
+            self.apply_radix_donation_with_radix(radix, &outcome)?;
+            Ok(outcome)
         }
     }
 
@@ -466,6 +787,17 @@ impl Qwen3_5Engine {
         keys.sort_unstable();
         keys.dedup();
         keys
+    }
+
+    pub fn captured_spec_verify_graph_shapes(&self) -> Vec<(usize, bool)> {
+        let mut shapes: Vec<(usize, bool)> = self.ranks[0]
+            .spec_verify_graphs
+            .iter()
+            .map(|(k, _, _)| (k.0, k.1))
+            .collect();
+        shapes.sort_unstable();
+        shapes.dedup();
+        shapes
     }
 
     pub fn captured_batched_spec_verify_graph_shapes(&self) -> Vec<(usize, usize, usize, bool)> {
@@ -942,7 +1274,7 @@ impl Qwen3_5Engine {
         };
         let lora_mode = self.batch_lora_mode(1);
         let spec_key = (q_len, long_ctx, sample_mode, lora_mode);
-        let can_use_spec_graph = (2..=MAX_SPEC_VERIFY_TOKENS).contains(&q_len)
+        let can_use_spec_graph = (1..=MAX_SPEC_VERIFY_TOKENS).contains(&q_len)
             && s.has_initial_state
             && s.emit_all_query_tokens
             && s.spec_slots.len() == q_len
@@ -979,8 +1311,7 @@ impl Qwen3_5Engine {
                     }
                 }
                 eprintln!(
-                    "[warp34] warning: spec_verify CUDA Graph capture failed for shape {:?} ({e}); degrading shape to eager verification",
-                    spec_key
+                    "[warp34] warning: spec_verify CUDA Graph capture failed for shape {spec_key:?} ({e}); degrading shape to eager verification"
                 );
                 None
             }
@@ -1041,7 +1372,7 @@ impl Qwen3_5Engine {
             lora_mode,
         );
         let can_use_batched_spec = valid_inputs
-            && (2..=MAX_SPEC_VERIFY_TOKENS).contains(&max_q)
+            && (1..=MAX_SPEC_VERIFY_TOKENS).contains(&max_q)
             && total_q <= MAX_BATCHED_SPEC_TOKENS
             && self
                 .ranks
@@ -1086,8 +1417,7 @@ impl Qwen3_5Engine {
                     }
                 }
                 eprintln!(
-                    "[warp34] warning: batched_spec_verify CUDA Graph capture failed for shape {:?} ({e}); degrading shape to eager verification",
-                    bspec_key
+                    "[warp34] warning: batched_spec_verify CUDA Graph capture failed for shape {bspec_key:?} ({e}); degrading shape to eager verification"
                 );
                 None
             }

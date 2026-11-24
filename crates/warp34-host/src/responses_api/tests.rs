@@ -225,6 +225,125 @@ fn sse_formatter_emits_monotonic_zero_indexed_sequence_numbers() {
 }
 
 #[test]
+fn responses_sse_streams_incremental_function_call_deltas_without_duplication() {
+    let store = ResponseStore::default();
+    let req = json!({"input": "Write src/scene.js"});
+    let (_, meta) = translate_responses_to_chat(&req, "qwen-test", &store, None, 8).unwrap();
+    let tools = vec![json!({"function":{"name":"write","parameters":{
+        "type":"object",
+        "properties":{
+            "path":{"type":"string"},
+            "content":{"type":"string"}
+        }
+    }}})];
+    let mut parser = Qwen3Parser::with_tools(false, &tools).unwrap();
+    let mut sse = ResponsesSseFormatter::new(meta);
+    let mut frames = sse.start();
+
+    let f1 =
+        sse.push_delta(parser.push_str("<tool_call>\n<function=write>\n<parameter=path>\nsrc/"));
+    assert!(
+        f1.iter().any(|(n, v)| n == "response.output_item.added"
+            && v["item"]["type"] == "function_call"
+            && v["item"]["name"] == "write"),
+        "expected function_call output_item.added before tool_call closes: {f1:?}"
+    );
+    assert!(
+        f1.iter()
+            .any(|(n, _)| n == "response.function_call_arguments.delta"),
+        "expected function_call_arguments.delta on first chunk: {f1:?}"
+    );
+    assert!(
+        !f1.iter()
+            .any(|(n, _)| n == "response.function_call_arguments.done"),
+        "function_call must remain open while streaming arguments"
+    );
+    frames.extend(f1);
+
+    for chunk in [
+        "scene.js\n</parameter>\n<parameter=content>\nconst a = 1;",
+        "\nconst b = 2;\n</parameter>\n</function>\n</tool_call>",
+    ] {
+        frames.extend(sse.push_delta(parser.push_str(chunk)));
+    }
+    let (tail, turn) = parser.finish();
+    frames.extend(sse.push_delta(tail));
+    let (end_frames, final_resp, _) = sse.finish(&turn, "tool_calls", 20, 10, 15, 0);
+    assert!(
+        !end_frames
+            .iter()
+            .any(|(n, _)| n == "response.output_item.added"),
+        "finish() emitted duplicate output_item.added: {end_frames:?}"
+    );
+    frames.extend(end_frames);
+
+    let fc_added = frames
+        .iter()
+        .filter(|(n, v)| n == "response.output_item.added" && v["item"]["type"] == "function_call")
+        .count();
+    assert_eq!(fc_added, 1);
+
+    let joined_deltas: String = frames
+        .iter()
+        .filter(|(n, _)| n == "response.function_call_arguments.delta")
+        .filter_map(|(_, v)| v["delta"].as_str())
+        .collect();
+    let expected = r#"{"path":"src/scene.js","content":"const a = 1;\nconst b = 2;"}"#;
+    assert_eq!(joined_deltas, expected);
+    assert_eq!(final_resp["output"].as_array().unwrap().len(), 1);
+    assert_eq!(final_resp["output"][0]["arguments"], expected);
+
+    // Multi-tool chunk handoff (tool 0 finishes + tool 1 starts in one chunk, then tool 1
+    // finishes + trailing text in the next chunk) + truncated tool call at finish().
+    let (_, meta2) = translate_responses_to_chat(&req, "qwen-test", &store, None, 9).unwrap();
+    let mut parser2 = Qwen3Parser::with_tools(false, &tools).unwrap();
+    let mut sse2 = ResponsesSseFormatter::new(meta2);
+    let mut frames2 = sse2.start();
+    frames2.extend(sse2.push_delta(parser2.push_str(concat!(
+        "<tool_call>\n<function=write>\n<parameter=path>a.js</parameter>\n</function>\n</tool_call>\n",
+        "<tool_call>\n<function=write>\n<parameter=path>b."
+    ))));
+    frames2.extend(sse2.push_delta(
+        parser2.push_str("js</parameter>\n</function>\n</tool_call>\nAll files written."),
+    ));
+    let (tail2, turn2) = parser2.finish();
+    frames2.extend(sse2.push_delta(tail2));
+    let (end2, resp2, _) = sse2.finish(&turn2, "stop", 20, 10, 15, 0);
+    frames2.extend(end2);
+
+    let out_items2 = resp2["output"].as_array().unwrap();
+    assert_eq!(out_items2.len(), 3);
+    assert_eq!(out_items2[0]["type"], "function_call");
+    assert_eq!(out_items2[0]["arguments"], r#"{"path":"a.js"}"#);
+    assert_eq!(out_items2[1]["type"], "function_call");
+    assert_eq!(out_items2[1]["arguments"], r#"{"path":"b.js"}"#);
+    assert_eq!(out_items2[2]["type"], "message");
+    assert_eq!(out_items2[2]["content"][0]["text"], "All files written.");
+
+    // Truncated tool call at max_tokens marks the function_call item as incomplete.
+    let (_, meta3) = translate_responses_to_chat(&req, "qwen-test", &store, None, 10).unwrap();
+    let mut parser3 = Qwen3Parser::with_tools(false, &tools).unwrap();
+    let mut sse3 = ResponsesSseFormatter::new(meta3);
+    let mut frames3 = sse3.start();
+    frames3.extend(
+        sse3.push_delta(parser3.push_str("<tool_call>\n<function=write>\n<parameter=path>trunc")),
+    );
+    let (tail3, turn3) = parser3.finish();
+    frames3.extend(sse3.push_delta(tail3));
+    let (end3, resp3, _) = sse3.finish(&turn3, "length", 20, 10, 15, 0);
+    frames3.extend(end3);
+    assert!(
+        !frames3
+            .iter()
+            .any(|(n, _)| n == "response.function_call_arguments.done"),
+        "truncated tool call must not emit function_call_arguments.done"
+    );
+    assert_eq!(resp3["status"], "incomplete");
+    assert_eq!(resp3["output"][0]["type"], "function_call");
+    assert_eq!(resp3["output"][0]["status"], "incomplete");
+}
+
+#[test]
 fn response_store_cancellation_deletion_and_lru_limits() {
     let store = ResponseStore::with_capacity(3);
     let flag = Arc::new(AtomicBool::new(false));
@@ -480,6 +599,7 @@ fn validates_all_responses_bad_request_paths() {
         json!({"input": "hi", "temperature": "high"}),
         json!({"input": "hi", "top_p": "high"}),
         json!({"input": "hi", "max_output_tokens": 0}),
+        json!({"input": "hi", "max_output_tokens": crate::server::MAX_OUTPUT_TOKENS + 1}),
     ];
     for case in &bad_cases {
         assert!(
@@ -487,6 +607,22 @@ fn validates_all_responses_bad_request_paths() {
             "expected bad-request error for payload: {case}"
         );
     }
+    let (large_chat, large_meta) = translate_responses_to_chat(
+        &json!({"input": "hi", "max_output_tokens": 16_384}),
+        "q",
+        &store,
+        None,
+        1,
+    )
+    .unwrap();
+    assert_eq!(large_chat["max_tokens"], 16_384);
+    assert_eq!(large_meta.max_output_tokens, 16_384);
+
+    // Omitted max_output_tokens leaves chat_req["max_tokens"] unset so prepare() resolves
+    // the remaining context budget after prompt tokenization.
+    let (omitted_chat, _) =
+        translate_responses_to_chat(&json!({"input": "hi"}), "q", &store, None, 2).unwrap();
+    assert!(omitted_chat.get("max_tokens").is_none());
 }
 
 #[test]
@@ -543,4 +679,138 @@ fn parallel_tool_calls_survives_responses_translation() {
             matches!(RequestConstraint::parse(&chat).unwrap(), Some(RequestConstraint::Tools { parallel: p, .. }) if p == parallel)
         );
     }
+}
+
+#[test]
+fn namespace_and_web_search_tools_roundtrip_for_codex() {
+    let request = json!({
+        "input": [
+            {"role": "user", "content": "Spawn an agent"},
+            {
+                "type": "function_call",
+                "call_id": "call_prev",
+                "namespace": "multi_agent_v1",
+                "name": "spawn_agent",
+                "arguments": "{\"message\":\"hi\"}"
+            },
+            {
+                "type": "function_call_output",
+                "call_id": "call_prev",
+                "output": "ok"
+            }
+        ],
+        "tools": [
+            {"type": "function", "name": "exec_command", "parameters": {"type": "object"}},
+            {
+                "type": "namespace",
+                "name": "multi_agent_v1",
+                "description": "Sub-agent tools.",
+                "tools": [
+                    {
+                        "type": "function",
+                        "name": "spawn_agent",
+                        "description": "Spawn a sub-agent",
+                        "parameters": {"type": "object", "properties": {"message": {"type": "string"}}}
+                    }
+                ]
+            },
+            {"type": "web_search"}
+        ]
+    });
+    let (chat, meta) =
+        translate_responses_to_chat(&request, "test", &ResponseStore::with_capacity(8), None, 1)
+            .expect("Codex namespace + web_search tools must translate cleanly");
+
+    let chat_tools = chat["tools"].as_array().unwrap();
+    assert_eq!(
+        chat_tools.len(),
+        2,
+        "web_search is skipped, namespace flattened"
+    );
+    assert_eq!(chat_tools[0]["function"]["name"], "exec_command");
+    assert_eq!(
+        chat_tools[1]["function"]["name"],
+        "multi_agent_v1__spawn_agent"
+    );
+    // Input history function_call with namespace maps to the same qualified model name.
+    assert_eq!(
+        chat["messages"][1]["tool_calls"][0]["function"]["name"],
+        "multi_agent_v1__spawn_agent"
+    );
+
+    // Non-streaming output restores wire `name` + `namespace`.
+    let turn = ParsedAssistantTurn {
+        reasoning_content: None,
+        content: None,
+        tool_calls: vec![ParsedToolCall {
+            id: "call_1".into(),
+            call_type: "function".into(),
+            function: crate::parser::ParsedFunctionCall {
+                name: "multi_agent_v1__spawn_agent".into(),
+                arguments: "{\"message\":\"go\"}".into(),
+            },
+        }],
+    };
+    let (resp, _) = build_response_object(&meta, &turn, "tool_calls", 10, 0, 5, 0);
+    assert_eq!(resp["output"][0]["type"], "function_call");
+    assert_eq!(resp["output"][0]["name"], "spawn_agent");
+    assert_eq!(resp["output"][0]["namespace"], "multi_agent_v1");
+
+    // Streaming SSE output also restores wire `name` + `namespace`.
+    let mut sse = ResponsesSseFormatter::new(meta);
+    let _ = sse.start();
+    let evs = sse.push_delta(crate::parser::StreamParseDelta {
+        completed_tool_calls: turn.tool_calls.clone(),
+        ..Default::default()
+    });
+    let added = evs
+        .iter()
+        .find(|(ev, _)| ev == "response.output_item.added")
+        .unwrap();
+    assert_eq!(added.1["item"]["name"], "spawn_agent");
+    assert_eq!(added.1["item"]["namespace"], "multi_agent_v1");
+    let done = evs
+        .iter()
+        .find(|(ev, _)| ev == "response.output_item.done")
+        .unwrap();
+    assert_eq!(done.1["item"]["name"], "spawn_agent");
+    assert_eq!(done.1["item"]["namespace"], "multi_agent_v1");
+}
+
+#[test]
+fn streaming_reasoning_uses_content_part_events_matching_vllm_034() {
+    let body = json!({
+        "model": "qwen3.8-27b",
+        "input": "hello",
+        "stream": true
+    });
+    let store = ResponseStore::with_capacity(16);
+    let (_, meta) = translate_responses_to_chat(&body, "qwen3.8-27b", &store, None, 1).unwrap();
+    let mut sse = ResponsesSseFormatter::new(meta);
+    let _ = sse.start();
+    let mut all = sse.push_delta(crate::parser::StreamParseDelta {
+        reasoning_delta: Some("thinking".into()),
+        ..Default::default()
+    });
+    all.extend(sse.push_delta(crate::parser::StreamParseDelta {
+        content_delta: Some("done".into()),
+        ..Default::default()
+    }));
+    let names: Vec<&str> = all.iter().map(|(ev, _)| ev.as_str()).collect();
+    assert!(!names.contains(&"response.reasoning_part.added"));
+    assert!(!names.contains(&"response.reasoning_part.done"));
+    let added = all
+        .iter()
+        .find(|(ev, data)| {
+            ev == "response.content_part.added" && data["part"]["type"] == "reasoning_text"
+        })
+        .expect("reasoning content_part.added");
+    assert_eq!(added.1["part"]["text"], "");
+    let done = all
+        .iter()
+        .find(|(ev, data)| {
+            ev == "response.content_part.done" && data["part"]["type"] == "reasoning_text"
+        })
+        .expect("reasoning content_part.done");
+    assert_eq!(done.1["part"]["text"], "thinking");
 }

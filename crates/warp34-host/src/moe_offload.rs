@@ -11,6 +11,7 @@ pub struct ExpertPackLayout {
     pub hidden: usize,
     pub group_size: usize,
     pub bits: usize,
+    pub u2_code_offset_half: bool,
     pub down_hadamard_block_size: usize,
     pub gate_up_packed: Range<usize>,
     pub gate_up_scales: Range<usize>,
@@ -80,6 +81,7 @@ impl ExpertPackLayout {
             hidden,
             group_size,
             bits,
+            u2_code_offset_half: false,
             down_hadamard_block_size: 0,
             gate_up_packed: regions[0].clone(),
             gate_up_scales: regions[1].clone(),
@@ -89,7 +91,14 @@ impl ExpertPackLayout {
         })
     }
 
-    /// Configures the optional pre-`down_proj` Hadamard block size (`0`, `16`, or `64`).
+    /// Configures whether 2-bit experts use symmetric half-integer codes (`code_offset == 0.5`).
+    #[inline]
+    pub fn with_u2_code_offset_half(mut self, half: bool) -> Self {
+        self.u2_code_offset_half = self.bits == 2 && half;
+        self
+    }
+
+    /// Configures the optional pre-`down_proj` Hadamard block size (`0`, `16`, `64`, `128`, or `512`).
     pub fn with_down_hadamard(mut self, block_size: usize) -> io::Result<Self> {
         if !crate::loader::is_valid_hadamard_block_for_dim(block_size, self.intermediate) {
             return Err(io::Error::new(
@@ -104,7 +113,8 @@ impl ExpertPackLayout {
     /// Returns whether this expert pack geometry is supported by the SIMD CPU+GPU hybrid bridge.
     #[inline]
     pub fn supports_cpu_bridge(&self) -> bool {
-        self.hidden <= TIERED_MOE_CPU_BRIDGE_MAX_HIDDEN
+        !self.u2_code_offset_half
+            && self.hidden <= TIERED_MOE_CPU_BRIDGE_MAX_HIDDEN
             && self.intermediate <= TIERED_MOE_CPU_BRIDGE_MAX_INTERMEDIATE
             && self.hidden.is_multiple_of(128)
             && self.intermediate.is_multiple_of(128)
@@ -190,7 +200,11 @@ impl ExpertPackLayout {
 
         let pack_factor = 32 / self.bits;
         let mask = (1u32 << self.bits) - 1;
-        let bias = 1i32 << (self.bits - 1);
+        let bias = if self.bits == 2 && self.u2_code_offset_half {
+            1.5f32
+        } else {
+            (1i32 << (self.bits - 1)) as f32
+        };
         let words_per_k = self.hidden / pack_factor;
         let groups_per_k = self.hidden / self.group_size;
         let words_per_group_k = self.group_size / pack_factor;
@@ -235,10 +249,10 @@ impl ExpertPackLayout {
                     let k_base = w_idx * pack_factor;
                     for b in 0..pack_factor {
                         let x_val = f16_to_f32(x_f16[k_base + b]);
-                        let gnib = ((gw >> (b * self.bits)) & mask) as i32 - bias;
-                        let unib = ((uw >> (b * self.bits)) & mask) as i32 - bias;
-                        let gw_h = f16_to_f32(f32_to_f16((gnib as f32) * gs));
-                        let uw_h = f16_to_f32(f32_to_f16((unib as f32) * us));
+                        let gnib = ((gw >> (b * self.bits)) & mask) as f32 - bias;
+                        let unib = ((uw >> (b * self.bits)) & mask) as f32 - bias;
+                        let gw_h = f16_to_f32(f32_to_f16(gnib * gs));
+                        let uw_h = f16_to_f32(f32_to_f16(unib * us));
                         gate_acc += gw_h * x_val;
                         up_acc += uw_h * x_val;
                     }
@@ -302,8 +316,8 @@ impl ExpertPackLayout {
                     let k_base = w_idx * pack_factor;
                     for b in 0..pack_factor {
                         let x_val = f16_to_f32(interm_f16[k_base + b]);
-                        let dnib = ((dw >> (b * self.bits)) & mask) as i32 - bias;
-                        let dw_h = f16_to_f32(f32_to_f16((dnib as f32) * ds));
+                        let dnib = ((dw >> (b * self.bits)) & mask) as f32 - bias;
+                        let dw_h = f16_to_f32(f32_to_f16(dnib * ds));
                         down_acc += dw_h * x_val;
                     }
                 }
@@ -318,14 +332,75 @@ impl ExpertPackLayout {
 ///
 /// Discovered automatically from `static_hot_cache_rankings.json` or
 /// `runtime/static_hot_cache_rankings.json` inside a checkpoint directory when present.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct HotExpertRankings {
     by_layer: std::collections::HashMap<usize, Vec<usize>>,
+    /// Piecewise `(cache_size, cumulative_hit_rate)` points per layer from
+    /// `runtime/expert_routing_profile.json` when available.
+    hit_curves: std::collections::HashMap<usize, Vec<(usize, f64)>>,
 }
 
 impl HotExpertRankings {
     pub fn from_json(val: &serde_json::Value) -> Option<Self> {
         let obj = val.as_object()?;
+        if let Some(layers_obj) = obj.get("layers").and_then(serde_json::Value::as_object) {
+            let mut by_layer = std::collections::HashMap::with_capacity(layers_obj.len());
+            let mut hit_curves = std::collections::HashMap::with_capacity(layers_obj.len());
+            for (k, v) in layers_obj {
+                let Ok(layer_id) = k.parse::<usize>() else {
+                    continue;
+                };
+                let Some(lobj) = v.as_object() else {
+                    continue;
+                };
+                if let Some(arr) = lobj
+                    .get("ranked_expert_ids")
+                    .and_then(serde_json::Value::as_array)
+                {
+                    let ids: Vec<usize> = arr
+                        .iter()
+                        .filter_map(|x| x.as_u64().and_then(|n| usize::try_from(n).ok()))
+                        .collect();
+                    if !ids.is_empty() {
+                        by_layer.insert(layer_id, ids);
+                    }
+                }
+                if let Some(hr_obj) = lobj
+                    .get("hit_rate_by_cache_size")
+                    .and_then(serde_json::Value::as_object)
+                {
+                    let mut pts = Vec::with_capacity(hr_obj.len() + 2);
+                    pts.push((0usize, 0.0f64));
+                    for (hk, hv) in hr_obj {
+                        if let Some(sz_str) = hk.strip_prefix("top_")
+                            && let Ok(sz) = sz_str.parse::<usize>()
+                            && let Some(rate) = hv.as_f64()
+                            && sz > 0
+                            && rate.is_finite()
+                        {
+                            pts.push((sz, rate.clamp(0.0, 1.0)));
+                        }
+                    }
+                    let num_exp = lobj
+                        .get("num_experts")
+                        .and_then(serde_json::Value::as_u64)
+                        .and_then(|n| usize::try_from(n).ok())
+                        .unwrap_or(512);
+                    pts.push((num_exp, 1.0f64));
+                    pts.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| b.1.total_cmp(&a.1)));
+                    pts.dedup_by_key(|p| p.0);
+                    if pts.len() >= 3 {
+                        hit_curves.insert(layer_id, pts);
+                    }
+                }
+            }
+            if !by_layer.is_empty() {
+                return Some(Self {
+                    by_layer,
+                    hit_curves,
+                });
+            }
+        }
         let mut by_layer = std::collections::HashMap::with_capacity(obj.len());
         for (k, v) in obj {
             let Ok(layer_id) = k.parse::<usize>() else {
@@ -342,13 +417,17 @@ impl HotExpertRankings {
                 by_layer.insert(layer_id, ids);
             }
         }
-        (!by_layer.is_empty()).then_some(Self { by_layer })
+        (!by_layer.is_empty()).then_some(Self {
+            by_layer,
+            hit_curves: std::collections::HashMap::new(),
+        })
     }
 
-    /// Probes standard checkpoint locations (`static_hot_cache_rankings.json` and
-    /// `runtime/static_hot_cache_rankings.json`) inside `model_dir`.
+    /// Probes standard checkpoint locations (`runtime/expert_routing_profile.json`,
+    /// `static_hot_cache_rankings.json`, and `runtime/static_hot_cache_rankings.json`) inside `model_dir`.
     pub fn from_model_dir(model_dir: &std::path::Path) -> Option<Self> {
         for rel in [
+            "runtime/expert_routing_profile.json",
             "static_hot_cache_rankings.json",
             "runtime/static_hot_cache_rankings.json",
         ] {
@@ -361,6 +440,88 @@ impl HotExpertRankings {
             }
         }
         None
+    }
+
+    fn interp_hit_rate(&self, layer_id: usize, k: usize) -> Option<f64> {
+        let pts = self.hit_curves.get(&layer_id)?;
+        if k == 0 {
+            return Some(0.0);
+        }
+        for w in pts.windows(2) {
+            let (k0, r0) = w[0];
+            let (k1, r1) = w[1];
+            if k <= k1 {
+                if k1 == k0 {
+                    return Some(r1);
+                }
+                let t = (k.saturating_sub(k0)) as f64 / (k1 - k0) as f64;
+                return Some(r0 + t * (r1 - r0));
+            }
+        }
+        pts.last().map(|&(_, r)| r)
+    }
+
+    /// Allocates per-layer `k_hot` capacities summing to `num_layers * mean_hot` by greedy
+    /// marginal hit-rate gain when empirical `hit_curves` are present, falling back to uniform
+    /// `mean_hot` otherwise. Preserves exact total VRAM slot count across all layers.
+    pub fn plan_layer_capacities(
+        &self,
+        num_layers: usize,
+        mean_hot: usize,
+        min_hot: usize,
+        max_hot: usize,
+        align: usize,
+    ) -> Vec<usize> {
+        if num_layers == 0 {
+            return Vec::new();
+        }
+        let step = align.max(2);
+        if mean_hot >= max_hot
+            || mean_hot <= min_hot
+            || !(0..num_layers).all(|l| self.hit_curves.contains_key(&l))
+        {
+            return vec![mean_hot; num_layers];
+        }
+        let total_budget = num_layers * mean_hot;
+        let dyn_floor = if mean_hot >= TIERED_MOE_DYNAMIC_LRU_MIN_HOT_EXPERTS {
+            TIERED_MOE_DYNAMIC_LRU_MIN_HOT_EXPERTS
+        } else {
+            min_hot
+        };
+        let floor = ((mean_hot * 3 / 4) / step * step).clamp(dyn_floor.max(min_hot), mean_hot);
+        let ceil = ((mean_hot * 5 / 4).max(mean_hot + 32) / step * step)
+            .min(max_hot)
+            .max(mean_hot);
+        let mut caps = vec![floor; num_layers];
+        let mut used = floor * num_layers;
+        while used + step <= total_budget {
+            let best = (0..num_layers)
+                .filter(|&l| caps[l] + step <= ceil)
+                .max_by(|&a, &b| {
+                    let ga = self.interp_hit_rate(a, caps[a] + step).unwrap_or(0.0)
+                        - self.interp_hit_rate(a, caps[a]).unwrap_or(0.0);
+                    let gb = self.interp_hit_rate(b, caps[b] + step).unwrap_or(0.0)
+                        - self.interp_hit_rate(b, caps[b]).unwrap_or(0.0);
+                    ga.total_cmp(&gb)
+                });
+            let Some(l) = best else {
+                break;
+            };
+            caps[l] += step;
+            used += step;
+        }
+        for cap in &mut caps {
+            if used >= total_budget {
+                break;
+            }
+            let add = (total_budget - used).min(max_hot.saturating_sub(*cap));
+            *cap += add;
+            used += add;
+        }
+        if used != total_budget {
+            return vec![mean_hot; num_layers];
+        }
+        caps
     }
 
     /// Selects `k_hot` unique local expert IDs within `local_expert_ids` for `layer_id`
@@ -432,6 +593,10 @@ pub const TIERED_MOE_CPU_BRIDGE_AVX2_GPU_SHARE_FRAC: f32 = 0.50;
 
 /// Minimum GPU hot expert count (`16`) required before auto-enabling the `TP=1` CPU MoE bridge.
 pub const TIERED_MOE_CPU_BRIDGE_MIN_HOT_EXPERTS: usize = 16;
+
+/// Minimum per-layer GPU hot expert capacity (`64`) required before enabling dynamic TinyLFU
+/// slot replacement (`k_static = 1`) and overlapped PCIe expert staging on the CPU MoE bridge.
+pub const TIERED_MOE_DYNAMIC_LRU_MIN_HOT_EXPERTS: usize = 64;
 
 /// Execution policy for tiered 512-expert MoE layers on multi-token prefill batches.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

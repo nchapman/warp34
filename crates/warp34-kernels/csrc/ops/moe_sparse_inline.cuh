@@ -23,10 +23,14 @@ __global__ __launch_bounds__(128, 4) void moe_sparse_vec4_kernel(
     const float * __restrict__ tw,
     __half * __restrict__ intermediate,
     __half * __restrict__ down,
-    int top_k, int N, int K) {
+    int top_k, int N, int K,
+    const int32_t * __restrict__ active_count = nullptr,
+    uint32_t u2_add_bits = 0xdc08dc08u) {
     static_assert(BITS == 2 || BITS == 4, "BITS must be 2 or 4");
     static_assert(GROUP_SIZE == 64 || GROUP_SIZE == 128, "GROUP_SIZE must be 64 or 128");
     static_assert(!APPLY_HAD64 || GATE, "APPLY_HAD64 is only valid for GATE=true");
+    if (active_count != nullptr && __ldg(active_count) <= 0)
+        return;
     using w_vec_t = typename std::conditional<BITS == 2, uint2, uint4>::type;
     constexpr int W_COLS_PER_GROUP = GROUP_SIZE / 32;
     const int e = __ldg(&experts[blockIdx.y]);
@@ -115,12 +119,12 @@ __global__ __launch_bounds__(128, 4) void moe_sparse_vec4_kernel(
                                 const float x0 = __low2float(xh2[p]);
                                 const float x1 = __high2float(xh2[p]);
                                 const __half2 gd = (BITS == 2)
-                                    ? unpack_u2b2_pair_scaled_h2(gw_v, ((word_i & 1) << 2) + p, gs_h2)
+                                    ? unpack_u2b2_pair_scaled_h2(gw_v, ((word_i & 1) << 2) + p, gs_h2, u2_add_bits)
                                     : unpack_u4b8_pair_scaled_h2(gw_v, p, gs_h2);
                                 g_r[ri] += __low2float(gd) * x0 + __high2float(gd) * x1;
                                 if (GATE) {
                                     const __half2 ud = (BITS == 2)
-                                        ? unpack_u2b2_pair_scaled_h2(uw_v, ((word_i & 1) << 2) + p, us_h2)
+                                        ? unpack_u2b2_pair_scaled_h2(uw_v, ((word_i & 1) << 2) + p, us_h2, u2_add_bits)
                                         : unpack_u4b8_pair_scaled_h2(uw_v, p, us_h2);
                                     u_r[ri] += __low2float(ud) * x0 + __high2float(ud) * x1;
                                 }
@@ -175,100 +179,154 @@ __global__ __launch_bounds__(128, 4) void moe_sparse_vec4_kernel(
             const size_t g_row_idx = (size_t)e * total_rows + row;
             const size_t u_row_idx = g_row_idx + N;
 
-            for (int mb = 0; mb < valid_cnt; mb += 2) {
-                const int p0 = (mb == 0) ? pair_v[0] : pair_v[2];
-                const int p1 = (mb == 0) ? pair_v[1] : pair_v[3];
-                const int xr0 = (mb == 0) ? xr_v[0] : xr_v[2];
-                const int xr1 = (mb == 0) ? xr_v[1] : xr_v[3];
-                const __half tw0 = (mb == 0) ? tw_v[0] : tw_v[2];
-                const __half tw1 = (mb == 0) ? tw_v[1] : tw_v[3];
-                const bool has1 = (mb + 1 < valid_cnt);
-                const size_t xm0 = (size_t)xr0 * x_u4_per_row;
-                const size_t xm1 = has1 ? ((size_t)xr1 * x_u4_per_row) : 0;
+            const bool has1 = (valid_cnt > 1);
+            const bool has2 = (valid_cnt > 2);
+            const bool has3 = (valid_cnt > 3);
+            const size_t xm0 = (size_t)xr_v[0] * x_u4_per_row;
+            const size_t xm1 = has1 ? ((size_t)xr_v[1] * x_u4_per_row) : 0;
+            const size_t xm2 = has2 ? ((size_t)xr_v[2] * x_u4_per_row) : 0;
+            const size_t xm3 = has3 ? ((size_t)xr_v[3] * x_u4_per_row) : 0;
 
-                float gv0 = 0.0f, uv0 = 0.0f;
-                float gv1 = 0.0f, uv1 = 0.0f;
+            float gv0 = 0.0f, uv0 = 0.0f;
+            float gv1 = 0.0f, uv1 = 0.0f;
+            float gv2 = 0.0f, uv2 = 0.0f;
+            float gv3 = 0.0f, uv3 = 0.0f;
 
-                for (int w_col = sub_lane; w_col < k_u4_per_row; w_col += lpr) {
-                    const int g_idx = w_col / W_COLS_PER_GROUP;
-                    const int x_col0 = w_col * 4;
-                    const w_vec_t gw4 = __ldg(&w_vec[g_row_idx * k_u4_per_row + w_col]);
-                    const __half2 gs_h2 =
-                        __half2half2(__ldg(&scales[g_row_idx * groups_per_row + g_idx]));
-                    w_vec_t uw4;
-                    __half2 us_h2;
-                    if (GATE) {
-                        uw4 = __ldg(&w_vec[u_row_idx * k_u4_per_row + w_col]);
-                        us_h2 = __half2half2(__ldg(&scales[u_row_idx * groups_per_row + g_idx]));
-                    }
-                    const uint32_t *gw_words = reinterpret_cast<const uint32_t *>(&gw4);
-                    const uint32_t *uw_words = reinterpret_cast<const uint32_t *>(&uw4);
+            for (int w_col = sub_lane; w_col < k_u4_per_row; w_col += lpr) {
+                const int g_idx = w_col / W_COLS_PER_GROUP;
+                const int x_col0 = w_col * 4;
+                const w_vec_t gw4 = __ldg(&w_vec[g_row_idx * k_u4_per_row + w_col]);
+                const __half2 gs_h2 =
+                    __half2half2(__ldg(&scales[g_row_idx * groups_per_row + g_idx]));
+                w_vec_t uw4;
+                __half2 us_h2;
+                if (GATE) {
+                    uw4 = __ldg(&w_vec[u_row_idx * k_u4_per_row + w_col]);
+                    us_h2 = __half2half2(__ldg(&scales[u_row_idx * groups_per_row + g_idx]));
+                }
+                const uint32_t *gw_words = reinterpret_cast<const uint32_t *>(&gw4);
+                const uint32_t *uw_words = reinterpret_cast<const uint32_t *>(&uw4);
 
 #pragma unroll
-                    for (int word_i = 0; word_i < 4; ++word_i) {
-                        const uint32_t gw_v = (BITS == 2) ? gw_words[word_i >> 1] : gw_words[word_i];
-                        const uint32_t uw_v = GATE
-                            ? ((BITS == 2) ? uw_words[word_i >> 1] : uw_words[word_i])
-                            : 0u;
+                for (int word_i = 0; word_i < 4; ++word_i) {
+                    const uint32_t gw_v = (BITS == 2) ? gw_words[word_i >> 1] : gw_words[word_i];
+                    const uint32_t uw_v = GATE
+                        ? ((BITS == 2) ? uw_words[word_i >> 1] : uw_words[word_i])
+                        : 0u;
+                    __half2 gd_h2[4];
+                    __half2 ud_h2[4];
+#pragma unroll
+                    for (int p = 0; p < 4; ++p) {
+                        gd_h2[p] = (BITS == 2)
+                            ? unpack_u2b2_pair_scaled_h2(gw_v, ((word_i & 1) << 2) + p, gs_h2, u2_add_bits)
+                            : unpack_u4b8_pair_scaled_h2(gw_v, p, gs_h2);
+                        if (GATE) {
+                            ud_h2[p] = (BITS == 2)
+                                ? unpack_u2b2_pair_scaled_h2(uw_v, ((word_i & 1) << 2) + p, us_h2, u2_add_bits)
+                                : unpack_u4b8_pair_scaled_h2(uw_v, p, us_h2);
+                        }
+                    }
+                    {
                         const uint4 xv0 = __ldg(&x_u4[xm0 + x_col0 + word_i]);
-                        const uint4 xv1 = has1 ? __ldg(&x_u4[xm1 + x_col0 + word_i]) : make_uint4(0, 0, 0, 0);
                         const __half2 *xh0 = reinterpret_cast<const __half2 *>(&xv0);
+#pragma unroll
+                        for (int p = 0; p < 4; ++p) {
+                            const float x0_l = __low2float(xh0[p]), x0_h = __high2float(xh0[p]);
+                            gv0 += __low2float(gd_h2[p]) * x0_l + __high2float(gd_h2[p]) * x0_h;
+                            if (GATE) uv0 += __low2float(ud_h2[p]) * x0_l + __high2float(ud_h2[p]) * x0_h;
+                        }
+                    }
+                    if (has1) {
+                        const uint4 xv1 = __ldg(&x_u4[xm1 + x_col0 + word_i]);
                         const __half2 *xh1 = reinterpret_cast<const __half2 *>(&xv1);
 #pragma unroll
                         for (int p = 0; p < 4; ++p) {
-                            const __half2 gd = (BITS == 2)
-                                ? unpack_u2b2_pair_scaled_h2(gw_v, ((word_i & 1) << 2) + p, gs_h2)
-                                : unpack_u4b8_pair_scaled_h2(gw_v, p, gs_h2);
-                            const float gd_l = __low2float(gd), gd_h = __high2float(gd);
-                            float ud_l = 0.0f, ud_h = 0.0f;
-                            if (GATE) {
-                                const __half2 ud = (BITS == 2)
-                                    ? unpack_u2b2_pair_scaled_h2(uw_v, ((word_i & 1) << 2) + p, us_h2)
-                                    : unpack_u4b8_pair_scaled_h2(uw_v, p, us_h2);
-                                ud_l = __low2float(ud);
-                                ud_h = __high2float(ud);
-                            }
-                            const float x0_l = __low2float(xh0[p]), x0_h = __high2float(xh0[p]);
-                            gv0 += gd_l * x0_l + gd_h * x0_h;
-                            if (GATE) uv0 += ud_l * x0_l + ud_h * x0_h;
-                            if (has1) {
-                                const float x1_l = __low2float(xh1[p]), x1_h = __high2float(xh1[p]);
-                                gv1 += gd_l * x1_l + gd_h * x1_h;
-                                if (GATE) uv1 += ud_l * x1_l + ud_h * x1_h;
-                            }
+                            const float x1_l = __low2float(xh1[p]), x1_h = __high2float(xh1[p]);
+                            gv1 += __low2float(gd_h2[p]) * x1_l + __high2float(gd_h2[p]) * x1_h;
+                            if (GATE) uv1 += __low2float(ud_h2[p]) * x1_l + __high2float(ud_h2[p]) * x1_h;
+                        }
+                    }
+                    if (has2) {
+                        const uint4 xv2 = __ldg(&x_u4[xm2 + x_col0 + word_i]);
+                        const __half2 *xh2 = reinterpret_cast<const __half2 *>(&xv2);
+#pragma unroll
+                        for (int p = 0; p < 4; ++p) {
+                            const float x2_l = __low2float(xh2[p]), x2_h = __high2float(xh2[p]);
+                            gv2 += __low2float(gd_h2[p]) * x2_l + __high2float(gd_h2[p]) * x2_h;
+                            if (GATE) uv2 += __low2float(ud_h2[p]) * x2_l + __high2float(ud_h2[p]) * x2_h;
+                        }
+                    }
+                    if (has3) {
+                        const uint4 xv3 = __ldg(&x_u4[xm3 + x_col0 + word_i]);
+                        const __half2 *xh3 = reinterpret_cast<const __half2 *>(&xv3);
+#pragma unroll
+                        for (int p = 0; p < 4; ++p) {
+                            const float x3_l = __low2float(xh3[p]), x3_h = __high2float(xh3[p]);
+                            gv3 += __low2float(gd_h2[p]) * x3_l + __high2float(gd_h2[p]) * x3_h;
+                            if (GATE) uv3 += __low2float(ud_h2[p]) * x3_l + __high2float(ud_h2[p]) * x3_h;
                         }
                     }
                 }
+            }
 
-                for (int off = lpr >> 1; off > 0; off >>= 1) {
-                    gv0 += __shfl_xor_sync(0xffffffffu, gv0, off);
-                    if (GATE) uv0 += __shfl_xor_sync(0xffffffffu, uv0, off);
-                    if (has1) {
-                        gv1 += __shfl_xor_sync(0xffffffffu, gv1, off);
-                        if (GATE) uv1 += __shfl_xor_sync(0xffffffffu, uv1, off);
-                    }
+            for (int off = lpr >> 1; off > 0; off >>= 1) {
+                gv0 += __shfl_xor_sync(0xffffffffu, gv0, off);
+                if (GATE) uv0 += __shfl_xor_sync(0xffffffffu, uv0, off);
+                if (has1) {
+                    gv1 += __shfl_xor_sync(0xffffffffu, gv1, off);
+                    if (GATE) uv1 += __shfl_xor_sync(0xffffffffu, uv1, off);
                 }
-                if (sub_lane == 0) {
-                    const int col_in_64 = sub_base + wid * rpw + sub_row + ri * wave_rows;
-                    if constexpr (APPLY_HAD64) {
-                        s_had[mb][col_in_64] =
-                            marlin_silu_and_mul_f16(__float2half_rn(gv0), __float2half_rn(uv0));
-                        if (has1) {
-                            s_had[mb + 1][col_in_64] =
-                                marlin_silu_and_mul_f16(__float2half_rn(gv1), __float2half_rn(uv1));
-                        }
-                    } else if (GATE) {
-                        intermediate[(size_t)p0 * N + row] =
-                            marlin_silu_and_mul_f16(__float2half_rn(gv0), __float2half_rn(uv0));
-                        if (has1) {
-                            intermediate[(size_t)p1 * N + row] =
-                                marlin_silu_and_mul_f16(__float2half_rn(gv1), __float2half_rn(uv1));
-                        }
-                    } else {
-                        down[(size_t)p0 * N + row] = __hmul(__float2half_rn(gv0), tw0);
-                        if (has1) {
-                            down[(size_t)p1 * N + row] = __hmul(__float2half_rn(gv1), tw1);
-                        }
+                if (has2) {
+                    gv2 += __shfl_xor_sync(0xffffffffu, gv2, off);
+                    if (GATE) uv2 += __shfl_xor_sync(0xffffffffu, uv2, off);
+                }
+                if (has3) {
+                    gv3 += __shfl_xor_sync(0xffffffffu, gv3, off);
+                    if (GATE) uv3 += __shfl_xor_sync(0xffffffffu, uv3, off);
+                }
+            }
+            if (sub_lane == 0) {
+                const int col_in_64 = sub_base + wid * rpw + sub_row + ri * wave_rows;
+                if constexpr (APPLY_HAD64) {
+                    s_had[0][col_in_64] =
+                        marlin_silu_and_mul_f16(__float2half_rn(gv0), __float2half_rn(uv0));
+                    if (has1) {
+                        s_had[1][col_in_64] =
+                            marlin_silu_and_mul_f16(__float2half_rn(gv1), __float2half_rn(uv1));
+                    }
+                    if (has2) {
+                        s_had[2][col_in_64] =
+                            marlin_silu_and_mul_f16(__float2half_rn(gv2), __float2half_rn(uv2));
+                    }
+                    if (has3) {
+                        s_had[3][col_in_64] =
+                            marlin_silu_and_mul_f16(__float2half_rn(gv3), __float2half_rn(uv3));
+                    }
+                } else if (GATE) {
+                    intermediate[(size_t)pair_v[0] * N + row] =
+                        marlin_silu_and_mul_f16(__float2half_rn(gv0), __float2half_rn(uv0));
+                    if (has1) {
+                        intermediate[(size_t)pair_v[1] * N + row] =
+                            marlin_silu_and_mul_f16(__float2half_rn(gv1), __float2half_rn(uv1));
+                    }
+                    if (has2) {
+                        intermediate[(size_t)pair_v[2] * N + row] =
+                            marlin_silu_and_mul_f16(__float2half_rn(gv2), __float2half_rn(uv2));
+                    }
+                    if (has3) {
+                        intermediate[(size_t)pair_v[3] * N + row] =
+                            marlin_silu_and_mul_f16(__float2half_rn(gv3), __float2half_rn(uv3));
+                    }
+                } else {
+                    down[(size_t)pair_v[0] * N + row] = __hmul(__float2half_rn(gv0), tw_v[0]);
+                    if (has1) {
+                        down[(size_t)pair_v[1] * N + row] = __hmul(__float2half_rn(gv1), tw_v[1]);
+                    }
+                    if (has2) {
+                        down[(size_t)pair_v[2] * N + row] = __hmul(__float2half_rn(gv2), tw_v[2]);
+                    }
+                    if (has3) {
+                        down[(size_t)pair_v[3] * N + row] = __hmul(__float2half_rn(gv3), tw_v[3]);
                     }
                 }
             }
@@ -315,7 +373,8 @@ __global__ void moe_sparse_mma_kernel(
     const float * __restrict__ tw,
     __half * __restrict__ intermediate,
     __half * __restrict__ down,
-    int top_k, int N, int K) {
+    int top_k, int N, int K,
+    uint32_t u2_add_bits = 0xdc08dc08u) {
     static_assert(BITS == 2 || BITS == 4, "BITS must be 2 or 4");
     static_assert(GROUP_SIZE == 64 || GROUP_SIZE == 128, "GROUP_SIZE must be 64 or 128");
     static_assert(!APPLY_HAD64 || GATE, "APPLY_HAD64 is only valid for GATE=true");
@@ -387,13 +446,13 @@ __global__ void moe_sparse_mma_kernel(
                         av[j] = unpack_u2b2_pair_scaled(
                             __shfl_sync(0xffffffffu, gv, (lane & ~3) + word16 / 2),
                             ((j >> 1) << 2) + c,
-                            gs_h2[j & 1][sg]);
+                            gs_h2[j & 1][sg], u2_add_bits);
                         if (GATE) {
                             const uint32_t uvv = reinterpret_cast<uint32_t *>(&uw[j & 1])[word16 % 2];
                             uv[j] = unpack_u2b2_pair_scaled(
                                 __shfl_sync(0xffffffffu, uvv, (lane & ~3) + word16 / 2),
                                 ((j >> 1) << 2) + c,
-                                us_h2[j & 1][sg]);
+                                us_h2[j & 1][sg], u2_add_bits);
                         }
                     } else {
                         const int word = kk / 8 + (j >> 1);

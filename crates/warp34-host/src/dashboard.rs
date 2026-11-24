@@ -1,4 +1,4 @@
-//! Read-only React dashboard, embedded at compile time. Build assets with
+//! React dashboard and API playground, embedded at compile time. Build assets with
 //! `mise run dashboard-build` before invoking Cargo directly.
 use axum::{
     Router,
@@ -16,14 +16,22 @@ pub fn router<S: Clone + Send + Sync + 'static>() -> Router<S> {
     Router::new()
         .route("/", get(index))
         .route("/playground", get(index))
+        .route("/playground/favicon.png", get(favicon_png))
+        .route("/playground/favicon.svg", get(favicon))
+        .route("/playground/assets/{*path}", get(asset))
         .route("/playground/{*path}", get(index))
         .route("/connect", get(index))
+        .route("/favicon.png", get(favicon_png))
         .route("/favicon.svg", get(favicon))
         .route("/assets/{*path}", get(asset))
 }
 
 async fn index() -> Response {
     embedded_file("index.html", false)
+}
+
+async fn favicon_png() -> Response {
+    embedded_file("favicon.png", false)
 }
 
 async fn favicon() -> Response {
@@ -47,6 +55,9 @@ fn embedded_file(path: &str, immutable: bool) -> Response {
         Some("js") => "text/javascript; charset=utf-8",
         Some("css") => "text/css; charset=utf-8",
         Some("svg") => "image/svg+xml",
+        Some("png") => "image/png",
+        Some("webp") => "image/webp",
+        Some("woff2") => "font/woff2",
         _ => return StatusCode::NOT_FOUND.into_response(),
     };
     (
@@ -73,6 +84,35 @@ fn embedded_file(path: &str, immutable: bool) -> Response {
 mod tests {
     use super::*;
 
+    #[test]
+    fn embedded_geist_fonts_use_woff2_and_stay_within_budget() {
+        let fonts: Vec<_> = ASSETS
+            .get_dir("assets")
+            .unwrap()
+            .files()
+            .filter(|file| file.path().extension().is_some_and(|ext| ext == "woff2"))
+            .collect();
+        assert_eq!(
+            fonts.len(),
+            4,
+            "three Geist weights and one Geist Mono face"
+        );
+        let bytes: usize = fonts.iter().map(|file| file.contents().len()).sum();
+        assert!(
+            bytes < 52_000,
+            "Latin WOFF2 font budget exceeded: {bytes} bytes"
+        );
+        for file in fonts {
+            let response = embedded_file(file.path().to_str().unwrap(), true);
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(response.headers()[header::CONTENT_TYPE], "font/woff2");
+            assert_eq!(
+                response.headers()[header::CACHE_CONTROL],
+                "public, max-age=31536000, immutable"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn embedded_dashboard_and_assets_serve_without_filesystem() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -94,18 +134,27 @@ mod tests {
         );
         let html = response.text().await.unwrap();
         assert!(html.contains("warp34"));
-        // Vite's real output is the contract: follow every generated asset reference.
+        // Vite's real output is the contract: follow every generated relative
+        // asset reference (both at `/` and under `/playground/` for deep-link
+        // reloads and subpath reverse proxies such as llama-swap).
         let mut assets = 0;
-        for url in html.split('"').filter(|part| part.starts_with("/assets/")) {
-            let response = client.get(format!("{base}{url}")).send().await.unwrap();
-            assert_eq!(response.status(), StatusCode::OK, "{url}");
-            assert!(
-                response.headers()[header::CACHE_CONTROL]
-                    .to_str()
-                    .unwrap()
-                    .contains("immutable")
-            );
-            assert!(!response.bytes().await.unwrap().is_empty());
+        for url in html.split('"').filter(|part| part.starts_with("./assets/")) {
+            let trimmed = url.trim_start_matches('.');
+            for prefix in ["", "/playground"] {
+                let response = client
+                    .get(format!("{base}{prefix}{trimmed}"))
+                    .send()
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), StatusCode::OK, "{prefix}{trimmed}");
+                assert!(
+                    response.headers()[header::CACHE_CONTROL]
+                        .to_str()
+                        .unwrap()
+                        .contains("immutable")
+                );
+                assert!(!response.bytes().await.unwrap().is_empty());
+            }
             assets += 1;
         }
         assert!(assets >= 2, "must embed the production JS and CSS");
@@ -124,6 +173,15 @@ mod tests {
                 StatusCode::NOT_FOUND
             );
         }
+        assert_eq!(
+            client
+                .get(format!("{base}/favicon.png"))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
         assert_eq!(
             client
                 .get(format!("{base}/favicon.svg"))

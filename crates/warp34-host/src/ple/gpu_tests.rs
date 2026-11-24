@@ -1263,6 +1263,103 @@ fn test_gpu_hc_ple_qsa_kernels_parity() {
     exp_all.dedup();
     assert_eq!(exp_all.len(), lg_select_k);
 
+    // 6a-split. Verify Split-B `qsa_select_blocks_split_f16_kernel` + `qsa_select_blocks_merge_f16_kernel`
+    // (`ex.scratch_ptr != 0`, `total_tokens <= 16`) matches non-split `qsa_select_blocks_f16_kernel`
+    // bit-for-bit when cold middle splits (`qsa_cand_better == false`) alternate with hot splits (`true`).
+    {
+        let sb_pages = 1030usize;
+        let sb_seq_len = 16_402usize; // 4100 completed groups + 1 tail group (4100); per_split = 507
+        let sb_blk_tbl: Vec<i32> = (0..sb_pages as i32).collect();
+        let d_sb_blk_tbl = dev_from_slice(&sb_blk_tbl, &stream);
+        let d_sb_ctx_before = dev_from_slice(&[(sb_seq_len - 1) as i32], &stream);
+        let d_sb_seq_after = dev_from_slice(&[sb_seq_len as i32], &stream);
+        let d_sb_slot = dev_from_slice(&[(sb_seq_len - 1) as i32], &stream);
+        let sb_batch = Warp34AttentionBatch {
+            query_start_loc: d_lg_qsl.addr() as usize as *const i32,
+            context_lens_before: d_sb_ctx_before.addr() as usize as *const i32,
+            seq_lens_after: d_sb_seq_after.addr() as usize as *const i32,
+            block_tables: d_sb_blk_tbl.addr() as usize as *const i32,
+            write_slot_mapping: d_sb_slot.addr() as usize as *const i32,
+            valid_token_mask: std::ptr::null(),
+            num_reqs: 1,
+            total_tokens: 1,
+            max_q_len: 1,
+            max_seq_len: sb_seq_len as i32,
+            max_blocks_per_req: sb_pages as i32,
+            ..nu_attn_batch
+        };
+        let mut h_sb_comp_k = vec![f32_to_f16(-1.0); sb_pages * 4 * 128];
+        // Fill split 0 (`[16..480)`) with positive scores (`0.5 + 0.001 * i`) so `thresh_sc > 0`,
+        // leave splits 1, 3, 4, 6 completely cold (`score = 0 < thresh_sc` -> `false` branch),
+        // and plant higher-scoring overrides in splits 2, 5, and 7 (`true` branch after `false`).
+        for i in 0..464usize {
+            let g = 16 + i;
+            let v = f32_to_f16(0.5 + (i as f32) * 0.002);
+            h_sb_comp_k[g * 128..(g + 1) * 128].fill(v);
+        }
+        for (k_i, g) in [1040usize, 1050, 2560, 2570, 3600, 3610]
+            .into_iter()
+            .enumerate()
+        {
+            let v = f32_to_f16(2.0 + (k_i as f32) * 0.1);
+            h_sb_comp_k[g * 128..(g + 1) * 128].fill(v);
+        }
+        let d_sb_comp_k = dev_from_slice(&h_sb_comp_k, &stream);
+        let d_sb_scratch = DeviceBuffer::alloc(0, 64 * 1024).unwrap();
+        let ex_sb = stream.exec(d_sb_scratch.addr(), 64 * 1024);
+
+        let d_ref_phys = DeviceBuffer::alloc(0, lg_select_k * 4).unwrap();
+        let d_ref_log = DeviceBuffer::alloc(0, lg_select_k * 4).unwrap();
+        let d_ref_num = DeviceBuffer::alloc(0, 4).unwrap();
+        let d_ref_pos = DeviceBuffer::alloc(0, 4).unwrap();
+        let d_got_phys = DeviceBuffer::alloc(0, lg_select_k * 4).unwrap();
+        let d_got_log = DeviceBuffer::alloc(0, lg_select_k * 4).unwrap();
+        let d_got_num = DeviceBuffer::alloc(0, 4).unwrap();
+        let d_got_pos = DeviceBuffer::alloc(0, 4).unwrap();
+
+        gpu_ops::qsa_select_blocks_f16(
+            &ex,
+            d_lg_q_idx.addr(),
+            d_sb_comp_k.addr(),
+            &sb_batch,
+            d_ref_phys.addr(),
+            d_ref_log.addr(),
+            d_ref_num.addr(),
+            d_ref_pos.addr(),
+            4,
+            128,
+            block_size,
+            lg_select_k,
+            lg_sink,
+            lg_recent,
+        )
+        .unwrap();
+        gpu_ops::qsa_select_blocks_f16(
+            &ex_sb,
+            d_lg_q_idx.addr(),
+            d_sb_comp_k.addr(),
+            &sb_batch,
+            d_got_phys.addr(),
+            d_got_log.addr(),
+            d_got_num.addr(),
+            d_got_pos.addr(),
+            4,
+            128,
+            block_size,
+            lg_select_k,
+            lg_sink,
+            lg_recent,
+        )
+        .unwrap();
+
+        let ref_log: Vec<i32> = dev_to_vec(&d_ref_log, lg_select_k, &stream);
+        let got_log: Vec<i32> = dev_to_vec(&d_got_log, lg_select_k, &stream);
+        let ref_phys: Vec<i32> = dev_to_vec(&d_ref_phys, lg_select_k, &stream);
+        let got_phys: Vec<i32> = dev_to_vec(&d_got_phys, lg_select_k, &stream);
+        assert_eq!(got_log, ref_log, "Split-B QSA logical block mismatch");
+        assert_eq!(got_phys, ref_phys, "Split-B QSA physical block mismatch");
+    }
+
     // Verify GQA-6 (`local_q_heads = 6, local_kv_heads = 1`) with and without Split-K scratch:
     let gqa6_heads = 6usize;
     let h_gqa6_q: Vec<u16> = (0..gqa6_heads * head_dim)
@@ -1344,6 +1441,104 @@ fn test_gpu_hc_ple_qsa_kernels_parity() {
         max_split_diff < 1e-3,
         "GQA-6 Split-K vs no-split mismatch: max_split_diff={max_split_diff}"
     );
+
+    // 6b. Verify Tensor-Core `qsa_sparse_paged_attn_mma_f16_kernel` (`num_splits == 1`) against
+    // Split-K `qsa_sparse_paged_attn_gqa_f16_kernel` (`num_splits > 1`) across `TQ4`, `Q8_0`,
+    // and (on `sm_89+`) `FP8_E4M3` KV caches.
+    let mut mma_kv_cases = vec![
+        (
+            "TQ4",
+            WARP34_KV_FORMAT_TQ4,
+            WARP34_KV_TRANSFORM_RADEMACHER_WHT256,
+            132usize,
+        ),
+        (
+            "Q8_0",
+            WARP34_KV_FORMAT_Q8_0,
+            WARP34_KV_TRANSFORM_IDENTITY,
+            272usize,
+        ),
+    ];
+    if CudaDevice::set_current(0)
+        .unwrap()
+        .props()
+        .unwrap()
+        .supports_fp8_kv()
+    {
+        mma_kv_cases.push((
+            "FP8_E4M3",
+            WARP34_KV_FORMAT_FP8_E4M3,
+            WARP34_KV_TRANSFORM_RADEMACHER_WHT256,
+            264usize,
+        ));
+    }
+    for (label, kv_fmt, kv_xform, row_stride) in mma_kv_cases {
+        let q_bytes = nu_pages * block_size * row_stride;
+        let d_k_q = DeviceBuffer::alloc(0, q_bytes).unwrap();
+        let d_v_q = DeviceBuffer::alloc(0, q_bytes).unwrap();
+        let layout_q = Warp34KvLayerLayout {
+            k_base: d_k_q.addr(),
+            v_base: d_v_q.addr(),
+            k_page_stride_bytes: (block_size * row_stride) as u64,
+            v_page_stride_bytes: (block_size * row_stride) as u64,
+            k_head_stride_bytes: (block_size * row_stride) as u64,
+            v_head_stride_bytes: (block_size * row_stride) as u64,
+            k_token_stride_bytes: row_stride as u64,
+            v_token_stride_bytes: row_stride as u64,
+            k_format: kv_fmt,
+            v_format: kv_fmt,
+            k_transform: kv_xform,
+            v_transform: kv_xform,
+            ..layout6
+        };
+        // SAFETY: `d_nu_k_in`/`d_nu_v_in` and `d_k_q`/`d_v_q` are sized for `nu_seq_len` tokens.
+        unsafe {
+            assert_eq!(
+                warp34_kv_cache_write_strided(
+                    &ex,
+                    &layout_q,
+                    &write_batch,
+                    d_nu_k_in.addr() as *const c_void,
+                    d_nu_v_in.addr() as *const c_void,
+                    head_dim as i32,
+                    head_dim as i32,
+                ),
+                0
+            );
+        }
+        let d_out_q_mma = DeviceBuffer::alloc(0, gqa6_heads * head_dim * 2).unwrap();
+        let d_out_q_ref = DeviceBuffer::alloc(0, gqa6_heads * head_dim * 2).unwrap();
+        for (exec_ref, out_buf) in [(&ex_nosplit, &d_out_q_mma), (&ex_splitk, &d_out_q_ref)] {
+            gpu_ops::qsa_sparse_paged_attn_hadamard_f16(
+                exec_ref,
+                d_gqa6_q.addr(),
+                d_gqa6_gate.addr(),
+                &layout_q,
+                d_nu_sel_phys.addr(),
+                d_nu_sel_log.addr(),
+                d_nu_num_sel.addr(),
+                d_nu_seq_pos.addr(),
+                0,
+                out_buf.addr(),
+                1,
+                gqa6_heads,
+                nu_select_k,
+                nu_attn_batch.sm_scale,
+            )
+            .unwrap();
+        }
+        let h_mma: Vec<u16> = dev_to_vec(&d_out_q_mma, gqa6_heads * head_dim, &stream);
+        let h_ref: Vec<u16> = dev_to_vec(&d_out_q_ref, gqa6_heads * head_dim, &stream);
+        let max_diff = h_mma
+            .iter()
+            .zip(h_ref.iter())
+            .map(|(&a, &b)| (f16_to_f32(a) - f16_to_f32(b)).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            max_diff < 2e-3,
+            "GQA-6 MMA vs Split-K mismatch for {label}: max_diff={max_diff}"
+        );
+    }
 
     // 7. Verify 0-ULP bit-identity of all producer-fused H_64 and residual-add kernels:
     let had64_ref = |src: &DeviceBuffer, rows: usize, cols: usize| -> Vec<u16> {
@@ -1664,4 +1859,119 @@ fn test_gpu_hc_combine_tap_f16_parity() {
         )
         .is_err()
     );
+}
+
+#[test]
+fn fused_hc_combine_tap_rmsnorm_matches_unfused_zero_ulp() {
+    let _dev = CudaDevice::set_current(0).unwrap();
+    let stream = CudaStream::new(0).unwrap();
+    let ex = stream.exec(0, 0);
+    let num_tokens = 5usize;
+    let hc_count = 4usize;
+    let hidden_size = 2560usize;
+    let eps = 1e-6f32;
+    let tap_stride = 5 * hidden_size;
+    let tap_offset = 2 * hidden_size;
+
+    let res_init: Vec<u16> = (0..(num_tokens * hc_count * hidden_size))
+        .map(|i| crate::cuda::f32_to_f16((((i * 19 + 7) % 97) as f32 - 48.0) * 0.03125))
+        .collect();
+    let blk_host: Vec<u16> = (0..(num_tokens * hidden_size))
+        .map(|i| crate::cuda::f32_to_f16((((i * 31 + 11) % 89) as f32 - 44.0) * 0.03125))
+        .collect();
+    let inj_host: Vec<f32> = (0..(num_tokens * hc_count))
+        .map(|i| 0.25 + ((i * 7 + 3) % 13) as f32 * 0.1)
+        .collect();
+    let norm_w_host: Vec<u16> = (0..(hc_count * hidden_size))
+        .map(|i| crate::cuda::f32_to_f16((((i * 23 + 5) % 61) as f32 - 30.0) * 0.015625))
+        .collect();
+    let mask_host: [u8; 5] = [1, 0, 1, 1, 0];
+
+    let d_blk = dev_from_slice(&blk_host, &stream);
+    let d_inj = dev_from_slice(&inj_host, &stream);
+    let d_norm_w = dev_from_slice(&norm_w_host, &stream);
+    let d_mask = dev_from_slice(&mask_host, &stream);
+
+    for with_tap in [false, true] {
+        for use_mask in [false, true] {
+            let mask_ptr = if use_mask { d_mask.addr() } else { 0 };
+            let d_res_ref = dev_from_slice(&res_init, &stream);
+            let d_res_fused = dev_from_slice(&res_init, &stream);
+
+            let d_norm_ref = DeviceBuffer::alloc(0, res_init.len() * 2).unwrap();
+            let d_norm_fused = DeviceBuffer::alloc(0, res_init.len() * 2).unwrap();
+            let d_tap_ref = DeviceBuffer::alloc(0, num_tokens * tap_stride * 2).unwrap();
+            let d_tap_fused = DeviceBuffer::alloc(0, num_tokens * tap_stride * 2).unwrap();
+            d_tap_ref.zero_async(&stream).unwrap();
+            d_tap_fused.zero_async(&stream).unwrap();
+
+            gpu_ops::hc_combine_tap_f16(
+                &ex,
+                d_res_ref.addr(),
+                d_blk.addr(),
+                d_inj.addr(),
+                0,
+                d_res_ref.addr(),
+                if with_tap { d_tap_ref.addr() } else { 0 },
+                mask_ptr,
+                num_tokens,
+                hc_count,
+                hidden_size,
+                if with_tap { tap_stride as i32 } else { 0 },
+                if with_tap { tap_offset as i32 } else { 0 },
+            )
+            .unwrap();
+            gpu_ops::hc_rmsnorm_f16(
+                &ex,
+                d_res_ref.addr(),
+                d_norm_w.addr(),
+                d_norm_ref.addr(),
+                mask_ptr,
+                num_tokens,
+                hc_count,
+                hidden_size,
+                eps,
+            )
+            .unwrap();
+
+            gpu_ops::hc_combine_tap_rmsnorm_f16(
+                &ex,
+                d_res_fused.addr(),
+                d_blk.addr(),
+                d_inj.addr(),
+                0,
+                d_res_fused.addr(),
+                if with_tap { d_tap_fused.addr() } else { 0 },
+                d_norm_w.addr(),
+                d_norm_fused.addr(),
+                mask_ptr,
+                num_tokens,
+                hc_count,
+                hidden_size,
+                eps,
+                if with_tap { tap_stride as i32 } else { 0 },
+                if with_tap { tap_offset as i32 } else { 0 },
+            )
+            .unwrap();
+
+            let ref_res: Vec<u16> = dev_to_vec(&d_res_ref, res_init.len(), &stream);
+            let fused_res: Vec<u16> = dev_to_vec(&d_res_fused, res_init.len(), &stream);
+            let ref_norm: Vec<u16> = dev_to_vec(&d_norm_ref, res_init.len(), &stream);
+            let fused_norm: Vec<u16> = dev_to_vec(&d_norm_fused, res_init.len(), &stream);
+            assert_eq!(
+                fused_res, ref_res,
+                "res mismatch tap={with_tap} mask={use_mask}"
+            );
+            assert_eq!(
+                fused_norm, ref_norm,
+                "norm mismatch tap={with_tap} mask={use_mask}"
+            );
+            if with_tap {
+                let ref_tap: Vec<u16> = dev_to_vec(&d_tap_ref, num_tokens * tap_stride, &stream);
+                let fused_tap: Vec<u16> =
+                    dev_to_vec(&d_tap_fused, num_tokens * tap_stride, &stream);
+                assert_eq!(fused_tap, ref_tap, "tap mismatch mask={use_mask}");
+            }
+        }
+    }
 }

@@ -81,8 +81,7 @@ impl QwenImage21Worker {
                                 .cfg
                                 .sample_sigmas
                                 .as_ref()
-                                .map(|s| s.len().max(1))
-                                .unwrap_or(40);
+                                .map_or(40, |s| s.len().max(1));
                             let _ = init_tx.send(Ok((default_steps, eng.tp_size())));
                             eng
                         }
@@ -130,6 +129,7 @@ impl QwenImage21Worker {
             kv_format: "fp16_dit_vae".to_string(),
             speculation: "flow_match_euler".to_string(),
             max_model_len: None,
+            lora_adapters: Vec::new(),
         });
         telemetry.set_model(model_name.to_string());
         Ok(Self {
@@ -218,6 +218,7 @@ impl QwenImage21Worker {
 pub struct QwenImage21ServerState {
     pub model_name: String,
     api_key: Option<crate::api_auth::ApiKey>,
+    webui: bool,
     pub worker: QwenImage21Worker,
     pub metrics: Arc<Telemetry>,
     pub allow_remote_images: bool,
@@ -240,6 +241,7 @@ impl QwenImage21ServerState {
         Ok(Arc::new(Self {
             model_name,
             api_key: options.api_key,
+            webui: options.webui,
             worker,
             metrics,
             allow_remote_images,
@@ -699,7 +701,7 @@ pub fn parse_json_image_request(
             None => opt_json_f64(obj, "cfg_scale")?,
         },
     };
-    let guidance_scale = raw_cfg.map(|v| v as f32).unwrap_or(1.0);
+    let guidance_scale = raw_cfg.map_or(1.0, |v| v as f32);
     if !guidance_scale.is_finite() || !(0.0..=30.0).contains(&guidance_scale) {
         return Err("'guidance_scale' must be in 0.0..=30.0".into());
     }
@@ -960,31 +962,31 @@ pub fn parse_multipart_image_request(
                     as_text()?
                         .parse()
                         .map_err(|_| "invalid multipart 'width'".to_string())?,
-                )
+                );
             }
             "height" => {
                 height = Some(
                     as_text()?
                         .parse()
                         .map_err(|_| "invalid multipart 'height'".to_string())?,
-                )
+                );
             }
             "steps" | "num_inference_steps" => {
                 steps = Some(
                     as_text()?
                         .parse()
                         .map_err(|_| "invalid multipart 'steps'".to_string())?,
-                )
+                );
             }
             "guidance_scale" | "true_cfg_scale" | "cfg_scale" => {
                 guidance_scale = as_text()?
                     .parse()
-                    .map_err(|_| "invalid multipart 'guidance_scale'".to_string())?
+                    .map_err(|_| "invalid multipart 'guidance_scale'".to_string())?;
             }
             "seed" => {
                 seed = as_text()?
                     .parse()
-                    .map_err(|_| "invalid multipart 'seed'".to_string())?
+                    .map_err(|_| "invalid multipart 'seed'".to_string())?;
             }
             "background" => background = Some(as_text()?),
             "rgba" => {
@@ -1001,7 +1003,7 @@ pub fn parse_multipart_image_request(
             "n" => {
                 n = as_text()?
                     .parse()
-                    .map_err(|_| "invalid multipart 'n'".to_string())?
+                    .map_err(|_| "invalid multipart 'n'".to_string())?;
             }
             "response_format" => response_format = as_text()?,
             "output_format" => output_format = Some(as_text()?),
@@ -1253,7 +1255,12 @@ async fn count_image_responses(
 }
 
 pub fn image_router(state: Arc<QwenImage21ServerState>) -> Router {
-    Router::new()
+    let webui = state.webui;
+    build_image_router(state, webui)
+}
+
+fn build_image_router(state: Arc<QwenImage21ServerState>, webui: bool) -> Router {
+    let app = Router::new()
         .route("/v1/models", get(image_models))
         .route("/v1/images/generations", post(images_generations))
         .route("/images/generations", post(images_generations))
@@ -1265,14 +1272,18 @@ pub fn image_router(state: Arc<QwenImage21ServerState>) -> Router {
         ))
         .route("/health", get(image_health))
         .route("/metrics", get(image_metrics))
-        .route("/api/metrics", get(image_metrics_json))
-        .merge(crate::dashboard::router())
-        .layer(axum::middleware::from_fn_with_state(
-            state.clone(),
-            count_image_responses,
-        ))
-        .fallback(|| async { super::http::error(StatusCode::NOT_FOUND, "not found") })
-        .with_state(state)
+        .route("/api/metrics", get(image_metrics_json));
+    let app = if webui {
+        app.merge(crate::dashboard::router())
+    } else {
+        app
+    };
+    app.layer(axum::middleware::from_fn_with_state(
+        state.clone(),
+        count_image_responses,
+    ))
+    .fallback(|| async { super::http::error(StatusCode::NOT_FOUND, "not found") })
+    .with_state(state)
 }
 
 pub fn run_blocking_image_server(
@@ -1295,8 +1306,12 @@ pub fn run_blocking_image_server(
             }
         };
         eprintln!(
-            "[warp34 serve] QwenImage21 ready on http://{}",
-            listener.local_addr()?
+            "{}",
+            super::http::serve_exposure_notice(
+                listener.local_addr()?,
+                state.api_key.is_some(),
+                state.webui,
+            )
         );
         let app = image_router(state.clone());
         let admission_shutdown = state.admission.clone();
@@ -1612,7 +1627,7 @@ mod tests {
         crate::qwen_image::tests::write_synthetic_qwen_image_pipeline_dir(tmp.path());
         let dir_path = tmp.path().to_path_buf();
 
-        let api_key = crate::api_auth::ApiKey::new("test-image-secret".to_string()).unwrap();
+        let api_key = crate::api_auth::ApiKey::new("test-image-secret").unwrap();
         let state = QwenImage21ServerState::from_loader_with_options(
             "Qwen/Qwen-Image-2.1-Turbo".to_string(),
             false,
@@ -1645,13 +1660,43 @@ mod tests {
             .unwrap();
         assert_eq!(unauth_resp.status(), StatusCode::UNAUTHORIZED);
 
-        // 2. Public health & metrics endpoints succeed without auth
+        // 2. Public health, dashboard (webui=true), & metrics endpoints succeed without auth
         let health_resp = client
             .get(format!("{base_url}/health"))
             .send()
             .await
             .unwrap();
         assert_eq!(health_resp.status(), StatusCode::OK);
+
+        let webui_resp = client.get(format!("{base_url}/")).send().await.unwrap();
+        assert_eq!(webui_resp.status(), StatusCode::OK);
+
+        // When webui=false (--no-webui), `/` is 404 while `/health` remains 200
+        let no_ui_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let no_ui_url = format!("http://{}", no_ui_listener.local_addr().unwrap());
+        let no_ui_app = build_image_router(state.clone(), false);
+        let no_ui_handle = tokio::spawn(async move {
+            let _ = axum::serve(no_ui_listener, no_ui_app).await;
+        });
+        assert_eq!(
+            client
+                .get(format!("{no_ui_url}/"))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            client
+                .get(format!("{no_ui_url}/health"))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
+        no_ui_handle.abort();
 
         let api_metrics_resp = client
             .get(format!("{base_url}/api/metrics"))

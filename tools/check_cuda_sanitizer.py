@@ -46,7 +46,12 @@ class SanitizerCase:
 
 
 SANITIZER_MATRIX: tuple[SanitizerCase, ...] = (
-    # 1. Quantized Linear (Marlin W4A16/W2A16/BF16, small_n_gemm, fused LoRA)
+    # 1. Quantized Linear (Marlin W4A16/W4A8-shared/W2A16/BF16, small_n_gemm, fused LoRA)
+    SanitizerCase(
+        subsystem="linear",
+        target="quant_formats",
+        test_name="marlin_w4a8_shared_k16_matches_exact_s8_reference_and_mixed_sign_scales",
+    ),
     SanitizerCase(
         subsystem="linear",
         target="lib",
@@ -113,6 +118,11 @@ SANITIZER_MATRIX: tuple[SanitizerCase, ...] = (
         subsystem="gdn",
         target="backbone_and_collectives",
         test_name="test_gdn_conv_paired_prefill_matches_chunked_scalar",
+    ),
+    SanitizerCase(
+        subsystem="gdn",
+        target="lib",
+        test_name="cache::checkpoint_pool::tests::wht128_q8_roundtrip_and_l2_spill_restore",
     ),
     # 4. Mixture-of-Experts (grouped MMA, down_accum, 512/k10 router, GPU LRU & CPU bridge)
     SanitizerCase(
@@ -320,12 +330,37 @@ def select_cases(
     return out
 
 
+def discover_prebuilt_test_executables(
+    repo_root: pathlib.Path, targets: set[str]
+) -> dict[str, pathlib.Path]:
+    deps_dir = repo_root / "target" / "release" / "deps"
+    executables: dict[str, pathlib.Path] = {}
+    for target in sorted(targets):
+        prefix = "warp34_host-" if target == "lib" else f"{target}-"
+        candidates = [
+            p
+            for p in deps_dir.glob(f"{prefix}*")
+            if p.is_file() and os.access(p, os.X_OK) and "." not in p.name
+        ]
+        if candidates:
+            candidates.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+            executables[target] = candidates[0]
+    missing = sorted(targets - set(executables))
+    if missing:
+        raise FileNotFoundError(
+            f"failed to locate prebuilt test executable(s) in {deps_dir} for: {missing}"
+        )
+    return executables
+
+
 def build_test_executables(
     repo_root: pathlib.Path, targets: set[str]
 ) -> dict[str, pathlib.Path]:
     env = os.environ.copy()
     if "/opt/cuda/bin" not in env.get("PATH", ""):
         env["PATH"] = f"/opt/cuda/bin:{env.get('PATH', '')}"
+    if env.get("WARP34_PREBUILT_TESTS") == "1" or shutil.which("cargo", path=env.get("PATH")) is None:
+        return discover_prebuilt_test_executables(repo_root, targets)
 
     cmd = [
         "cargo",

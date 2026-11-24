@@ -22,7 +22,9 @@ fn terminal_test_request() -> (
 ) {
     let (output, events) = generation_channel(2);
     let (tx, rx) = tokio::sync::oneshot::channel();
+    let cache_lookup = Arc::new(std::sync::OnceLock::new());
     let cached_tokens = Arc::new(AtomicU64::new(0));
+    let hit_limit = Arc::new(AtomicBool::new(false));
     let cancelled = Arc::new(AtomicBool::new(false));
     let request = Request {
         lifecycle: Some(Arc::new(Telemetry::default()).request(1)),
@@ -30,7 +32,10 @@ fn terminal_test_request() -> (
         images: Vec::new(),
         vision: None,
         reserved_pages: 0,
+        soft_output_budget: false,
+        cache_lookup: cache_lookup.clone(),
         cached_tokens: cached_tokens.clone(),
+        hit_limit: hit_limit.clone(),
         sampler: SamplerV1::new(SamplingParams::default(), &[1], None),
         output,
         terminal: events.terminal.clone(),
@@ -48,7 +53,9 @@ fn terminal_test_request() -> (
         request,
         GenerationStream {
             events,
+            cache_lookup,
             cached_tokens,
+            hit_limit,
             cancelled,
         },
         rx,
@@ -83,6 +90,7 @@ async fn terminal_finished_survives_full_queue_and_is_delivered_once() {
     request.set_terminal(GenerationEvent::Finished {
         cached_tokens: 3,
         generated_tokens: 2,
+        thinking_budget_exhausted: false,
     });
     // A later cleanup must not overwrite the already committed terminal result.
     notify_request_error(request, WorkerError::worker_stopped("late stop"));
@@ -95,6 +103,7 @@ async fn terminal_finished_survives_full_queue_and_is_delivered_once() {
         Some(GenerationEvent::Finished {
             cached_tokens: 3,
             generated_tokens: 2,
+            ..
         })
     ));
     assert!(stream.events.recv().await.is_none());
@@ -265,10 +274,9 @@ async fn check_locally_owned_panic(pulled_batch: bool) {
                 #[allow(clippy::useless_vec)]
                 let _pulled = vec![(0, 1, Vec::<i32>::new(), reqs.remove(&1).unwrap())];
                 panic!("panic while MTP owns pulled requests");
-            } else {
-                let _admitting = rx.try_recv().unwrap();
-                panic!("panic during admission before registry insert");
             }
+            let _admitting = rx.try_recv().unwrap();
+            panic!("panic during admission before registry insert");
         },
     );
     assert!(matches!(stream.events.recv().await,
@@ -386,15 +394,20 @@ fn worker_panic_containment_drains_in_flight_and_queued_and_poisons_future_submi
         eos_token_ids: vec![2],
         vocab_size: 1024,
         default_preserve_thinking: false,
+        chat_template: crate::chatml::ChatTemplate::default_qwen(),
+        default_sampling_params: SamplingParams::default(),
         decision_profile: crate::decision::DecisionModelProfile::CausalLm { temperature: 1.0 },
         vision_config: None,
+        vision_preprocessor: crate::vision::VisionPreprocessorConfig::default(),
         has_vision_weights: false,
         hidden_size: 1024,
         kv_token_capacity: 4096,
+        max_position_embeddings: Some(2048),
         unshareable_prefill: false,
         lora_registry: crate::lora::LoraAdapterRegistry::new(),
         max_model_len: None,
     };
+    assert_eq!(worker.max_model_len(), 2048);
 
     let mut active_stream = worker
         .submit(vec![10, 20], SamplingParams::default(), None)

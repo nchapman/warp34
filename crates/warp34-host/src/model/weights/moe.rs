@@ -8,6 +8,7 @@ pub enum MoeExpertStorage {
         down_packed_ptr: u64,
         down_scales_ptr: u64,
         group_size: usize,
+        code_offset_half: bool,
     },
     W4A16 {
         gate_up_packed_ptr: u64,
@@ -72,27 +73,63 @@ impl FfnBlockWeights {
         rows: usize,
         h_dim: usize,
     ) -> [u64; 2] {
+        self.pre_mlp_norm_targets_with_block(normed_buf, mlp_out_buf, ex, rows, h_dim, false)
+            .0
+    }
+
+    #[inline]
+    pub fn pre_mlp_norm_targets_with_block(
+        &self,
+        normed_buf: u64,
+        mlp_out_buf: u64,
+        ex: &Warp34Exec,
+        rows: usize,
+        h_dim: usize,
+        allow_h512: bool,
+    ) -> ([u64; 2], usize) {
         if h_dim > PRODUCER_FUSED_H64_MAX_HIDDEN_SIZE || !h_dim.is_multiple_of(HADAMARD_BLOCK_64) {
-            return [normed_buf, 0];
+            return ([normed_buf, 0], 0);
         }
         match self {
-            Self::Dense { gate_up_proj, .. } if gate_up_proj.can_fuse_h64_from_producer() => {
-                [0, normed_buf]
+            Self::Dense { gate_up_proj, .. } => {
+                if gate_up_proj.can_fuse_h64_from_producer() {
+                    ([0, normed_buf], HADAMARD_BLOCK_64)
+                } else if allow_h512
+                    && h_dim.is_multiple_of(512)
+                    && gate_up_proj.can_fuse_h512_from_producer()
+                {
+                    ([0, normed_buf], 512)
+                } else {
+                    ([normed_buf, 0], 0)
+                }
             }
-            Self::Moe(moe)
-                if moe.routed_input_hadamard == HADAMARD_BLOCK_64
+            Self::Moe(moe) => {
+                let had_block = if moe.routed_input_hadamard == HADAMARD_BLOCK_64
                     && moe
                         .shared_gate_up_proj
                         .as_ref()
-                        .is_none_or(LinearProj::can_fuse_h64_from_producer) =>
-            {
+                        .is_none_or(LinearProj::can_fuse_h64_from_producer)
+                {
+                    HADAMARD_BLOCK_64
+                } else if allow_h512
+                    && moe.routed_input_hadamard == 512
+                    && h_dim.is_multiple_of(512)
+                    && moe
+                        .shared_gate_up_proj
+                        .as_ref()
+                        .is_none_or(LinearProj::can_fuse_h512_from_producer)
+                {
+                    512
+                } else {
+                    return ([normed_buf, 0], 0);
+                };
                 match &moe.experts {
                     MoeExpertStorage::W2A16 { .. }
                     | MoeExpertStorage::W4A16 { .. }
                     | MoeExpertStorage::W4A16Zp { .. }
                         if mlp_out_buf != 0 && mlp_out_buf != normed_buf =>
                     {
-                        [normed_buf, mlp_out_buf]
+                        ([normed_buf, mlp_out_buf], had_block)
                     }
                     MoeExpertStorage::Tiered { .. } => {
                         let reserved = align_up_hadamard_workspace(
@@ -101,6 +138,9 @@ impl FfnBlockWeights {
                         let extra_ws = moe
                             .shared_down_proj
                             .as_ref()
+                            .filter(|p| {
+                                !p.can_fuse_h64_from_producer() && !p.can_fuse_h512_from_producer()
+                            })
                             .and_then(|p| p.input_transform_workspace_bytes(rows))
                             .unwrap_or(0);
                         if ex.scratch_ptr != 0
@@ -109,15 +149,14 @@ impl FfnBlockWeights {
                                 .is_multiple_of(HADAMARD_WORKSPACE_ALIGN_BYTES as u64)
                             && ex.scratch_size >= reserved.saturating_add(extra_ws)
                         {
-                            [normed_buf, ex.scratch_ptr]
+                            ([normed_buf, ex.scratch_ptr], had_block)
                         } else {
-                            [normed_buf, 0]
+                            ([normed_buf, 0], 0)
                         }
                     }
-                    _ => [normed_buf, 0],
+                    _ => ([normed_buf, 0], 0),
                 }
             }
-            _ => [normed_buf, 0],
         }
     }
 
@@ -209,6 +248,7 @@ impl FfnBlockWeights {
                 stream: ex.stream,
                 scratch_ptr: ex.scratch_ptr + reserved_prerot as u64,
                 scratch_size: ex.scratch_size - reserved_prerot,
+                flags: ex.flags,
             }
         } else {
             *ex
@@ -241,8 +281,11 @@ impl FfnBlockWeights {
                     )?;
                 }
                 let fuse_down_h64 = down_proj.can_fuse_h64_from_producer();
+                let fuse_down_h512 = !fuse_down_h64 && down_proj.can_fuse_h512_from_producer();
                 let silu_fn = if fuse_down_h64 {
                     ffi::warp34_silu_and_mul_hadamard_f16
+                } else if fuse_down_h512 {
+                    ffi::warp34_silu_and_mul_hadamard512_f16
                 } else {
                     ffi::warp34_silu_and_mul_f16
                 };
@@ -263,7 +306,7 @@ impl FfnBlockWeights {
                     },
                     "warp34_silu_and_mul_f16",
                 )?;
-                if fuse_down_h64 {
+                if fuse_down_h64 || fuse_down_h512 {
                     down_proj.forward_prerotated(
                         ex,
                         cublas,
@@ -383,16 +426,16 @@ impl FfnBlockWeights {
                     "warp34_moe_topk_router_f16",
                 )?;
 
-                let fuse_shared_and_routed_in_h64 = !input_prerotated
-                    && moe.routed_input_hadamard == HADAMARD_BLOCK_64
-                    && moe
-                        .shared_gate_up_proj
-                        .as_ref()
-                        .is_some_and(LinearProj::can_fuse_h64_from_producer);
-                if fuse_shared_and_routed_in_h64 {
+                let fuse_shared_and_routed_in_hadamard = !input_prerotated
+                    && moe.routed_input_hadamard > 0
+                    && h_dim.is_multiple_of(moe.routed_input_hadamard)
+                    && moe.shared_gate_up_proj.as_ref().is_some_and(|p| {
+                        p.can_fuse_hadamard_from_producer(moe.routed_input_hadamard)
+                    });
+                if fuse_shared_and_routed_in_hadamard {
                     check_rc(
                         // SAFETY: `normed_buf` holds `num_tokens * h_dim` FP16 elements with `h_dim`
-                        // divisible by `HADAMARD_BLOCK_64`; router_gate and shared_expert_gate have
+                        // divisible by `moe.routed_input_hadamard`; router_gate and shared_expert_gate have
                         // already consumed the unrotated input on `ex.stream`.
                         unsafe {
                             ffi::warp34_block_hadamard_inplace_f16(
@@ -400,7 +443,7 @@ impl FfnBlockWeights {
                                 normed_buf as *mut c_void,
                                 num_tokens as i32,
                                 h_dim as i32,
-                                HADAMARD_BLOCK_64 as i32,
+                                moe.routed_input_hadamard as i32,
                             )
                         },
                         "warp34_block_hadamard_inplace_f16 (moe shared+routed input)",
@@ -415,7 +458,7 @@ impl FfnBlockWeights {
                 let (sh_out_ptr, sh_gate_ptr) = if let (Some(sh_gu), Some(sh_dn)) =
                     (&moe.shared_gate_up_proj, &moe.shared_down_proj)
                 {
-                    if input_prerotated || fuse_shared_and_routed_in_h64 {
+                    if input_prerotated || fuse_shared_and_routed_in_hadamard {
                         sh_gu.forward_prerotated(
                             ex,
                             cublas,
@@ -437,8 +480,12 @@ impl FfnBlockWeights {
                         )?;
                     }
                     let fuse_sh_down_h64 = sh_dn.can_fuse_h64_from_producer();
+                    let fuse_sh_down_h512 =
+                        !fuse_sh_down_h64 && sh_dn.can_fuse_h512_from_producer();
                     let sh_silu_fn = if fuse_sh_down_h64 {
                         ffi::warp34_silu_and_mul_hadamard_f16
+                    } else if fuse_sh_down_h512 {
+                        ffi::warp34_silu_and_mul_hadamard512_f16
                     } else {
                         ffi::warp34_silu_and_mul_f16
                     };
@@ -458,7 +505,7 @@ impl FfnBlockWeights {
                         },
                         "warp34_silu_and_mul_f16 (shared_expert)",
                     )?;
-                    if fuse_sh_down_h64 {
+                    if fuse_sh_down_h64 || fuse_sh_down_h512 {
                         sh_dn.forward_prerotated(
                             ex,
                             cublas,
@@ -491,7 +538,7 @@ impl FfnBlockWeights {
 
                 if moe.routed_input_hadamard > 0
                     && !input_prerotated
-                    && !fuse_shared_and_routed_in_h64
+                    && !fuse_shared_and_routed_in_hadamard
                 {
                     check_rc(
                         // SAFETY: `normed_buf` holds `num_tokens * h_dim` FP16 elements with `h_dim`
@@ -517,36 +564,71 @@ impl FfnBlockWeights {
                         down_packed_ptr,
                         down_scales_ptr,
                         group_size,
-                    } => check_rc(
-                        // SAFETY: loader stores expert-major packed U2B2 weights and
-                        // FP16 scales with the loaded group size. Top-k buffers were
-                        // produced above; model scratch reserves routed intermediate
-                        // and output rows. Shared inputs are null when absent.
-                        unsafe {
-                            ffi::warp34_moe_w2a16_mlp_ex_f16(
-                                ex,
-                                rotated_input_buf as *const c_void,
-                                *gate_up_packed_ptr as *const u32,
-                                *gate_up_scales_ptr as *const c_void,
-                                *down_packed_ptr as *const u32,
-                                *down_scales_ptr as *const c_void,
-                                moe_topk_ids_buf as *const i32,
-                                moe_topk_weights_buf as *const f32,
-                                sh_out_ptr,
-                                sh_gate_ptr,
-                                moe_interm_buf as *mut c_void,
-                                mlp_out_buf as *mut c_void,
-                                num_tokens as i32,
-                                moe.top_k as i32,
-                                moe.num_experts as i32,
-                                moe.local_moe_interm as i32,
-                                h_dim as i32,
-                                *group_size as i32,
-                                moe.routed_down_hadamard as i32,
+                        code_offset_half,
+                    } => {
+                        type MoeW2MlpExFn = unsafe extern "C" fn(
+                            *const ffi::Warp34Exec,
+                            *const c_void,
+                            *const u32,
+                            *const c_void,
+                            *const u32,
+                            *const c_void,
+                            *const i32,
+                            *const f32,
+                            *const c_void,
+                            *const c_void,
+                            *mut c_void,
+                            *mut c_void,
+                            i32,
+                            i32,
+                            i32,
+                            i32,
+                            i32,
+                            i32,
+                            i32,
+                        ) -> i32;
+                        let (moe_fn, label): (MoeW2MlpExFn, &str) = if *code_offset_half {
+                            (
+                                ffi::warp34_moe_w2a16_sym_mlp_ex_f16,
+                                "warp34_moe_w2a16_sym_mlp_ex_f16",
                             )
-                        },
-                        "warp34_moe_w2a16_mlp_ex_f16",
-                    ),
+                        } else {
+                            (
+                                ffi::warp34_moe_w2a16_mlp_ex_f16,
+                                "warp34_moe_w2a16_mlp_ex_f16",
+                            )
+                        };
+                        check_rc(
+                            // SAFETY: loader stores expert-major packed U2B2 weights and
+                            // FP16 scales with the loaded group size. Top-k buffers were
+                            // produced above; model scratch reserves routed intermediate
+                            // and output rows. Shared inputs are null when absent.
+                            unsafe {
+                                moe_fn(
+                                    ex,
+                                    rotated_input_buf as *const c_void,
+                                    *gate_up_packed_ptr as *const u32,
+                                    *gate_up_scales_ptr as *const c_void,
+                                    *down_packed_ptr as *const u32,
+                                    *down_scales_ptr as *const c_void,
+                                    moe_topk_ids_buf as *const i32,
+                                    moe_topk_weights_buf as *const f32,
+                                    sh_out_ptr,
+                                    sh_gate_ptr,
+                                    moe_interm_buf as *mut c_void,
+                                    mlp_out_buf as *mut c_void,
+                                    num_tokens as i32,
+                                    moe.top_k as i32,
+                                    moe.num_experts as i32,
+                                    moe.local_moe_interm as i32,
+                                    h_dim as i32,
+                                    *group_size as i32,
+                                    moe.routed_down_hadamard as i32,
+                                )
+                            },
+                            label,
+                        )
+                    }
                     MoeExpertStorage::W4A16 {
                         gate_up_packed_ptr,
                         gate_up_scales_ptr,
@@ -697,9 +779,345 @@ impl FfnBlockWeights {
 
     /// Executes the host/VRAM tiered MoE dispatch when `self` is a tiered `FfnBlockWeights::Moe`;
     /// no-op for `Dense` and VRAM-resident `Moe`.
+    /// Executes a tiered MoE FFN layer while overlapping `shared_expert` (`gate_up -> SiLU -> down`)
+    /// behind `warp34_moe_hybrid_submit_and_pull` so CPU `eval_expert_vnni` wakes immediately
+    /// after `warp34_moe_topk_router_f16`. Falls back to sequential execution for non-tiered FFNs
+    /// or mixed-Hadamard layouts where `normed_buf` must be rotated after `shared_gate_up_proj`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_and_execute_tiered_overlapped(
+        &self,
+        tiered_moe: Option<&mut crate::moe_offload::RankTieredMoe>,
+        ex: &ffi::Warp34Exec,
+        stream: &CudaStream,
+        is_capturing_graph: bool,
+        cublas: &CublasHandle,
+        marlin_ws_ptr: u64,
+        marlin_ws_ints: usize,
+        normed_buf: u64,
+        mlp_out_buf: u64,
+        num_tokens: usize,
+        h_dim: usize,
+        interm: usize,
+        gate_up_buf: u64,
+        mlp_act_buf: u64,
+        moe_router_logits_buf: u64,
+        moe_topk_weights_buf: u64,
+        moe_topk_ids_buf: u64,
+        moe_interm_buf: u64,
+        moe_sh_gu_buf: u64,
+        moe_sh_act_buf: u64,
+        moe_sh_out_buf: u64,
+        moe_sh_gate_buf: u64,
+        prerotated_input_buf: u64,
+    ) -> Result<()> {
+        let input_prerotated = prerotated_input_buf != 0;
+        let can_defer_shared = (num_tokens
+            <= crate::moe_offload::TIERED_MOE_CPU_BRIDGE_MAX_DECODE_TOKENS
+            || (!is_capturing_graph && num_tokens <= 40))
+            && match self {
+                Self::Moe(moe) => {
+                    matches!(moe.experts, MoeExpertStorage::Tiered { .. })
+                        && (input_prerotated
+                            || moe.routed_input_hadamard == 0
+                            || (moe.routed_input_hadamard > 0
+                                && h_dim.is_multiple_of(moe.routed_input_hadamard)
+                                && moe.shared_gate_up_proj.as_ref().is_some_and(|p| {
+                                    p.can_fuse_hadamard_from_producer(moe.routed_input_hadamard)
+                                })))
+                }
+                Self::Dense { .. } => false,
+            };
+        if !can_defer_shared {
+            self.forward_with_prerotated_input(
+                ex,
+                cublas,
+                marlin_ws_ptr,
+                marlin_ws_ints,
+                normed_buf,
+                mlp_out_buf,
+                num_tokens,
+                h_dim,
+                interm,
+                gate_up_buf,
+                mlp_act_buf,
+                moe_router_logits_buf,
+                moe_topk_weights_buf,
+                moe_topk_ids_buf,
+                moe_interm_buf,
+                moe_sh_gu_buf,
+                moe_sh_act_buf,
+                moe_sh_out_buf,
+                moe_sh_gate_buf,
+                prerotated_input_buf,
+            )?;
+            return self.execute_tiered(
+                tiered_moe,
+                ex,
+                stream,
+                is_capturing_graph,
+                if input_prerotated {
+                    prerotated_input_buf
+                } else {
+                    normed_buf
+                },
+                [
+                    moe_topk_ids_buf,
+                    moe_topk_weights_buf,
+                    moe_sh_out_buf,
+                    moe_sh_gate_buf,
+                    mlp_out_buf,
+                ],
+                num_tokens,
+            );
+        }
+
+        let Self::Moe(moe) = self else {
+            unreachable!();
+        };
+        let MoeExpertStorage::Tiered { layer_id } = moe.experts else {
+            unreachable!();
+        };
+        let reserved_prerot = align_up_hadamard_workspace(
+            num_tokens
+                .saturating_mul(h_dim)
+                .saturating_mul(FP16_ELEM_BYTES),
+        );
+        let sub_ex = if input_prerotated
+            && prerotated_input_buf == ex.scratch_ptr
+            && ex.scratch_size >= reserved_prerot
+        {
+            Warp34Exec {
+                stream: ex.stream,
+                scratch_ptr: ex.scratch_ptr + reserved_prerot as u64,
+                scratch_size: ex.scratch_size - reserved_prerot,
+                flags: ex.flags,
+            }
+        } else {
+            *ex
+        };
+        let ex = &sub_ex;
+        let dual_router_sh_gate = match (
+            &moe.router_gate,
+            moe.shared_gate_up_proj
+                .as_ref()
+                .zip(moe.shared_down_proj.as_ref()),
+            &moe.shared_expert_gate,
+            num_tokens <= 16,
+        ) {
+            (
+                LinearProj::DenseF16 {
+                    weight_ptr: w0,
+                    size_n: n0,
+                    size_k: k0,
+                },
+                Some(_),
+                Some(LinearProj::DenseF16 {
+                    weight_ptr: w1,
+                    size_n: n1,
+                    size_k: k1,
+                }),
+                true,
+            ) if *n0 <= SMALL_N_GEMM_ROUTER_512_MAX_N
+                && *n1 <= SMALL_N_GEMM_ALWAYS_MAX_N
+                && *k0 == *k1
+                && k0.is_multiple_of(SMALL_N_GEMM_K_ALIGN) =>
+            {
+                Some((*w0, *n0, *w1, *n1, *k0))
+            }
+            _ => None,
+        };
+        if let Some((w0, n0, w1, n1, k)) = dual_router_sh_gate {
+            check_rc(
+                // SAFETY: `normed_buf` holds `[num_tokens, k]` FP16 inputs and scratch reserves
+                // disjoint `moe_router_logits_buf` / `moe_sh_gate_buf` outputs.
+                unsafe {
+                    ffi::warp34_small_n_gemm_dual_f16(
+                        ex,
+                        normed_buf as *const c_void,
+                        w0 as *const c_void,
+                        moe_router_logits_buf as *mut c_void,
+                        n0 as i32,
+                        w1 as *const c_void,
+                        moe_sh_gate_buf as *mut c_void,
+                        n1 as i32,
+                        num_tokens as i32,
+                        k as i32,
+                    )
+                },
+                "warp34_small_n_gemm_dual_f16",
+            )?;
+        } else {
+            moe.router_gate.forward(
+                ex,
+                cublas,
+                marlin_ws_ptr,
+                marlin_ws_ints,
+                normed_buf,
+                moe_router_logits_buf,
+                num_tokens,
+            )?;
+            if moe.shared_gate_up_proj.is_some()
+                && moe.shared_down_proj.is_some()
+                && let Some(sh_gate) = &moe.shared_expert_gate
+            {
+                sh_gate.forward(
+                    ex,
+                    cublas,
+                    marlin_ws_ptr,
+                    marlin_ws_ints,
+                    normed_buf,
+                    moe_sh_gate_buf,
+                    num_tokens,
+                )?;
+            }
+        }
+        check_rc(
+            // SAFETY: router projection precedes this on `ex.stream`.
+            unsafe {
+                ffi::warp34_moe_topk_router_f16(
+                    ex,
+                    moe_router_logits_buf as *const c_void,
+                    moe_topk_weights_buf as *mut f32,
+                    moe_topk_ids_buf as *mut i32,
+                    num_tokens as i32,
+                    moe.num_experts as i32,
+                    moe.top_k as i32,
+                    i32::from(moe.norm_topk_prob),
+                    moe.scoring_func,
+                )
+            },
+            "warp34_moe_topk_router_f16",
+        )?;
+        let fuse_shared_and_routed_in_hadamard = !input_prerotated
+            && moe.routed_input_hadamard > 0
+            && h_dim.is_multiple_of(moe.routed_input_hadamard)
+            && moe
+                .shared_gate_up_proj
+                .as_ref()
+                .is_some_and(|p| p.can_fuse_hadamard_from_producer(moe.routed_input_hadamard));
+        if fuse_shared_and_routed_in_hadamard {
+            check_rc(
+                // SAFETY: `normed_buf` holds `num_tokens * h_dim` FP16 elements.
+                unsafe {
+                    ffi::warp34_block_hadamard_inplace_f16(
+                        ex,
+                        normed_buf as *mut c_void,
+                        num_tokens as i32,
+                        h_dim as i32,
+                        moe.routed_input_hadamard as i32,
+                    )
+                },
+                "warp34_block_hadamard_inplace_f16 (moe shared+routed input)",
+            )?;
+        }
+        let rotated_input_buf = if input_prerotated {
+            prerotated_input_buf
+        } else {
+            normed_buf
+        };
+        let sh_out_ptr = if moe.shared_down_proj.is_some() {
+            moe_sh_out_buf
+        } else {
+            0
+        };
+        let sh_gate_ptr = if moe.shared_expert_gate.is_some() {
+            moe_sh_gate_buf
+        } else {
+            0
+        };
+        let tmoe_engine =
+            tiered_moe.ok_or_else(|| loader_err("missing RankTieredMoe for tiered MoE layer"))?;
+        let mut run_shared = |_s: &CudaStream| -> Result<()> {
+            if let (Some(sh_gu), Some(sh_dn)) = (&moe.shared_gate_up_proj, &moe.shared_down_proj) {
+                if input_prerotated || fuse_shared_and_routed_in_hadamard {
+                    sh_gu.forward_prerotated(
+                        ex,
+                        cublas,
+                        marlin_ws_ptr,
+                        marlin_ws_ints,
+                        rotated_input_buf,
+                        moe_sh_gu_buf,
+                        num_tokens,
+                    )?;
+                } else {
+                    sh_gu.forward(
+                        ex,
+                        cublas,
+                        marlin_ws_ptr,
+                        marlin_ws_ints,
+                        normed_buf,
+                        moe_sh_gu_buf,
+                        num_tokens,
+                    )?;
+                }
+                let fuse_sh_down_h64 = sh_dn.can_fuse_h64_from_producer();
+                let fuse_sh_down_h512 = !fuse_sh_down_h64 && sh_dn.can_fuse_h512_from_producer();
+                let sh_silu_fn = if fuse_sh_down_h64 {
+                    ffi::warp34_silu_and_mul_hadamard_f16
+                } else if fuse_sh_down_h512 {
+                    ffi::warp34_silu_and_mul_hadamard512_f16
+                } else {
+                    ffi::warp34_silu_and_mul_f16
+                };
+                check_rc(
+                    // SAFETY: `moe_sh_gu_buf` and `moe_sh_act_buf` are disjoint FFN scratch buffers.
+                    unsafe {
+                        sh_silu_fn(
+                            ex,
+                            moe_sh_gu_buf as *const c_void,
+                            moe_sh_act_buf as *mut c_void,
+                            core::ptr::null(),
+                            num_tokens as i32,
+                            moe.local_shared_interm as i32,
+                        )
+                    },
+                    "warp34_silu_and_mul_f16 (shared_expert)",
+                )?;
+                if fuse_sh_down_h64 || fuse_sh_down_h512 {
+                    sh_dn.forward_prerotated(
+                        ex,
+                        cublas,
+                        marlin_ws_ptr,
+                        marlin_ws_ints,
+                        moe_sh_act_buf,
+                        moe_sh_out_buf,
+                        num_tokens,
+                    )?;
+                } else {
+                    sh_dn.forward(
+                        ex,
+                        cublas,
+                        marlin_ws_ptr,
+                        marlin_ws_ints,
+                        moe_sh_act_buf,
+                        moe_sh_out_buf,
+                        num_tokens,
+                    )?;
+                }
+            }
+            Ok(())
+        };
+        tmoe_engine.execute_layer_auto_with_hook(
+            stream,
+            is_capturing_graph,
+            layer_id,
+            rotated_input_buf,
+            moe_topk_ids_buf,
+            moe_topk_weights_buf,
+            sh_out_ptr,
+            sh_gate_ptr,
+            mlp_out_buf,
+            num_tokens,
+            moe.top_k,
+            Some(&mut run_shared),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
     pub fn execute_tiered(
         &self,
         tiered_moe: Option<&mut crate::moe_offload::RankTieredMoe>,
+        ex: &ffi::Warp34Exec,
         stream: &CudaStream,
         is_capturing_graph: bool,
         normed_buf: u64,
@@ -730,7 +1148,22 @@ impl FfnBlockWeights {
         } else {
             0
         };
-        tmoe_engine.execute_layer_auto(
+        let mut ext_ptr = ex.scratch_ptr;
+        let mut ext_size = ex.scratch_size;
+        let x_bytes = (num_tokens * tmoe_engine.stores[layer_id].layout().hidden * 2) as u64;
+        if normed_buf != 0 && normed_buf >= ext_ptr && normed_buf < ext_ptr + ext_size as u64 {
+            let after_x = (normed_buf + x_bytes + 255) & !255u64;
+            let end_cap = ext_ptr + ext_size as u64;
+            if after_x < end_cap {
+                ext_ptr = after_x;
+                ext_size = (end_cap - after_x) as usize;
+            } else {
+                ext_ptr = 0;
+                ext_size = 0;
+            }
+        }
+        tmoe_engine.ws.external_scratch = (ext_ptr, ext_size);
+        let res = tmoe_engine.execute_layer_auto(
             stream,
             is_capturing_graph,
             layer_id,
@@ -742,7 +1175,9 @@ impl FfnBlockWeights {
             mlp_out_buf,
             num_tokens,
             moe.top_k,
-        )
+        );
+        tmoe_engine.ws.external_scratch = (0, 0);
+        res
     }
 }
 
@@ -754,16 +1189,15 @@ pub(crate) fn load_moe_layer_weights(
     pfx: &str,
     [rank, tp_size]: [usize; 2],
     weight_arena: &mut DeviceArena,
-    (stream, repack_staging): (&CudaStream, &DeviceBuffer),
+    (stream, upload_ring): (&CudaStream, &mut crate::cuda::PinnedUploadRing),
 ) -> Result<MoeLayerWeights> {
     let raw_router = RawLinearHost::load(archive, &format!("{pfx}.mlp.gate"), &cfg.quant)?;
-    let router_gate = raw_router.upload(weight_arena, stream, repack_staging)?;
+    let router_gate = raw_router.upload_pipelined(weight_arena, stream, upload_ring)?;
 
     let full_interm = cfg.moe_intermediate_size;
     if tiered_layer_id.is_none() && !full_interm.is_multiple_of(tp_size) {
         return Err(loader_err_msg(format!(
-            "moe_intermediate_size {} is not divisible by TP={tp_size}",
-            full_interm
+            "moe_intermediate_size {full_interm} is not divisible by TP={tp_size}"
         )));
     }
     // Tiered MoE partitions expert IDs across EP ranks, preserving full `moe_intermediate_size` per expert.
@@ -906,8 +1340,8 @@ pub(crate) fn load_moe_layer_weights(
         }
         drop(gu_all);
         drop(dn_all);
-        let gate_up_ptr = weight_arena.upload_slice(&all_gu_f16, stream)?;
-        let down_ptr = weight_arena.upload_slice(&all_dn_f16, stream)?;
+        let gate_up_ptr = upload_ring.upload_slice(weight_arena, &all_gu_f16, stream)?;
+        let down_ptr = upload_ring.upload_slice(weight_arena, &all_dn_f16, stream)?;
         (
             MoeExpertStorage::DenseF16 {
                 gate_up_ptr,
@@ -930,20 +1364,51 @@ pub(crate) fn load_moe_layer_weights(
         }
         let (exp0_in_had, exp0_dn_had) = resolve_expert0_hadamard_blocks()?;
 
+        // Probe expert 0 to determine W2A16 vs W4A16 vs W4A16Zp vs DenseF16 storage and validate full dims.
+        let (exp0_gate, _) = RawLinearHost::load(
+            archive,
+            &format!("{pfx}.mlp.experts.0.gate_proj"),
+            &cfg.quant,
+        )?
+        .unwrap_hadamard();
+        if exp0_gate.dims() != (full_interm, h) {
+            return Err(loader_err_msg(format!(
+                "MoE gate_proj dims {:?} at '{pfx}.mlp.experts.0' do not match expected ({full_interm}, {h})",
+                exp0_gate.dims()
+            )));
+        }
+        if matches!(exp0_gate, RawLinearHost::U8B128NMajor { .. }) {
+            return Err(loader_err_msg(format!(
+                "unsupported 8-bit W8A16 routed MoE experts at '{pfx}' (sm_86/sm_89 MoE supports 4-bit W4A16 or FP16/BF16 experts)"
+            )));
+        }
+
         let load_expert_parts = |e: usize| -> Result<(RawLinearHost, RawLinearHost)> {
             let epfx = format!("{pfx}.mlp.experts.{e}");
-            let rg_full = RawLinearHost::load(archive, &format!("{epfx}.gate_proj"), &cfg.quant)?;
-            if rg_full.dims() != (full_interm, h) {
+            let (rg, rg_full_n) = RawLinearHost::load_row_shard_with_full_n(
+                archive,
+                &format!("{epfx}.gate_proj"),
+                &cfg.quant,
+                rank * local_moe_interm,
+                (rank + 1) * local_moe_interm,
+            )?;
+            if rg_full_n != full_interm || rg.dims() != (local_moe_interm, h) {
                 return Err(loader_err_msg(format!(
-                    "MoE gate_proj dims {:?} at '{epfx}' do not match expected ({full_interm}, {h})",
-                    rg_full.dims()
+                    "MoE gate_proj full_n={rg_full_n} shard dims {:?} at '{epfx}' do not match expected ({local_moe_interm}, {h}) from full ({full_interm}, {h})",
+                    rg.dims()
                 )));
             }
-            let ru_full = RawLinearHost::load(archive, &format!("{epfx}.up_proj"), &cfg.quant)?;
-            if ru_full.dims() != (full_interm, h) {
+            let (ru, ru_full_n) = RawLinearHost::load_row_shard_with_full_n(
+                archive,
+                &format!("{epfx}.up_proj"),
+                &cfg.quant,
+                rank * local_moe_interm,
+                (rank + 1) * local_moe_interm,
+            )?;
+            if ru_full_n != full_interm || ru.dims() != (local_moe_interm, h) {
                 return Err(loader_err_msg(format!(
-                    "MoE up_proj dims {:?} at '{epfx}' do not match expected ({full_interm}, {h})",
-                    ru_full.dims()
+                    "MoE up_proj full_n={ru_full_n} shard dims {:?} at '{epfx}' do not match expected ({local_moe_interm}, {h}) from full ({full_interm}, {h})",
+                    ru.dims()
                 )));
             }
             let rd_full = RawLinearHost::load(archive, &format!("{epfx}.down_proj"), &cfg.quant)?;
@@ -953,11 +1418,9 @@ pub(crate) fn load_moe_layer_weights(
                     rd_full.dims()
                 )));
             }
-            let rg = rg_full.slice_rows(rank * local_moe_interm, (rank + 1) * local_moe_interm);
-            let ru = ru_full.slice_rows(rank * local_moe_interm, (rank + 1) * local_moe_interm);
             let (gu, gu_had) = RawLinearHost::concat_rows(&[rg, ru])?.unwrap_hadamard();
             let (rd, rd_had) = rd_full
-                .slice_cols(rank * local_moe_interm, (rank + 1) * local_moe_interm)?
+                .into_slice_cols(rank * local_moe_interm, (rank + 1) * local_moe_interm)?
                 .unwrap_hadamard();
             if gu_had != exp0_in_had || rd_had != exp0_dn_had {
                 return Err(loader_err_msg(format!(
@@ -967,59 +1430,9 @@ pub(crate) fn load_moe_layer_weights(
             Ok((gu, rd))
         };
 
-        // Probe expert 0 to determine W2A16 vs W4A16 vs W4A16Zp vs DenseF16 storage
-        let (exp0_gate, _) = RawLinearHost::load(
-            archive,
-            &format!("{pfx}.mlp.experts.0.gate_proj"),
-            &cfg.quant,
-        )?
-        .unwrap_hadamard();
-        if matches!(exp0_gate, RawLinearHost::U8B128NMajor { .. }) {
-            return Err(loader_err_msg(format!(
-                "unsupported 8-bit W8A16 routed MoE experts at '{pfx}' (sm_86/sm_89 MoE supports 4-bit W4A16 or FP16/BF16 experts)"
-            )));
-        }
         let num_workers = std::thread::available_parallelism()
-            .map(|n| (n.get() / tp_size.max(1)).clamp(1, 8))
-            .unwrap_or(4)
+            .map_or(4, |n| (n.get() / tp_size.max(1)).clamp(1, 12))
             .min(num_exp.max(1));
-        const EXP_BATCH: usize = 32;
-        let load_expert_batch =
-            |batch_start: usize, batch_end: usize| -> Result<Vec<(RawLinearHost, RawLinearHost)>> {
-                let batch_len = batch_end - batch_start;
-                if num_workers <= 1 || batch_len <= 4 {
-                    (batch_start..batch_end)
-                        .map(&load_expert_parts)
-                        .collect::<Result<Vec<_>>>()
-                } else {
-                    let chunk_size = batch_len.div_ceil(num_workers).max(1);
-                    std::thread::scope(|s| -> Result<Vec<(RawLinearHost, RawLinearHost)>> {
-                        let mut handles = Vec::with_capacity(num_workers);
-                        for chunk_idx in 0..batch_len.div_ceil(chunk_size) {
-                            let start = batch_start + chunk_idx * chunk_size;
-                            let end = (start + chunk_size).min(batch_end);
-                            let load_fn = &load_expert_parts;
-                            handles.push(s.spawn(
-                                move || -> Result<Vec<(RawLinearHost, RawLinearHost)>> {
-                                    let mut out = Vec::with_capacity(end - start);
-                                    for e in start..end {
-                                        out.push(load_fn(e)?);
-                                    }
-                                    Ok(out)
-                                },
-                            ));
-                        }
-                        let mut all = Vec::with_capacity(batch_len);
-                        for h in handles {
-                            let chunk = h
-                                .join()
-                                .map_err(|_| loader_err("MoE expert loader thread panicked"))??;
-                            all.extend(chunk);
-                        }
-                        Ok(all)
-                    })
-                }
-            };
 
         match exp0_gate {
             RawLinearHost::U4B8NMajor { group_size, .. } => {
@@ -1037,56 +1450,85 @@ pub(crate) fn load_moe_layer_weights(
                 let dn_words_per_exp = h * (local_moe_interm / 8);
                 let dn_scales_per_exp = h * (local_moe_interm / group_size);
 
-                let mut all_gu_packed = Vec::with_capacity(num_exp * gu_words_per_exp);
-                let mut all_gu_scales = Vec::with_capacity(num_exp * gu_scales_per_exp);
-                let mut all_dn_packed = Vec::with_capacity(num_exp * dn_words_per_exp);
-                let mut all_dn_scales = Vec::with_capacity(num_exp * dn_scales_per_exp);
+                let mut all_gu_packed = vec![0u32; num_exp * gu_words_per_exp];
+                let mut all_gu_scales = vec![0u16; num_exp * gu_scales_per_exp];
+                let mut all_dn_packed = vec![0u32; num_exp * dn_words_per_exp];
+                let mut all_dn_scales = vec![0u16; num_exp * dn_scales_per_exp];
 
-                for batch_start in (0..num_exp).step_by(EXP_BATCH) {
-                    let batch_end = (batch_start + EXP_BATCH).min(num_exp);
-                    for (rel_e, (gu, rd)) in load_expert_batch(batch_start, batch_end)?
-                        .into_iter()
+                let exp_per_worker = num_exp.div_ceil(num_workers).max(1);
+                std::thread::scope(|s| -> Result<()> {
+                    let mut handles = Vec::with_capacity(num_workers);
+                    let load_fn = &load_expert_parts;
+                    for (chunk_idx, (((gu_pk_ch, gu_sc_ch), dn_pk_ch), dn_sc_ch)) in all_gu_packed
+                        .chunks_mut(exp_per_worker * gu_words_per_exp)
+                        .zip(all_gu_scales.chunks_mut(exp_per_worker * gu_scales_per_exp))
+                        .zip(all_dn_packed.chunks_mut(exp_per_worker * dn_words_per_exp))
+                        .zip(all_dn_scales.chunks_mut(exp_per_worker * dn_scales_per_exp))
                         .enumerate()
                     {
-                        let e = batch_start + rel_e;
-                        let epfx = format!("{pfx}.mlp.experts.{e}");
-                        if let RawLinearHost::U4B8NMajor {
-                            packed,
-                            scales,
-                            group_size: gs,
-                            ..
-                        } = gu
-                            && gs == group_size
-                        {
-                            all_gu_packed.extend_from_slice(&packed);
-                            all_gu_scales.extend_from_slice(&scales);
-                        } else {
-                            return Err(loader_err_msg(format!(
-                                "inconsistent MoE expert quantization at '{epfx}' (expected symmetric W4A16 group_size={group_size})"
-                            )));
-                        }
-                        if let RawLinearHost::U4B8NMajor {
-                            packed,
-                            scales,
-                            group_size: gs,
-                            ..
-                        } = rd
-                            && gs == group_size
-                        {
-                            all_dn_packed.extend_from_slice(&packed);
-                            all_dn_scales.extend_from_slice(&scales);
-                        } else {
-                            return Err(loader_err_msg(format!(
-                                "inconsistent MoE down_proj quantization at '{epfx}' (expected symmetric W4A16 group_size={group_size})"
-                            )));
-                        }
+                        let base_e = chunk_idx * exp_per_worker;
+                        let count_e = gu_pk_ch.len() / gu_words_per_exp;
+                        handles.push(s.spawn(move || -> Result<()> {
+                            for rel in 0..count_e {
+                                let e = base_e + rel;
+                                let (gu, rd) = load_fn(e)?;
+                                let epfx = format!("{pfx}.mlp.experts.{e}");
+                                if let RawLinearHost::U4B8NMajor {
+                                    packed,
+                                    scales,
+                                    group_size: gs,
+                                    ..
+                                } = gu
+                                    && gs == group_size
+                                {
+                                    gu_pk_ch[rel * gu_words_per_exp..(rel + 1) * gu_words_per_exp]
+                                        .copy_from_slice(&packed);
+                                    gu_sc_ch
+                                        [rel * gu_scales_per_exp..(rel + 1) * gu_scales_per_exp]
+                                        .copy_from_slice(&scales);
+                                } else {
+                                    return Err(loader_err_msg(format!(
+                                        "inconsistent MoE expert quantization at '{epfx}' (expected symmetric W4A16 group_size={group_size})"
+                                    )));
+                                }
+                                if let RawLinearHost::U4B8NMajor {
+                                    packed,
+                                    scales,
+                                    group_size: gs,
+                                    ..
+                                } = rd
+                                    && gs == group_size
+                                {
+                                    dn_pk_ch[rel * dn_words_per_exp..(rel + 1) * dn_words_per_exp]
+                                        .copy_from_slice(&packed);
+                                    dn_sc_ch
+                                        [rel * dn_scales_per_exp..(rel + 1) * dn_scales_per_exp]
+                                        .copy_from_slice(&scales);
+                                } else {
+                                    return Err(loader_err_msg(format!(
+                                        "inconsistent MoE down_proj quantization at '{epfx}' (expected symmetric W4A16 group_size={group_size})"
+                                    )));
+                                }
+                            }
+                            Ok(())
+                        }));
                     }
-                }
+                    for h_worker in handles {
+                        h_worker
+                            .join()
+                            .map_err(|_| loader_err("MoE expert loader thread panicked"))??;
+                    }
+                    Ok(())
+                })?;
 
-                let gate_up_packed_ptr = weight_arena.upload_slice(&all_gu_packed, stream)?;
-                let gate_up_scales_ptr = weight_arena.upload_slice(&all_gu_scales, stream)?;
-                let down_packed_ptr = weight_arena.upload_slice(&all_dn_packed, stream)?;
-                let down_scales_ptr = weight_arena.upload_slice(&all_dn_scales, stream)?;
+                let gate_up_packed_ptr =
+                    upload_ring.upload_slice(weight_arena, &all_gu_packed, stream)?;
+                let gate_up_scales_ptr =
+                    upload_ring.upload_slice(weight_arena, &all_gu_scales, stream)?;
+                let down_packed_ptr =
+                    upload_ring.upload_slice(weight_arena, &all_dn_packed, stream)?;
+                let down_scales_ptr =
+                    upload_ring.upload_slice(weight_arena, &all_dn_scales, stream)?;
                 (
                     MoeExpertStorage::W4A16 {
                         gate_up_packed_ptr,
@@ -1118,64 +1560,104 @@ pub(crate) fn load_moe_layer_weights(
                 let dn_scales_per_exp = h * dn_groups;
                 let dn_qzeros_per_exp = (h / 8) * dn_groups;
 
-                let mut all_gu_packed = Vec::with_capacity(num_exp * gu_words_per_exp);
-                let mut all_gu_scales = Vec::with_capacity(num_exp * gu_scales_per_exp);
-                let mut all_gu_qzeros = Vec::with_capacity(num_exp * gu_qzeros_per_exp);
-                let mut all_dn_packed = Vec::with_capacity(num_exp * dn_words_per_exp);
-                let mut all_dn_scales = Vec::with_capacity(num_exp * dn_scales_per_exp);
-                let mut all_dn_qzeros = Vec::with_capacity(num_exp * dn_qzeros_per_exp);
+                let mut all_gu_packed = vec![0u32; num_exp * gu_words_per_exp];
+                let mut all_gu_scales = vec![0u16; num_exp * gu_scales_per_exp];
+                let mut all_gu_qzeros = vec![0u32; num_exp * gu_qzeros_per_exp];
+                let mut all_dn_packed = vec![0u32; num_exp * dn_words_per_exp];
+                let mut all_dn_scales = vec![0u16; num_exp * dn_scales_per_exp];
+                let mut all_dn_qzeros = vec![0u32; num_exp * dn_qzeros_per_exp];
 
-                for batch_start in (0..num_exp).step_by(EXP_BATCH) {
-                    let batch_end = (batch_start + EXP_BATCH).min(num_exp);
-                    for (rel_e, (gu, rd)) in load_expert_batch(batch_start, batch_end)?
-                        .into_iter()
+                let exp_per_worker = num_exp.div_ceil(num_workers).max(1);
+                std::thread::scope(|s| -> Result<()> {
+                    let mut handles = Vec::with_capacity(num_workers);
+                    let load_fn = &load_expert_parts;
+                    for (
+                        chunk_idx,
+                        (((((gu_pk_ch, gu_sc_ch), gu_qz_ch), dn_pk_ch), dn_sc_ch), dn_qz_ch),
+                    ) in all_gu_packed
+                        .chunks_mut(exp_per_worker * gu_words_per_exp)
+                        .zip(all_gu_scales.chunks_mut(exp_per_worker * gu_scales_per_exp))
+                        .zip(all_gu_qzeros.chunks_mut(exp_per_worker * gu_qzeros_per_exp))
+                        .zip(all_dn_packed.chunks_mut(exp_per_worker * dn_words_per_exp))
+                        .zip(all_dn_scales.chunks_mut(exp_per_worker * dn_scales_per_exp))
+                        .zip(all_dn_qzeros.chunks_mut(exp_per_worker * dn_qzeros_per_exp))
                         .enumerate()
                     {
-                        let e = batch_start + rel_e;
-                        let epfx = format!("{pfx}.mlp.experts.{e}");
-                        if let RawLinearHost::U4ZpNMajor {
-                            packed,
-                            scales,
-                            qzeros,
-                            group_size: gs,
-                            ..
-                        } = gu
-                            && gs == group_size
-                        {
-                            all_gu_packed.extend_from_slice(&packed);
-                            all_gu_scales.extend_from_slice(&scales);
-                            all_gu_qzeros.extend_from_slice(&qzeros);
-                        } else {
-                            return Err(loader_err_msg(format!(
-                                "inconsistent MoE expert quantization at '{epfx}' (expected asymmetric W4A16 group_size={group_size})"
-                            )));
-                        }
-                        if let RawLinearHost::U4ZpNMajor {
-                            packed,
-                            scales,
-                            qzeros,
-                            group_size: gs,
-                            ..
-                        } = rd
-                            && gs == group_size
-                        {
-                            all_dn_packed.extend_from_slice(&packed);
-                            all_dn_scales.extend_from_slice(&scales);
-                            all_dn_qzeros.extend_from_slice(&qzeros);
-                        } else {
-                            return Err(loader_err_msg(format!(
-                                "inconsistent MoE down_proj quantization at '{epfx}' (expected asymmetric W4A16 group_size={group_size})"
-                            )));
-                        }
+                        let base_e = chunk_idx * exp_per_worker;
+                        let count_e = gu_pk_ch.len() / gu_words_per_exp;
+                        handles.push(s.spawn(move || -> Result<()> {
+                            for rel in 0..count_e {
+                                let e = base_e + rel;
+                                let (gu, rd) = load_fn(e)?;
+                                let epfx = format!("{pfx}.mlp.experts.{e}");
+                                if let RawLinearHost::U4ZpNMajor {
+                                    packed,
+                                    scales,
+                                    qzeros,
+                                    group_size: gs,
+                                    ..
+                                } = gu
+                                    && gs == group_size
+                                {
+                                    gu_pk_ch[rel * gu_words_per_exp..(rel + 1) * gu_words_per_exp]
+                                        .copy_from_slice(&packed);
+                                    gu_sc_ch
+                                        [rel * gu_scales_per_exp..(rel + 1) * gu_scales_per_exp]
+                                        .copy_from_slice(&scales);
+                                    gu_qz_ch
+                                        [rel * gu_qzeros_per_exp..(rel + 1) * gu_qzeros_per_exp]
+                                        .copy_from_slice(&qzeros);
+                                } else {
+                                    return Err(loader_err_msg(format!(
+                                        "inconsistent MoE expert quantization at '{epfx}' (expected asymmetric W4A16 group_size={group_size})"
+                                    )));
+                                }
+                                if let RawLinearHost::U4ZpNMajor {
+                                    packed,
+                                    scales,
+                                    qzeros,
+                                    group_size: gs,
+                                    ..
+                                } = rd
+                                    && gs == group_size
+                                {
+                                    dn_pk_ch[rel * dn_words_per_exp..(rel + 1) * dn_words_per_exp]
+                                        .copy_from_slice(&packed);
+                                    dn_sc_ch
+                                        [rel * dn_scales_per_exp..(rel + 1) * dn_scales_per_exp]
+                                        .copy_from_slice(&scales);
+                                    dn_qz_ch
+                                        [rel * dn_qzeros_per_exp..(rel + 1) * dn_qzeros_per_exp]
+                                        .copy_from_slice(&qzeros);
+                                } else {
+                                    return Err(loader_err_msg(format!(
+                                        "inconsistent MoE down_proj quantization at '{epfx}' (expected asymmetric W4A16 group_size={group_size})"
+                                    )));
+                                }
+                            }
+                            Ok(())
+                        }));
                     }
-                }
+                    for h_worker in handles {
+                        h_worker
+                            .join()
+                            .map_err(|_| loader_err("MoE expert loader thread panicked"))??;
+                    }
+                    Ok(())
+                })?;
 
-                let gate_up_packed_ptr = weight_arena.upload_slice(&all_gu_packed, stream)?;
-                let gate_up_scales_ptr = weight_arena.upload_slice(&all_gu_scales, stream)?;
-                let gate_up_qzeros_ptr = weight_arena.upload_slice(&all_gu_qzeros, stream)?;
-                let down_packed_ptr = weight_arena.upload_slice(&all_dn_packed, stream)?;
-                let down_scales_ptr = weight_arena.upload_slice(&all_dn_scales, stream)?;
-                let down_qzeros_ptr = weight_arena.upload_slice(&all_dn_qzeros, stream)?;
+                let gate_up_packed_ptr =
+                    upload_ring.upload_slice(weight_arena, &all_gu_packed, stream)?;
+                let gate_up_scales_ptr =
+                    upload_ring.upload_slice(weight_arena, &all_gu_scales, stream)?;
+                let gate_up_qzeros_ptr =
+                    upload_ring.upload_slice(weight_arena, &all_gu_qzeros, stream)?;
+                let down_packed_ptr =
+                    upload_ring.upload_slice(weight_arena, &all_dn_packed, stream)?;
+                let down_scales_ptr =
+                    upload_ring.upload_slice(weight_arena, &all_dn_scales, stream)?;
+                let down_qzeros_ptr =
+                    upload_ring.upload_slice(weight_arena, &all_dn_qzeros, stream)?;
                 (
                     MoeExpertStorage::W4A16Zp {
                         gate_up_packed_ptr,
@@ -1192,34 +1674,55 @@ pub(crate) fn load_moe_layer_weights(
             }
             RawLinearHost::Hadamard { .. } | RawLinearHost::U8B128NMajor { .. } => unreachable!(),
             RawLinearHost::DenseF16 { .. } => {
-                let mut all_gu_f16 = Vec::with_capacity(num_exp * 2 * local_moe_interm * h);
-                let mut all_dn_f16 = Vec::with_capacity(num_exp * h * local_moe_interm);
-                for batch_start in (0..num_exp).step_by(EXP_BATCH) {
-                    let batch_end = (batch_start + EXP_BATCH).min(num_exp);
-                    for (rel_e, (gu, rd)) in load_expert_batch(batch_start, batch_end)?
-                        .into_iter()
+                let gu_elems_per_exp = 2 * local_moe_interm * h;
+                let dn_elems_per_exp = h * local_moe_interm;
+                let mut all_gu_f16 = vec![0u16; num_exp * gu_elems_per_exp];
+                let mut all_dn_f16 = vec![0u16; num_exp * dn_elems_per_exp];
+                let exp_per_worker = num_exp.div_ceil(num_workers).max(1);
+                std::thread::scope(|s| -> Result<()> {
+                    let mut handles = Vec::with_capacity(num_workers);
+                    let load_fn = &load_expert_parts;
+                    for (chunk_idx, (gu_ch, dn_ch)) in all_gu_f16
+                        .chunks_mut(exp_per_worker * gu_elems_per_exp)
+                        .zip(all_dn_f16.chunks_mut(exp_per_worker * dn_elems_per_exp))
                         .enumerate()
                     {
-                        let e = batch_start + rel_e;
-                        let epfx = format!("{pfx}.mlp.experts.{e}");
-                        if let RawLinearHost::DenseF16 { weight, .. } = gu {
-                            all_gu_f16.extend_from_slice(&weight);
-                        } else {
-                            return Err(loader_err_msg(format!(
-                                "inconsistent MoE expert quantization at '{epfx}' (expected DenseF16)"
-                            )));
-                        }
-                        if let RawLinearHost::DenseF16 { weight, .. } = rd {
-                            all_dn_f16.extend_from_slice(&weight);
-                        } else {
-                            return Err(loader_err_msg(format!(
-                                "inconsistent MoE down_proj quantization at '{epfx}' (expected DenseF16)"
-                            )));
-                        }
+                        let base_e = chunk_idx * exp_per_worker;
+                        let count_e = gu_ch.len() / gu_elems_per_exp;
+                        handles.push(s.spawn(move || -> Result<()> {
+                            for rel in 0..count_e {
+                                let e = base_e + rel;
+                                let (gu, rd) = load_fn(e)?;
+                                let epfx = format!("{pfx}.mlp.experts.{e}");
+                                if let RawLinearHost::DenseF16 { weight, .. } = gu {
+                                    gu_ch[rel * gu_elems_per_exp..(rel + 1) * gu_elems_per_exp]
+                                        .copy_from_slice(&weight);
+                                } else {
+                                    return Err(loader_err_msg(format!(
+                                        "inconsistent MoE expert quantization at '{epfx}' (expected DenseF16)"
+                                    )));
+                                }
+                                if let RawLinearHost::DenseF16 { weight, .. } = rd {
+                                    dn_ch[rel * dn_elems_per_exp..(rel + 1) * dn_elems_per_exp]
+                                        .copy_from_slice(&weight);
+                                } else {
+                                    return Err(loader_err_msg(format!(
+                                        "inconsistent MoE down_proj quantization at '{epfx}' (expected DenseF16)"
+                                    )));
+                                }
+                            }
+                            Ok(())
+                        }));
                     }
-                }
-                let gate_up_ptr = weight_arena.upload_slice(&all_gu_f16, stream)?;
-                let down_ptr = weight_arena.upload_slice(&all_dn_f16, stream)?;
+                    for h_worker in handles {
+                        h_worker
+                            .join()
+                            .map_err(|_| loader_err("MoE expert loader thread panicked"))??;
+                    }
+                    Ok(())
+                })?;
+                let gate_up_ptr = upload_ring.upload_slice(weight_arena, &all_gu_f16, stream)?;
+                let down_ptr = upload_ring.upload_slice(weight_arena, &all_dn_f16, stream)?;
                 (
                     MoeExpertStorage::DenseF16 {
                         gate_up_ptr,
@@ -1229,7 +1732,11 @@ pub(crate) fn load_moe_layer_weights(
                     exp0_dn_had,
                 )
             }
-            RawLinearHost::U2B2NMajor { group_size, .. } => {
+            RawLinearHost::U2B2NMajor {
+                group_size,
+                code_offset_half,
+                ..
+            } => {
                 if !h.is_multiple_of(16)
                     || !local_moe_interm.is_multiple_of(16)
                     || !h.is_multiple_of(group_size)
@@ -1244,56 +1751,89 @@ pub(crate) fn load_moe_layer_weights(
                 let dn_words_per_exp = h * (local_moe_interm / 16);
                 let dn_scales_per_exp = h * (local_moe_interm / group_size);
 
-                let mut all_gu_packed = Vec::with_capacity(num_exp * gu_words_per_exp);
-                let mut all_gu_scales = Vec::with_capacity(num_exp * gu_scales_per_exp);
-                let mut all_dn_packed = Vec::with_capacity(num_exp * dn_words_per_exp);
-                let mut all_dn_scales = Vec::with_capacity(num_exp * dn_scales_per_exp);
+                let mut all_gu_packed = vec![0u32; num_exp * gu_words_per_exp];
+                let mut all_gu_scales = vec![0u16; num_exp * gu_scales_per_exp];
+                let mut all_dn_packed = vec![0u32; num_exp * dn_words_per_exp];
+                let mut all_dn_scales = vec![0u16; num_exp * dn_scales_per_exp];
 
-                for batch_start in (0..num_exp).step_by(EXP_BATCH) {
-                    let batch_end = (batch_start + EXP_BATCH).min(num_exp);
-                    for (rel_e, (gu, rd)) in load_expert_batch(batch_start, batch_end)?
-                        .into_iter()
+                let exp_per_worker = num_exp.div_ceil(num_workers).max(1);
+                std::thread::scope(|s| -> Result<()> {
+                    let mut handles = Vec::with_capacity(num_workers);
+                    let load_fn = &load_expert_parts;
+                    for (chunk_idx, (((gu_pk_ch, gu_sc_ch), dn_pk_ch), dn_sc_ch)) in all_gu_packed
+                        .chunks_mut(exp_per_worker * gu_words_per_exp)
+                        .zip(all_gu_scales.chunks_mut(exp_per_worker * gu_scales_per_exp))
+                        .zip(all_dn_packed.chunks_mut(exp_per_worker * dn_words_per_exp))
+                        .zip(all_dn_scales.chunks_mut(exp_per_worker * dn_scales_per_exp))
                         .enumerate()
                     {
-                        let e = batch_start + rel_e;
-                        let epfx = format!("{pfx}.mlp.experts.{e}");
-                        if let RawLinearHost::U2B2NMajor {
-                            packed,
-                            scales,
-                            group_size: gs,
-                            ..
-                        } = gu
-                            && gs == group_size
-                        {
-                            all_gu_packed.extend_from_slice(&packed);
-                            all_gu_scales.extend_from_slice(&scales);
-                        } else {
-                            return Err(loader_err_msg(format!(
-                                "inconsistent MoE expert quantization at '{epfx}' (expected symmetric W2A16 group_size={group_size})"
-                            )));
-                        }
-                        if let RawLinearHost::U2B2NMajor {
-                            packed,
-                            scales,
-                            group_size: gs,
-                            ..
-                        } = rd
-                            && gs == group_size
-                        {
-                            all_dn_packed.extend_from_slice(&packed);
-                            all_dn_scales.extend_from_slice(&scales);
-                        } else {
-                            return Err(loader_err_msg(format!(
-                                "inconsistent MoE down_proj quantization at '{epfx}' (expected symmetric W2A16 group_size={group_size})"
-                            )));
-                        }
+                        let base_e = chunk_idx * exp_per_worker;
+                        let count_e = gu_pk_ch.len() / gu_words_per_exp;
+                        handles.push(s.spawn(move || -> Result<()> {
+                            for rel in 0..count_e {
+                                let e = base_e + rel;
+                                let (gu, rd) = load_fn(e)?;
+                                let epfx = format!("{pfx}.mlp.experts.{e}");
+                                if let RawLinearHost::U2B2NMajor {
+                                    packed,
+                                    scales,
+                                    group_size: gs,
+                                    code_offset_half: co,
+                                    ..
+                                } = gu
+                                    && gs == group_size
+                                    && co == code_offset_half
+                                {
+                                    gu_pk_ch[rel * gu_words_per_exp..(rel + 1) * gu_words_per_exp]
+                                        .copy_from_slice(&packed);
+                                    gu_sc_ch
+                                        [rel * gu_scales_per_exp..(rel + 1) * gu_scales_per_exp]
+                                        .copy_from_slice(&scales);
+                                } else {
+                                    return Err(loader_err_msg(format!(
+                                        "inconsistent MoE expert quantization at '{epfx}' (expected symmetric W2A16 group_size={group_size}, code_offset_half={code_offset_half})"
+                                    )));
+                                }
+                                if let RawLinearHost::U2B2NMajor {
+                                    packed,
+                                    scales,
+                                    group_size: gs,
+                                    code_offset_half: co,
+                                    ..
+                                } = rd
+                                    && gs == group_size
+                                    && co == code_offset_half
+                                {
+                                    dn_pk_ch[rel * dn_words_per_exp..(rel + 1) * dn_words_per_exp]
+                                        .copy_from_slice(&packed);
+                                    dn_sc_ch
+                                        [rel * dn_scales_per_exp..(rel + 1) * dn_scales_per_exp]
+                                        .copy_from_slice(&scales);
+                                } else {
+                                    return Err(loader_err_msg(format!(
+                                        "inconsistent MoE down_proj quantization at '{epfx}' (expected symmetric W2A16 group_size={group_size}, code_offset_half={code_offset_half})"
+                                    )));
+                                }
+                            }
+                            Ok(())
+                        }));
                     }
-                }
+                    for h_worker in handles {
+                        h_worker
+                            .join()
+                            .map_err(|_| loader_err("MoE expert loader thread panicked"))??;
+                    }
+                    Ok(())
+                })?;
 
-                let gate_up_packed_ptr = weight_arena.upload_slice(&all_gu_packed, stream)?;
-                let gate_up_scales_ptr = weight_arena.upload_slice(&all_gu_scales, stream)?;
-                let down_packed_ptr = weight_arena.upload_slice(&all_dn_packed, stream)?;
-                let down_scales_ptr = weight_arena.upload_slice(&all_dn_scales, stream)?;
+                let gate_up_packed_ptr =
+                    upload_ring.upload_slice(weight_arena, &all_gu_packed, stream)?;
+                let gate_up_scales_ptr =
+                    upload_ring.upload_slice(weight_arena, &all_gu_scales, stream)?;
+                let down_packed_ptr =
+                    upload_ring.upload_slice(weight_arena, &all_dn_packed, stream)?;
+                let down_scales_ptr =
+                    upload_ring.upload_slice(weight_arena, &all_dn_scales, stream)?;
                 (
                     MoeExpertStorage::W2A16 {
                         gate_up_packed_ptr,
@@ -1301,6 +1841,7 @@ pub(crate) fn load_moe_layer_weights(
                         down_packed_ptr,
                         down_scales_ptr,
                         group_size,
+                        code_offset_half,
                     },
                     exp0_in_had,
                     exp0_dn_had,
@@ -1320,36 +1861,36 @@ pub(crate) fn load_moe_layer_weights(
             })
             .is_some()
     {
-        let s_gate_full = RawLinearHost::load(
+        let (s_gate, sg_full_n) = RawLinearHost::load_row_shard_with_full_n(
             archive,
             &format!("{pfx}.mlp.shared_expert.gate_proj"),
             &cfg.quant,
+            rank * local_shared_interm,
+            (rank + 1) * local_shared_interm,
         )?;
-        if s_gate_full.dims() != (full_shared_interm, h) {
+        if sg_full_n != full_shared_interm || s_gate.dims() != (local_shared_interm, h) {
             return Err(loader_err_msg(format!(
-                "shared_expert.gate_proj dims {:?} at '{pfx}' do not match expected ({full_shared_interm}, {h})",
-                s_gate_full.dims()
+                "shared_expert.gate_proj full_n={sg_full_n} shard dims {:?} at '{pfx}' do not match expected ({local_shared_interm}, {h}) from full ({full_shared_interm}, {h})",
+                s_gate.dims()
             )));
         }
-        let s_gate =
-            s_gate_full.slice_rows(rank * local_shared_interm, (rank + 1) * local_shared_interm);
-        let s_up_full = RawLinearHost::load(
+        let (s_up, su_full_n) = RawLinearHost::load_row_shard_with_full_n(
             archive,
             &format!("{pfx}.mlp.shared_expert.up_proj"),
             &cfg.quant,
+            rank * local_shared_interm,
+            (rank + 1) * local_shared_interm,
         )?;
-        if s_up_full.dims() != (full_shared_interm, h) {
+        if su_full_n != full_shared_interm || s_up.dims() != (local_shared_interm, h) {
             return Err(loader_err_msg(format!(
-                "shared_expert.up_proj dims {:?} at '{pfx}' do not match expected ({full_shared_interm}, {h})",
-                s_up_full.dims()
+                "shared_expert.up_proj full_n={su_full_n} shard dims {:?} at '{pfx}' do not match expected ({local_shared_interm}, {h}) from full ({full_shared_interm}, {h})",
+                s_up.dims()
             )));
         }
-        let s_up =
-            s_up_full.slice_rows(rank * local_shared_interm, (rank + 1) * local_shared_interm);
-        let s_gu = RawLinearHost::concat_rows(&[s_gate, s_up])?.upload(
+        let s_gu = RawLinearHost::concat_rows(&[s_gate, s_up])?.upload_pipelined(
             weight_arena,
             stream,
-            repack_staging,
+            upload_ring,
         )?;
         let s_dn_full = RawLinearHost::load(
             archive,
@@ -1363,8 +1904,8 @@ pub(crate) fn load_moe_layer_weights(
             )));
         }
         let s_dn = s_dn_full
-            .slice_cols(rank * local_shared_interm, (rank + 1) * local_shared_interm)?
-            .upload(weight_arena, stream, repack_staging)?;
+            .into_slice_cols(rank * local_shared_interm, (rank + 1) * local_shared_interm)?
+            .upload_pipelined(weight_arena, stream, upload_ring)?;
         let s_eg = if archive
             .resolve_name(&format!("{pfx}.mlp.shared_expert_gate.weight"))
             .or_else(|| archive.resolve_name(&format!("{pfx}.mlp.shared_expert_gate.qweight")))
@@ -1384,7 +1925,7 @@ pub(crate) fn load_moe_layer_weights(
                     raw_eg.dims()
                 )));
             }
-            Some(raw_eg.upload(weight_arena, stream, repack_staging)?)
+            Some(raw_eg.upload_pipelined(weight_arena, stream, upload_ring)?)
         } else {
             None
         };
@@ -1418,7 +1959,7 @@ pub(crate) fn load_hc_block_weights(
     has_inject: bool,
     weight_arena: &mut DeviceArena,
     stream: &CudaStream,
-    repack_staging: &DeviceBuffer,
+    upload_ring: &mut crate::cuda::PinnedUploadRing,
 ) -> Result<HcBlockWeights> {
     let total_dim = cfg.hc_count * cfg.hidden_size;
     let low_dim = cfg.hc_lowrank;
@@ -1438,7 +1979,7 @@ pub(crate) fn load_hc_block_weights(
             cfg.hidden_size
         )));
     }
-    let hc_norm_ptr = weight_arena.upload_slice(&hc_norm_bits, stream)?;
+    let hc_norm_ptr = upload_ring.upload_slice(weight_arena, &hc_norm_bits, stream)?;
 
     let raw_down = RawLinearHost::load(
         archive,
@@ -1451,7 +1992,7 @@ pub(crate) fn load_hc_block_weights(
             raw_down.dims()
         )));
     }
-    let input_mix_weight_down = raw_down.upload(weight_arena, stream, repack_staging)?;
+    let input_mix_weight_down = raw_down.upload_pipelined(weight_arena, stream, upload_ring)?;
 
     let raw_up = RawLinearHost::load(
         archive,
@@ -1464,7 +2005,7 @@ pub(crate) fn load_hc_block_weights(
             raw_up.dims()
         )));
     }
-    let input_mix_weight_up = raw_up.upload(weight_arena, stream, repack_staging)?;
+    let input_mix_weight_up = raw_up.upload_pipelined(weight_arena, stream, upload_ring)?;
 
     let block_inject_weight = if has_inject {
         let raw_inj = RawLinearHost::load(
@@ -1479,7 +2020,7 @@ pub(crate) fn load_hc_block_weights(
                 cfg.hc_count
             )));
         }
-        Some(raw_inj.upload(weight_arena, stream, repack_staging)?)
+        Some(raw_inj.upload_pipelined(weight_arena, stream, upload_ring)?)
     } else {
         None
     };
@@ -1499,7 +2040,7 @@ pub(crate) fn load_qsa_indexer_weights(
     pfx: &str,
     weight_arena: &mut DeviceArena,
     stream: &CudaStream,
-    repack_staging: &DeviceBuffer,
+    upload_ring: &mut crate::cuda::PinnedUploadRing,
 ) -> Result<QsaIndexerWeights> {
     let idx_pfx = format!("{pfx}.self_attn.indexer");
     let expected_n = (cfg.indexer_n_heads + cfg.indexer_kv_heads) * cfg.indexer_head_dim;
@@ -1511,7 +2052,7 @@ pub(crate) fn load_qsa_indexer_weights(
             cfg.hidden_size
         )));
     }
-    let index_qk_proj = raw_qk.upload(weight_arena, stream, repack_staging)?;
+    let index_qk_proj = raw_qk.upload_pipelined(weight_arena, stream, upload_ring)?;
 
     let q_ln_key = archive
         .resolve_name(&format!("{idx_pfx}.q_layernorm.weight"))
@@ -1526,7 +2067,7 @@ pub(crate) fn load_qsa_indexer_weights(
             cfg.indexer_head_dim
         )));
     }
-    let q_layernorm_ptr = weight_arena.upload_slice(&q_ln_bits, stream)?;
+    let q_layernorm_ptr = upload_ring.upload_slice(weight_arena, &q_ln_bits, stream)?;
 
     let k_ln_key = archive
         .resolve_name(&format!("{idx_pfx}.k_layernorm.weight"))
@@ -1541,7 +2082,7 @@ pub(crate) fn load_qsa_indexer_weights(
             cfg.indexer_head_dim
         )));
     }
-    let k_layernorm_ptr = weight_arena.upload_slice(&k_ln_bits, stream)?;
+    let k_layernorm_ptr = upload_ring.upload_slice(weight_arena, &k_ln_bits, stream)?;
 
     Ok(QsaIndexerWeights {
         index_qk_proj,
@@ -1557,7 +2098,7 @@ pub(crate) fn load_ple_layer_weights(
     pfx: &str,
     weight_arena: &mut DeviceArena,
     stream: &CudaStream,
-    repack_staging: &DeviceBuffer,
+    upload_ring: &mut crate::cuda::PinnedUploadRing,
 ) -> Result<PleLayerWeights> {
     let ple_pfx = format!("{pfx}.ple");
     let total_dim = cfg.hc_count * cfg.hidden_size;
@@ -1569,7 +2110,7 @@ pub(crate) fn load_ple_layer_weights(
             cfg.ple_embed_dim
         )));
     }
-    let key_proj = raw_key.upload(weight_arena, stream, repack_staging)?;
+    let key_proj = raw_key.upload_pipelined(weight_arena, stream, upload_ring)?;
 
     let raw_val = RawLinearHost::load(archive, &format!("{ple_pfx}.value_proj"), &cfg.quant)?;
     if raw_val.dims() != (cfg.hidden_size, cfg.ple_embed_dim) {
@@ -1580,9 +2121,9 @@ pub(crate) fn load_ple_layer_weights(
             cfg.ple_embed_dim
         )));
     }
-    let value_proj = raw_val.upload(weight_arena, stream, repack_staging)?;
+    let value_proj = raw_val.upload_pipelined(weight_arena, stream, upload_ring)?;
 
-    let load_norm = |suffix: &str, arena: &mut DeviceArena| -> Result<u64> {
+    let mut load_norm = |suffix: &str, arena: &mut DeviceArena| -> Result<u64> {
         let key = archive
             .resolve_name(&format!("{ple_pfx}.{suffix}"))
             .ok_or_else(|| loader_err_msg(format!("missing '{ple_pfx}.{suffix}'")))?;
@@ -1595,7 +2136,7 @@ pub(crate) fn load_ple_layer_weights(
                 bits.len()
             )));
         }
-        arena.upload_slice(&bits, stream)
+        upload_ring.upload_slice(arena, &bits, stream)
     };
     let norm_key_ptr = load_norm("norm_key.weight", weight_arena)?;
     let norm_query_ptr = load_norm("norm_query.weight", weight_arena)?;
@@ -1614,7 +2155,7 @@ pub(crate) fn load_ple_layer_weights(
             total_dim * cfg.ple_conv_kernel_size
         )));
     }
-    let conv1d_weight_ptr = weight_arena.upload_slice(&conv_bits, stream)?;
+    let conv1d_weight_ptr = upload_ring.upload_slice(weight_arena, &conv_bits, stream)?;
 
     let ngram_heads = (cfg.heads_per_ngram * cfg.ngram_size.saturating_sub(1)).max(1);
     if cfg.ple_embed_dim == 0 || !cfg.ple_embed_dim.is_multiple_of(ngram_heads) {
@@ -1657,7 +2198,7 @@ pub(crate) fn load_ple_layer_weights(
             )));
         }
         let group_size = head_dim / scale_info.shape[1];
-        let lut_ptr = weight_arena.upload_slice(&lut_vals, stream)?;
+        let lut_ptr = upload_ring.upload_slice(weight_arena, &lut_vals, stream)?;
         (1.0f32, lut_ptr, group_size)
     } else {
         let scale_key = archive

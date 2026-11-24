@@ -11,7 +11,7 @@ import {
   MAX_SAMPLES,
 } from "./metrics";
 import { histogram, snapshot } from "./fixtures";
-import { chartAreaPath, chartPath } from "./Chart";
+import { normalizeChartPoints } from "./Chart";
 
 describe("shared metric derivations", () => {
   it("has no invented rates or percentiles before observations", () => {
@@ -76,39 +76,71 @@ describe("shared metric derivations", () => {
     unknown.speculation.draft_tokens = null;
     expect(parseSnapshot(unknown).speculation.draft_tokens).toBeNull();
   });
+  it("validates optional tiered GDN checkpoint pool stats", () => {
+    const tiered = snapshot({
+      pools: {
+        kv: { capacity: 100, active: 10, cached: 20, free: 70 },
+        gdn: { capacity: 179, active: 4, cached: 46, free: 129 },
+        gdn_checkpoints: {
+          vram_capacity: 16,
+          vram_used: 12,
+          host_capacity: 99,
+          host_used: 34,
+        },
+      },
+    });
+    expect(parseSnapshot(tiered).pools.gdn_checkpoints).toEqual({
+      vram_capacity: 16,
+      vram_used: 12,
+      host_capacity: 99,
+      host_used: 34,
+    });
+    const malformed = {
+      ...tiered,
+      pools: {
+        ...tiered.pools,
+        gdn_checkpoints: {
+          vram_capacity: -1,
+          vram_used: 0,
+          host_capacity: 0,
+          host_used: 0,
+        },
+      },
+    };
+    expect(() => parseSnapshot(malformed)).toThrow();
+    const withLora = snapshot({
+      config: {
+        tp_size: 1,
+        kv_format: "tq4",
+        speculation: "none",
+        lora_adapters: ["sql-expert"],
+      },
+    });
+    expect(parseSnapshot(withLora).config.lora_adapters).toEqual([
+      "sql-expert",
+    ]);
+    expect(() =>
+      parseSnapshot({
+        ...withLora,
+        config: { ...withLora.config, lora_adapters: [123] },
+      }),
+    ).toThrow();
+  });
   it("does not draw across unavailable samples or disconnected intervals", () => {
-    const path = chartPath(
-      [
-        { time: 100, value: 1 },
-        { time: 102, value: 2 },
-        { time: 104, value: null },
-        { time: 106, value: 1 },
-        { time: 140, value: 1 },
-      ],
-      140,
-      2,
-      800,
-      200,
-    );
-    expect(path.match(/M/g)).toHaveLength(3);
-    expect(path.match(/L/g)).toHaveLength(1);
-    expect(path).not.toContain("NaN");
-
-    const area = chartAreaPath(
-      [
-        { time: 100, value: 1 },
-        { time: 102, value: 2 },
-        { time: 104, value: null },
-        { time: 106, value: 1 },
-        { time: 140, value: 1 },
-      ],
-      140,
-      2,
-      800,
-      200,
-    );
-    // Only the contiguous [100, 102] pair forms a closed area polygon; isolated points do not bridge gaps.
-    expect(area.match(/Z/g)).toHaveLength(1);
-    expect(area).not.toContain("NaN");
+    const points = normalizeChartPoints([
+      { time: 100, value: 1 },
+      { time: 102, value: 2 },
+      { time: 104, value: null },
+      { time: 106, value: 1 },
+      { time: 140, value: 1 },
+    ]);
+    expect(points).toEqual([
+      { time: 100, value: 1 },
+      { time: 102, value: 2 },
+      { time: 104, value: null },
+      { time: 106, value: 1 },
+      { time: 123, value: null },
+      { time: 140, value: 1 },
+    ]);
   });
 });

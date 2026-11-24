@@ -63,7 +63,7 @@ pub struct ConstraintFactory {
 }
 impl ConstraintFactory {
     pub fn new(
-        tokenizer: tokenizers::Tokenizer,
+        tokenizer: &tokenizers::Tokenizer,
         vocab_size: usize,
         eos_ids: &[u32],
     ) -> Result<Self, String> {
@@ -82,7 +82,7 @@ impl ConstraintFactory {
             return Err("model vocabulary is smaller than tokenizer vocabulary".into());
         }
         let eos_ids: Vec<i32> = eos_ids.iter().map(|id| *id as i32).collect();
-        let info = TokenizerInfo::from_huggingface(&tokenizer, Some(vocab_size), Some(&eos_ids))?;
+        let info = TokenizerInfo::from_huggingface(tokenizer, Some(vocab_size), Some(&eos_ids))?;
         let bytes = Arc::new(info.decoded_vocab().to_vec());
         let mut valid_mask = vec![0; vocab_size.div_ceil(32)];
         for id in vocab.values() {
@@ -121,31 +121,29 @@ impl ConstraintFactory {
     }
 
     pub fn json_object(&self, thinking: bool) -> Result<TokenBitmaskConstraint, String> {
-        self.json_schema(json!({"type":"object"}), thinking)
+        self.json_schema(&json!({"type":"object"}), thinking)
     }
     pub fn json_schema(
         &self,
-        schema: Value,
+        schema: &Value,
         thinking: bool,
     ) -> Result<TokenBitmaskConstraint, String> {
-        validate_json_schema(&schema)?;
+        validate_json_schema(schema)?;
         let g = self
             .compiler
             .compile_json_schema(&schema.to_string(), true, None, None, true, None)
             .map_err(|e| e.to_string())?;
-        self.wrap(g, thinking, false)
+        self.wrap(&g, thinking, false)
     }
     pub fn regex(&self, regex: &str, thinking: bool) -> Result<TokenBitmaskConstraint, String> {
         if regex.contains('\0') {
             return Err("regex must not contain NUL".into());
         }
-        self.wrap(
-            self.compiler
-                .compile_regex(regex)
-                .map_err(|e| e.to_string())?,
-            thinking,
-            false,
-        )
+        let g = self
+            .compiler
+            .compile_regex(regex)
+            .map_err(|e| e.to_string())?;
+        self.wrap(&g, thinking, false)
     }
     /// Accept native Lark (start rule) or EBNF (root rule).
     pub fn lark(&self, grammar: &str, thinking: bool) -> Result<TokenBitmaskConstraint, String> {
@@ -155,7 +153,7 @@ impl ConstraintFactory {
             self.compiler.compile_lark(grammar, &[])
         }
         .map_err(|e| e.to_string())?;
-        self.wrap(g, thinking, false)
+        self.wrap(&g, thinking, false)
     }
     pub fn structural_tags(
         &self,
@@ -168,21 +166,22 @@ impl ConstraintFactory {
             validate_json_schema(&tag.schema)?;
             native.push(json!({"type":"tag", "begin":tag.begin,"end":tag.end,"content":{"type":"json_schema","json_schema":tag.schema}}));
         }
-        self.structural_tag(json!({"type":"structural_tag","format":{"type":"triggered_tags","triggers":triggers,"tags":native}}), thinking)
+        self.structural_tag(
+            &json!({"type":"structural_tag","format":{"type":"triggered_tags","triggers":triggers,"tags":native}}),
+            thinking,
+        )
     }
     pub fn structural_tag(
         &self,
-        value: Value,
+        value: &Value,
         thinking: bool,
     ) -> Result<TokenBitmaskConstraint, String> {
-        validate_tag_schemas(&value)?;
-        self.wrap(
-            self.compiler
-                .compile_structural_tag(&value.to_string())
-                .map_err(|e| e.to_string())?,
-            thinking,
-            false,
-        )
+        validate_tag_schemas(value)?;
+        let g = self
+            .compiler
+            .compile_structural_tag(&value.to_string())
+            .map_err(|e| e.to_string())?;
+        self.wrap(&g, thinking, false)
     }
     pub fn tools(
         &self,
@@ -205,7 +204,7 @@ impl ConstraintFactory {
         else {
             let mut c = TokenBitmaskConstraint::unconstrained(self.vocab_size)
                 .with_terminal_eos_ids(self.eos_ids.clone());
-            c.mask = self.valid_mask.as_ref().clone();
+            c.mask.clone_from(self.valid_mask.as_ref());
             c.base_mask = Arc::clone(&self.valid_mask);
             return Ok(c);
         };
@@ -214,22 +213,22 @@ impl ConstraintFactory {
             .compiler
             .compile_structural_tag(&value.to_string())
             .map_err(|e| e.to_string())?;
-        self.wrap(g, thinking, true)
+        self.wrap(&g, thinking, true)
     }
     fn wrap(
         &self,
-        g: CompiledGrammar,
+        g: &CompiledGrammar,
         thinking: bool,
         implicit_tool: bool,
     ) -> Result<TokenBitmaskConstraint, String> {
         let mut c = TokenBitmaskConstraint::unconstrained(self.vocab_size);
         c.matcher = Some(
-            GrammarMatcher::with_options(&g, Some(self.eos_ids.clone()), false, None)
+            GrammarMatcher::with_options(g, Some(self.eos_ids.clone()), false, None)
                 .map_err(|e| e.to_string())?,
         );
         c.bytes = Arc::clone(&self.bytes);
         c.base_mask = Arc::clone(&self.valid_mask);
-        c.eos_ids = self.eos_ids.clone();
+        c.eos_ids.clone_from(&self.eos_ids);
         c.gate = thinking.then(Vec::new);
         c.implicit_tool = implicit_tool;
         c.refresh()?;
@@ -259,10 +258,44 @@ fn validate_tag_schemas(v: &Value) -> Result<(), String> {
     Ok(())
 }
 
+/// Maximum allowed JSON value nesting depth for structured-output schemas
+/// (matches vLLM `#60036` hardening against stack overflow / compiler DoS).
+pub(crate) const MAX_JSON_SCHEMA_DEPTH: usize = 64;
+
+fn check_json_depth(root: &Value, max_depth: usize) -> Result<(), String> {
+    let mut stack: Vec<(&Value, usize)> = vec![(root, 0)];
+    while let Some((node, depth)) = stack.pop() {
+        if depth > max_depth {
+            return Err(format!(
+                "JSON schema exceeds maximum nesting depth of {max_depth}"
+            ));
+        }
+        match node {
+            Value::Object(map) => {
+                for v in map.values() {
+                    stack.push((v, depth + 1));
+                }
+            }
+            Value::Array(arr) => {
+                for v in arr {
+                    stack.push((v, depth + 1));
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
 /// Reject known silently weakened constraints, while leaving schema syntax and
 /// supported extensions to the native compiler. Traverse schema positions only
 /// (a property named `contains`, or an enum object, is not a keyword).
 pub(crate) fn validate_json_schema(v: &Value) -> Result<(), String> {
+    check_json_depth(v, MAX_JSON_SCHEMA_DEPTH)?;
+    validate_json_schema_inner(v)
+}
+
+fn validate_json_schema_inner(v: &Value) -> Result<(), String> {
     let Some(o) = v.as_object() else {
         return Ok(());
     };
@@ -341,9 +374,8 @@ pub(crate) fn validate_json_schema(v: &Value) -> Result<(), String> {
     if o.contains_key("propertyNames")
         && (o.contains_key("properties")
             || o.contains_key("patternProperties")
-            || o.get("additionalProperties").is_some_and(Value::is_object)
-            || o.get("unevaluatedProperties")
-                .is_some_and(|v| v != &Value::Bool(true)))
+            || o.get("additionalProperties") == Some(&Value::Bool(false))
+            || o.get("unevaluatedProperties") == Some(&Value::Bool(false)))
     {
         return Err(
             "propertyNames combined with object property constraints is unsupported".into(),
@@ -357,7 +389,7 @@ pub(crate) fn validate_json_schema(v: &Value) -> Result<(), String> {
     for k in ["properties", "patternProperties", "$defs", "definitions"] {
         if let Some(m) = o.get(k).and_then(Value::as_object) {
             for v in m.values() {
-                validate_json_schema(v)?;
+                validate_json_schema_inner(v)?;
             }
         }
     }
@@ -371,21 +403,174 @@ pub(crate) fn validate_json_schema(v: &Value) -> Result<(), String> {
         if let Some(v) = o.get(k) {
             if let Some(a) = v.as_array() {
                 for v in a {
-                    validate_json_schema(v)?;
+                    validate_json_schema_inner(v)?;
                 }
             } else {
-                validate_json_schema(v)?;
+                validate_json_schema_inner(v)?;
             }
         }
     }
     for k in ["allOf", "anyOf", "oneOf", "prefixItems"] {
         if let Some(a) = o.get(k).and_then(Value::as_array) {
             for v in a {
-                validate_json_schema(v)?;
+                validate_json_schema_inner(v)?;
             }
         }
     }
     Ok(())
+}
+
+const SUPPORTED_STRING_FORMATS: &[&str] = &[
+    "email",
+    "date",
+    "time",
+    "date-time",
+    "duration",
+    "ipv4",
+    "ipv6",
+    "hostname",
+    "uuid",
+    "uri",
+    "uri-reference",
+    "uri-template",
+    "json-pointer",
+    "relative-json-pointer",
+];
+
+/// Normalize a client-supplied tool parameter JSON Schema for XGrammar lowering.
+///
+/// Unlike explicit `response_format: json_schema` constraints (which fail closed),
+/// real-world tool schemas (Claude Code, MCP servers, Zod, Pydantic) routinely use
+/// JSON Schema 2020-12 features that XGrammar cannot enforce exactly (such as JS
+/// lookahead regexes `(?!...)`, `pattern` + `maxLength`, `allOf`, `oneOf` over
+/// objects, `multipleOf`, or unknown `format` strings). Following `llama.cpp` and
+/// `vLLM`, drop or relax only those unsupported sub-constraints while keeping the
+/// full original schema in the prompt and rejecting unresolvable external `$ref`s.
+pub(crate) fn sanitize_tool_schema(v: &Value) -> Result<Value, String> {
+    let mut budget = 4096usize;
+    sanitize_tool_schema_inner(v, 0, &mut budget)
+}
+
+fn sanitize_tool_schema_inner(
+    v: &Value,
+    depth: usize,
+    budget: &mut usize,
+) -> Result<Value, String> {
+    if depth >= 32 {
+        return Err("tool JSON schema exceeds maximum nesting depth".into());
+    }
+    if *budget == 0 {
+        return Err("tool JSON schema exceeds maximum node budget".into());
+    }
+    *budget -= 1;
+    let Some(o) = v.as_object() else {
+        return Ok(v.clone());
+    };
+    if let Some(reference) = o.get("$ref").and_then(Value::as_str)
+        && reference != "#"
+        && !reference.starts_with("#/")
+    {
+        return Err("only local JSON schema references are supported".into());
+    }
+    let mut out = o.clone();
+    for k in [
+        "multipleOf",
+        "uniqueItems",
+        "contains",
+        "minContains",
+        "maxContains",
+        "not",
+        "if",
+        "then",
+        "else",
+        "dependentSchemas",
+        "dependentRequired",
+    ] {
+        out.remove(k);
+    }
+    if let Some(f) = out.get("format").and_then(Value::as_str)
+        && !SUPPORTED_STRING_FORMATS.contains(&f)
+    {
+        out.remove("format");
+    }
+    if let Some(pat) = out.get("pattern").and_then(Value::as_str)
+        && xgrammar::Grammar::from_regex(pat).is_err()
+    {
+        out.remove("pattern");
+    }
+    if out.contains_key("pattern") || out.contains_key("format") {
+        out.remove("minLength");
+        out.remove("maxLength");
+    }
+    if out.contains_key("propertyNames")
+        && (out.contains_key("properties")
+            || out.contains_key("patternProperties")
+            || out.get("additionalProperties") == Some(&Value::Bool(false))
+            || out.get("unevaluatedProperties") == Some(&Value::Bool(false)))
+    {
+        out.remove("propertyNames");
+    }
+    if let Some(pp) = out.get("patternProperties").and_then(Value::as_object) {
+        let unsupported = pp.len() > 1
+            || out.contains_key("properties")
+            || pp
+                .keys()
+                .any(|pat| xgrammar::Grammar::from_regex(pat).is_err());
+        if unsupported {
+            out.remove("patternProperties");
+            // Relax additionalProperties unconditionally so dropping patternProperties
+            // never narrows an existing `additionalProperties: false` / typed schema.
+            out.insert("additionalProperties".into(), Value::Bool(true));
+        }
+    }
+    if let Some(branches) = out.get("allOf").and_then(Value::as_array)
+        && branches.len() != 1
+    {
+        out.remove("allOf");
+    }
+    if !out.contains_key("anyOf")
+        && let Some(one_of) = out.remove("oneOf")
+    {
+        out.insert("anyOf".into(), one_of);
+    }
+    for k in ["properties", "patternProperties", "$defs", "definitions"] {
+        if let Some(m) = out.get(k).and_then(Value::as_object).cloned() {
+            let mut next = serde_json::Map::with_capacity(m.len());
+            for (name, val) in m {
+                next.insert(name, sanitize_tool_schema_inner(&val, depth + 1, budget)?);
+            }
+            out.insert(k.into(), Value::Object(next));
+        }
+    }
+    for k in [
+        "items",
+        "additionalItems",
+        "additionalProperties",
+        "unevaluatedProperties",
+        "propertyNames",
+    ] {
+        if let Some(val) = out.get(k).cloned() {
+            let next = if let Some(a) = val.as_array() {
+                a.iter()
+                    .map(|item| sanitize_tool_schema_inner(item, depth + 1, budget))
+                    .collect::<Result<Vec<_>, _>>()
+                    .map(Value::Array)?
+            } else {
+                sanitize_tool_schema_inner(&val, depth + 1, budget)?
+            };
+            out.insert(k.into(), next);
+        }
+    }
+    for k in ["allOf", "anyOf", "oneOf", "prefixItems"] {
+        if let Some(a) = out.get(k).and_then(Value::as_array).cloned() {
+            let next = a
+                .iter()
+                .map(|item| sanitize_tool_schema_inner(item, depth + 1, budget))
+                .collect::<Result<Vec<_>, _>>()?;
+            out.insert(k.into(), Value::Array(next));
+        }
+    }
+    Ok(Value::Object(out))
 }
 
 #[derive(Clone, Debug)]
@@ -463,6 +648,22 @@ impl TokenBitmaskConstraint {
     pub fn has_pending(&self) -> bool {
         self.pending_token.is_some()
     }
+    /// Returns `true` if the constraint is currently inside its `<think>` reasoning gate
+    /// (accounting for any pending deferred token).
+    pub fn in_reasoning_gate(&self) -> bool {
+        let Some(prefix) = &self.gate else {
+            return false;
+        };
+        if let Some(pending_id) = self.pending_token
+            && let Some(bytes) = usize::try_from(pending_id)
+                .ok()
+                .and_then(|idx| self.bytes.get(idx))
+        {
+            let (_, answer) = gate_token(prefix, bytes, self.implicit_tool);
+            return answer.is_none();
+        }
+        true
+    }
     pub fn is_terminal_eos(&self) -> bool {
         self.terminal
             || self
@@ -512,20 +713,18 @@ impl TokenBitmaskConstraint {
         let mut used = false;
         if let Some(prefix) = &self.gate {
             if self.eos_ids.contains(&id) {
-                self.terminal = true;
-            } else {
-                let (next, answer) =
-                    gate_token(prefix, &self.bytes[id as usize], self.implicit_tool);
-                if let Some(answer) = answer
-                    && !answer.is_empty()
-                {
-                    if !self.matcher.as_mut().unwrap().accept_bytes(&answer) {
-                        return Err("reasoning boundary suffix violates grammar".into());
-                    }
-                    used = true;
-                }
-                self.gate = next;
+                return Err("EOS token is not allowed inside reasoning gate".into());
             }
+            let (next, answer) = gate_token(prefix, &self.bytes[id as usize], self.implicit_tool);
+            if let Some(answer) = answer
+                && !answer.is_empty()
+            {
+                if !self.matcher.as_mut().unwrap().accept_bytes(&answer) {
+                    return Err("reasoning boundary suffix violates grammar".into());
+                }
+                used = true;
+            }
+            self.gate = next;
         } else if let Some(m) = &mut self.matcher {
             if !m.accept_token(id) {
                 return Err(format!("native matcher rejected token {id}"));
@@ -569,6 +768,14 @@ impl TokenBitmaskConstraint {
             if let Some(saved) = cached.get(prefix) {
                 self.mask.clone_from(saved);
                 return Ok(());
+            }
+            // Mask EOS/stop tokens while inside `<think>` so the model must emit
+            // `</think>` (or an implicit `<tool_call>`) before terminating, matching
+            // upstream xgrammar/vLLM `_build_reasoning_prefix`.
+            for &eos in &self.eos_ids {
+                if eos >= 0 && (eos as usize) < self.vocab_size {
+                    mask[eos as usize / 32] &= !(1 << (eos as usize % 32));
+                }
             }
             // Only tokens that cross a boundary need a matcher fork. Ordinary
             // reasoning tokens never clone the growing grammar parser.
@@ -792,7 +999,7 @@ mod tests {
     fn implicit_tool_boundary_preserves_marker() {
         let f = factory();
         let g = f.compiler.compile_regex("<tool_call>a").unwrap();
-        let mut c = f.wrap(g, true, true).unwrap();
+        let mut c = f.wrap(&g, true, true).unwrap();
         c.advance(259).unwrap();
         assert!(c.is_token_allowed(97));
         c.rollback(1).unwrap();
@@ -828,6 +1035,272 @@ mod tests {
                 &json!({"properties":{"multipleOf":{"type":"integer"}},"enum":[{"multipleOf":3}]})
             )
             .is_ok()
+        );
+        // xgrammar-rs 0.2.8 natively supports propertyNames + additionalProperties schema objects.
+        assert!(
+            validate_json_schema(&json!({
+                "type": "object",
+                "propertyNames": {"type": "string", "minLength": 1, "maxLength": 64},
+                "additionalProperties": {"type": "string"}
+            }))
+            .is_ok()
+        );
+        // Still reject propertyNames combined with declared properties or additionalProperties: false.
+        assert!(
+            validate_json_schema(&json!({
+                "type": "object",
+                "properties": {"a": {"type": "string"}},
+                "propertyNames": {"type": "string"}
+            }))
+            .is_err()
+        );
+        assert!(
+            validate_json_schema(&json!({
+                "type": "object",
+                "propertyNames": {"type": "string"},
+                "additionalProperties": false
+            }))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn sanitize_tool_schema_relaxes_unsupported_keywords_and_preserves_external_ref_error() {
+        assert!(sanitize_tool_schema(&json!({"$ref": "https://example.invalid/schema"})).is_err());
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "collection": {
+                    "type": "string",
+                    "maxLength": 1000,
+                    "pattern": "^(?!\\.\\.?)[a-z]+$"
+                },
+                "version": {
+                    "type": "string",
+                    "pattern": "^[0-9]+\\.[0-9]+$",
+                    "maxLength": 20
+                },
+                "to": {
+                    "type": "string",
+                    "allOf": [{"pattern": "^[^\\n]*$"}, {"pattern": "^.{0,300}$"}]
+                },
+                "choice": {
+                    "oneOf": [
+                        {"type": "object", "properties": {"a": {"type": "string"}}},
+                        {"type": "object", "properties": {"b": {"type": "integer"}}}
+                    ]
+                },
+                "step": {"type": "integer", "multipleOf": 5},
+                "custom_fmt": {"type": "string", "format": "file-path"},
+                "map": {
+                    "type": "object",
+                    "propertyNames": {"type": "string", "minLength": 1, "maxLength": 64},
+                    "additionalProperties": {"type": "string"}
+                }
+            }
+        });
+        let sanitized = sanitize_tool_schema(&schema).unwrap();
+        validate_json_schema(&sanitized).unwrap();
+        // Unsupported lookahead pattern dropped, maxLength preserved.
+        assert!(
+            sanitized["properties"]["collection"]
+                .get("pattern")
+                .is_none()
+        );
+        assert_eq!(sanitized["properties"]["collection"]["maxLength"], 1000);
+        // Supported pattern preserved, conflicting maxLength dropped.
+        assert_eq!(
+            sanitized["properties"]["version"]["pattern"],
+            "^[0-9]+\\.[0-9]+$"
+        );
+        assert!(
+            sanitized["properties"]["version"]
+                .get("maxLength")
+                .is_none()
+        );
+        // Multi-branch allOf dropped so type:string is preserved.
+        assert!(sanitized["properties"]["to"].get("allOf").is_none());
+        assert_eq!(sanitized["properties"]["to"]["type"], "string");
+        // oneOf rewritten to anyOf.
+        assert!(sanitized["properties"]["choice"].get("oneOf").is_none());
+        assert!(sanitized["properties"]["choice"].get("anyOf").is_some());
+        // multipleOf and unknown format dropped.
+        assert!(sanitized["properties"]["step"].get("multipleOf").is_none());
+        assert!(
+            sanitized["properties"]["custom_fmt"]
+                .get("format")
+                .is_none()
+        );
+        // propertyNames + additionalProperties preserved.
+        assert!(
+            sanitized["properties"]["map"]
+                .get("propertyNames")
+                .is_some()
+        );
+        // Unsupported patternProperties with additionalProperties: false relaxes to true.
+        let pp_relaxed = sanitize_tool_schema(&json!({
+            "type": "object",
+            "patternProperties": {"^(?!bad)[a-z]+$": {"type": "string"}},
+            "additionalProperties": false
+        }))
+        .unwrap();
+        assert!(pp_relaxed.get("patternProperties").is_none());
+        assert_eq!(pp_relaxed["additionalProperties"], json!(true));
+        // Coexisting anyOf + oneOf preserves oneOf instead of silently discarding it.
+        let both = sanitize_tool_schema(&json!({
+            "anyOf": [{"type": "string"}],
+            "oneOf": [{"type": "object"}, {"type": "object"}]
+        }))
+        .unwrap();
+        assert!(both.get("oneOf").is_some());
+        assert!(validate_json_schema(&both).is_err());
+        // Depth bound fails closed without stack overflow.
+        let mut deep = json!({"type": "string"});
+        for _ in 0..40 {
+            deep = json!({"type": "array", "items": deep});
+        }
+        assert!(sanitize_tool_schema(&deep).is_err());
+
+        // validate_json_schema enforces MAX_JSON_SCHEMA_DEPTH (64, matching vLLM #60036).
+        let mut at_limit = json!({"type": "string"});
+        for _ in 0..63 {
+            at_limit = json!({"type": "array", "items": at_limit});
+        }
+        assert!(validate_json_schema(&at_limit).is_ok());
+        let over_limit = json!({"type": "array", "items": at_limit});
+        let err = validate_json_schema(&over_limit).unwrap_err();
+        assert!(err.contains("maximum nesting depth"), "unexpected: {err}");
+    }
+
+    #[test]
+    fn tool_call_trigger_constrains_immediately_after_tool_call_tag() {
+        let mut bytes: Vec<Vec<u8>> = (0..=255).map(|b| vec![b]).collect();
+        bytes.extend([
+            b"</s>".to_vec(),         // 256 (EOS / <|im_end|>)
+            b"<tool_call>".to_vec(),  // 257
+            b"<|im_start|>".to_vec(), // 258
+        ]);
+        let vocab_size = bytes.len();
+        let info = TokenizerInfo::new_from_bytes(
+            &bytes,
+            xgrammar::VocabType::Raw,
+            Some(vocab_size as i32),
+            Some(vec![256]),
+            false,
+        )
+        .unwrap();
+        let mut mask = vec![0u32; vocab_size.div_ceil(32)];
+        for id in 0..vocab_size {
+            mask[id / 32] |= 1 << (id % 32);
+        }
+        let f = ConstraintFactory {
+            compiler: Arc::new(GrammarCompiler::new(info, 1, true, 1024 * 1024)),
+            bytes: Arc::new(bytes),
+            valid_mask: Arc::new(mask),
+            vocab_size,
+            eos_ids: vec![256],
+        };
+        let tools = json!([{
+            "type": "function",
+            "function": {
+                "name": "bash",
+                "parameters": {
+                    "type": "object",
+                    "properties": { "command": { "type": "string" } },
+                    "required": ["command"]
+                }
+            }
+        }]);
+        let mut c = f
+            .tools_with_parallel(
+                &tools,
+                &crate::tool_constraints::ToolChoice::Auto,
+                false,
+                true,
+            )
+            .unwrap();
+        // Before `<tool_call>`, free prose and EOS are allowed.
+        assert!(c.is_token_allowed(b'A' as i32));
+        assert!(c.is_token_allowed(256));
+        // Emit `<tool_call>` — grammar must trigger immediately so premature EOS and
+        // `<|im_start|>` corruption cannot slip through before `<function=`.
+        c.advance(257).unwrap();
+        assert!(
+            !c.is_token_allowed(256),
+            "EOS must be masked immediately after <tool_call>"
+        );
+        assert!(
+            !c.is_token_allowed(258),
+            "<|im_start|> must be masked immediately after <tool_call>"
+        );
+        assert!(
+            c.is_token_allowed(b'\n' as i32),
+            "newline must be allowed immediately after <tool_call>"
+        );
+        c.advance(b'\n' as i32).unwrap();
+        assert!(
+            !c.is_token_allowed(258),
+            "<|im_start|> must be masked after <tool_call>\\n"
+        );
+        assert!(
+            c.is_token_allowed(b'<' as i32),
+            "'<' must be allowed after <tool_call>\\n to start <function=bash>"
+        );
+    }
+
+    #[test]
+    fn eos_is_masked_inside_reasoning_gate() {
+        let f = factory();
+        // 1. JSON schema with thinking=true: EOS must be masked until </think> + valid JSON.
+        let mut c = f.json_object(true).unwrap();
+        assert!(c.in_reasoning_gate());
+        assert!(
+            !c.is_token_allowed(256),
+            "EOS must be masked while inside <think> reasoning gate"
+        );
+        assert!(c.advance(256).is_err());
+        // Reasoning text stays inside the gate and keeps EOS masked.
+        c.advance(b'a' as i32).unwrap();
+        assert!(c.in_reasoning_gate());
+        assert!(!c.is_token_allowed(256));
+        // Close `</think>` byte-by-byte; still need valid JSON object before EOS.
+        for &b in b"</think>" {
+            c.advance(b as i32).unwrap();
+        }
+        assert!(!c.in_reasoning_gate());
+        assert!(!c.is_token_allowed(256));
+        c.advance(b'{' as i32).unwrap();
+        c.advance(b'}' as i32).unwrap();
+        assert!(c.is_token_allowed(256));
+
+        // 2. Tools with thinking=true (Auto): EOS must be masked inside <think>, allowed after </think>.
+        let tools = json!([{
+            "type": "function",
+            "function": {
+                "name": "ping",
+                "parameters": { "type": "object", "properties": {} }
+            }
+        }]);
+        let mut t = f
+            .tools_with_parallel(
+                &tools,
+                &crate::tool_constraints::ToolChoice::Auto,
+                true,
+                true,
+            )
+            .unwrap();
+        assert!(t.in_reasoning_gate());
+        assert!(
+            !t.is_token_allowed(256),
+            "EOS must be masked inside <think> for tools(Auto)"
+        );
+        for &b in b"</think>" {
+            t.advance(b as i32).unwrap();
+        }
+        assert!(!t.in_reasoning_gate());
+        assert!(
+            t.is_token_allowed(256),
+            "EOS must be allowed after </think> for tools(Auto)"
         );
     }
 }

@@ -35,7 +35,6 @@ fn malformed_tool_history_and_template_roles_are_rejected() {
         json!({"role":"assistant","tool_calls":[{"function":{"name":"x>bad","arguments":{}}}]}),
         json!({"role":"assistant","tool_calls":[{"function":{"name":"x","arguments":{"bad>key":0}}}]}),
         json!({"role":"tool","tool_calls":[{"function":{"name":"x","arguments":{}}}]}),
-        json!({"role":"system","content":"late system"}),
         json!({"role":"unknown","content":"bad role"}),
     ] {
         assert!(
@@ -54,6 +53,21 @@ fn malformed_tool_history_and_template_roles_are_rejected() {
 }
 
 #[test]
+fn mid_turn_system_messages_render_in_place() {
+    let (messages, _) = parse_openai_messages_multimodal(&json!([
+        {"role":"system", "content":"Global instructions"},
+        {"role":"user", "content":"hi"},
+        {"role":"system", "content":"# Environment\nWorking dir: /tmp"}
+    ]))
+    .unwrap();
+    let prompt = format_chatml_prompt(&messages, None, true);
+    assert_eq!(
+        prompt,
+        "<|im_start|>system\nGlobal instructions<|im_end|>\n<|im_start|>user\nhi<|im_end|>\n<|im_start|>system\n# Environment\nWorking dir: /tmp<|im_end|>\n<|im_start|>assistant\n<think>\n"
+    );
+}
+
+#[test]
 fn system_and_tools_include_native_qwen_instructions() {
     let (messages, _) = parse_openai_messages_multimodal(&json!([
         {"role":"system", "content":"  Be precise.  "},
@@ -65,7 +79,7 @@ fn system_and_tools_include_native_qwen_instructions() {
     let prompt = format_chatml_prompt(&messages, Some(&tools), false);
     assert!(prompt.starts_with("<|im_start|>system\n# Tools\n\n"));
     assert!(prompt.contains("<function=example_function_name>"));
-    assert!(prompt.contains("Required parameters MUST be specified"));
+    assert!(prompt.contains("Function calls MUST follow the specified format"));
     assert!(prompt.contains("</IMPORTANT>\n\nBe precise.<|im_end|>\n"));
     assert_eq!(prompt.matches("<|im_start|>system").count(), 1);
 }

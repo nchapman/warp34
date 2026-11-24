@@ -1,16 +1,15 @@
-# HGPTQ integration (`feat/hgptq`)
+# HGPTQ & W2.6-RCO Quantization
 
 ## Status
 
-**Complete and verified end-to-end** against `vLLM 0.31.0` across all five flagship HGPTQ target models and the quantized `DFlash2` drafter:
-- **`nchapman/Qwen3.5-2B-W4A16-HGPTQ`** (`0fbb9a38f631ea63678f4b51a491e7ecb26c681c`)
-- **`nchapman/Qwen3.5-9B-W4A16-HGPTQ`** (`7b2e48b7e7e8ee38925f5337c66feed22d3b031b`)
-- **`nchapman/Qwen3.8-27B-W4A16-HGPTQ`** (`1de743eedefdb7422e6b171174c7080204f5b005` / `ae51987e3339a2a70070702548571e10fe8bcbc2`)
-- **`nchapman/Qwen3.8-27B-DFlash2-W4A16-HGPTQ`** (`46b87ea125d24924affa8da9c3e981a937aab216`, `2.16 GiB` vs `4.81 GiB` for `incoai/Qwen3.8-27B-DFlash2`)
-- **`nchapman/Qwen3.6-35B-A3B-W4A16-HGPTQ`** (`4f5de21c886d79e17af5b8a4bfc625e226703fb6`, `19.24 GiB`, 256-expert `H_64` MoE + `H_64` `shared_expert` + Vision + MTP)
-- **`nchapman/Qwen3.8-Flash-Next-W4A16-HGPTQ`** (`6ee06d2936b111f19eb5eb331044cb8b8b28562b`, `94 GiB`, 48-layer 512-expert `qwen4_exp` with `H_64` `group_size=64` routed/shared/MTP experts + 4-bit `lut4-gptq` `PLE` + `QSA` + `HC` + Vision)
+**Complete and verified end-to-end** against `vLLM` (`0.31.0` / `0.34.0`) across the full `nchapman/...` `W4A16-HGPTQ` and mixed-precision `W2.6A16-HGPTQ-RCO` / `W2.2A16-HGPTQ-RCO` checkpoint catalog and quantized `DFlash2` drafters:
+- **Dense `W4A16-HGPTQ`:** `nchapman/Qwen3.5-{0.8B,2B,4B,9B}-W4A16-HGPTQ` and `nchapman/Qwen3.8-27B-W4A16-HGPTQ`
+- **MoE `W4A16-HGPTQ`:** `nchapman/Qwen3.6-35B-A3B-W4A16-HGPTQ` (`19.24 GiB`, 256-expert `H_64` MoE + `H_64` `shared_expert` + Vision + MTP) and `nchapman/Qwen3.8-Flash-Next-W4A16-HGPTQ` (`94 GiB`, 48-layer 512-expert `qwen4_exp` with `H_64` `group_size=64` routed/shared/MTP experts + 4-bit `lut4-gptq` `PLE` + `QSA` + `HC` + Vision)
+- **Mixed-Precision `W2.6A16-HGPTQ-RCO` & `W2.2A16-HGPTQ-RCO`:** `nchapman/Qwen3.5-9B-W2.6A16-HGPTQ-RCO` (fits 8 GB GPUs @ `128K` with Vision + `MTP-3`), `nchapman/Qwen3.8-27B-{W2.6A16,W2.2A16}-HGPTQ-RCO` (fits 16 GB / 12 GB GPUs), `nchapman/Qwen3.6-35B-A3B-W2.6A16-HGPTQ-RCO` (fits 16 GB GPUs), and `nchapman/Qwen3.8-Flash-Next-W2.6A16-HGPTQ-RCO` (`2-bit U2B2` + `4-bit U4B8` + online `U8B128` `lm_head` + `lut4-gptq` `PLE`)
+- **`DFlash2` Drafters:** `nchapman/Qwen3.8-27B-DFlash2-W4A16-HGPTQ` (`2.16 GiB` vs `4.81 GiB` for `incoai/Qwen3.8-27B-DFlash2`) and `nchapman/Qwen3.8-Flash-Next-DFlash2-W4A16-HGPTQ`
+- **Decision Models:** `nchapman/GLiDE-{0.8B,2B,9B,27B}-W4A16-HGPTQ` and `nchapman/d3-{edge,lite,nano,mini,flash,turbo,ultra}-W4A16-HGPTQ` (see [`docs/DECISION_MODELS.md`](DECISION_MODELS.md))
 
-Verified across Text (`dump-diff` & `greedy-diff`), `MTP` (`k=1..3` lossless), `DFlash2` (`M=8` lossless, both `BF16` and `W4A16-HGPTQ`), Vision (`coco_sample.png`, including 9B/27B/35B-A3B `b=16` channelwise `K/N=4304`), CUDA Graphs, and `TP=1 == TP=2`.
+Verified across Text (`dump-diff` & `greedy-diff`), `MTP` (`k=1..3` lossless), `DFlash2` (`M=8` / `M=16` lossless, both `BF16` and `W4A16-HGPTQ`), Vision (`coco_sample.png`, including 9B/27B/35B-A3B/Flash-Next `b=16` channelwise `K/N=4304`), CUDA Graphs, and `TP=1 == TP=2`.
 
 ## Pinned checkpoint inventory
 
@@ -32,6 +31,10 @@ Verified across Text (`dump-diff` & `greedy-diff`), `MTP` (`k=1..3` lossless), `
    - All target and MTP attention, GDN (`in_proj_qkvz`, `out_proj`), `shared_expert`, and `512` routed experts (`mlp.experts.*`, `mtp.layers.0.mlp.experts.*`), plus Vision `attn`/`mlp.linear_fc1`/`merger`, use `U4B8` `group_size=64` with `H_64`; `visual.blocks.*.mlp.linear_fc2` (`K/N=4304`) uses channelwise `U4B8` (`strategy="channel"`) with `H_16`; and the 8 PLE tables use 4-bit `lut4-gptq` (`PleTableFormat::Lut4Gptq`, `group_size=64`, `weight_packed [248320, 1280] I32` + `weight_scale [248320, 160] BF16` + `weight_codebook [16] F32`, cutting PLE disk/mmap footprint by **`3.63×`** vs FP8 PLE).
    - `moe_cpu_bridge` (`crates/warp34-host/src/moe_cpu_bridge.rs`, `moe_cpu_bridge/eval.rs`) supports `group_size in {64, 128}` and `down_hadamard in {0, 64}` (`prepare_x_perm_grouped`, `row_tile_avx2<R, T, G64>`, `hadamard64_f32_inplace`) with 0-ULP agreement across `portable`, `AVX2`, and `AVX-512`.
 - Target rules use negative lookbehind (`re:.*(?<!mtp\.)model\.layers\.\d+\.mlp\.(gate|up|down)_proj$`) and explicit `ignore` lists (`lm_head`, `patch_embed.proj`, `mtp.fc`, `in_proj_a`, `in_proj_b`), resolved via bounded `fancy-regex` in `crates/warp34-host/src/loader/config_rules.rs`.
+- **Mixed-Precision `W2.6A16-HGPTQ-RCO` & `W2.2A16-HGPTQ-RCO` (`crates/warp34-host/src/loader/config_rules.rs`, `crates/warp34-host/src/model/weights.rs`, `crates/warp34-host/src/model/weights/hgptq.rs`, `crates/warp34-kernels/csrc/ops/op_marlin.cu`):**
+  - Combines symmetric 2-bit `U2B2` (`group_size=64`, `H_64` block-Hadamard, Marlin `warp34_marlin_gemm_f16u2` and MoE `warp34_moe_w2a16_mlp_ex_f16` / AVX-512/AVX2 `moe_cpu_bridge`) on capacity-insensitive FFN/expert projections with 4-bit `U4B8` (`group_size=64`, `H_64`) on sensitive attention/GDN/early-layer projections and online-quantized 8-bit `U8B128` (`quantize_f16_n_major_to_u8b128`, `group_size=128`) on `lm_head`.
+- **Shared-Weight `W4A8` INT8-IMMA Prefill (`crates/warp34-kernels/csrc/marlin/marlin_template.h`, `crates/warp34-kernels/csrc/ops/op_marlin.cu`):**
+  - On RTX 30-series (`sm_86`) and RTX 40-series (`sm_89`), `warp34_marlin_gemm_s8u4_shared` unpacks existing `W4A16` `k16` (`U4B8`) weight tiles directly into `mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32` for `M >= 128` prefill rows (`per_token_quant_i8_kernel`) with **zero extra weight VRAM**, while keeping `< 64`-row tails, decode, speculative verify, CUDA Graphs, and `lm_head` on 0-ULP `W4A16`.
 
 ## Architecture, kernel contracts & bug fixes
 
@@ -117,10 +120,10 @@ Verified across Text (`dump-diff` & `greedy-diff`), `MTP` (`k=1..3` lossless), `
 | **35B-A3B HGPTQ** | `TP=1` | `MTP-3` | `4,079` / **429.1** (`3.88x`) | `5,718` / **402.9** (`3.63x`) | — | — | Fits 1× 24 GB with `MTP-3` + Vision | **`2.30×`** vs GPTQ `TP=1` (`186.5`) |
 | **35B-A3B HGPTQ** | `TP=2` | Plain | `3,229` / **261.5** | `6,916` / **261.5** | — | `226.3 ms` / **205.5 tok/s** | **`1.37×`** (vs `191.4 tok/s`) | **`+4.3%`** vs GPTQ (`250.7`) |
 | **35B-A3B HGPTQ** | `TP=2` | `MTP-3` | `4,742` / **553.4** (`3.88x`) | `6,039` / **519.6** (`3.63x`) | — | — | **`2.89×`** (vs `191.4 tok/s`) | **`+62.6%`–`+73.2%`** vs GPTQ `MTP` (`319.6`) |
-| **Flash-Next HGPTQ** | `TP=1` | Plain (`k_hot=96`, `CpuHybrid`) | `288.1` / **32.2** (`warm 64-tok`) | `532.0` / **25.4** | — | `612.1 ms` cold (`236.4 ms` warm, `2.59×`) / **28.2 tok/s** | `vLLM` OOMs on 1× 24 GB | **`100.4%`** of FP8PLE (`32.04`) |
-| **Flash-Next HGPTQ** | `TP=1` | `MTP-3` (`k_hot=96`) | `286.2` / **45.3** (`2.74x` warm) | `549.3` / **34.0** (`2.59x`, lossless) | — | — | Fits 1× 24 GB with `MTP-3` + `Radix` (`45.3×` TTFT) | `96.8%` of FP8PLE (`46.80`) |
-| **Flash-Next HGPTQ** | `TP=2` | Plain (`EP=2`, `k_hot=112`) | `379.5` / **69.7** (`warm 64-tok`) | `776.1` / **50.6** (`93.7` radix warm) | — | `588.0 ms` cold (`41.7 ms` warm, **`14.1×`**) / **84.7 tok/s** | — | **`+2.5%`** vs FP8PLE (`68.04`) |
-| **Flash-Next HGPTQ** | `TP=2` | `MTP-3` (`EP=2`, `k_hot=112`) | `250.0` / **109.7** (`64-tok`), **90.1** (`128:256`) | `273.8` / **85.7** (`128:512`), **81.6** (`chat-512` mean, max **93.3**) | `1,595` / **78.0** (`4096:256`, `3.07x`), `1,650` / **74.5** (`8192:1024`, `3.42x`) | — | — | **`+2.2%`** on `chat-512` mean (`81.61` vs `79.83`), `-22 GiB` disk |
+| **Flash-Next HGPTQ** | `TP=1` | Plain (`k_hot=64..96`, `CpuHybrid`) | `288.1` / **32.2** (`warm 64-tok`) | `532.0` / **25.4** | — | `612.1 ms` cold (`236.4 ms` warm, `2.59×`) / **28.2 tok/s** | `vLLM` OOMs on 1× 24 GB | **`100.4%`** of FP8PLE (`32.04`) |
+| **Flash-Next HGPTQ** | `TP=1` | `MTP-3` / `DFlash2` (`131K` auto-fit) | **`53.7 tok/s`** (`MTP-3` `short-chat` e2e) / **`83.9 tok/s`** (`DFlash2` `short-chat` e2e, **`97.9`** dec) | **`74.0 tok/s`** (`DFlash2` `prefix-primed` e2e) / **`58.4 tok/s`** (`DFlash2` `coding-agent`) | **`32.1 tok/s`** (`DFlash2` `prefill-r16` e2e) / **`34.7 tok/s`** (`code-r64` e2e) | — | Fits 1× 24 GB with `131K` `TQ4` KV + Vision (`W2.6-RCO` reaches **`100.2`** `DFlash2` / **`66.2`** `MTP-3`) | **`+4%` chat & `+36%` prefill** vs `Strata v0.2.17` (`80.9` / `23.6`) |
+| **Flash-Next HGPTQ** | `TP=2` | Plain (`EP=2`, `k_hot=112..192`) | `379.5` / **69.7** (`warm 64-tok`) | `776.1` / **50.6** (`93.7` radix warm) | — | `588.0 ms` cold (`41.7 ms` warm, **`14.1×`**) / **84.7 tok/s** | — | **`+2.5%`** vs FP8PLE (`68.04`) |
+| **Flash-Next HGPTQ** | `TP=2` | `MTP-3` / `DFlash2` (`EP=2`, `131K`) | **`99.4 tok/s`** (`MTP-3` `short-chat` e2e) / **`140.1 tok/s`** (`DFlash2` `3090 Ti`) / **`179.6 tok/s`** (`DFlash2` `4090`) | **`123.5 tok/s`** (`DFlash2` `prefix-primed` `3090 Ti`) / **`178.7 tok/s`** (`4090`) | **`123.6 tok/s`** (`DFlash2` `agent` `3090 Ti`) / **`184.7 tok/s`** (`4090`) | — | `W2.6-RCO` reaches **`167.0`** (`2× 3090 Ti`) / **`201.3 tok/s`** (`2× 4090`) | **`+10%`–`+64%`** over `Strata v0.2.17` across all 5 cases |
 
 ## Reproducing checks
 

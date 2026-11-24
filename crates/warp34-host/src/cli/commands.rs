@@ -10,27 +10,14 @@ pub(crate) fn prepare_multimodal_prompt_and_images(
     if image_urls.is_empty() {
         return Ok((raw_prompt.to_string(), Vec::new()));
     }
-    let (patch_size, temporal_patch_size, merge_size) = cfg
-        .vision_config
-        .as_ref()
-        .map(|v| (v.patch_size, v.temporal_patch_size, v.spatial_merge_size))
-        .unwrap_or((16, 2, 2));
+    let merge_size = cfg.vision_preprocessor.spatial_merge_size;
     let mut images = Vec::with_capacity(image_urls.len());
     let mut prefix = String::new();
     for url in image_urls {
-        let (rgb, h, w) = crate::vision::load_cli_image_with_policy(url, allow_remote_images)
-            .map_err(|e| e.to_string())?;
+        let (rgb, h, w) = crate::vision::load_cli_image_with_policy(url, allow_remote_images)?;
         crate::vision::validate_image_aspect_ratio(h, w)?;
-        let pre = crate::vision::preprocess_rgb_image(
-            &rgb,
-            h,
-            w,
-            patch_size,
-            temporal_patch_size,
-            merge_size,
-            64 * 32 * 32,
-            2048 * 32 * 32,
-        );
+        let pre =
+            crate::vision::preprocess_rgb_image_with_config(&rgb, h, w, &cfg.vision_preprocessor);
         if !raw_prompt.contains("<|image_pad|>") {
             let n_pads = pre.num_merged_tokens(merge_size);
             prefix.push_str("<|vision_start|>");
@@ -51,6 +38,9 @@ pub(crate) fn prepare_multimodal_prompt_and_images(
 
 #[cfg(feature = "cuda")]
 pub fn run_cuda_cli(args: &[String]) -> Result<ExitCode, String> {
+    if args.first().map(String::as_str) == Some("update") {
+        return run_update(&args[1..]);
+    }
     let Some(PreparedCudaCli {
         options,
         policy,
@@ -381,11 +371,27 @@ pub(crate) fn run_generate(
         active_lora,
         ..
     } = options;
+    let gen_kv_pages = kv_pages.or_else(|| {
+        let min_pages = max_tokens.saturating_add(512).div_ceil(16);
+        if min_pages > crate::model::DEFAULT_TARGET_KV_PAGES {
+            let max_cap = if spec_config
+                .as_ref()
+                .is_some_and(|c| c.kind == crate::proposer::SpeculativeKind::DFlash2)
+            {
+                crate::dflash::DFLASH2_MAX_KV_CAPACITY / 16
+            } else {
+                super::options::MAX_CLI_KV_PAGES
+            };
+            Some(min_pages.min(max_cap))
+        } else {
+            None
+        }
+    });
     let mut engine = load_cli_engine_with_lora(
         &resolved_model,
         tp,
         policy,
-        kv_pages,
+        gen_kv_pages,
         use_cuda_graph,
         &spec_config,
         &lora_modules,
@@ -413,7 +419,10 @@ pub(crate) fn run_generate(
                 reasoning_content: None,
             },
         ];
-        crate::server::format_chatml_prompt(&msgs, None, false)
+        let chat_template = crate::chatml::ChatTemplate::from_model_dir(&engine.model_dir);
+        let mut template_kwargs = serde_json::Map::new();
+        template_kwargs.insert("enable_thinking".into(), serde_json::Value::Bool(false));
+        chat_template.render(&msgs, None, true, &template_kwargs)?
     } else {
         expanded_prompt
     };
@@ -472,10 +481,42 @@ pub(crate) fn run_generate(
         format!(" images={}", mm_images.len())
     };
     eprintln!(
-        "[warp34 generate] model={model} tp={tp} kv={kv_format}{img_tag} prompt_toks={} gen_toks={} ttft={:.2}ms decode={:.2}tok/s ({:.2}ms/tok)",
-        prompt_len, gen_len, ttft_ms, decode_tok_per_s, itl_ms
+        "[warp34 generate] model={model} tp={tp} kv={kv_format}{img_tag} prompt_toks={prompt_len} gen_toks={gen_len} ttft={ttft_ms:.2}ms decode={decode_tok_per_s:.2}tok/s ({itl_ms:.2}ms/tok)"
     );
     Ok(ExitCode::SUCCESS)
+}
+
+#[cfg(feature = "cuda")]
+const REALISTIC_BENCH_PROMPT_CORPUS: &str = "\
+<|im_start|>user\n\
+Write a clean, well-commented Rust implementation of a bounded lock-free SPSC ring buffer with \
+explicit acquire/release atomic ordering, a complexity analysis, and a unit test. Keep your \
+explanation concise and avoid repeating the prompt.\n\
+```rust\n\
+use std::sync::atomic::{AtomicUsize, Ordering};\n\
+pub struct RingBuffer<T, const N: usize> {\n\
+    head: AtomicUsize,\n\
+    tail: AtomicUsize,\n\
+    slots: [std::mem::MaybeUninit<T>; N],\n\
+}\n\
+```\n\
+<|im_end|>\n\
+<|im_start|>assistant\n\
+<think>\n\n</think>\n\n";
+
+#[cfg(feature = "cuda")]
+fn select_bench_prompt_seed(
+    prompt: &str,
+    prompt_explicit: bool,
+    realistic_prompt: bool,
+) -> (&'static str, &str) {
+    if prompt_explicit {
+        ("custom", prompt)
+    } else if realistic_prompt {
+        ("realistic", REALISTIC_BENCH_PROMPT_CORPUS)
+    } else {
+        ("synthetic", "The quick brown fox jumps over the lazy dog. ")
+    }
 }
 
 #[cfg(feature = "cuda")]
@@ -491,6 +532,9 @@ pub(crate) fn run_bench(
         model,
         resolved_model,
         tp,
+        prompt,
+        prompt_explicit,
+        realistic_prompt,
         prompt_len,
         gen_len,
         kv_format,
@@ -506,8 +550,18 @@ pub(crate) fn run_bench(
         active_lora,
         ..
     } = options;
+    let min_stage_tokens =
+        super::options::bench_required_stage_tokens(&bench_stage, prompt_len, gen_len);
+    let min_stage_pages = min_stage_tokens.div_ceil(16);
     let mut engine = if matches!(bench_stage.as_str(), "scheduler" | "all") {
-        let pages = kv_pages.or_else(|| spec_config.as_ref().map(|_| 512));
+        let default_pages = if spec_config.is_some() {
+            Some(min_stage_pages.max(512))
+        } else if min_stage_pages > crate::model::DEFAULT_TARGET_KV_PAGES {
+            Some(min_stage_pages)
+        } else {
+            Some(crate::model::DEFAULT_SERVING_TARGET_KV_PAGES)
+        };
+        let pages = kv_pages.or(default_pages);
         let state_slot_seqs = serve_state_slot_seqs(batch_size.max(8), spec_config.as_ref());
         let mut eng = Qwen3_5Engine::load_for_serving_with_speculative_and_lora(
             &resolved_model,
@@ -524,11 +578,17 @@ pub(crate) fn run_bench(
             .map_err(|e| e.to_string())?;
         eng
     } else {
+        let bench_kv_pages =
+            kv_pages.or(if min_stage_pages > crate::model::DEFAULT_TARGET_KV_PAGES {
+                Some(min_stage_pages)
+            } else {
+                None
+            });
         load_cli_engine_with_lora(
             &resolved_model,
             tp,
             policy,
-            kv_pages,
+            bench_kv_pages,
             use_cuda_graph,
             &spec_config,
             &lora_modules,
@@ -536,9 +596,12 @@ pub(crate) fn run_bench(
         )
         .map_err(|e| e.to_string())?
     };
-    let base_ids = engine
-        .encode("The quick brown fox jumps over the lazy dog. ")
-        .map_err(|e| e.to_string())?;
+    let (prompt_source, seed_text) =
+        select_bench_prompt_seed(prompt.as_str(), prompt_explicit, realistic_prompt);
+    let base_ids = engine.encode(seed_text).map_err(|e| e.to_string())?;
+    if base_ids.is_empty() {
+        return Err("benchmark prompt encoded to 0 tokens".into());
+    }
     let make_prompt = |len: usize| -> Vec<i32> {
         let mut out = Vec::with_capacity(len);
         while out.len() < len {
@@ -550,10 +613,16 @@ pub(crate) fn run_bench(
         }
         out
     };
-    let synth_prompt = make_prompt(prompt_len);
-    // Warmup pass (captures CUDA Graph on decode step 1 and ramps GPU boost clock out of P8)
+    let synth_prompt = if prompt_explicit || realistic_prompt {
+        let mut custom = base_ids.clone();
+        custom.truncate(prompt_len);
+        custom
+    } else {
+        make_prompt(prompt_len)
+    };
+    // Warmup pass (captures CUDA Graph on decode step 1, warms tiered MoE / L2, and ramps GPU boost clock out of P8)
     let _ = engine
-        .generate_tokens(&synth_prompt[..16.min(prompt_len)], 32, false)
+        .generate_tokens(&synth_prompt, 64, false)
         .map_err(|e| e.to_string())?;
 
     let spec_label = speculative_kind.map(|k| match k {
@@ -572,10 +641,7 @@ pub(crate) fn run_bench(
         };
         let accepted = engine.speculative.as_ref().map(|p| p.last_accepted.clone());
         let verify_rounds = accepted.as_ref().map(Vec::len);
-        let total_accepted: usize = accepted
-            .as_ref()
-            .map(|v| v.iter().copied().sum())
-            .unwrap_or(0);
+        let total_accepted: usize = accepted.as_ref().map_or(0, |v| v.iter().copied().sum());
         let mean_accepted_drafts = verify_rounds.and_then(|r| {
             if r > 0 {
                 Some(total_accepted as f64 / r as f64)
@@ -609,6 +675,7 @@ pub(crate) fn run_bench(
             "num_experts_per_tok": engine.cfg.num_experts_per_tok,
             "cuda_graph": engine.use_cuda_graph,
             "speculative": spec_label,
+            "prompt_source": prompt_source,
             "accepted_drafts_per_round": accepted,
             "verify_rounds": verify_rounds,
             "measured_rounds": verify_rounds.unwrap_or(metrics.gen_len.saturating_sub(1)),
@@ -711,13 +778,13 @@ pub(crate) fn run_bench(
             };
             let (v_prompt_str, mm_imgs_a) = prepare_multimodal_prompt_and_images(
                 &engine.cfg,
-                "Describe the colors, geometry, and layout of this image in detail across several sentences.",
+                "Describe the colors, geometry, and layout of the image in detail across several sentences.",
                 &urls,
                 allow_remote_images,
             )?;
             let (_, mm_imgs_b) = prepare_multimodal_prompt_and_images(
                 &engine.cfg,
-                "Describe the colors, geometry, and layout of this image in detail across several sentences.",
+                "Describe the colors, geometry, and layout of the image in detail across several sentences.",
                 &["rgb://https://warp34.test/bench_img_b_distinct.ppm".to_string()],
                 allow_remote_images,
             )?;
@@ -735,12 +802,19 @@ pub(crate) fn run_bench(
             let distinct = engine
                 .generate_multimodal_with_radix_cache(&v_prompt_ids, &mm_imgs_b, 4, 64, false)
                 .map_err(|e| e.to_string())?;
-            let lossless_parity = cold.generated_token_ids == warm.generated_token_ids;
+            let (lossless_parity, prefix_match_tokens) = vision_warm_parity_ok(
+                &cold.generated_token_ids,
+                &warm.generated_token_ids,
+                engine.has_checkpoint_pool(),
+            );
             if !lossless_parity {
-                return Err(
-                    "vision benchmark: warm multimodal radix hit diverged from cold reference"
-                        .into(),
-                );
+                return Err(format!(
+                    "vision benchmark: warm multimodal radix hit diverged from cold reference (prefix_match={prefix_match_tokens}/{v_gen}, compressed_ckpt={}, cached_prefix={}, cold_sample={:?}, warm_sample={:?})",
+                    engine.has_checkpoint_pool(),
+                    warm.cached_prefix_tokens,
+                    &cold.generated_token_ids[..cold.generated_token_ids.len().min(8)],
+                    &warm.generated_token_ids[..warm.generated_token_ids.len().min(8)],
+                ));
             }
             if warm.cached_prefix_tokens < 64 {
                 return Err(format!(
@@ -759,8 +833,7 @@ pub(crate) fn run_bench(
                 .cfg
                 .vision_config
                 .as_ref()
-                .map(|v| v.spatial_merge_size)
-                .unwrap_or(2);
+                .map_or(2, |v| v.spatial_merge_size);
             let visual_tokens: usize = mm_imgs_a
                 .iter()
                 .map(|img| img.num_merged_tokens(merge_sz))
@@ -941,43 +1014,377 @@ pub(crate) fn serve_state_slot_seqs(
 }
 
 #[cfg(feature = "cuda")]
+#[derive(Debug, Clone)]
+pub(crate) struct ServeBootSummary {
+    pub(crate) served_model: String,
+    pub(crate) checkpoint_label: String,
+    pub(crate) gpu_name: String,
+    pub(crate) gpu_sm_tag: String,
+    pub(crate) gpu_sm_count: i32,
+    pub(crate) tp_size: usize,
+    pub(crate) total_vram_bytes: usize,
+    pub(crate) post_load_free_vram_bytes: usize,
+    pub(crate) kv_policy: KvFormatPolicy,
+    pub(crate) supports_fp8_kv: bool,
+    pub(crate) kv_compression_ratio: f64,
+    pub(crate) kv_policy_explicit: bool,
+    pub(crate) kv_policy_auto_adjusted: bool,
+    pub(crate) kv_pages: usize,
+    pub(crate) context_limit: usize,
+    pub(crate) max_model_context_tokens: usize,
+    pub(crate) context_auto_fitted: bool,
+    pub(crate) kv_pool_bytes_per_rank: usize,
+    pub(crate) state_slots: usize,
+    pub(crate) state_pool_bytes_per_rank: usize,
+    pub(crate) ckpt_vram_slots: usize,
+    pub(crate) ckpt_host_slots: usize,
+    pub(crate) ckpt_bytes_per_slot: usize,
+    pub(crate) weight_bytes_per_rank: usize,
+    pub(crate) scratch_bytes_per_rank: usize,
+    pub(crate) host_embed_offload: bool,
+    pub(crate) embed_saved_bytes: usize,
+    pub(crate) speculative_label: String,
+    pub(crate) max_num_seqs: usize,
+    pub(crate) bind_addr: String,
+    pub(crate) auth_enabled: bool,
+    pub(crate) webui_enabled: bool,
+    pub(crate) use_cuda_graph: bool,
+    pub(crate) default_sampling_params: crate::parser::SamplingParams,
+    pub(crate) sampling_from_generation_config: bool,
+    pub(crate) chat_template_source: String,
+    pub(crate) preserve_thinking: bool,
+    pub(crate) default_reasoning_effort: Option<String>,
+    pub(crate) reasoning_effort_budget: bool,
+    pub(crate) default_reasoning_budget: Option<usize>,
+    pub(crate) default_reasoning_budget_message: Option<String>,
+    pub(crate) vision_banner: Option<String>,
+    pub(crate) lora_adapters: Vec<String>,
+}
+
+#[cfg(feature = "cuda")]
+fn format_thinking_banner_line(
+    default_effort: Option<&str>,
+    effort_budget: bool,
+    default_budget: Option<usize>,
+    default_message: Option<&str>,
+) -> String {
+    let effort_prefix = default_effort.map(|e| format!("effort={e} [configured], "));
+    let effort = if effort_budget {
+        format!(
+            "effort-budget=on (ceil={})",
+            crate::server::DEFAULT_MAX_REASONING_BUDGET_TOKENS
+        )
+    } else {
+        "effort-budget=off [configured]".to_string()
+    };
+    let budget = match default_budget {
+        Some(n) => format!("budget={n} [configured]"),
+        None if effort_budget => "budget=auto".to_string(),
+        None => "budget=unlimited".to_string(),
+    };
+    let cutoff = match default_message {
+        Some("") => "cutoff=none [configured]".to_string(),
+        Some(m) => {
+            let trimmed = m.trim().replace('\n', " ");
+            let preview = if trimmed.chars().count() > 48 {
+                let s: String = trimmed.chars().take(45).collect();
+                format!("{s}...")
+            } else {
+                trimmed
+            };
+            format!("cutoff=\"{preview}\" [configured]")
+        }
+        None if effort_budget || default_budget.is_some() => {
+            let trimmed = crate::server::DEFAULT_REASONING_BUDGET_MESSAGE
+                .trim()
+                .replace('\n', " ");
+            format!("cutoff=\"{trimmed}\" [default]")
+        }
+        None => "cutoff=none".to_string(),
+    };
+    format!(
+        "{}{effort}, {budget}, {cutoff}",
+        effort_prefix.unwrap_or_default()
+    )
+}
+
+#[cfg(feature = "cuda")]
+fn format_sampling_banner_line(
+    p: &crate::parser::SamplingParams,
+    from_generation_config: bool,
+) -> String {
+    let tag = if from_generation_config {
+        "[generation_config.json]"
+    } else {
+        "[default]"
+    };
+    if p.temperature == 0.0 {
+        return format!("temp=0.0 (greedy) {tag}");
+    }
+    let mut parts = vec![format!("temp={}", p.temperature)];
+    if p.top_p < 1.0 {
+        parts.push(format!("top_p={}", p.top_p));
+    }
+    if p.top_k > 0 {
+        parts.push(format!("top_k={}", p.top_k));
+    }
+    if p.min_p > 0.0 {
+        parts.push(format!("min_p={}", p.min_p));
+    }
+    if (p.repetition_penalty - 1.0).abs() > f32::EPSILON {
+        parts.push(format!("rep_pen={}", p.repetition_penalty));
+    }
+    if p.presence_penalty.abs() > f32::EPSILON {
+        parts.push(format!("pres_pen={}", p.presence_penalty));
+    }
+    if p.frequency_penalty.abs() > f32::EPSILON {
+        parts.push(format!("freq_pen={}", p.frequency_penalty));
+    }
+    format!("{} {tag}", parts.join(", "))
+}
+
+#[cfg(feature = "cuda")]
+pub(crate) fn format_serve_boot_banner(s: &ServeBootSummary) -> String {
+    let gib = 1024.0 * 1024.0 * 1024.0;
+    let mib = 1024.0 * 1024.0;
+    let kv_desc = match s.kv_policy {
+        KvFormatPolicy::Tq4 if s.supports_fp8_kv => {
+            format!(
+                "tq4 ({:.2}x, rotated TQ4 + FP8 tail)",
+                s.kv_compression_ratio
+            )
+        }
+        KvFormatPolicy::Tq4 => {
+            format!(
+                "tq4 ({:.2}x, rotated TQ4 + Q8_0 tail)",
+                s.kv_compression_ratio
+            )
+        }
+        KvFormatPolicy::Tq4All => "tq4_all (3.88x, 132B/row TQ4 all attention layers)".to_string(),
+        KvFormatPolicy::Fp8 => "fp8 (1.94x, 264B/row hardware E4M3)".to_string(),
+        KvFormatPolicy::Q8_0 => "q8_0 (1.88x, 272B/row)".to_string(),
+        KvFormatPolicy::Fp16 => "fp16 (1.00x, 512B/row)".to_string(),
+        KvFormatPolicy::Bf16 => "bf16 (1.00x, 512B/row)".to_string(),
+    };
+    let kv_mode_tag = if s.kv_policy_auto_adjusted {
+        if s.kv_policy == KvFormatPolicy::Fp16 {
+            "[auto: fp16 fallback for non-256 head_dim]"
+        } else {
+            "[auto: stepped down from tq4 to fit full context]"
+        }
+    } else if s.kv_policy_explicit {
+        "[configured]"
+    } else {
+        "[auto]"
+    };
+    let ctx_pct = if s.max_model_context_tokens > 0 {
+        ((s.context_limit as f64 / s.max_model_context_tokens as f64) * 100.0).round() as usize
+    } else {
+        100
+    };
+    let ctx_mode_tag = if s.context_auto_fitted {
+        format!(
+            "[auto-fit: {}% of {} model max]",
+            ctx_pct, s.max_model_context_tokens
+        )
+    } else {
+        "[configured]".to_string()
+    };
+    let embed_desc = if s.host_embed_offload {
+        format!(
+            "host-mapped ({:.2} GiB VRAM saved) [auto]",
+            s.embed_saved_bytes as f64 / gib
+        )
+    } else {
+        "gpu-resident".to_string()
+    };
+    let ckpt_desc = if s.ckpt_vram_slots + s.ckpt_host_slots > 0 {
+        format!(
+            " + {} WHT128-Q8_0 ckpts ({} VRAM + {} Host, {:.1} MiB/slot)",
+            s.ckpt_vram_slots + s.ckpt_host_slots,
+            s.ckpt_vram_slots,
+            s.ckpt_host_slots,
+            s.ckpt_bytes_per_slot as f64 / mib,
+        )
+    } else {
+        String::new()
+    };
+    let model_line = if s.served_model == s.checkpoint_label {
+        s.served_model.clone()
+    } else {
+        format!("{} ({})", s.served_model, s.checkpoint_label)
+    };
+    let sampling_line = format_sampling_banner_line(
+        &s.default_sampling_params,
+        s.sampling_from_generation_config,
+    );
+    let thinking_line = format_thinking_banner_line(
+        s.default_reasoning_effort.as_deref(),
+        s.reasoning_effort_budget,
+        s.default_reasoning_budget,
+        s.default_reasoning_budget_message.as_deref(),
+    );
+    let lora_line = match s.lora_adapters.len() {
+        0 => String::new(),
+        1 => format!("  LoRA         : {}\n", s.lora_adapters[0]),
+        n => format!(
+            "  LoRA         : {} ({n} adapters)\n",
+            s.lora_adapters.join(", ")
+        ),
+    };
+    let vision_line = s
+        .vision_banner
+        .as_deref()
+        .map(|v| format!("  Vision       : {v}\n"))
+        .unwrap_or_default();
+    format!(
+        concat!(
+            "\n",
+            "                          _____  __ __\n",
+            " _      ______ _________ |__  / / // /\n",
+            "| | /| / / __ `/ ___/ __ \\/_ < / // /_\n",
+            "| |/ |/ / /_/ / /  / /_/ /__/ /__  __/\n",
+            "|__/|__/\\__,_/_/  / .___/____/  /_/    v{}\n",
+            "                 /_/                   Hybrid GDN + Attention + MoE CUDA Engine\n",
+            "\n",
+            "  Model        : {}\n",
+            "{}",
+            "  Hardware     : {}x {} ({}, {} SMs, {:.2} GiB VRAM) [tp={}]\n",
+            "  Speculative  : {}\n",
+            "  Sampling     : {}\n",
+            "  Template     : {} (preserve_thinking={})\n",
+            "  Thinking     : {}\n",
+            "{}",
+            "  KV Cache     : {} {}\n",
+            "  Context      : {} tokens ({} pages, {:.2} GiB/rank) {}\n",
+            "  GDN States   : {} slots ({:.2} GiB/rank, max_num_seqs={}){} [auto-sized]\n",
+            "  Placement    : weights={:.2} GiB, scratch={:.0} MiB, embed={}, free={:.0} MiB\n",
+            "  Endpoint     : http://{} (auth={}, webui={}, cuda_graph={})\n",
+        ),
+        env!("CARGO_PKG_VERSION"),
+        model_line,
+        lora_line,
+        s.tp_size,
+        s.gpu_name,
+        s.gpu_sm_tag,
+        s.gpu_sm_count,
+        s.total_vram_bytes as f64 / gib,
+        s.tp_size,
+        s.speculative_label,
+        sampling_line,
+        s.chat_template_source,
+        s.preserve_thinking,
+        thinking_line,
+        vision_line,
+        kv_desc,
+        kv_mode_tag,
+        s.context_limit,
+        s.kv_pages,
+        s.kv_pool_bytes_per_rank as f64 / gib,
+        ctx_mode_tag,
+        s.state_slots,
+        s.state_pool_bytes_per_rank as f64 / gib,
+        s.max_num_seqs,
+        ckpt_desc,
+        s.weight_bytes_per_rank as f64 / gib,
+        s.scratch_bytes_per_rank as f64 / mib,
+        embed_desc,
+        s.post_load_free_vram_bytes as f64 / mib,
+        s.bind_addr,
+        if s.auth_enabled {
+            "enabled"
+        } else {
+            "disabled"
+        },
+        if s.webui_enabled {
+            "enabled"
+        } else {
+            "disabled"
+        },
+        if s.use_cuda_graph {
+            "enabled"
+        } else {
+            "disabled"
+        },
+    )
+}
+
+#[cfg(feature = "cuda")]
 pub(crate) fn run_serve(
     options: CudaCliOptions,
     policy: KvFormatPolicy,
     spec_config: Option<crate::proposer::SpeculativeConfig>,
 ) -> Result<ExitCode, String> {
     let CudaCliOptions {
-        model,
+        model: raw_model,
         serve,
         resolved_model,
         tp,
         tp_auto,
         tp_explicit,
         host,
+        explicit_host,
         port,
         allow_remote_images,
         kv_format,
+        explicit_kv_format,
         kv_pages,
         use_cuda_graph,
         lora_modules,
+        speculative_choice,
         ..
     } = options;
+    let checkpoint_label = raw_model.clone();
     let model = serve
         .model_name
-        .map(|name| name.trim().to_string())
-        .unwrap_or(model);
+        .map_or(raw_model, |name| name.trim().to_string());
     let max_num_seqs = serve.options.max_num_seqs;
     let max_model_len = serve.options.max_model_len;
     let auth_enabled = serve.options.api_key.is_some();
+    let webui_enabled = serve.options.webui;
     let spec_label = match spec_config.as_ref().map(|s| s.kind) {
-        Some(crate::proposer::SpeculativeKind::Mtp) => format!(
-            "mtp (k={})",
-            spec_config.as_ref().map(|s| s.mtp_k).unwrap_or(3)
-        ),
-        Some(crate::proposer::SpeculativeKind::DFlash2) => "dflash2".to_string(),
+        Some(crate::proposer::SpeculativeKind::Mtp) => {
+            format!("mtp (k={})", spec_config.as_ref().map_or(3, |s| s.mtp_k))
+        }
+        Some(crate::proposer::SpeculativeKind::DFlash2) => {
+            if let Some(draft) = spec_config.as_ref().and_then(|s| s.draft_model.as_deref()) {
+                let p = std::path::Path::new(draft);
+                let draft_short = p
+                    .parent()
+                    .filter(|par| par.file_name().and_then(|n| n.to_str()) == Some("snapshots"))
+                    .and_then(|par| par.parent())
+                    .and_then(|repo| repo.file_name())
+                    .and_then(|n| n.to_str())
+                    .and_then(|n| n.strip_prefix("models--"))
+                    .and_then(|s| s.split_once("--"))
+                    .map_or_else(
+                        || {
+                            p.file_name()
+                                .and_then(|n| n.to_str())
+                                .unwrap_or(draft)
+                                .to_string()
+                        },
+                        |(org, name)| format!("{org}/{name}"),
+                    );
+                format!("dflash2 ({draft_short})")
+            } else {
+                "dflash2".to_string()
+            }
+        }
         None => "none".to_string(),
     };
+    let spec_label = if speculative_choice == SpeculativeChoice::Auto && spec_config.is_some() {
+        format!("{spec_label} [auto]")
+    } else {
+        spec_label
+    };
+    let host = resolve_serve_host(
+        &host,
+        explicit_host,
+        std::env::var("WARP34_HOST").ok().as_deref(),
+    );
     let bind_addr = format!("{host}:{port}");
+    preflight_bind_addr(&bind_addr, port)?;
     if is_qwen_image_model(&resolved_model) {
         if tp_explicit && !tp_auto && !matches!(tp, 1 | 2) {
             return Err("--tp for QwenImage21 models must be 1, 2, or auto".into());
@@ -992,6 +1399,7 @@ pub(crate) fn run_serve(
             }
         );
         let worker_model = resolved_model;
+        let webui_enabled = serve.options.webui;
         let state = crate::server::QwenImage21ServerState::from_loader_with_options(
             model,
             allow_remote_images,
@@ -1006,8 +1414,9 @@ pub(crate) fn run_serve(
             },
         )?;
         println!(
-            "[warp34 serve] QwenImage21 api_auth={} tp={} default_steps={} max_num_seqs={max_num_seqs} (dashboard/metrics/health are public)",
+            "[warp34 serve] QwenImage21 api_auth={} webui={} tp={} default_steps={} max_num_seqs={max_num_seqs}",
             if auth_enabled { "enabled" } else { "disabled" },
+            if webui_enabled { "enabled" } else { "disabled" },
             state.worker.tp_size,
             state.worker.default_steps,
         );
@@ -1015,10 +1424,21 @@ pub(crate) fn run_serve(
             .map_err(|e| format!("server error: {e}"))?;
         return Ok(ExitCode::SUCCESS);
     }
+    let kv_mode_init = if explicit_kv_format {
+        kv_format.clone()
+    } else {
+        format!("{kv_format} (auto)")
+    };
     println!(
-        "[warp34 serve] loading model={model} tp={tp} kv={kv_format} speculative={spec_label} for http://{bind_addr}"
+        "[warp34 serve] loading model={model} tp={tp} kv={kv_mode_init} speculative={spec_label} for http://{bind_addr}"
     );
     let worker_model = resolved_model;
+    let boot_info = std::sync::Arc::new(std::sync::OnceLock::new());
+    let boot_info_loader = std::sync::Arc::clone(&boot_info);
+    let spec_label_loader = spec_label.clone();
+    let checkpoint_label_loader = checkpoint_label.clone();
+    let model_loader = model.clone();
+    let bind_addr_loader = bind_addr.clone();
     let state = crate::server::OpenAiServerState::from_loader_with_options(
         model,
         allow_remote_images,
@@ -1027,10 +1447,11 @@ pub(crate) fn run_serve(
             let pages =
                 ServeCliConfig::effective_kv_pages(kv_pages, max_model_len, spec_config.as_ref());
             let state_slot_seqs = serve_state_slot_seqs(max_num_seqs, spec_config.as_ref());
-            let mut engine = Qwen3_5Engine::load_for_serving_with_speculative_and_lora(
+            let mut engine = Qwen3_5Engine::load_for_serving_with_auto_fit(
                 &worker_model,
                 tp,
                 policy,
+                !explicit_kv_format,
                 pages,
                 use_cuda_graph,
                 state_slot_seqs,
@@ -1039,11 +1460,137 @@ pub(crate) fn run_serve(
             )
             .map_err(|e| e.to_string())?;
             attach_cli_lora(&mut engine, &lora_modules, None, false).map_err(|e| e.to_string())?;
+            if let Some(r0) = engine.ranks.first() {
+                let props = r0.device.props().ok();
+                let (post_free, total_vram) = r0.device.mem_info().unwrap_or((0, 0));
+                let supports_fp8 = engine
+                    .ranks
+                    .iter()
+                    .all(|r| r.device.props().is_ok_and(|p| p.supports_fp8_kv()));
+                let fit = engine.serving_fit;
+                let selected_kv_policy = fit.map_or(policy, |f| f.kv_policy);
+                let (page_bytes, state_bytes) = crate::model::Qwen3_5ModelRank::pool_geometry(
+                    &engine.cfg,
+                    tp,
+                    selected_kv_policy,
+                    supports_fp8,
+                );
+                let (fp16_page_bytes, _) = crate::model::Qwen3_5ModelRank::pool_geometry(
+                    &engine.cfg,
+                    tp,
+                    KvFormatPolicy::Fp16,
+                    false,
+                );
+                let kv_compression_ratio = if page_bytes > 0 {
+                    fp16_page_bytes as f64 / page_bytes as f64
+                } else {
+                    1.0
+                };
+                let max_model_ctx = fit.map_or_else(
+                    || engine.cfg.max_position_embeddings.unwrap_or(262_144),
+                    |f| f.max_model_context_tokens,
+                );
+                let _ =
+                    boot_info_loader.set(ServeBootSummary {
+                        served_model: model_loader,
+                        checkpoint_label: checkpoint_label_loader,
+                        gpu_name: props
+                            .as_ref()
+                            .map_or_else(|| "CUDA GPU".to_string(), |p| p.name.clone()),
+                        gpu_sm_tag: props
+                            .as_ref()
+                            .map_or_else(|| "sm_80+".to_string(), |p| p.sm_tag()),
+                        gpu_sm_count: props.as_ref().map_or(0, |p| p.multi_processor_count),
+                        tp_size: tp,
+                        total_vram_bytes: total_vram,
+                        post_load_free_vram_bytes: post_free,
+                        kv_policy: selected_kv_policy,
+                        supports_fp8_kv: supports_fp8,
+                        kv_compression_ratio,
+                        kv_policy_explicit: explicit_kv_format,
+                        kv_policy_auto_adjusted: fit.is_some_and(|f| f.kv_policy_auto_adjusted),
+                        kv_pages: r0.kv_pool.num_pages,
+                        context_limit: max_model_len
+                            .unwrap_or_else(|| r0.kv_pool.num_pages.saturating_mul(16)),
+                        max_model_context_tokens: max_model_ctx,
+                        context_auto_fitted: kv_pages.is_none() && max_model_len.is_none(),
+                        kv_pool_bytes_per_rank: page_bytes.saturating_mul(r0.kv_pool.num_pages),
+                        state_slots: r0.state_pool.total_slots,
+                        state_pool_bytes_per_rank: state_bytes
+                            .saturating_mul(r0.state_pool.total_slots),
+                        ckpt_vram_slots: r0.checkpoint_pool.as_ref().map_or(0, |c| c.vram_slots),
+                        ckpt_host_slots: r0.checkpoint_pool.as_ref().map_or(0, |c| c.host_slots),
+                        ckpt_bytes_per_slot: r0
+                            .checkpoint_pool
+                            .as_ref()
+                            .map_or(0, |c| c.layout.bundle_bytes),
+                        weight_bytes_per_rank: r0.weight_arena.used(),
+                        scratch_bytes_per_rank: r0.scratch_arena.capacity(),
+                        host_embed_offload: r0.host_embed_tokens.is_some(),
+                        embed_saved_bytes: engine
+                            .cfg
+                            .vocab_size
+                            .saturating_mul(engine.cfg.hidden_size)
+                            .saturating_mul(2),
+                        speculative_label: spec_label_loader,
+                        max_num_seqs,
+                        bind_addr: bind_addr_loader,
+                        auth_enabled,
+                        webui_enabled,
+                        use_cuda_graph,
+                        default_sampling_params:
+                            crate::parser::SamplingParams::from_generation_config_dir(
+                                &engine.model_dir,
+                            ),
+                        sampling_from_generation_config: engine
+                            .model_dir
+                            .join("generation_config.json")
+                            .is_file(),
+                        chat_template_source: String::new(),
+                        preserve_thinking: false,
+                        default_reasoning_effort: None,
+                        reasoning_effort_budget: false,
+                        default_reasoning_budget: None,
+                        default_reasoning_budget_message: None,
+                        vision_banner: engine.cfg.vision_config.as_ref().map(|_| {
+                            let vp = &engine.cfg.vision_preprocessor;
+                            format!(
+                                "{} (patch={}, merge={}, pixels={}..{})",
+                                vp.source_name,
+                                vp.patch_size,
+                                vp.spatial_merge_size,
+                                vp.min_pixels,
+                                vp.max_pixels,
+                            )
+                        }),
+                        lora_adapters: engine
+                            .lora_registry
+                            .entries()
+                            .iter()
+                            .map(|e| e.name.clone())
+                            .collect(),
+                    });
+            }
             Ok(engine)
         },
     )?;
+    if let Some(mut summary) = boot_info.get().cloned() {
+        summary.context_limit = state.worker.max_model_len();
+        summary.default_sampling_params = state.worker.default_sampling_params.clone();
+        summary.chat_template_source = state.worker.chat_template.source_name().to_string();
+        summary.preserve_thinking = state.worker.default_preserve_thinking;
+        summary
+            .default_reasoning_effort
+            .clone_from(&state.default_reasoning_effort);
+        summary.reasoning_effort_budget = state.reasoning_effort_budget;
+        summary.default_reasoning_budget = state.default_reasoning_budget;
+        summary
+            .default_reasoning_budget_message
+            .clone_from(&state.default_reasoning_budget_message);
+        print!("{}", format_serve_boot_banner(&summary));
+    }
     println!(
-        "[warp34 serve] api_auth={} max_num_seqs={max_num_seqs} kv_pool={} tokens context_limit={} tokens (dashboard/metrics/health are public)",
+        "[warp34 serve] api_auth={} max_num_seqs={max_num_seqs} kv_pool={} tokens context_limit={} tokens",
         if auth_enabled { "enabled" } else { "disabled" },
         state.worker.kv_token_capacity,
         state.worker.max_model_len(),
@@ -1080,11 +1627,12 @@ pub(crate) fn run_chat(
         ..
     } = options;
     ensure_llm_model_dir(&model, &resolved_model, "chat")?;
+    let chat_kv_pages = kv_pages.or(Some(1024));
     let mut engine = load_cli_engine_with_lora(
         &resolved_model,
         tp,
         policy,
-        kv_pages,
+        chat_kv_pages,
         use_cuda_graph,
         &spec_config,
         &lora_modules,
@@ -1128,7 +1676,13 @@ pub(crate) fn run_chat(
         content: Some(expanded_prompt),
         reasoning_content: None,
     });
-    let formatted = crate::server::format_chatml_prompt(&msgs, None, enable_thinking);
+    let chat_template = crate::chatml::ChatTemplate::from_model_dir(&engine.model_dir);
+    let mut template_kwargs = serde_json::Map::new();
+    template_kwargs.insert(
+        "enable_thinking".into(),
+        serde_json::Value::Bool(enable_thinking),
+    );
+    let formatted = chat_template.render(&msgs, None, true, &template_kwargs)?;
     let prompt_ids = engine.encode(&formatted).map_err(|e| e.to_string())?;
     let metrics = if sampling.is_custom() {
         let params = sampling.to_sampling_params(max_tokens, &engine.cfg.eos_token_ids);
@@ -1196,17 +1750,14 @@ fn run_chat_repl(
     mut sampling: CliSamplingOptions,
 ) -> Result<ExitCode, String> {
     use std::io::{BufRead, Write};
-    let kv_tokens = engine
-        .ranks
-        .first()
-        .map(|r| r.kv_pool.num_pages * 16)
-        .unwrap_or(0);
+    let kv_tokens = engine.ranks.first().map_or(0, |r| r.kv_pool.num_pages * 16);
     eprintln!(
         "[warp34 chat] model={model} tp={tp} kv={kv_format} ({kv_tokens} tokens) thinking={}\n\
          Interactive multi-turn REPL (MambaRadixCache prefix reuse enabled).\n\
          Commands: /help  /clear  /system <text>  /think [on|off]  /temp <0..2>  /stats  /exit",
         if enable_thinking { "on" } else { "off" }
     );
+    let chat_template = crate::chatml::ChatTemplate::from_model_dir(&engine.model_dir);
     let mut history: Vec<crate::server::ChatMessage> = Vec::new();
     let mut last_stats: Option<(usize, usize, usize, f64, f64)> = None;
     let stdin = std::io::stdin();
@@ -1229,8 +1780,7 @@ fn run_chat_repl(
         if let Some(cmd) = input.strip_prefix('/') {
             let (verb, rest) = cmd
                 .split_once(char::is_whitespace)
-                .map(|(v, r)| (v, r.trim()))
-                .unwrap_or((cmd, ""));
+                .map_or((cmd, ""), |(v, r)| (v, r.trim()));
             match verb {
                 "exit" | "quit" | "q" => break,
                 "help" | "?" => {
@@ -1320,10 +1870,15 @@ fn run_chat_repl(
                 content: Some(input.to_string()),
                 reasoning_content: None,
             });
-            let formatted = crate::server::format_chatml_prompt(&msgs, None, enable_thinking);
+            let mut template_kwargs = serde_json::Map::new();
+            template_kwargs.insert(
+                "enable_thinking".into(),
+                serde_json::Value::Bool(enable_thinking),
+            );
+            let formatted = chat_template.render(&msgs, None, true, &template_kwargs)?;
             let ids = engine.encode(&formatted).map_err(|e| e.to_string())?;
             if kv_tokens > 0
-                && ids.len().saturating_add(max_tokens).saturating_add(4) > kv_tokens
+                && ids.len().saturating_add(max_tokens) > kv_tokens
                 && history.len() >= 2
             {
                 history.drain(0..2);
@@ -1393,8 +1948,164 @@ fn run_chat_repl(
             tool_calls: Vec::new(),
             role: "assistant".to_string(),
             content: Some(assistant_reply),
-            reasoning_content: None,
+            reasoning_content: parsed.reasoning_content,
         });
     }
     Ok(ExitCode::SUCCESS)
+}
+
+/// Minimum matching greedy prefix length required when comparing cold vs warm
+/// vision benchmark runs backed by lossy 8-bit `WHT128-Q8_0` GDN checkpoints.
+/// Long enough (6 consecutive tokens immediately after restore) to catch
+/// corrupted state restores or off-by-one radix prefixes while tolerating
+/// synonym greedy near-ties (e.g. "diagonal stripes" vs "diagonal bands").
+const COMPRESSED_VISION_MIN_PREFIX_TOKENS: usize = 6;
+
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+fn preflight_bind_addr(addr: &str, port: u16) -> Result<(), String> {
+    if port == 0 {
+        return Ok(());
+    }
+    match std::net::TcpListener::bind(addr) {
+        Ok(listener) => {
+            drop(listener);
+            Ok(())
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => Err(format!(
+            "cannot bind {addr}: {e} (is another server already running on port {port}?)"
+        )),
+        Err(e) => Err(format!("cannot bind {addr}: {e}")),
+    }
+}
+
+fn vision_warm_parity_ok(
+    cold_ids: &[i32],
+    warm_ids: &[i32],
+    compressed_checkpoint: bool,
+) -> (bool, usize) {
+    let prefix_match_tokens = cold_ids
+        .iter()
+        .zip(warm_ids)
+        .take_while(|(a, b)| a == b)
+        .count();
+    let exact_parity = cold_ids == warm_ids;
+    let same_len = cold_ids.len() == warm_ids.len();
+    let ok = if compressed_checkpoint {
+        exact_parity
+            || (same_len
+                && prefix_match_tokens >= cold_ids.len().min(COMPRESSED_VISION_MIN_PREFIX_TOKENS))
+    } else {
+        exact_parity
+    };
+    (ok, prefix_match_tokens)
+}
+
+#[cfg(all(test, feature = "cuda"))]
+mod tests {
+    use super::*;
+    use crate::proposer::{SpeculativeConfig, SpeculativeKind};
+
+    #[test]
+    fn select_bench_prompt_seed_picks_custom_realistic_or_synthetic() {
+        assert_eq!(
+            select_bench_prompt_seed("my prompt", true, true),
+            ("custom", "my prompt")
+        );
+        let (kind, corpus) = select_bench_prompt_seed("ignored", false, true);
+        assert_eq!(kind, "realistic");
+        assert!(!corpus.is_empty());
+        assert_eq!(
+            select_bench_prompt_seed("ignored", false, false),
+            ("synthetic", "The quick brown fox jumps over the lazy dog. ")
+        );
+    }
+
+    #[test]
+    fn serve_state_slot_seqs_enforces_dflash2_minimum() {
+        assert_eq!(serve_state_slot_seqs(2, None), 2);
+        let mtp = SpeculativeConfig {
+            kind: SpeculativeKind::Mtp,
+            draft_model: None,
+            mtp_k: 4,
+        };
+        assert_eq!(serve_state_slot_seqs(2, Some(&mtp)), 2);
+        let dflash = SpeculativeConfig {
+            kind: SpeculativeKind::DFlash2,
+            ..mtp
+        };
+        assert_eq!(serve_state_slot_seqs(2, Some(&dflash)), 6);
+        assert_eq!(serve_state_slot_seqs(12, Some(&dflash)), 12);
+    }
+
+    #[test]
+    fn prepare_multimodal_prompt_handles_empty_and_missing_images() {
+        let cfg = crate::loader::ModelConfig::from_json(&serde_json::json!({
+            "architectures": ["Qwen3_5ForConditionalGeneration"],
+            "hidden_size": 1024,
+            "num_hidden_layers": 1,
+            "num_attention_heads": 8,
+            "num_key_value_heads": 2,
+            "head_dim": 128,
+            "vocab_size": 1024,
+            "intermediate_size": 2048
+        }))
+        .unwrap();
+        let (prompt, imgs) =
+            prepare_multimodal_prompt_and_images(&cfg, "hello", &[], false).unwrap();
+        assert_eq!(prompt, "hello");
+        assert!(imgs.is_empty());
+
+        let missing = vec!["/nonexistent/warp34_test_image.png".to_string()];
+        assert!(prepare_multimodal_prompt_and_images(&cfg, "hello", &missing, false).is_err());
+    }
+
+    #[test]
+    fn vision_warm_parity_rejects_early_divergence_and_requires_exact_fp32() {
+        let cold: Vec<i32> = (100..132).collect();
+
+        // Exact match passes in both FP32 and compressed modes.
+        assert_eq!(vision_warm_parity_ok(&cold, &cold, false), (true, 32));
+        assert_eq!(vision_warm_parity_ok(&cold, &cold, true), (true, 32));
+
+        // Early divergence at step 4 (after 4 matching tokens) must fail in BOTH modes.
+        let mut early_div = cold.clone();
+        early_div[4] = 9999;
+        assert_eq!(vision_warm_parity_ok(&cold, &early_div, false), (false, 4));
+        assert_eq!(vision_warm_parity_ok(&cold, &early_div, true), (false, 4));
+
+        // Divergence just before the 6-token threshold (step 5) must also fail.
+        let mut step5_div = cold.clone();
+        step5_div[5] = 9999;
+        assert_eq!(vision_warm_parity_ok(&cold, &step5_div, true), (false, 5));
+
+        // Synonym near-tie divergence (step 7/32) fails FP32 exact mode, passes compressed mode.
+        let mut late_div = cold.clone();
+        late_div[7] = 9999;
+        assert_eq!(vision_warm_parity_ok(&cold, &late_div, false), (false, 7));
+        assert_eq!(vision_warm_parity_ok(&cold, &late_div, true), (true, 7));
+
+        // Length mismatch always fails even when the shared prefix is >= 6 tokens.
+        assert_eq!(vision_warm_parity_ok(&cold, &cold[..24], true), (false, 24));
+    }
+
+    #[test]
+    fn preflight_bind_addr_fails_fast_when_port_in_use() {
+        // Ephemeral port 0 is skipped so OS-assigned ports always pass.
+        assert!(preflight_bind_addr("127.0.0.1:0", 0).is_ok());
+
+        let occupied = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = occupied.local_addr().unwrap().port();
+        let addr = format!("127.0.0.1:{port}");
+
+        let err = preflight_bind_addr(&addr, port).unwrap_err();
+        assert!(
+            err.contains("already running on port") && err.contains(&port.to_string()),
+            "unexpected error: {err}"
+        );
+
+        // Once released, preflight succeeds and leaves the port free for the server.
+        drop(occupied);
+        assert!(preflight_bind_addr(&addr, port).is_ok());
+        assert!(std::net::TcpListener::bind(&addr).is_ok());
+    }
 }

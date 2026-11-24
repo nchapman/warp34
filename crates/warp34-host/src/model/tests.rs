@@ -217,16 +217,28 @@ mod serving_capacity_tests {
             (0, 0)
         );
 
-        // TP=1 (<=1.5 GiB base+KV) and TP=2 with ample VRAM preserve default_hot (104 and 160),
-        // while TP=1 with 4096-page KV reserve uses 96 so MTP-3 keeps k_hot = 192 in VRAM.
-        let (hot_tp1_default, _) = plan_tiered_moe_hot_per_layer(
+        // Uncapped smooth scaling: `plan_tiered_moe_hot_per_layer` fills available VRAM above
+        // fixed overhead (8-aligned) up to `local_experts` rather than artificially capping at
+        // 96/104/160. Plain mode (`native_mtp = false`) frees the unused MTP reserve for more
+        // hot experts.
+        let (hot_tp1_mtp, _) = plan_tiered_moe_hot_per_layer(
             &cfg,
             1,
             19_600 * 1024 * 1024,
             gib + 38 * 1024 * 1024,
             450 * 1024 * 1024,
         );
-        assert_eq!(hot_tp1_default, 104);
+        assert!(hot_tp1_mtp > TIERED_MOE_TP1_COMPACT_KV_DEFAULT_HOT);
+        let (hot_tp1_plain, _) = plan_tiered_moe_hot_per_layer_with_options(
+            &cfg,
+            1,
+            19_600 * 1024 * 1024,
+            gib + 38 * 1024 * 1024,
+            450 * 1024 * 1024,
+            false,
+            0,
+        );
+        assert!(hot_tp1_plain > hot_tp1_mtp);
         let (hot_tp1_4k_kv, _) = plan_tiered_moe_hot_per_layer(
             &cfg,
             1,
@@ -234,7 +246,7 @@ mod serving_capacity_tests {
             2 * gib,
             450 * 1024 * 1024,
         );
-        assert_eq!(hot_tp1_4k_kv, 96);
+        assert!(hot_tp1_4k_kv < hot_tp1_mtp);
 
         let (hot_tp2_default, _) = plan_tiered_moe_hot_per_layer(
             &cfg,
@@ -243,11 +255,20 @@ mod serving_capacity_tests {
             gib + 38 * 1024 * 1024,
             450 * 1024 * 1024,
         );
-        assert_eq!(hot_tp2_default, 160);
+        let (hot_tp2_plain, _) = plan_tiered_moe_hot_per_layer_with_options(
+            &cfg,
+            2,
+            22_500 * 1024 * 1024,
+            gib + 38 * 1024 * 1024,
+            450 * 1024 * 1024,
+            false,
+            0,
+        );
+        assert!(hot_tp2_plain > TIERED_MOE_TP2_DEFAULT_HOT);
+        assert!(hot_tp2_plain > hot_tp2_default);
 
-        // On high-VRAM datacenter GPUs (e.g. 40 GiB / 80 GiB A100 where >= 4 GiB slack remains
-        // after placing all local experts in VRAM), `plan_tiered_moe_hot_per_layer` promotes
-        // `hot_per_layer` to 100% full GPU residency (`512` on TP=1, `256` on TP=2).
+        // On high-VRAM datacenter GPUs (e.g. 40 GiB / 80 GiB A100), `plan_tiered_moe_hot_per_layer`
+        // scales smoothly to 100% full GPU residency (`512` on TP=1, `256` on TP=2).
         let (hot_tp1_a100_80g, _) = plan_tiered_moe_hot_per_layer(&cfg, 1, 70 * gib, 2 * gib, gib);
         assert_eq!(hot_tp1_a100_80g, 512);
         let (hot_tp2_a100_40g, _) = plan_tiered_moe_hot_per_layer(&cfg, 2, 38 * gib, 2 * gib, gib);
@@ -274,8 +295,8 @@ mod serving_capacity_tests {
         );
         assert!(hot_with_dflash < hot_without_dflash);
 
-        // TP=2 at 12288 pages + MTP reserve (~4.3 GiB base+KV+MTP) and 1.2 GiB state pool:
-        // exact 8-aligned hot_per_layer = 104, fitting within 19_600 MiB.
+        // TP=2 at 12288 pages + MTP reserve and 1.2 GiB state pool:
+        // exact 2-aligned hot_per_layer = 102, fitting within 19_600 MiB.
         let base_plus_kv_12k = gib + 1536 * 1024 * 1024 + 1824 * 1024 * 1024;
         let min_state_12k = 1200 * 1024 * 1024;
         let (hot_tp2_12k, reserve_12k) = plan_tiered_moe_hot_per_layer(
@@ -285,7 +306,7 @@ mod serving_capacity_tests {
             base_plus_kv_12k,
             min_state_12k,
         );
-        assert_eq!(hot_tp2_12k, 104);
+        assert_eq!(hot_tp2_12k, 102);
         assert!(base_plus_kv_12k + min_state_12k + reserve_12k <= 19_600 * 1024 * 1024);
 
         // Insufficient VRAM falls back to min_hot (16 on TP=1, 32 on TP=2)
@@ -411,8 +432,34 @@ mod serving_capacity_tests {
             base_plus_kv_8k_tq4,
             min_state_18,
         );
-        assert_eq!(hot_rco_tp2_8k, TIERED_MOE_TP2_DEFAULT_HOT);
+        assert!(hot_rco_tp2_8k >= 176);
         assert!(base_plus_kv_8k_tq4 + min_state_18 + reserve_rco_tp2_8k <= 16_400 * mib);
+    }
+
+    #[test]
+    fn tp2_tiered_moe_stage_capacity_and_compact_scratch() {
+        let cfg = sample_qwen4_exp_config();
+        let gib = 1024usize * 1024 * 1024;
+        assert_eq!(
+            super::super::rank_capacity::select_tiered_moe_stage_capacity_with_bridge(
+                &cfg, 2, 128, true
+            ),
+            super::super::rank_capacity::TIERED_MOE_STAGE_CAPACITY_TP4
+        );
+        assert_eq!(
+            super::super::rank_capacity::select_tiered_moe_stage_capacity_with_bridge(
+                &cfg, 2, 128, false
+            ),
+            super::super::rank_capacity::TIERED_MOE_STAGE_CAPACITY_DEFAULT
+        );
+        assert!(
+            super::super::rank_capacity::should_use_compact_tiered_moe_scratch(
+                &cfg,
+                2,
+                24 * gib,
+                crate::model::LoraCapacityReserve::default(),
+            )
+        );
     }
 
     #[test]
@@ -438,9 +485,9 @@ mod serving_capacity_tests {
             plan_mtp_tiered_moe_hot_experts(1, cfg.num_experts, exp_bytes, full_residency_need - 1),
             MTP_TP1_SERVING_HOT_EXPERTS
         );
-        assert_eq!(
-            plan_mtp_tiered_moe_hot_experts(1, cfg.num_experts, exp_bytes, post_target_free_vram),
-            MTP_TP1_STREAMED_PREFILL_MAX_HOT
+        assert!(
+            plan_mtp_tiered_moe_hot_experts(1, cfg.num_experts, exp_bytes, post_target_free_vram)
+                >= MTP_TP1_STREAMED_PREFILL_MAX_HOT
         );
         assert_eq!(
             plan_mtp_tiered_moe_hot_experts(
@@ -472,10 +519,19 @@ mod serving_capacity_tests {
             cfg.num_experts / 2
         );
 
-        // Stepped degradation under tighter VRAM budgets
+        // Stepped degradation under tighter VRAM budgets (512 MiB partial headroom floor)
+        assert_eq!(
+            plan_mtp_tiered_moe_hot_experts(
+                1,
+                512,
+                exp_bytes,
+                MTP_MEDIUM_HOT_EXPERTS * exp_bytes + MTP_PARTIAL_CACHE_HEADROOM_BYTES
+            ),
+            MTP_MEDIUM_HOT_EXPERTS
+        );
         assert_eq!(
             plan_mtp_tiered_moe_hot_experts(1, 512, exp_bytes, 600 * 1024 * 1024),
-            MTP_MEDIUM_HOT_EXPERTS
+            MTP_COMPACT_HOT_EXPERTS
         );
         assert_eq!(
             plan_mtp_tiered_moe_hot_experts(1, 512, exp_bytes, 300 * 1024 * 1024),
@@ -485,6 +541,210 @@ mod serving_capacity_tests {
             plan_mtp_tiered_moe_hot_experts(1, 32, exp_bytes, 300 * 1024 * 1024),
             MTP_FALLBACK_HOT_EXPERTS
         );
+    }
+
+    #[test]
+    fn tiered_moe_pareto_auto_fit_balances_kv_and_hot_experts_across_cards_and_quants() {
+        use super::super::rank_capacity::{
+            evaluate_serving_kv_candidate_budget, select_tiered_moe_auto_fit_pages,
+            tiered_moe_auto_fit_knee_hot,
+        };
+        let mib = 1024 * 1024;
+        let gib = 1024 * mib;
+        let mut w4_cfg = sample_qwen4_exp_config();
+        w4_cfg.moe_intermediate_size = 512;
+
+        // Build RCO mixed W2/W4 config (63.95 MiB/hot step vs 95.625 MiB W4).
+        let mut rco_targets_w2 = Vec::new();
+        let mut rco_targets_w4 = Vec::new();
+        for layer in 0..48usize {
+            let pat = format!(
+                "re:.*(?<!mtp\\.)layers\\.{layer}\\.mlp\\.experts\\.\\d+\\.(gate_proj|up_proj|down_proj)$"
+            );
+            if (layer + 1).is_multiple_of(4) {
+                rco_targets_w4.push(pat);
+            } else {
+                rco_targets_w2.push(pat);
+            }
+        }
+        let rco_quant_json = serde_json::json!({
+            "quant_method": "compressed-tensors",
+            "format": "pack-quantized",
+            "config_groups": {
+                "w2_g64": {
+                    "format": "pack-quantized",
+                    "targets": rco_targets_w2,
+                    "weights": { "actorder": null, "dynamic": false, "group_size": 64, "num_bits": 2, "strategy": "group", "symmetric": true, "type": "int" }
+                },
+                "w4_g64": {
+                    "format": "pack-quantized",
+                    "targets": rco_targets_w4,
+                    "weights": { "actorder": null, "dynamic": false, "group_size": 64, "num_bits": 4, "strategy": "group", "symmetric": true, "type": "int" }
+                }
+            },
+            "transform_config": {
+                "config_groups": {
+                    "v": {
+                        "head_dim": 64,
+                        "precision": "torch.float32",
+                        "randomize": false,
+                        "requires_grad": false,
+                        "type": "hadamard",
+                        "apply": [
+                            { "ignore": [], "inverse": true, "location": "weight_input", "targets": ["re:.*(?<!mtp\\.)layers\\.\\d+\\.mlp\\.experts\\.\\d+\\.(gate_proj|up_proj|down_proj)$"] },
+                            { "ignore": [], "inverse": false, "location": "input", "targets": ["re:.*(?<!mtp\\.)layers\\.\\d+\\.mlp\\.experts\\.\\d+\\.(gate_proj|up_proj|down_proj)$"] }
+                        ]
+                    }
+                }
+            }
+        });
+        let mut rco_cfg = w4_cfg.clone();
+        rco_cfg.moe_intermediate_size = 512;
+        rco_cfg.quant = crate::loader::ModelConfig::parse_quant(Some(&rco_quant_json)).unwrap();
+
+        let fit_for = |cfg: &ModelConfig, tp: usize, free_vram: usize, native_mtp: bool| {
+            let raw_est = if tp == 1 { 4_150 * mib } else { 2_800 * mib };
+            select_tiered_moe_auto_fit_pages(cfg, tp, 16_384, |pages| {
+                evaluate_serving_kv_candidate_budget(
+                    cfg,
+                    tp,
+                    KvFormatPolicy::Tq4,
+                    false,
+                    pages,
+                    raw_est,
+                    256 * mib,
+                    8 * mib,
+                    free_vram,
+                    64,
+                    native_mtp,
+                    true,
+                    false,
+                    0,
+                    0,
+                    LoraCapacityReserve::default(),
+                    true,
+                )
+            })
+        };
+
+        // 1. 24 GiB TP=1 W4 (Plain & MTP-3): selects 128K (8,192 pages) coding-agent ideal
+        //    instead of wasting 1.58 GiB on 262K, and Plain gets more hot experts than MTP-3.
+        let (p_24_tp1_w4_plain, _, _, h_24_tp1_w4_plain) =
+            fit_for(&w4_cfg, 1, 24 * gib, false).expect("24 GiB TP=1 W4 Plain");
+        let (p_24_tp1_w4_mtp, _, _, h_24_tp1_w4_mtp) =
+            fit_for(&w4_cfg, 1, 24 * gib, true).expect("24 GiB TP=1 W4 MTP");
+        assert_eq!(p_24_tp1_w4_plain, TIERED_MOE_AUTO_FIT_IDEAL_KV_PAGES);
+        assert_eq!(p_24_tp1_w4_mtp, TIERED_MOE_AUTO_FIT_IDEAL_KV_PAGES);
+        assert!(h_24_tp1_w4_plain > h_24_tp1_w4_mtp);
+        assert!(h_24_tp1_w4_mtp >= 112);
+
+        // 2. 24 GiB TP=1 RCO (Plain & MTP-3): 128K KV + ~2x more hot experts than old 96 cap!
+        let (p_24_tp1_rco_plain, _, _, h_24_tp1_rco_plain) =
+            fit_for(&rco_cfg, 1, 24 * gib, false).expect("24 GiB TP=1 RCO Plain");
+        assert_eq!(p_24_tp1_rco_plain, TIERED_MOE_AUTO_FIT_IDEAL_KV_PAGES);
+        assert!(h_24_tp1_rco_plain >= 192);
+
+        // 3. 24 GiB TP=2 RCO (Plain & MTP-3): exceeds the 75% Pareto knee (192/256) even at
+        //    262K, so it unlocks BOTH 262K KV and >= 75% hot experts!
+        let knee_tp2 = tiered_moe_auto_fit_knee_hot(&rco_cfg, 2);
+        assert_eq!(knee_tp2, 192);
+        let (p_24_tp2_rco_plain, _, _, h_24_tp2_rco_plain) =
+            fit_for(&rco_cfg, 2, 24 * gib, false).expect("24 GiB TP=2 RCO Plain");
+        let (p_24_tp2_rco_mtp, _, _, h_24_tp2_rco_mtp) =
+            fit_for(&rco_cfg, 2, 24 * gib, true).expect("24 GiB TP=2 RCO MTP");
+        assert_eq!(p_24_tp2_rco_plain, 16_384);
+        assert!(h_24_tp2_rco_plain >= knee_tp2);
+        assert_eq!(p_24_tp2_rco_mtp, 16_384);
+        assert!(h_24_tp2_rco_mtp >= knee_tp2);
+
+        // 4. 16 GiB TP=1 RCO Plain: fits 128K coding-agent baseline while staying above the
+        //    64-expert CPU-bridge cliff.
+        let (p_16_tp1_rco_plain, _, _, h_16_tp1_rco_plain) =
+            fit_for(&rco_cfg, 1, 15_600 * mib, false).expect("16 GiB TP=1 RCO Plain");
+        assert_eq!(p_16_tp1_rco_plain, TIERED_MOE_AUTO_FIT_IDEAL_KV_PAGES);
+        assert!(h_16_tp1_rco_plain >= 64);
+
+        // 5. 16 GiB TP=1 W4 (8 state slots): Plain fits 128K with >= 64 hot, and under tighter
+        //    headroom where 128K would drop below the 64-expert CPU-bridge cliff, Tier 3a steps
+        //    KV down to <= 64K to keep the CPU bridge active (>= 64 hot).
+        let (p_16_tp1_w4_plain, _, _, h_16_tp1_w4_plain) =
+            select_tiered_moe_auto_fit_pages(&w4_cfg, 1, 16_384, |pages| {
+                evaluate_serving_kv_candidate_budget(
+                    &w4_cfg,
+                    1,
+                    KvFormatPolicy::Tq4,
+                    false,
+                    pages,
+                    4_150 * mib,
+                    256 * mib,
+                    8 * mib,
+                    15_600 * mib,
+                    8,
+                    false,
+                    true,
+                    false,
+                    0,
+                    0,
+                    LoraCapacityReserve::default(),
+                    true,
+                )
+            })
+            .expect("16 GiB TP=1 W4 Plain");
+        assert_eq!(p_16_tp1_w4_plain, TIERED_MOE_AUTO_FIT_IDEAL_KV_PAGES);
+        assert!(h_16_tp1_w4_plain >= 64);
+    }
+
+    #[test]
+    fn tiered_moe_pareto_auto_fit_protects_64k_floor_and_compact_fallback() {
+        use crate::model::rank_capacity::select_tiered_moe_auto_fit_pages;
+
+        let w4_cfg = sample_qwen4_exp_config();
+
+        // Direct deterministic verification of Tier 2 ([64K..128K] cliff avoidance),
+        // floor protection (never crushing context below 64K just to chase hot=64), and Tier 3.
+        let (p_mid, _, _, h_mid) = select_tiered_moe_auto_fit_pages(&w4_cfg, 1, 16_384, |pages| {
+            let hot = if pages > 6_144 { 56 } else { 64 };
+            Some((8, true, hot))
+        })
+        .expect("Tier 2 intermediate 96K cliff avoidance");
+        assert_eq!(p_mid, 6_144);
+        assert_eq!(h_mid, 64);
+
+        let (p_cliff, _, _, h_cliff) =
+            select_tiered_moe_auto_fit_pages(&w4_cfg, 1, 16_384, |pages| {
+                let hot = if pages > TIERED_MOE_AUTO_FIT_FLOOR_KV_PAGES {
+                    56
+                } else {
+                    64
+                };
+                Some((8, true, hot))
+            })
+            .expect("Tier 2 64K floor cliff avoidance");
+        assert_eq!(p_cliff, TIERED_MOE_AUTO_FIT_FLOOR_KV_PAGES);
+        assert_eq!(h_cliff, 64);
+
+        let (p_no_crush, _, _, h_no_crush) =
+            select_tiered_moe_auto_fit_pages(&w4_cfg, 1, 16_384, |pages| {
+                // hot=64 only fits at <= 8K; planner must NOT crush context to 8K and instead
+                // keeps 128K usable context at hot=56 via Tier 3.
+                let hot = if pages <= 512 { 64 } else { 56 };
+                Some((8, true, hot))
+            })
+            .expect("Never crush context below 64K to chase hot=64");
+        assert_eq!(p_no_crush, TIERED_MOE_AUTO_FIT_IDEAL_KV_PAGES);
+        assert_eq!(h_no_crush, 56);
+
+        let (p_compact, _, _, h_compact) =
+            select_tiered_moe_auto_fit_pages(&w4_cfg, 1, 16_384, |pages| {
+                if pages <= 2_048 {
+                    Some((4, true, 16))
+                } else {
+                    None
+                }
+            })
+            .expect("Tier 3 compact fallback");
+        assert_eq!(p_compact, 2_048);
+        assert_eq!(h_compact, 16);
     }
 
     #[test]
@@ -548,6 +808,32 @@ mod serving_capacity_tests {
         )
         .expect("tiered 2048-token scratch layout");
         assert!(tiered_2k_scratch_bytes <= tiered_bytes);
+        for (tp, min_expected) in [(1usize, 3840usize), (2usize, 6016usize)] {
+            let streams = tiered_cfg.hc_count.max(1);
+            let cap_512m = crate::model::scratch::token_capacity_up_to(
+                crate::scheduler::DEFAULT_SCRATCH_ARENA_BYTES,
+                tiered_cfg.hidden_size,
+                tiered_cfg.vocab_size / tp,
+                16,
+                256,
+                |tokens| {
+                    let hc_extra = tokens * (streams - 1) * tiered_cfg.hidden_size * 2
+                        + tokens * streams * 4
+                        + 512;
+                    let transform = (tokens * (tiered_cfg.hidden_size.div_ceil(128) * 128) * 2
+                        + 512)
+                        .saturating_sub(8 * 1024 * 1024);
+                    crate::model::layer_scratch_layout(&tiered_cfg, tp, tokens)
+                        .ok()
+                        .map(|l| l.0 + hc_extra + transform)
+                },
+            )
+            .expect("tiered 512 MiB token capacity");
+            assert!(
+                cap_512m >= min_expected,
+                "expected >= {min_expected} tokens on TP={tp}, got {cap_512m}"
+            );
+        }
         let mut sched = SchedulerConfig::default();
         sched.clamp_for_scratch_bytes(tiered_bytes);
         assert_eq!(
@@ -677,6 +963,302 @@ mod serving_capacity_tests {
             ),
             DEFAULT_TARGET_KV_PAGES
         );
+    }
+
+    #[test]
+    fn evaluate_serving_kv_candidate_budget_distinguishes_tq4_and_tq4_all_at_256k() {
+        use super::super::rank_capacity::evaluate_serving_kv_candidate_budget;
+        let mib = 1024 * 1024;
+        let mut cfg = sample_qwen4_exp_config();
+        cfg.num_experts = 0;
+        cfg.tie_word_embeddings = false;
+        cfg.vocab_size = 248_320;
+        cfg.hidden_size = 5120;
+        cfg.num_hidden_layers = 64;
+        cfg.indexer_n_heads = 0;
+        cfg.ple_layer_ids.clear();
+        cfg.num_key_value_heads = 4;
+        cfg.head_dim = 256;
+        cfg.linear_num_key_heads = 16;
+        cfg.linear_num_value_heads = 48;
+        cfg.linear_key_head_dim = 128;
+        cfg.linear_value_head_dim = 128;
+        cfg.linear_conv_kernel_dim = 4;
+        cfg.layer_types = (0..64)
+            .map(|i| {
+                if i % 4 == 3 {
+                    LayerKind::FullAttention
+                } else {
+                    LayerKind::LinearAttention
+                }
+            })
+            .collect();
+
+        // Real Qwen3.8-27B-W4A16-HGPTQ on-disk weight arena estimate (13.31 GiB body + 2.37 GiB embed)
+        let raw_est = 16_056 * mib;
+        let staging = 256 * mib;
+        let marlin_ws = 8 * mib;
+        let free_24g = 24_148 * mib;
+        let dflash_reserve = 2_150 * mib;
+        let dflash_min_slots = 11usize; // real M=8 DFlash2 minimum (block_size + 3)
+
+        // 1. On 1x 24 GiB with 27B + DFlash2 + vision, 256K (16,384 pages) does not fit in
+        //    Tq4 with required GDN state slots + 1.5 GiB lazy ViT headroom, but fits in
+        //    Tq4All with >= SINGLE_GPU_DFLASH2_MIN_STATE_SLOTS state slots and host-mapped
+        //    embed_tokens.
+        assert_eq!(
+            evaluate_serving_kv_candidate_budget(
+                &cfg,
+                1,
+                KvFormatPolicy::Tq4,
+                false,
+                16_384,
+                raw_est,
+                staging,
+                marlin_ws,
+                free_24g,
+                60,
+                false,
+                false,
+                true,
+                dflash_reserve,
+                dflash_min_slots,
+                LoraCapacityReserve::default(),
+                true,
+            ),
+            None
+        );
+        let (slots_tq4_all, host_embed, _) = evaluate_serving_kv_candidate_budget(
+            &cfg,
+            1,
+            KvFormatPolicy::Tq4All,
+            false,
+            16_384,
+            raw_est,
+            staging,
+            marlin_ws,
+            free_24g,
+            60,
+            false,
+            false,
+            true,
+            dflash_reserve,
+            dflash_min_slots,
+            LoraCapacityReserve::default(),
+            true,
+        )
+        .expect("27B + DFlash2 must fit 256K in Tq4All on 24 GiB");
+        assert!(slots_tq4_all >= dflash_min_slots);
+        assert!(host_embed);
+
+        // 2. When --kv-format tq4 is explicitly pinned, 27B + DFlash2 + vision still fits
+        //    >= 196K (12,288 pages) on 24 GiB while preserving lazy ViT headroom.
+        let (slots_tq4_196k, host_embed_196k, _) = evaluate_serving_kv_candidate_budget(
+            &cfg,
+            1,
+            KvFormatPolicy::Tq4,
+            false,
+            12_288,
+            raw_est,
+            staging,
+            marlin_ws,
+            free_24g,
+            60,
+            false,
+            false,
+            true,
+            dflash_reserve,
+            dflash_min_slots,
+            LoraCapacityReserve::default(),
+            true,
+        )
+        .expect("27B + DFlash2 with explicit Tq4 must fit 196K + ViT headroom on 24 GiB");
+        assert!(slots_tq4_196k >= dflash_min_slots);
+        assert!(host_embed_196k);
+
+        // 3. Without DFlash2 (27B Plain), 256K (16,384 pages) fits directly in Tq4.
+        let (slots_plain, _, _) = evaluate_serving_kv_candidate_budget(
+            &cfg,
+            1,
+            KvFormatPolicy::Tq4,
+            false,
+            16_384,
+            raw_est,
+            staging,
+            marlin_ws,
+            free_24g,
+            8,
+            false,
+            false,
+            true,
+            0,
+            0,
+            LoraCapacityReserve::default(),
+            true,
+        )
+        .expect("27B Plain must fit 256K in Tq4 on 24 GiB");
+        assert!(slots_plain >= 4);
+    }
+
+    #[test]
+    fn serving_auto_planner_sme_invariants() {
+        use super::super::rank_capacity::{
+            HOST_EMBED_GPU_RESIDENCY_MIN_SLACK_BYTES, MIN_BOOT_MARGIN_BYTES,
+            evaluate_serving_kv_candidate_budget, plan_host_embed_with_serving_budget,
+            target_pool_geometry,
+        };
+        let mib = 1024 * 1024;
+        let gib = 1024 * mib;
+
+        // C1: LoRA scratch sizing stays aligned with `attach_lora_adapters` even at >= 128K on 64L TP=1.
+        let mut dense_64l = sample_qwen4_exp_config();
+        dense_64l.num_experts = 0;
+        dense_64l.num_hidden_layers = 64;
+        dense_64l.indexer_n_heads = 0;
+        dense_64l.ple_layer_ids.clear();
+        let midloop_lora = LoraCapacityReserve {
+            device_bytes_per_rank: 64 * mib,
+            has_midloop: true,
+            requires_atomic_prefix: false,
+        };
+        let std_lora = LoraCapacityReserve {
+            device_bytes_per_rank: 64 * mib,
+            has_midloop: false,
+            requires_atomic_prefix: false,
+        };
+        assert_eq!(
+            plan_scratch_arena_bytes_with_lora(&dense_64l, 1, 14 * gib, Some(16_384), midloop_lora),
+            960 * mib
+        );
+        assert_eq!(
+            plan_scratch_arena_bytes_with_lora(&dense_64l, 1, 14 * gib, Some(16_384), std_lora),
+            crate::scheduler::TIERED_MOE_SCRATCH_ARENA_BYTES
+        );
+
+        // C2: Tiered MoE + DFlash2 (M=16 -> 19 min state slots) succeeds on TP=2 without
+        // capping `effective_requested_state_slots` below `dflash_min_state_slots` or
+        // double-charging `dflash_reserve_bytes`.
+        let tiered_cfg = sample_qwen4_exp_config();
+        let (slots_tiered_tp2, _, _) = evaluate_serving_kv_candidate_budget(
+            &tiered_cfg,
+            2,
+            KvFormatPolicy::Tq4,
+            false,
+            1024,
+            12 * gib,
+            256 * mib,
+            8 * mib,
+            40 * gib,
+            64,
+            false,
+            false,
+            false,
+            2_400 * mib,
+            19,
+            LoraCapacityReserve::default(),
+            true,
+        )
+        .expect("TP=2 tiered MoE + DFlash2 M=16 (19 slots) must fit on 40 GiB");
+        assert!(slots_tiered_tp2 >= 19);
+        // C2b: TP=1 tiered MoE + DFlash2 (`dflash_min_state_slots = 11`) must reserve at
+        // least `dflash_min_state_slots` ahead of `RankTieredMoe` hot-expert placement even
+        // when `PLE_OR_LARGE_MODEL_DEFAULT_STATE_SLOTS` (8) or `requested_state_slots` is lower.
+        assert_eq!(
+            super::rank_capacity::tiered_moe_min_state_slots_for_budget(
+                1,
+                false,
+                2048,
+                8,
+                2_400 * mib,
+                11
+            ),
+            11
+        );
+        assert_eq!(
+            super::rank_capacity::tiered_moe_min_state_slots_for_budget(
+                1,
+                false,
+                8192,
+                20,
+                2_400 * mib,
+                11
+            ),
+            11
+        );
+        let (slots_tiered_tp1, _, _) = evaluate_serving_kv_candidate_budget(
+            &tiered_cfg,
+            1,
+            KvFormatPolicy::Tq4,
+            false,
+            2048,
+            4 * gib,
+            256 * mib,
+            8 * mib,
+            24 * gib,
+            8,
+            false,
+            false,
+            true,
+            2_400 * mib,
+            11,
+            LoraCapacityReserve::default(),
+            true,
+        )
+        .expect("TP=1 tiered MoE + DFlash2 (11 slots) must fit on 24 GiB even when requested_state_slots=8");
+        assert!(slots_tiered_tp1 >= 11);
+
+        // C3: `plan_host_embed_with_serving_budget` accounts for double-buffered `PinnedUploadRing`
+        // (2 * staging_bytes) in boot_need.
+        let mut untied = dense_64l.clone();
+        untied.tie_word_embeddings = false;
+        untied.vocab_size = 248_320;
+        untied.hidden_size = 5120;
+        let staging = 512 * mib;
+        let scratch = 512 * mib;
+        let est_weights = 16 * gib;
+        // Free VRAM fits 1x staging + slack, but NOT 2x staging + slack -> must offload embed.
+        let free_just_under_2x_staging = est_weights
+            + scratch
+            + staging
+            + MIN_BOOT_MARGIN_BYTES
+            + HOST_EMBED_GPU_RESIDENCY_MIN_SLACK_BYTES
+            + 64 * mib;
+        let (_, use_host_embed) = plan_host_embed_with_serving_budget(
+            &untied,
+            est_weights,
+            scratch,
+            staging,
+            free_just_under_2x_staging,
+            0,
+            None,
+            None,
+        );
+        assert!(
+            use_host_embed,
+            "boot_need must account for 2 * staging_bytes in PinnedUploadRing"
+        );
+
+        // I4: QSA indexer KV geometry includes +8 padding on raw tokens (matching `KvPool::init_qsa_indexer_caches`).
+        let mut qsa_only = sample_qwen4_exp_config();
+        qsa_only.layer_types = vec![LayerKind::FullAttention];
+        qsa_only.num_hidden_layers = 1;
+        qsa_only.num_key_value_heads = 1;
+        qsa_only.head_dim = 256;
+        qsa_only.indexer_n_heads = 1;
+        qsa_only.indexer_kv_heads = 1;
+        qsa_only.indexer_head_dim = 128;
+        qsa_only.indexer_compress_ratio = 4;
+        let (page_with_qsa, _) = target_pool_geometry(&qsa_only, 1, KvFormatPolicy::Fp16);
+        let mut no_qsa = qsa_only.clone();
+        no_qsa.indexer_n_heads = 0;
+        let (page_without_qsa, _) = target_pool_geometry(&no_qsa, 1, KvFormatPolicy::Fp16);
+        let expected_qsa_bytes = (16 * (128 + 8) + 4 * 128) * 2;
+        assert_eq!(page_with_qsa - page_without_qsa, expected_qsa_bytes);
+
+        // `clamp_state_slots` must never panic when `requested < MIN_ACTIVE_STATE_SLOTS`.
+        assert_eq!(clamp_state_slots(1, 10 * gib, gib, 128 * mib), 1);
+        assert_eq!(clamp_state_slots(2, 10 * gib, gib, 128 * mib), 2);
+        assert_eq!(clamp_state_slots(0, 10 * gib, gib, 128 * mib), 0);
     }
 
     #[test]
@@ -973,8 +1555,8 @@ mod serving_capacity_tests {
             .count();
         let qsa = full
             * cfg.indexer_kv_heads
-            * (16 + 16 / cfg.indexer_compress_ratio)
-            * cfg.indexer_head_dim
+            * (16 * (cfg.indexer_head_dim + 8)
+                + (16 / cfg.indexer_compress_ratio) * cfg.indexer_head_dim)
             * 2;
         let ple = cfg.ple_layer_ids.len() * cfg.hc_count * cfg.hidden_size * 18;
         assert_eq!(tp_page, (page - qsa) / 2 + qsa);
@@ -1160,9 +1742,11 @@ mod serving_capacity_tests {
         tied_cfg.tie_word_embeddings = true;
         let tp1_tied =
             Qwen3_5ModelRank::estimate_weight_arena_bytes(&tied_cfg, &archive, 1, Some(128));
-        assert_eq!(
-            tp1_bytes, tp1_tied,
-            "untied (host_embed_tokens + GPU lm_head.weight) and tied (GPU embed_tokens) must use identical weight_arena bytes"
+        // Untied quantized tiered-MoE online-quantizes `lm_head.weight` (`BF16 -> MarlinW8A16`,
+        // saving ~596 MiB vs FP16 `embed_tokens` in the tied configuration).
+        assert!(
+            tp1_tied > tp1_bytes && tp1_tied - tp1_bytes >= 580 * 1024 * 1024,
+            "expected untied MarlinW8A16 lm_head to save >=580 MiB vs tied FP16 embed_tokens (untied={tp1_bytes}, tied={tp1_tied})"
         );
     }
 
@@ -1349,5 +1933,178 @@ mod serving_capacity_tests {
             .copy_to_host(&mut h_prerot_after, &stream)
             .unwrap();
         assert_eq!(h_prerot_after, h_prerot_before);
+    }
+
+    #[test]
+    fn tp1_tiered_moe_dflash2_caps_state_slots_for_graph_headroom() {
+        let mib = 1024 * 1024;
+        let gib = 1024 * mib;
+        let tiered_cfg = sample_qwen4_exp_config();
+        // On a 24 GiB TP=1 card with Qwen3.8-Flash-Next + DFlash2 (`M=8`, `min_slots=11`),
+        // `evaluate_serving_kv_candidate_budget` must cap serving GDN state slots to `<= 16`
+        // (`2 * 8` full concurrent DFlash2 verify sequences) rather than filling up to `19-20`
+        // slots and starving CUDA Graph instantiation (`m_verify = 1..=8`, ~28 MiB/shape).
+        let (slots_tp1_m8, _, _) = super::rank_capacity::evaluate_serving_kv_candidate_budget(
+            &tiered_cfg,
+            1,
+            KvFormatPolicy::Tq4,
+            false,
+            8192,
+            3_560 * mib,
+            512 * mib,
+            8 * mib,
+            23_600 * mib,
+            64,
+            false,
+            false,
+            false,
+            520 * mib,
+            11,
+            LoraCapacityReserve::default(),
+            true,
+        )
+        .expect("TP=1 tiered MoE + DFlash2 M=8 must fit on 24 GiB");
+        assert!(
+            (11..=16).contains(&slots_tp1_m8),
+            "expected TP=1 DFlash2 M=8 state slots in 11..=16 to preserve CUDA Graph VRAM headroom, got {slots_tp1_m8}"
+        );
+
+        // Multimodal `qwen4_exp` (`archive_has_vision = true`) must reserve enough extra headroom
+        // (`>= 120 MiB` above the 200 MiB baseline, i.e. `>= 320 MiB` total covering
+        // `Qwen3VisionEncoder::try_load` peak ~262–294 MiB + ViT workspace) to reject a tight
+        // budget where text-only (`archive_has_vision = false`) still fits, while fitting 131K
+        // (`8,192` pages) and `hot_per_layer >= 128` on a 24 GiB TP=1 card.
+        let (slots_tp1_m8_vis, _, hot_tp1_m8_vis) =
+            super::rank_capacity::evaluate_serving_kv_candidate_budget(
+                &tiered_cfg,
+                1,
+                KvFormatPolicy::Tq4,
+                false,
+                8192,
+                3_560 * mib,
+                512 * mib,
+                8 * mib,
+                23_600 * mib,
+                64,
+                false,
+                false,
+                true,
+                512 * mib,
+                11,
+                LoraCapacityReserve::default(),
+                true,
+            )
+            .expect("TP=1 multimodal tiered MoE + DFlash2 M=8 must fit 131K on 24 GiB");
+        assert!(
+            (11..=16).contains(&slots_tp1_m8_vis),
+            "expected multimodal TP=1 DFlash2 M=8 state slots in 11..=16, got {slots_tp1_m8_vis}"
+        );
+        assert!(
+            hot_tp1_m8_vis >= 126,
+            "expected multimodal TP=1 hot_per_layer >= 126, got {hot_tp1_m8_vis}"
+        );
+        // Behavioral verification: compare the minimum VRAM (`min_mib`) needed with
+        // `archive_has_vision = true` vs `false` inside the `[20 GiB, 28 GiB)` 24 GiB card band,
+        // proving `archive_has_vision = true` enforces `>= 120 MiB` extra headroom (`>= 320 MiB`
+        // total reserve above the 200 MiB baseline).
+        let min_fit_mib = |has_vis: bool| {
+            let mut lo = 20_500usize;
+            let mut hi = 28_000usize;
+            while lo < hi {
+                let mid = (lo + hi) / 2;
+                if super::rank_capacity::evaluate_serving_kv_candidate_budget(
+                    &tiered_cfg,
+                    1,
+                    KvFormatPolicy::Tq4,
+                    false,
+                    8192,
+                    16_500 * mib,
+                    512 * mib,
+                    8 * mib,
+                    mid * mib,
+                    64,
+                    false,
+                    false,
+                    has_vis,
+                    512 * mib,
+                    11,
+                    LoraCapacityReserve::default(),
+                    true,
+                )
+                .is_some()
+                {
+                    hi = mid;
+                } else {
+                    lo = mid + 1;
+                }
+            }
+            lo
+        };
+        let min_txt_mib = min_fit_mib(false);
+        let min_vis_mib = min_fit_mib(true);
+        assert!(
+            min_vis_mib >= min_txt_mib + 120,
+            "expected multimodal reserve to require >= 120 MiB above text-only floor (txt={min_txt_mib} MiB, vis={min_vis_mib} MiB)"
+        );
+
+        // When `dflash_min_state_slots` is larger (e.g. `M=16` -> `19` slots on >= 40 GiB),
+        // `.max(dflash_min_state_slots)` must still honor the drafter's minimum requirement.
+        let (slots_tp1_m16, _, _) = super::rank_capacity::evaluate_serving_kv_candidate_budget(
+            &tiered_cfg,
+            1,
+            KvFormatPolicy::Tq4,
+            false,
+            8192,
+            3_560 * mib,
+            512 * mib,
+            8 * mib,
+            40 * gib,
+            64,
+            false,
+            false,
+            false,
+            2_400 * mib,
+            19,
+            LoraCapacityReserve::default(),
+            true,
+        )
+        .expect("TP=1 tiered MoE + DFlash2 M=16 must fit on 40 GiB");
+        assert_eq!(slots_tp1_m16, 19);
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn graph_launch_failure_clears_sticky_cuda_last_error() {
+        let _dev = CudaDevice::set_current(0).unwrap();
+        let stream = CudaStream::new(0).unwrap();
+        let ex = stream.exec(0, 0);
+        // Trigger a non-zero return from `warp34_graph_launch` (simulating OOM / invalid handle
+        // during speculative CUDA Graph capture/launch fallback).
+        // SAFETY: `0` is intentionally invalid and handled by CUDA runtime; `stream.handle` is live.
+        let launch_rc = unsafe { ffi::warp34_graph_launch(0, stream.handle) };
+        assert_ne!(launch_rc, 0);
+
+        // An immediately following eager kernel that inspects `cudaGetLastError()` must NOT
+        // fail due to a sticky error left behind by `warp34_graph_launch`.
+        let d_in = DeviceBuffer::alloc(0, 256 * 2).unwrap();
+        let d_out = DeviceBuffer::alloc(0, 4 * 256 * 2).unwrap();
+        d_in.copy_from_host(&vec![0u16; 256], &stream).unwrap();
+        // SAFETY: `d_in` (`[1, 256]`) and `d_out` (`[1, 4, 256]`) are live device buffers.
+        let eager_rc = unsafe {
+            ffi::warp34_hc_init_streams_f16(
+                &ex,
+                d_in.addr() as *const std::ffi::c_void,
+                d_out.addr() as *mut std::ffi::c_void,
+                std::ptr::null(),
+                1,
+                4,
+                256,
+            )
+        };
+        assert_eq!(
+            eager_rc, 0,
+            "sticky CUDA runtime error from failed graph launch poisoned subsequent eager kernel"
+        );
+        stream.synchronize().unwrap();
     }
 }

@@ -75,6 +75,48 @@ fn warmup_norms(
                     "warmup warp34_fused_add_gemma_rms_norm_tap_hadamard_f16",
                 )?;
             }
+            if byte_off == 0 && (hs & 511) == 0 && hs <= 12288 {
+                check_rc(
+                    // SAFETY: Warmup arena buffers are 16-byte aligned and sized for this launch.
+                    unsafe {
+                        ffi::warp34_gemma_rms_norm_hadamard512_f16(
+                            ex,
+                            buf_a as *const c_void,
+                            buf_b as *const c_void,
+                            buf_c as *mut c_void,
+                            buf_ws as *mut c_void,
+                            core::ptr::null(),
+                            1,
+                            hs,
+                            1e-6,
+                        )
+                    },
+                    "warmup warp34_gemma_rms_norm_hadamard512_f16",
+                )?;
+                if hs <= 6144 {
+                    check_rc(
+                        // SAFETY: Warmup arena buffers are 16-byte aligned and sized for this launch.
+                        unsafe {
+                            ffi::warp34_fused_add_gemma_rms_norm_tap_hadamard512_f16(
+                                ex,
+                                buf_a as *const c_void,
+                                buf_b as *mut c_void,
+                                buf_c as *const c_void,
+                                buf_d as *mut c_void,
+                                buf_ws as *mut c_void,
+                                core::ptr::null_mut(),
+                                core::ptr::null(),
+                                1,
+                                hs,
+                                1e-6,
+                                0,
+                                0,
+                            )
+                        },
+                        "warmup warp34_fused_add_gemma_rms_norm_tap_hadamard512_f16",
+                    )?;
+                }
+            }
         }
     }
     Ok(())
@@ -97,8 +139,7 @@ pub fn prepare_execution_plan(device_id: i32) -> Result<()> {
     let bit = u32::try_from(device_id)
         .ok()
         .filter(|&d| d < 64)
-        .map(|d| 1u64 << d)
-        .unwrap_or(0);
+        .map_or(0, |d| 1u64 << d);
     if bit != 0 && (WARMED_LLM_BITS.load(std::sync::atomic::Ordering::Acquire) & bit) != 0 {
         return dev.synchronize();
     }
@@ -128,7 +169,9 @@ pub fn prepare_execution_plan(device_id: i32) -> Result<()> {
 
     // HGPTQ input transforms are independent of GEMM and must be resident before
     // any rank enters graph capture or a collective warmup barrier.
-    for block_size in [16, 64] {
+    for block_size in [16, 64, 128, 512] {
+        let k_warm = 512;
+        let padded_k_warm = 1024;
         for had_fn in [
             ffi::warp34_block_hadamard_f16,
             ffi::warp34_block_hadamard_bf16,
@@ -139,15 +182,21 @@ pub fn prepare_execution_plan(device_id: i32) -> Result<()> {
                     buf_a as *const c_void,
                     buf_b as *mut c_void,
                     2,
-                    128,
-                    192,
+                    k_warm,
+                    padded_k_warm,
                     block_size,
                 ),
                 "warmup warp34_block_hadamard"
             )?;
         }
         warmup_ffi!(
-            ffi::warp34_block_hadamard_inplace_f16(&ex, buf_b as *mut c_void, 2, 128, block_size),
+            ffi::warp34_block_hadamard_inplace_f16(
+                &ex,
+                buf_b as *mut c_void,
+                2,
+                k_warm,
+                block_size
+            ),
             "warmup warp34_block_hadamard_inplace_f16"
         )?;
     }
@@ -280,6 +329,17 @@ pub fn prepare_execution_plan(device_id: i32) -> Result<()> {
         ),
         "warmup warp34_silu_and_mul_hadamard_f16"
     )?;
+    warmup_ffi!(
+        ffi::warp34_silu_and_mul_hadamard512_f16(
+            &ex,
+            buf_a as *const c_void,
+            buf_c as *mut c_void,
+            core::ptr::null(),
+            1,
+            512,
+        ),
+        "warmup warp34_silu_and_mul_hadamard512_f16"
+    )?;
     type GateFn = unsafe extern "C" fn(
         *const ffi::Warp34Exec,
         *const c_void,
@@ -298,6 +358,10 @@ pub fn prepare_execution_plan(device_id: i32) -> Result<()> {
             ffi::warp34_apply_attn_output_gate_hadamard_f16 as GateFn,
             "warmup warp34_apply_attn_output_gate_hadamard_f16",
         ),
+        (
+            ffi::warp34_apply_attn_output_gate_hadamard512_f16 as GateFn,
+            "warmup warp34_apply_attn_output_gate_hadamard512_f16",
+        ),
     ] {
         warmup_ffi!(
             gate_fn(
@@ -307,7 +371,7 @@ pub fn prepare_execution_plan(device_id: i32) -> Result<()> {
                 buf_c as *mut c_void,
                 core::ptr::null(),
                 1,
-                256,
+                512,
             ),
             label
         )?;
@@ -363,6 +427,10 @@ pub fn prepare_execution_plan(device_id: i32) -> Result<()> {
                     "warmup warp34_marlin_gemm_f16u2",
                 ),
                 (
+                    ffi::warp34_marlin_gemm_f16u2_sym as MarlinGemmFn,
+                    "warmup warp34_marlin_gemm_f16u2_sym",
+                ),
+                (
                     ffi::warp34_marlin_gemm_f16u4 as MarlinGemmFn,
                     "warmup warp34_marlin_gemm_f16u4",
                 ),
@@ -414,6 +482,41 @@ pub fn prepare_execution_plan(device_id: i32) -> Result<()> {
             )?;
         }
     }
+    {
+        let (rem_ws, rem_cap) = arena.remaining_workspace();
+        let s8_ex = stream.exec(rem_ws, rem_cap);
+        warmup_ffi!(
+            ffi::warp34_per_token_quant_i8(
+                &s8_ex,
+                buf_a as *const c_void,
+                buf_b as *mut c_void,
+                buf_c as *mut f32,
+                16,
+                128,
+            ),
+            "warmup warp34_per_token_quant_i8"
+        )?;
+        for m_warm in [16i64, 40, 64] {
+            for group_blocks in [8i32, 4, 2, -1] {
+                warmup_ffi!(
+                    ffi::warp34_marlin_gemm_s8u4_shared(
+                        &s8_ex,
+                        buf_a as *const c_void,
+                        buf_b as *const c_void,
+                        buf_c as *const c_void,
+                        buf_d as *mut c_void,
+                        buf_ws as *mut i32,
+                        m_warm,
+                        64,
+                        128,
+                        marlin_ws_ints,
+                        group_blocks,
+                    ),
+                    "warmup warp34_marlin_gemm_s8u4_shared"
+                )?;
+            }
+        }
+    }
     cublas.gemm_f16(buf_a, buf_b, buf_c, 1, 64, 128)?;
     // Mandatory lazy-module warmup before TP workers/capture.
     cublas.gemm_f16_bias(buf_a, buf_b, buf_d, buf_c, 1, 64, 128)?;
@@ -447,6 +550,21 @@ pub fn prepare_execution_plan(device_id: i32) -> Result<()> {
             "warmup warp34_small_n_gemm_dual_f16"
         )?;
     }
+    warmup_ffi!(
+        ffi::warp34_small_n_gemm_dual_f16(
+            &ex,
+            buf_a as *const c_void,
+            buf_b as *const c_void,
+            buf_c as *mut c_void,
+            128,
+            buf_b as *const c_void,
+            buf_d as *mut c_void,
+            128,
+            8,
+            128,
+        ),
+        "warmup warp34_small_n_gemm_dual_f16 (8x4)"
+    )?;
     for hs in [128i32, 3072, 5120, 6144] {
         // SAFETY: Pure query returning constant signal struct byte size.
         let sig_bytes = unsafe { ffi::warp34_tp2_signal_bytes() };
@@ -808,12 +926,35 @@ pub fn prepare_execution_plan(device_id: i32) -> Result<()> {
         )?;
     }
 
+    let bf16_layout_128 = Warp34KvLayerLayout {
+        namespace_id: ffi::WARP34_KV_NAMESPACE_DFLASH_DRAFT_CTX,
+        head_dim: 128,
+        k_token_stride_bytes: 256,
+        v_token_stride_bytes: 256,
+        k_head_stride_bytes: 16 * 256,
+        v_head_stride_bytes: 16 * 256,
+        k_page_stride_bytes: 16 * 256,
+        v_page_stride_bytes: 16 * 256,
+        k_format: ffi::WARP34_KV_FORMAT_BF16,
+        v_format: ffi::WARP34_KV_FORMAT_BF16,
+        ..layout
+    };
     let bf16_layout = Warp34KvLayerLayout {
         namespace_id: ffi::WARP34_KV_NAMESPACE_DFLASH_DRAFT_CTX,
         k_format: ffi::WARP34_KV_FORMAT_BF16,
         v_format: ffi::WARP34_KV_FORMAT_BF16,
         ..layout
     };
+    warmup_ffi!(
+        ffi::warp34_kv_cache_write_bf16(
+            &ex,
+            &bf16_layout_128,
+            &attn_batch,
+            buf_c as *const c_void,
+            buf_c as *const c_void,
+        ),
+        "warmup warp34_kv_cache_write_bf16 hd128"
+    )?;
     warmup_ffi!(
         ffi::warp34_kv_cache_write_bf16(
             &ex,
@@ -827,13 +968,35 @@ pub fn prepare_execution_plan(device_id: i32) -> Result<()> {
     warmup_ffi!(
         ffi::warp34_paged_attention_bf16(
             &ex,
-            &bf16_layout,
+            &bf16_layout_128,
             &attn_batch,
             buf_c as *const c_void,
             buf_d as *mut c_void,
             2,
         ),
         "warmup warp34_paged_attention_bf16 hd128"
+    )?;
+    warmup_ffi!(
+        ffi::warp34_paged_attention_bf16(
+            &ex,
+            &bf16_layout_128,
+            &attn_batch_m2,
+            buf_c as *const c_void,
+            buf_d as *mut c_void,
+            2,
+        ),
+        "warmup warp34_paged_attention_bf16 hd128 packed"
+    )?;
+    warmup_ffi!(
+        ffi::warp34_paged_attention_bf16(
+            &ex_split,
+            &bf16_layout_128,
+            &attn_batch_m2,
+            buf_c as *const c_void,
+            buf_d as *mut c_void,
+            2,
+        ),
+        "warmup warp34_paged_attention_bf16 hd128 splitk"
     )?;
     let bf16_layout_256 = Warp34KvLayerLayout {
         namespace_id: ffi::WARP34_KV_NAMESPACE_DFLASH_DRAFT_CTX,
@@ -851,6 +1014,28 @@ pub fn prepare_execution_plan(device_id: i32) -> Result<()> {
             2,
         ),
         "warmup warp34_paged_attention_bf16 hd256"
+    )?;
+    warmup_ffi!(
+        ffi::warp34_paged_attention_bf16(
+            &ex,
+            &bf16_layout_256,
+            &attn_batch_m2,
+            buf_c as *const c_void,
+            buf_d as *mut c_void,
+            2,
+        ),
+        "warmup warp34_paged_attention_bf16 hd256 packed"
+    )?;
+    warmup_ffi!(
+        ffi::warp34_paged_attention_bf16(
+            &ex_split,
+            &bf16_layout_256,
+            &attn_batch_m2,
+            buf_c as *const c_void,
+            buf_d as *mut c_void,
+            2,
+        ),
+        "warmup warp34_paged_attention_bf16 hd256 splitk"
     )?;
     warmup_ffi!(
         ffi::warp34_paged_attention_bf16(
@@ -1071,6 +1256,48 @@ pub fn prepare_execution_plan(device_id: i32) -> Result<()> {
             "warmup warp34_gdn_recurrent_f16 prefill wide"
         )?;
     }
+    let ckpt_ssm_ptrs = arena.upload_slice(&[buf_a], &stream)?;
+    let ckpt_conv_ptrs = arena.upload_slice(&[buf_b], &stream)?;
+    warmup_ffi!(
+        ffi::warp34_gdn_checkpoint_pack_wht_q8(
+            &ex,
+            ckpt_ssm_ptrs as *const u64,
+            ckpt_conv_ptrs as *const u64,
+            (buf_b + 4096) as *const c_void,
+            0,
+            1,
+            1,
+            4,
+            128,
+            64,
+            64,
+            buf_c as *mut c_void,
+            (buf_c + 4096) as *mut c_void,
+            (buf_c + 8192) as *mut c_void,
+            (buf_c + 12288) as *mut c_void,
+        ),
+        "warmup warp34_gdn_checkpoint_pack_wht_q8"
+    )?;
+    warmup_ffi!(
+        ffi::warp34_gdn_checkpoint_unpack_wht_q8(
+            &ex,
+            buf_c as *const c_void,
+            (buf_c + 4096) as *const c_void,
+            (buf_c + 8192) as *const c_void,
+            (buf_c + 12288) as *const c_void,
+            ckpt_ssm_ptrs as *const u64,
+            ckpt_conv_ptrs as *const u64,
+            (buf_d + 4096) as *mut c_void,
+            0,
+            1,
+            1,
+            4,
+            128,
+            64,
+            64,
+        ),
+        "warmup warp34_gdn_checkpoint_unpack_wht_q8"
+    )?;
 
     // 5. Sampler & MTP / DFlash2 kernels
     warmup_ffi!(ffi::warp34_tp2_warmup(), "warmup op_collectives module")?;
@@ -1276,6 +1503,25 @@ pub fn prepare_execution_plan(device_id: i32) -> Result<()> {
             1e-6,
         ),
         "warmup BF16 QK/RoPE + KV write"
+    )?;
+    warmup_ffi!(
+        ffi::warp34_dflash_qk_norm_rope_kv_write_bf16_inv_freq(
+            &ex,
+            buf_a as *mut c_void,
+            buf_d as *mut c_void,
+            candidate_ids as *const i32,
+            buf_b as *const c_void,
+            buf_b as *const c_void,
+            buf_c as *const f32,
+            &bf16_layout,
+            slot_map as *const i32,
+            1,
+            1,
+            1,
+            256,
+            1e-6,
+        ),
+        "warmup BF16 QK/RoPE inv_freq + KV write"
     )?;
     warmup_ffi!(
         ffi::warp34_dflash_select_greedy_bf16(
@@ -1524,43 +1770,76 @@ pub fn prepare_execution_plan(device_id: i32) -> Result<()> {
         ),
         "warmup warp34_rejection_stochastic"
     )?;
+    for &(size_n, rank_pad) in &[
+        (64, 4),
+        (64, 8),
+        (4096, 8),
+        (64, 16),
+        (64, 32),
+        (64, 64),
+        (64, 68),
+        (64, 128),
+        (256, 128),
+    ] {
+        warmup_ffi!(
+            ffi::warp34_lora_shrink_expand_f16(
+                &ex,
+                buf_a as *const c_void,
+                buf_b as *const c_void,
+                buf_c as *const c_void,
+                reject_ids as *const i32,
+                buf_ws as *mut f32,
+                16 * 1024,
+                buf_d as *mut c_void,
+                1,
+                size_n,
+                64,
+                rank_pad,
+                1,
+                0,
+                1,
+                0,
+                core::ptr::null(),
+            ),
+            "warmup warp34_lora_shrink_expand_f16"
+        )?;
+    }
+    let lora_warmup_slices: [i32; 8] = [0, 64, 0, 8, 64, 64, 8, 8];
     warmup_ffi!(
-        ffi::warp34_lora_shrink_expand_f16(
-            &ex,
+        ffi::warp34_cublas_lora_shrink_expand_f16(
+            cublas.handle,
             buf_a as *const c_void,
+            buf_d as *mut c_void,
             buf_b as *const c_void,
             buf_c as *const c_void,
-            reject_ids as *const i32,
-            buf_ws as *mut f32,
-            buf_d as *mut c_void,
-            1,
-            64,
-            64,
-            4,
-            1,
+            buf_ws as *mut c_void,
             0,
-            1,
+            32,
+            128,
+            128,
+            16,
+            2,
+            lora_warmup_slices.as_ptr(),
         ),
-        "warmup warp34_lora_shrink_expand_f16 (fused)"
+        "warmup warp34_cublas_lora_shrink_expand_f16 (r=8 sliced)"
     )?;
     warmup_ffi!(
-        ffi::warp34_lora_shrink_expand_f16(
-            &ex,
+        ffi::warp34_cublas_lora_shrink_expand_f16(
+            cublas.handle,
             buf_a as *const c_void,
+            buf_d as *mut c_void,
             buf_b as *const c_void,
             buf_c as *const c_void,
-            reject_ids as *const i32,
-            buf_ws as *mut f32,
-            buf_d as *mut c_void,
-            1,
-            64,
-            64,
-            32,
-            1,
+            buf_ws as *mut c_void,
             0,
-            1,
+            32,
+            128,
+            128,
+            64,
+            0,
+            core::ptr::null(),
         ),
-        "warmup warp34_lora_shrink_expand_f16 (split)"
+        "warmup warp34_cublas_lora_shrink_expand_f16 (r=64)"
     )?;
     warmup_vision_moe::warmup_vision_moe_and_qwen4(
         &mut arena,
@@ -1598,8 +1877,7 @@ pub fn prepare_qwen_image_execution_plan(device_id: i32) -> Result<()> {
     let bit = u32::try_from(device_id)
         .ok()
         .filter(|&d| d < 64)
-        .map(|d| 1u64 << d)
-        .unwrap_or(0);
+        .map_or(0, |d| 1u64 << d);
     if bit != 0 && (WARMED_QWEN_IMAGE_BITS.load(std::sync::atomic::Ordering::Acquire) & bit) != 0 {
         return dev.synchronize();
     }
@@ -1615,4 +1893,12 @@ pub fn prepare_qwen_image_execution_plan(device_id: i32) -> Result<()> {
         WARMED_QWEN_IMAGE_BITS.fetch_or(bit, std::sync::atomic::Ordering::Release);
     }
     Ok(())
+}
+
+#[cfg(all(test, feature = "cuda"))]
+mod tests {
+    #[test]
+    fn test_prepare_execution_plan_succeeds() {
+        super::prepare_execution_plan(0).expect("prepare_execution_plan(0)");
+    }
 }

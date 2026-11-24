@@ -5,8 +5,8 @@ use core::ffi::c_void;
 
 #[cfg(feature = "cuda")]
 use super::{
-    Warp34AttentionBatch, Warp34Exec, Warp34GdnBatch, Warp34KvLayerLayout, Warp34SamplerRowCfg,
-    Warp34SamplerSparseEntry,
+    Warp34AttentionBatch, Warp34Exec, Warp34GdnBatch, Warp34KvLayerLayout, Warp34MoeHybridDesc,
+    Warp34SamplerRowCfg, Warp34SamplerSparseEntry,
 };
 
 #[cfg(feature = "cuda")]
@@ -229,6 +229,28 @@ unsafe extern "C" {
         down_hadamard_block_size: i32,
     ) -> i32;
 
+    pub fn warp34_moe_w2a16_sym_mlp_ex_f16(
+        ex: *const Warp34Exec,
+        x: *const c_void,
+        gate_up_packed: *const u32,
+        gate_up_scales: *const c_void,
+        down_packed: *const u32,
+        down_scales: *const c_void,
+        topk_ids: *const i32,
+        topk_weights: *const f32,
+        shared_expert_out: *const c_void,
+        shared_expert_gate_logits: *const c_void,
+        interm_buf: *mut c_void,
+        out: *mut c_void,
+        num_tokens: i32,
+        top_k: i32,
+        num_experts: i32,
+        n_interm: i32,
+        k_hidden: i32,
+        group_size: i32,
+        down_hadamard_block_size: i32,
+    ) -> i32;
+
     pub fn warp34_moe_w4a16_mlp_zp_f16(
         ex: *const Warp34Exec,
         x: *const c_void,
@@ -387,6 +409,25 @@ unsafe extern "C" {
         num_tokens: i32,
         hc_count: i32,
         hidden_size: i32,
+        tap_stride_elems: i32,
+        tap_offset_elems: i32,
+    ) -> i32;
+
+    pub fn warp34_hc_combine_tap_rmsnorm_f16(
+        ex: *const Warp34Exec,
+        residual_in: *const c_void,
+        block_out: *const c_void,
+        inject_weights: *const f32,
+        ple_delta: *const c_void,
+        residual_out: *mut c_void,
+        tap_bf16_out: *mut c_void,
+        next_norm_weight: *const c_void,
+        next_normed_out: *mut c_void,
+        valid_token_mask: *const u8,
+        num_tokens: i32,
+        hc_count: i32,
+        hidden_size: i32,
+        eps: f32,
         tap_stride_elems: i32,
         tap_offset_elems: i32,
     ) -> i32;
@@ -679,35 +720,70 @@ unsafe extern "C" {
 
     pub fn warp34_moe_hybrid_submit_and_pull(
         ex: *const Warp34Exec,
-        d_req_slot: *mut c_void,
-        x_f16: *const c_void,
-        global_topk_ids: *const i32,
+        desc: *const Warp34MoeHybridDesc,
+    ) -> i32;
+
+    pub fn warp34_moe_w4a16_pulled_add_f16(
+        ex: *const Warp34Exec,
+        x: *const c_void,
+        gate_up_packed: *const u32,
+        gate_up_scales: *const c_void,
+        down_packed: *const u32,
+        down_scales: *const c_void,
+        pulled_topk_ids: *const i32,
         topk_weights: *const f32,
-        expert_to_slot: *mut i32,
-        slot_to_expert: *mut i32,
-        slot_last_used: *mut u64,
-        step_counter: *mut u64,
-        remapped_topk_ids: *mut i32,
-        miss_local_experts: *mut i32,
-        miss_victim_slots: *mut i32,
-        num_misses_buf: *mut i32,
-        mapped_host_packs: *const c_void,
-        gate_up_packed_base: *mut u32,
-        gate_up_scales_base: *mut c_void,
-        down_packed_base: *mut u32,
-        down_scales_base: *mut c_void,
+        active_count: *const i32,
+        interm_buf: *mut c_void,
+        out: *mut c_void,
         num_tokens: i32,
         top_k: i32,
-        global_expert_offset: i32,
-        local_num_experts: i32,
-        k_static: i32,
-        k_hot: i32,
-        pack_stride_bytes: usize,
+        num_experts: i32,
         n_interm: i32,
         k_hidden: i32,
         group_size: i32,
-        bits: i32,
-        gpu_share_frac: f32,
+        down_hadamard_block_size: i32,
+    ) -> i32;
+
+    pub fn warp34_moe_w2a16_pulled_add_f16(
+        ex: *const Warp34Exec,
+        x: *const c_void,
+        gate_up_packed: *const u32,
+        gate_up_scales: *const c_void,
+        down_packed: *const u32,
+        down_scales: *const c_void,
+        pulled_topk_ids: *const i32,
+        topk_weights: *const f32,
+        active_count: *const i32,
+        interm_buf: *mut c_void,
+        out: *mut c_void,
+        num_tokens: i32,
+        top_k: i32,
+        num_experts: i32,
+        n_interm: i32,
+        k_hidden: i32,
+        group_size: i32,
+        down_hadamard_block_size: i32,
+    ) -> i32;
+
+    pub fn warp34_moe_w2a16_sym_pulled_add_f16(
+        ex: *const Warp34Exec,
+        x: *const c_void,
+        gate_up_packed: *const u32,
+        gate_up_scales: *const c_void,
+        down_packed: *const u32,
+        down_scales: *const c_void,
+        pulled_topk_ids: *const i32,
+        topk_weights: *const f32,
+        active_count: *const i32,
+        interm_buf: *mut c_void,
+        out: *mut c_void,
+        num_tokens: i32,
+        top_k: i32,
+        num_experts: i32,
+        n_interm: i32,
+        k_hidden: i32,
+        group_size: i32,
+        down_hadamard_block_size: i32,
     ) -> i32;
 
     pub fn warp34_moe_hybrid_wait_and_add(
@@ -748,6 +824,34 @@ unsafe extern "C" {
         tap_col_offset: i32,
     ) -> i32;
 
+    pub fn warp34_gemma_rms_norm_hadamard512_f16(
+        ex: *const Warp34Exec,
+        x: *const c_void,
+        weight: *const c_void,
+        out: *mut c_void,
+        out_had512: *mut c_void,
+        valid_token_mask: *const u8,
+        num_tokens: i32,
+        hidden_size: i32,
+        eps: f32,
+    ) -> i32;
+
+    pub fn warp34_fused_add_gemma_rms_norm_tap_hadamard512_f16(
+        ex: *const Warp34Exec,
+        x: *const c_void,
+        residual: *mut c_void,
+        weight: *const c_void,
+        out: *mut c_void,
+        out_had512: *mut c_void,
+        tap_dst_bf16: *mut c_void,
+        valid_token_mask: *const u8,
+        num_tokens: i32,
+        hidden_size: i32,
+        eps: f32,
+        tap_row_stride: i32,
+        tap_col_offset: i32,
+    ) -> i32;
+
     pub fn warp34_tp2_all_reduce_residual_gemma_rms_norm_hadamard_f16(
         ex: *const Warp34Exec,
         local_in: *const c_void,
@@ -767,6 +871,31 @@ unsafe extern "C" {
         eps: f32,
         tap_row_stride: i32,
         tap_col_offset: i32,
+    ) -> i32;
+
+    pub fn warp34_tp2_all_reduce_residual_gemma_rms_norm_hadamard_pipelined_f16(
+        ex: *const Warp34Exec,
+        local_in: *const c_void,
+        ar_out: *mut c_void,
+        residual: *mut c_void,
+        weight: *const c_void,
+        out: *mut c_void,
+        out_had64: *mut c_void,
+        tap_dst_bf16: *mut c_void,
+        stage0: *mut c_void,
+        stage1: *mut c_void,
+        sig0: *mut c_void,
+        sig1: *mut c_void,
+        rank: i32,
+        num_tokens: i32,
+        hidden_size: i32,
+        eps: f32,
+        tap_row_stride: i32,
+        tap_col_offset: i32,
+        dma_stream: usize,
+        ev_ready: usize,
+        ev_tx_done: *const usize,
+        max_chunks: i32,
     ) -> i32;
 
     pub fn warp34_tp4_all_reduce_residual_gemma_rms_norm_hadamard_f16(
@@ -831,7 +960,26 @@ unsafe extern "C" {
         intermediate_size: i32,
     ) -> i32;
 
+    pub fn warp34_silu_and_mul_hadamard512_f16(
+        ex: *const Warp34Exec,
+        gate_up: *const c_void,
+        out: *mut c_void,
+        valid_token_mask: *const u8,
+        num_tokens: i32,
+        intermediate_size: i32,
+    ) -> i32;
+
     pub fn warp34_apply_attn_output_gate_hadamard_f16(
+        ex: *const Warp34Exec,
+        attn_out: *const c_void,
+        gate: *const c_void,
+        out: *mut c_void,
+        valid_token_mask: *const u8,
+        num_tokens: i32,
+        total_dim: i32,
+    ) -> i32;
+
+    pub fn warp34_apply_attn_output_gate_hadamard512_f16(
         ex: *const Warp34Exec,
         attn_out: *const c_void,
         gate: *const c_void,
@@ -930,6 +1078,7 @@ unsafe extern "C" {
         lora_b_stacked: *const c_void,
         token_lora_ids: *const i32,
         lowrank_f32_ws: *mut f32,
+        lowrank_ws_elems: usize,
         y_inout_f16: *mut c_void,
         m: i32,
         size_n: i32,
@@ -938,6 +1087,8 @@ unsafe extern "C" {
         num_adapters: i32,
         default_lora_id: i32,
         adapter_mask: u64,
+        num_b_slices: i32,
+        b_slices4: *const i32,
     ) -> i32;
 
     pub fn warp34_sampler_shard_fast_greedy_f16(

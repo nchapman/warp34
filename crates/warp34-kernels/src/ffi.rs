@@ -1,6 +1,5 @@
 //! FFI bindings to `csrc/warp34_cuda.h`.
 
-#[cfg(feature = "cuda")]
 use core::ffi::c_void;
 
 #[repr(C)]
@@ -9,9 +8,12 @@ pub struct Warp34Exec {
     pub stream: usize,
     pub scratch_ptr: u64,
     pub scratch_size: usize,
+    pub flags: u64,
 }
 
-const _: [(); 24] = [(); core::mem::size_of::<Warp34Exec>()];
+const _: [(); 32] = [(); core::mem::size_of::<Warp34Exec>()];
+
+pub const WARP34_EXEC_FLAG_ALLOW_W4A8_PREFILL: u64 = 1 << 0;
 
 pub const WARP34_DTYPE_F16: i32 = 0;
 pub const WARP34_DTYPE_BF16: i32 = 1;
@@ -85,6 +87,48 @@ pub struct Warp34AttentionBatch {
 }
 
 const _: [(); 96] = [(); core::mem::size_of::<Warp34AttentionBatch>()];
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Warp34MoeHybridDesc {
+    pub d_req_slot: *mut c_void,
+    pub x_f16: *const c_void,
+    pub global_topk_ids: *const i32,
+    pub topk_weights: *const f32,
+    pub expert_to_slot: *mut i32,
+    pub slot_to_expert: *mut i32,
+    pub slot_last_used: *mut u64,
+    pub step_counter: *mut u64,
+    pub expert_freq: *mut u8,
+    pub remapped_topk_ids: *mut i32,
+    pub pulled_topk_ids: *mut i32,
+    pub miss_local_experts: *mut i32,
+    pub miss_victim_slots: *mut i32,
+    pub num_misses_buf: *mut i32,
+    pub mapped_host_packs: *const c_void,
+    pub gate_up_packed_base: *mut u32,
+    pub gate_up_scales_base: *mut c_void,
+    pub down_packed_base: *mut u32,
+    pub down_scales_base: *mut c_void,
+    pub pull_stream: *mut c_void,
+    pub plan_event: *mut c_void,
+    pub pull_done_event: *mut c_void,
+    pub pack_stride_bytes: usize,
+    pub num_tokens: i32,
+    pub top_k: i32,
+    pub global_expert_offset: i32,
+    pub local_num_experts: i32,
+    pub k_static: i32,
+    pub k_hot: i32,
+    pub n_interm: i32,
+    pub k_hidden: i32,
+    pub group_size: i32,
+    pub bits: i32,
+    pub gpu_share_frac: f32,
+    pub reserved: i32,
+}
+
+const _: [(); 232] = [(); core::mem::size_of::<Warp34MoeHybridDesc>()];
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -620,6 +664,19 @@ unsafe extern "C" {
         workspace_ints: i64,
         group_blocks: i32,
     ) -> i32;
+    pub fn warp34_marlin_gemm_f16u2_sym(
+        ex: *const Warp34Exec,
+        a: *const c_void,
+        b: *const c_void,
+        scales: *const c_void,
+        c: *mut c_void,
+        workspace: *mut i32,
+        m: i64,
+        n: i64,
+        k: i64,
+        workspace_ints: i64,
+        group_blocks: i32,
+    ) -> i32;
     pub fn warp34_marlin_gemm_f16u4(
         ex: *const Warp34Exec,
         a: *const c_void,
@@ -652,6 +709,27 @@ unsafe extern "C" {
         b: *const c_void,
         scales: *const c_void,
         zeros: *const c_void,
+        c: *mut c_void,
+        workspace: *mut i32,
+        m: i64,
+        n: i64,
+        k: i64,
+        workspace_ints: i64,
+        group_blocks: i32,
+    ) -> i32;
+    pub fn warp34_per_token_quant_i8(
+        ex: *const Warp34Exec,
+        x_f16: *const c_void,
+        q_i8: *mut c_void,
+        scales_f32: *mut f32,
+        m: i64,
+        k: i64,
+    ) -> i32;
+    pub fn warp34_marlin_gemm_s8u4_shared(
+        ex: *const Warp34Exec,
+        a: *const c_void,
+        b: *const c_void,
+        scales: *const c_void,
         c: *mut c_void,
         workspace: *mut i32,
         m: i64,
@@ -803,6 +881,42 @@ unsafe extern "C" {
         head_v_dim: i32,
         ba_row_stride: i32,
         total_state_slots: i32,
+    ) -> i32;
+
+    pub fn warp34_gdn_checkpoint_pack_wht_q8(
+        ex: *const Warp34Exec,
+        ssm_layer_ptrs: *const u64,
+        conv_layer_ptrs: *const u64,
+        ple_conv_pool: *const c_void,
+        src_state_slot: i32,
+        total_state_slots: i32,
+        num_layers: i32,
+        rows_per_layer: i32,
+        head_k_dim: i32,
+        conv_elems_per_slot: i32,
+        ple_conv_elems_per_slot: i32,
+        dst_qdata: *mut c_void,
+        dst_scales_bf16: *mut c_void,
+        dst_conv_f16: *mut c_void,
+        dst_ple_conv_f16: *mut c_void,
+    ) -> i32;
+
+    pub fn warp34_gdn_checkpoint_unpack_wht_q8(
+        ex: *const Warp34Exec,
+        src_qdata: *const c_void,
+        src_scales_bf16: *const c_void,
+        src_conv_f16: *const c_void,
+        src_ple_conv_f16: *const c_void,
+        ssm_layer_ptrs: *const u64,
+        conv_layer_ptrs: *const u64,
+        ple_conv_pool: *mut c_void,
+        dst_state_slot: i32,
+        total_state_slots: i32,
+        num_layers: i32,
+        rows_per_layer: i32,
+        head_k_dim: i32,
+        conv_elems_per_slot: i32,
+        ple_conv_elems_per_slot: i32,
     ) -> i32;
 
     pub fn warp34_tp2_signal_bytes() -> usize;
@@ -1187,6 +1301,22 @@ unsafe extern "C" {
         table_rows: i32,
         eps: f32,
     ) -> i32;
+    pub fn warp34_dflash_qk_norm_rope_kv_write_bf16_inv_freq(
+        ex: *const Warp34Exec,
+        qkv: *mut c_void,
+        q_out: *mut c_void,
+        positions: *const i32,
+        qw: *const c_void,
+        kw: *const c_void,
+        inv_freq: *const f32,
+        kv_layout: *const Warp34KvLayerLayout,
+        write_slot_mapping: *const i32,
+        rows: i32,
+        q_heads: i32,
+        kv_heads: i32,
+        dim: i32,
+        eps: f32,
+    ) -> i32;
     pub fn warp34_dflash_select_greedy_bf16(
         ex: *const Warp34Exec,
         ids: *const i32,
@@ -1201,6 +1331,21 @@ unsafe extern "C" {
         rank: i32,
         vocab: i32,
     ) -> i32;
+    pub fn warp34_dflash_select_greedy_with_conf_bf16(
+        ex: *const Warp34Exec,
+        ids: *const i32,
+        unary: *const f32,
+        hidden: *const c_void,
+        pred: *const c_void,
+        succ: *const c_void,
+        out_path: *mut i32,
+        out_confs: *mut f32,
+        anchor: i32,
+        k: i32,
+        topk: i32,
+        rank: i32,
+        vocab: i32,
+    ) -> i32;
     pub fn warp34_dflash_select_greedy_dev_anchor_bf16(
         ex: *const Warp34Exec,
         ids: *const i32,
@@ -1209,6 +1354,21 @@ unsafe extern "C" {
         pred: *const c_void,
         succ: *const c_void,
         out_path: *mut i32,
+        anchor_dev: *const i32,
+        k: i32,
+        topk: i32,
+        rank: i32,
+        vocab: i32,
+    ) -> i32;
+    pub fn warp34_dflash_select_greedy_dev_anchor_with_conf_bf16(
+        ex: *const Warp34Exec,
+        ids: *const i32,
+        unary: *const f32,
+        hidden: *const c_void,
+        pred: *const c_void,
+        succ: *const c_void,
+        out_path: *mut i32,
+        out_confs: *mut f32,
         anchor_dev: *const i32,
         k: i32,
         topk: i32,

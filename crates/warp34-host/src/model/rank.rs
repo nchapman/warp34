@@ -57,6 +57,7 @@ pub struct Qwen3_5ModelRank {
     pub layers: Vec<DecoderLayerWeights>,
     pub kv_pool: KvPool,
     pub state_pool: StateBundlePool,
+    pub checkpoint_pool: Option<crate::cache::GdnCheckpointPool>,
     pub decode_io: DecodeGraphIo,
     pub decode_graph: Vec<((bool, GraphLoraMode), u64, CudaGraph)>,
     pub spec_verify_io: SpecVerifyGraphIo,
@@ -154,20 +155,26 @@ fn prepare_layer_linear_shards(
     std::thread::scope(|s| -> Result<PreloadedLayerShards> {
         let ffn_handle = (!is_moe_layer).then(|| {
             let gate_h = s.spawn(move || -> Result<RawLinearHost> {
-                Ok(
-                    RawLinearHost::load(archive, &format!("{pfx_ref}.mlp.gate_proj"), &cfg.quant)?
-                        .slice_rows(rank * local_interm, (rank + 1) * local_interm),
+                RawLinearHost::load_row_shard(
+                    archive,
+                    &format!("{pfx_ref}.mlp.gate_proj"),
+                    &cfg.quant,
+                    rank * local_interm,
+                    (rank + 1) * local_interm,
                 )
             });
             let up_h = s.spawn(move || -> Result<RawLinearHost> {
-                Ok(
-                    RawLinearHost::load(archive, &format!("{pfx_ref}.mlp.up_proj"), &cfg.quant)?
-                        .slice_rows(rank * local_interm, (rank + 1) * local_interm),
+                RawLinearHost::load_row_shard(
+                    archive,
+                    &format!("{pfx_ref}.mlp.up_proj"),
+                    &cfg.quant,
+                    rank * local_interm,
+                    (rank + 1) * local_interm,
                 )
             });
             let down_h = s.spawn(move || -> Result<RawLinearHost> {
                 RawLinearHost::load(archive, &format!("{pfx_ref}.mlp.down_proj"), &cfg.quant)?
-                    .slice_cols(rank * local_interm, (rank + 1) * local_interm)
+                    .into_slice_cols(rank * local_interm, (rank + 1) * local_interm)
             });
             (gate_h, up_h, down_h)
         });
@@ -175,29 +182,33 @@ fn prepare_layer_linear_shards(
         let attn = match cfg.layer_types[layer_id] {
             LayerKind::FullAttention => {
                 let q_h = s.spawn(move || -> Result<RawLinearHost> {
-                    let raw_q = RawLinearHost::load(
+                    let q_shard = RawLinearHost::load_row_shard(
                         archive,
                         &format!("{pfx_ref}.self_attn.q_proj"),
                         &cfg.quant,
+                        rank * q_gate_local,
+                        (rank + 1) * q_gate_local,
                     )?;
-                    debug_assert_eq!(raw_q.slice_rows(0, q_gate_total).size_check(), q_gate_total);
-                    Ok(raw_q.slice_rows(rank * q_gate_local, (rank + 1) * q_gate_local))
+                    debug_assert_eq!(q_shard.size_check() * tp_size, q_gate_total);
+                    Ok(q_shard)
                 });
                 let k_h = s.spawn(move || -> Result<RawLinearHost> {
-                    Ok(RawLinearHost::load(
+                    RawLinearHost::load_row_shard(
                         archive,
                         &format!("{pfx_ref}.self_attn.k_proj"),
                         &cfg.quant,
-                    )?
-                    .slice_rows(kv_shard_idx * kv_local, (kv_shard_idx + 1) * kv_local))
+                        kv_shard_idx * kv_local,
+                        (kv_shard_idx + 1) * kv_local,
+                    )
                 });
                 let v_h = s.spawn(move || -> Result<RawLinearHost> {
-                    Ok(RawLinearHost::load(
+                    RawLinearHost::load_row_shard(
                         archive,
                         &format!("{pfx_ref}.self_attn.v_proj"),
                         &cfg.quant,
-                    )?
-                    .slice_rows(kv_shard_idx * kv_local, (kv_shard_idx + 1) * kv_local))
+                        kv_shard_idx * kv_local,
+                        (kv_shard_idx + 1) * kv_local,
+                    )
                 });
                 let o_cols = local_q_heads * cfg.head_dim;
                 let o_h = s.spawn(move || -> Result<RawLinearHost> {
@@ -206,7 +217,7 @@ fn prepare_layer_linear_shards(
                         &format!("{pfx_ref}.self_attn.o_proj"),
                         &cfg.quant,
                     )?
-                    .slice_cols(rank * o_cols, (rank + 1) * o_cols)
+                    .into_slice_cols(rank * o_cols, (rank + 1) * o_cols)
                 });
                 let q_shard = q_h
                     .join()
@@ -224,49 +235,68 @@ fn prepare_layer_linear_shards(
                 PreloadedAttnShards::FullAttention { qkv_shard, o_shard }
             }
             LayerKind::LinearAttention => {
-                let qkv_h = s.spawn(
-                    move || -> Result<(RawLinearHost, RawLinearHost, RawLinearHost)> {
-                        let raw_qkv = RawLinearHost::load(
-                            archive,
-                            &format!("{pfx_ref}.linear_attn.in_proj_qkv"),
-                            &cfg.quant,
-                        )?;
-                        let q_part =
-                            raw_qkv.slice_rows(rank * gdn_k_local, (rank + 1) * gdn_k_local);
-                        let k_part = raw_qkv.slice_rows(
-                            gdn_k_total + rank * gdn_k_local,
-                            gdn_k_total + (rank + 1) * gdn_k_local,
-                        );
-                        let v_part = raw_qkv.slice_rows(
-                            2 * gdn_k_total + rank * gdn_v_local,
-                            2 * gdn_k_total + (rank + 1) * gdn_v_local,
-                        );
-                        Ok((q_part, k_part, v_part))
-                    },
-                );
+                let qkv_h = s.spawn(move || -> Result<Vec<RawLinearHost>> {
+                    let qkv_pfx = format!("{pfx_ref}.linear_attn.in_proj_qkv");
+                    if tp_size == 1 {
+                        let raw_qkv = RawLinearHost::load(archive, &qkv_pfx, &cfg.quant)?;
+                        if raw_qkv.dims().0 == 2 * gdn_k_total + gdn_v_total {
+                            return Ok(vec![raw_qkv]);
+                        }
+                        let q_part = raw_qkv.slice_rows(0, gdn_k_local);
+                        let k_part = raw_qkv.slice_rows(gdn_k_total, gdn_k_total + gdn_k_local);
+                        let v_part =
+                            raw_qkv.slice_rows(2 * gdn_k_total, 2 * gdn_k_total + gdn_v_local);
+                        return Ok(vec![q_part, k_part, v_part]);
+                    }
+                    let q_part = RawLinearHost::load_row_shard(
+                        archive,
+                        &qkv_pfx,
+                        &cfg.quant,
+                        rank * gdn_k_local,
+                        (rank + 1) * gdn_k_local,
+                    )?;
+                    let k_part = RawLinearHost::load_row_shard(
+                        archive,
+                        &qkv_pfx,
+                        &cfg.quant,
+                        gdn_k_total + rank * gdn_k_local,
+                        gdn_k_total + (rank + 1) * gdn_k_local,
+                    )?;
+                    let v_part = RawLinearHost::load_row_shard(
+                        archive,
+                        &qkv_pfx,
+                        &cfg.quant,
+                        2 * gdn_k_total + rank * gdn_v_local,
+                        2 * gdn_k_total + (rank + 1) * gdn_v_local,
+                    )?;
+                    Ok(vec![q_part, k_part, v_part])
+                });
                 let z_h = s.spawn(move || -> Result<RawLinearHost> {
-                    Ok(RawLinearHost::load(
+                    RawLinearHost::load_row_shard(
                         archive,
                         &format!("{pfx_ref}.linear_attn.in_proj_z"),
                         &cfg.quant,
-                    )?
-                    .slice_rows(rank * gdn_v_local, (rank + 1) * gdn_v_local))
+                        rank * gdn_v_local,
+                        (rank + 1) * gdn_v_local,
+                    )
                 });
                 let b_h = s.spawn(move || -> Result<RawLinearHost> {
-                    Ok(RawLinearHost::load(
+                    RawLinearHost::load_row_shard(
                         archive,
                         &format!("{pfx_ref}.linear_attn.in_proj_b"),
                         &cfg.quant,
-                    )?
-                    .slice_rows(rank * local_v_heads, (rank + 1) * local_v_heads))
+                        rank * local_v_heads,
+                        (rank + 1) * local_v_heads,
+                    )
                 });
                 let a_h = s.spawn(move || -> Result<RawLinearHost> {
-                    Ok(RawLinearHost::load(
+                    RawLinearHost::load_row_shard(
                         archive,
                         &format!("{pfx_ref}.linear_attn.in_proj_a"),
                         &cfg.quant,
-                    )?
-                    .slice_rows(rank * local_v_heads, (rank + 1) * local_v_heads))
+                        rank * local_v_heads,
+                        (rank + 1) * local_v_heads,
+                    )
                 });
                 let out_h = s.spawn(move || -> Result<RawLinearHost> {
                     RawLinearHost::load(
@@ -274,9 +304,9 @@ fn prepare_layer_linear_shards(
                         &format!("{pfx_ref}.linear_attn.out_proj"),
                         &cfg.quant,
                     )?
-                    .slice_cols(rank * gdn_v_local, (rank + 1) * gdn_v_local)
+                    .into_slice_cols(rank * gdn_v_local, (rank + 1) * gdn_v_local)
                 });
-                let (q_part, k_part, v_part) = qkv_h
+                let mut qkvz_parts = qkv_h
                     .join()
                     .map_err(|_| loader_err("in_proj_qkv loader panicked"))??;
                 let z_shard = z_h
@@ -291,7 +321,8 @@ fn prepare_layer_linear_shards(
                 let out_shard = out_h
                     .join()
                     .map_err(|_| loader_err("out_proj loader panicked"))??;
-                let qkvz_shard = RawLinearHost::concat_rows(&[q_part, k_part, v_part, z_shard])?;
+                qkvz_parts.push(z_shard);
+                let qkvz_shard = RawLinearHost::concat_rows(&qkvz_parts)?;
                 let ba_shard = RawLinearHost::concat_rows(&[b_shard, a_shard])?;
                 PreloadedAttnShards::LinearAttention {
                     qkvz_shard,
@@ -640,7 +671,27 @@ impl Qwen3_5ModelRank {
                 || name.contains(".out_proj.")
                 || name.contains(".down_proj.");
             let raw_gpu_bytes = match info.dtype.as_str() {
-                "F16" | "BF16" => info.num_elems().saturating_mul(2),
+                "F16" | "BF16" => {
+                    // Online-quantize untied `lm_head.weight` (`N = 248320`) to `MarlinW8A16`
+                    // while keeping hyper-connection spine matrices in exact `DenseF16`.
+                    let online_u8_gs = if info.shape.len() == 2
+                        && (name == "lm_head.weight" || name.ends_with(".lm_head.weight"))
+                    {
+                        RawLinearHost::lm_head_online_u8_group_size(
+                            cfg,
+                            info.shape[0] / tp_size.max(1),
+                            info.shape[1],
+                        )
+                    } else {
+                        None
+                    };
+                    if let Some(gs) = online_u8_gs {
+                        info.num_elems()
+                            .saturating_add((info.num_elems() / gs).saturating_mul(2))
+                    } else {
+                        info.num_elems().saturating_mul(2)
+                    }
+                }
                 "F32" => {
                     if name.ends_with(".A_log") {
                         info.num_elems().saturating_mul(4)
@@ -830,6 +881,7 @@ impl Qwen3_5ModelRank {
                         num_bits: 8,
                         group_size: cfg.quant.raw_group_size(),
                         symmetric: true,
+                        code_offset_half: false,
                         ignore: Vec::new(),
                         rules: None,
                     };
@@ -838,6 +890,7 @@ impl Qwen3_5ModelRank {
                         num_bits: 4,
                         group_size: cfg.quant.raw_group_size(),
                         symmetric: !has_zp,
+                        code_offset_half: false,
                         ignore: Vec::new(),
                         rules: None,
                     };
@@ -855,6 +908,271 @@ impl Qwen3_5ModelRank {
             return Ok(raw_embed.to_f16_vec());
         }
         Err(loader_err_msg("missing model.embed_tokens.weight"))
+    }
+
+    pub(crate) fn pool_geometry(
+        cfg: &ModelConfig,
+        tp_size: usize,
+        kv_policy: KvFormatPolicy,
+        supports_fp8_kv: bool,
+    ) -> (usize, usize) {
+        target_pool_geometry_with_fp8(cfg, tp_size, kv_policy, supports_fp8_kv)
+    }
+
+    pub(super) fn populate_shared_vocab(
+        cell: &SharedVocabHost,
+        archive: &SafetensorsArchive,
+        cfg: &ModelConfig,
+    ) {
+        let _ = cell.get_or_init(|| Self::load_embed_tokens_f16(archive, cfg));
+    }
+
+    #[allow(clippy::cognitive_complexity, clippy::too_many_arguments)]
+    pub(super) fn fit_serving_plan(
+        archive: &SafetensorsArchive,
+        cfg: &ModelConfig,
+        tp_size: usize,
+        requested_policy: KvFormatPolicy,
+        allow_kv_format_stepdown: bool,
+        requested_kv_pages: Option<usize>,
+        requested_state_slots: usize,
+        native_mtp: bool,
+        dflash_draft_dir: Option<&Path>,
+        lora_reserve: LoraCapacityReserve,
+    ) -> Result<(ServingAutoFitPlan, usize, usize)> {
+        Self::validate_tp_geometry(cfg, tp_size)?;
+        let mut min_free_vram = usize::MAX;
+        let mut min_total_vram = usize::MAX;
+        let mut supports_fp8_kv = true;
+        let mut marlin_ws_bytes = 0usize;
+        for r in 0..tp_size {
+            let device_id = r as i32;
+            prepare_execution_plan(device_id)?;
+            let device = CudaDevice::set_current(device_id)?;
+            let dev_props = device.props()?;
+            dev_props.validate_supported()?;
+            supports_fp8_kv &= dev_props.supports_fp8_kv();
+            marlin_ws_bytes = marlin_ws_bytes.max(dev_props.marlin_workspace_bytes());
+            let (free_vram, total_vram) = device.mem_info()?;
+            min_free_vram = min_free_vram.min(free_vram);
+            min_total_vram = min_total_vram.min(total_vram);
+        }
+        let _ = CudaDevice::set_current(0)?;
+
+        let raw_est_default = Self::estimate_weight_arena_bytes(cfg, archive, tp_size, Some(0));
+        let raw_est_extreme = Self::estimate_weight_arena_bytes(
+            cfg,
+            archive,
+            tp_size,
+            Some(EXTREME_LONGCTX_MIN_PAGES),
+        );
+        let max_packed_tensor_bytes = archive
+            .iter_entries()
+            .filter(|(name, info)| {
+                matches!(info.dtype.as_str(), "I32" | "U32")
+                    && !name.contains(".ple_embedding.")
+                    && !(cfg.uses_tiered_moe() && name.contains(".experts."))
+            })
+            .map(|(name, info)| {
+                let bytes = info.len_bytes as usize;
+                if name.starts_with("lm_head.")
+                    || name.contains(".lm_head.")
+                    || name.contains(".experts.")
+                {
+                    bytes.div_ceil(tp_size)
+                } else {
+                    bytes
+                        .div_ceil(tp_size)
+                        .saturating_mul(REPACK_STAGING_TENSOR_MULTIPLIER)
+                }
+            })
+            .max()
+            .unwrap_or(0);
+        let staging_bytes = MIN_REPACK_STAGING_BYTES.max(max_packed_tensor_bytes);
+        let archive_has_vision = has_vision_weights(cfg, archive);
+        let mtp_experts_w4 = cfg.quant.bits() == 4
+            && (archive
+                .resolve_name("mtp.layers.0.mlp.experts.0.gate_proj.qweight")
+                .is_some()
+                || archive
+                    .resolve_name("mtp.layers.0.mlp.experts.0.gate_proj.weight_packed")
+                    .is_some());
+
+        let max_cap_tokens = if dflash_draft_dir.is_some() {
+            crate::dflash::DFLASH2_MAX_KV_CAPACITY
+        } else {
+            262_144
+        };
+        let max_model_context_tokens = cfg
+            .max_position_embeddings
+            .unwrap_or(262_144)
+            .clamp(DEFAULT_TARGET_KV_PAGES * 16, max_cap_tokens);
+        let max_target_pages = ((max_model_context_tokens / 16) & !63).max(DEFAULT_TARGET_KV_PAGES);
+        let dflash_max_plan = if let Some(draft) = dflash_draft_dir {
+            let bound_pages = requested_kv_pages.unwrap_or(max_target_pages);
+            let tokens = bound_pages
+                .checked_mul(16)
+                .ok_or_else(|| loader_err("DFlash context capacity overflow"))?;
+            Some(
+                crate::dflash::serving_reserve(draft, cfg, tp_size, tokens).map_err(|e| {
+                    loader_err_ctx(
+                        "DFlash2 memory preflight",
+                        format!("{}: {e}", draft.display()),
+                    )
+                })?,
+            )
+        } else {
+            None
+        };
+        let dflash_res_upper = dflash_max_plan.as_ref().map_or(0, |p| p.resident_bytes);
+        let dflash_slots_upper = dflash_max_plan.as_ref().map_or(0, |p| p.min_state_slots);
+
+        let eval_candidate = |policy: KvFormatPolicy, pages: usize, auto_mode: bool| {
+            let raw_est = if tp_size == 1
+                && cfg.num_hidden_layers >= EXTREME_LONGCTX_MIN_LAYERS
+                && pages >= EXTREME_LONGCTX_MIN_PAGES
+            {
+                raw_est_extreme
+            } else {
+                raw_est_default
+            };
+            evaluate_serving_kv_candidate_budget(
+                cfg,
+                tp_size,
+                policy,
+                supports_fp8_kv,
+                pages,
+                raw_est,
+                staging_bytes,
+                marlin_ws_bytes,
+                min_free_vram,
+                requested_state_slots,
+                native_mtp,
+                mtp_experts_w4,
+                archive_has_vision,
+                dflash_res_upper,
+                dflash_slots_upper,
+                lora_reserve,
+                auto_mode,
+            )
+        };
+
+        let find_for_policy_mode = |policy: KvFormatPolicy,
+                                    auto_mode: bool|
+         -> Option<(usize, usize, bool)> {
+            if let Some(explicit_pages) = requested_kv_pages {
+                return eval_candidate(policy, explicit_pages, auto_mode)
+                    .map(|(slots, host_embed, _)| (explicit_pages, slots, host_embed));
+            }
+            if cfg.uses_tiered_moe() {
+                return select_tiered_moe_auto_fit_pages(cfg, tp_size, max_target_pages, |pages| {
+                    eval_candidate(policy, pages, auto_mode)
+                })
+                .map(|(pages, slots, host_embed, _)| (pages, slots, host_embed));
+            }
+            let mut pages = max_target_pages;
+            loop {
+                if let Some((slots, host_embed, _)) = eval_candidate(policy, pages, auto_mode) {
+                    return Some((pages, slots, host_embed));
+                }
+                if pages <= DEFAULT_TARGET_KV_PAGES {
+                    break;
+                }
+                pages = pages.saturating_sub(64).max(DEFAULT_TARGET_KV_PAGES);
+            }
+            None
+        };
+
+        let mut selected_policy = requested_policy;
+        let mut policy_adjusted = false;
+        if cfg.head_dim != 256
+            && allow_kv_format_stepdown
+            && !matches!(selected_policy, KvFormatPolicy::Fp16 | KvFormatPolicy::Bf16)
+        {
+            selected_policy = KvFormatPolicy::Fp16;
+            policy_adjusted = true;
+        }
+
+        let goal_pages = requested_kv_pages.unwrap_or_else(|| {
+            if cfg.uses_tiered_moe() {
+                TIERED_MOE_AUTO_FIT_IDEAL_KV_PAGES.min(max_target_pages)
+            } else {
+                max_target_pages
+            }
+        });
+        let can_stepdown_tq4_all = allow_kv_format_stepdown
+            && selected_policy == KvFormatPolicy::Tq4
+            && cfg.head_dim == 256;
+
+        // Try `auto_mode = true` (preserving full vision + multi-slot headroom) across
+        // `[selected_policy, Tq4All]` before falling back to `auto_mode = false` so explicit
+        // `--max-model-len` / `--kv-pages` and tight cards still step down `tq4 -> tq4_all`
+        // rather than silently dropping `vision_headroom` to 0.
+        let mut selected_fit = find_for_policy_mode(selected_policy, true);
+        if can_stepdown_tq4_all
+            && selected_fit.map_or(0, |f| f.0) < goal_pages
+            && let Some(tq4_all_fit) = find_for_policy_mode(KvFormatPolicy::Tq4All, true)
+            && selected_fit.is_none_or(|cur| tq4_all_fit.0 > cur.0)
+        {
+            selected_policy = KvFormatPolicy::Tq4All;
+            selected_fit = Some(tq4_all_fit);
+            policy_adjusted = true;
+        }
+        if selected_fit.is_none() {
+            selected_fit = find_for_policy_mode(selected_policy, false);
+            if can_stepdown_tq4_all
+                && selected_fit.map_or(0, |f| f.0) < goal_pages
+                && let Some(tq4_all_fit) = find_for_policy_mode(KvFormatPolicy::Tq4All, false)
+                && selected_fit.is_none_or(|cur| tq4_all_fit.0 > cur.0)
+            {
+                selected_policy = KvFormatPolicy::Tq4All;
+                selected_fit = Some(tq4_all_fit);
+                policy_adjusted = true;
+            }
+        }
+
+        let (fitted_pages, estimated_state_slots, host_embed_offload) = selected_fit
+            .unwrap_or_else(|| {
+                let fallback_pages = requested_kv_pages.unwrap_or(DEFAULT_TARGET_KV_PAGES);
+                (
+                    fallback_pages,
+                    dflash_slots_upper.max(MIN_ACTIVE_STATE_SLOTS),
+                    !cfg.tie_word_embeddings,
+                )
+            });
+
+        let (final_dflash_reserve, final_dflash_slots) = if let Some(draft) = dflash_draft_dir {
+            let tokens = fitted_pages
+                .checked_mul(16)
+                .ok_or_else(|| loader_err("DFlash context capacity overflow"))?;
+            let plan =
+                crate::dflash::serving_reserve(draft, cfg, tp_size, tokens).map_err(|e| {
+                    loader_err_ctx(
+                        "DFlash2 memory preflight",
+                        format!("{}: {e}", draft.display()),
+                    )
+                })?;
+            (plan.resident_bytes, plan.min_state_slots)
+        } else {
+            (0, 0)
+        };
+
+        Ok((
+            ServingAutoFitPlan {
+                kv_policy: selected_policy,
+                kv_pages: fitted_pages,
+                context_tokens: fitted_pages.saturating_mul(16),
+                max_model_context_tokens,
+                estimated_state_slots,
+                host_embed_offload,
+                min_free_vram_bytes: min_free_vram,
+                total_vram_bytes: min_total_vram,
+                kv_policy_auto_adjusted: policy_adjusted,
+                kv_pages_auto_fitted: requested_kv_pages.is_none(),
+            },
+            final_dflash_reserve,
+            final_dflash_slots,
+        ))
     }
 
     #[allow(clippy::cognitive_complexity, clippy::too_many_arguments)]
@@ -897,7 +1215,7 @@ impl Qwen3_5ModelRank {
         if cfg.head_dim != 256 && !matches!(kv_policy, KvFormatPolicy::Fp16 | KvFormatPolicy::Bf16)
         {
             return Err(loader_err_msg(format!(
-                "unsupported KV format {kv_policy:?} for head_dim={} (TQ4 and Q8_0 require head_dim=256; use --kv fp16)",
+                "unsupported KV format {kv_policy:?} for head_dim={} (TQ4 and Q8_0 require head_dim=256; use --kv-format fp16)",
                 cfg.head_dim
             )));
         }
@@ -950,7 +1268,7 @@ impl Qwen3_5ModelRank {
             requested_kv_pages,
             capacity.lora_reserve,
         );
-        if cfg.uses_tiered_moe() && free_vram < TIERED_MOE_COMPACT_VRAM_THRESHOLD_BYTES {
+        if should_use_compact_tiered_moe_scratch(cfg, tp_size, free_vram, capacity.lora_reserve) {
             scratch_bytes = crate::scheduler::DEFAULT_SCRATCH_ARENA_BYTES;
         }
         let pages = requested_kv_pages.unwrap_or(DEFAULT_TARGET_KV_PAGES);
@@ -1000,8 +1318,11 @@ impl Qwen3_5ModelRank {
         );
         let desired_gpu_steady_bytes = capacity.state_slots.map(|req_slots| {
             let desired_slots = req_slots.max(min_state_floor);
-            let vision = if rank == 0 && archive_has_vision && pages < EXTREME_LONGCTX_MIN_PAGES {
-                VISION_ENCODER_LAZY_RESERVE_BYTES
+            // Apply vision reserve symmetrically across TP ranks so all ranks make the same
+            // host-embed offload decision and never leak unused slots on non-zero ranks.
+            let vision = if archive_has_vision {
+                vision_lazy_reserve_bytes(cfg, tp_size)
+                    .saturating_sub(target_base_headroom(cfg, tp_size, pages, free_vram))
             } else {
                 0
             };
@@ -1010,19 +1331,22 @@ impl Qwen3_5ModelRank {
                 .saturating_add(state_bytes.saturating_mul(desired_slots))
                 .saturating_add(vision)
         });
+        let boot_persistent_bytes = BATCH_META_ARENA_BYTES.saturating_add(marlin_ws_bytes);
         let (est_weight_bytes, use_host_embed) = plan_host_embed_with_serving_budget(
             cfg,
             raw_est_weight_bytes,
             scratch_bytes,
             staging_bytes,
             free_vram,
-            BATCH_META_ARENA_BYTES.saturating_add(marlin_ws_bytes),
+            boot_persistent_bytes,
             Some(steady_bytes),
             desired_gpu_steady_bytes,
         );
+        // `PinnedUploadRing::new` allocates two device repack staging buffers concurrently.
         let min_boot_bytes = est_weight_bytes
             .saturating_add(scratch_bytes)
-            .saturating_add(staging_bytes)
+            .saturating_add(staging_bytes.saturating_mul(2))
+            .saturating_add(boot_persistent_bytes)
             .saturating_add(MIN_BOOT_MARGIN_BYTES);
         if min_boot_bytes > free_vram {
             let gib = 1024.0 * 1024.0 * 1024.0;
@@ -1039,41 +1363,33 @@ impl Qwen3_5ModelRank {
             )));
         }
 
-        let mut weight_arena = DeviceArena::new(device_id, est_weight_bytes)?;
-        let scratch_arena = DeviceArena::new(device_id, scratch_bytes)?;
+        let mut weight_arena = DeviceArena::new_on_stream(device_id, est_weight_bytes, &stream)?;
+        let scratch_arena = DeviceArena::new_on_stream(device_id, scratch_bytes, &stream)?;
         let _ = stream
             .set_persisting_l2_window(scratch_arena.allocation_base(), scratch_arena.capacity());
-        let batch_meta_arena = DeviceArena::new(device_id, BATCH_META_ARENA_BYTES)?;
-        let marlin_ws = DeviceBuffer::alloc(device_id, marlin_ws_bytes)?;
-        let repack_staging = DeviceBuffer::alloc(device_id, staging_bytes)?;
+        let batch_meta_arena =
+            DeviceArena::new_on_stream(device_id, BATCH_META_ARENA_BYTES, &stream)?;
+        let marlin_ws = DeviceBuffer::alloc_on_stream(device_id, marlin_ws_bytes, &stream)?;
+        let mut upload_ring =
+            crate::cuda::PinnedUploadRing::new(device_id, staging_bytes, &stream)?;
 
-        // 1. embed_tokens (replicated in FP16; dequantized on host when packed)
-        //    and optional untied lm_head (loaded once and shared across TP ranks when `shared_vocab` is provided).
+        // 1. embed_tokens (replicated in FP16; dequantized on host when packed, and optionally
+        //    preloaded in parallel with GPU warmup via `shared_vocab`).
         let has_untied_lm_head = !cfg.tie_word_embeddings
             && ["lm_head.weight", "lm_head.weight_packed", "lm_head.qweight"]
                 .iter()
                 .any(|k| archive.resolve_name(k).is_some());
         let owned_vocab;
-        let (embed_f16, shared_lm_opt): (&[u16], Option<&RawLinearHost>) =
-            if let Some(cell) = shared_vocab {
-                let res = cell.get_or_init(|| {
-                    let emb = Self::load_embed_tokens_f16(archive, cfg)?;
-                    let lm = if has_untied_lm_head {
-                        Some(RawLinearHost::load(archive, "lm_head", &cfg.quant)?)
-                    } else {
-                        None
-                    };
-                    Ok((emb, lm))
-                });
-                let (emb, lm) = res.as_ref().map_err(Clone::clone)?;
-                (emb.as_slice(), lm.as_ref())
-            } else {
-                owned_vocab = Self::load_embed_tokens_f16(archive, cfg)?;
-                (owned_vocab.as_slice(), None)
-            };
+        let embed_f16: &[u16] = if let Some(cell) = shared_vocab {
+            let res = cell.get_or_init(|| Self::load_embed_tokens_f16(archive, cfg));
+            res.as_ref().map_err(Clone::clone)?.as_slice()
+        } else {
+            owned_vocab = Self::load_embed_tokens_f16(archive, cfg)?;
+            owned_vocab.as_slice()
+        };
         let (embed_tokens_ptr, host_embed_tokens) = if use_host_embed {
             let bytes = core::mem::size_of_val(embed_f16);
-            let buf = crate::cuda::MappedHostBuffer::alloc(bytes)?;
+            let buf = crate::cuda::MappedHostBuffer::alloc_unzeroed(bytes)?;
             // SAFETY: `buf.host_ptr` is a freshly allocated pinned buffer of `bytes` bytes.
             unsafe {
                 core::ptr::copy_nonoverlapping(
@@ -1084,7 +1400,10 @@ impl Qwen3_5ModelRank {
             }
             (buf.dev_ptr as u64, Some(buf))
         } else {
-            (weight_arena.upload_slice(embed_f16, &stream)?, None)
+            (
+                upload_ring.upload_slice(&mut weight_arena, embed_f16, &stream)?,
+                None,
+            )
         };
 
         // 2. final norm or multi-stream HyperConnection mixer
@@ -1096,7 +1415,7 @@ impl Qwen3_5ModelRank {
                 false,
                 &mut weight_arena,
                 &stream,
-                &repack_staging,
+                &mut upload_ring,
             )?;
             FinalResidual::HyperConnection { mixer }
         } else {
@@ -1107,7 +1426,7 @@ impl Qwen3_5ModelRank {
                 .read_f16_bits(&norm_key)
                 .map_err(|_| loader_err("read model.norm.weight"))?;
             FinalResidual::SingleStream {
-                norm_ptr: weight_arena.upload_slice(&norm_f16, &stream)?,
+                norm_ptr: upload_ring.upload_slice(&mut weight_arena, &norm_f16, &stream)?,
             }
         };
 
@@ -1121,25 +1440,35 @@ impl Qwen3_5ModelRank {
             let ptr = if tp_size == 1 {
                 embed_tokens_ptr
             } else {
-                weight_arena.upload_slice(slice, &stream)?
+                upload_ring.upload_slice(&mut weight_arena, slice, &stream)?
             };
             Some(LinearProj::DenseF16 {
                 weight_ptr: ptr,
                 size_n: local_vocab_size,
                 size_k: cfg.hidden_size,
             })
-        } else if let Some(raw_lm) = shared_lm_opt {
-            let sharded = raw_lm.slice_rows(vocab_offset, vocab_offset + local_vocab_size);
-            Some(sharded.upload(&mut weight_arena, &stream, &repack_staging)?)
         } else if has_untied_lm_head {
-            let raw_lm = RawLinearHost::load(archive, "lm_head", &cfg.quant)?;
-            let sharded = raw_lm.slice_rows(vocab_offset, vocab_offset + local_vocab_size);
-            Some(sharded.upload(&mut weight_arena, &stream, &repack_staging)?)
+            let mut sharded = RawLinearHost::load_row_shard(
+                archive,
+                "lm_head",
+                &cfg.quant,
+                vocab_offset,
+                vocab_offset + local_vocab_size,
+            )?;
+            if sharded.dims() != (local_vocab_size, cfg.hidden_size) {
+                return Err(loader_err_msg(format!(
+                    "lm_head shard dims {:?} do not match expected ({local_vocab_size}, {})",
+                    sharded.dims(),
+                    cfg.hidden_size
+                )));
+            }
+            sharded = sharded.into_lm_head_u8b128_if_eligible(cfg);
+            Some(sharded.upload_pipelined(&mut weight_arena, &stream, &mut upload_ring)?)
         } else {
             None
         };
 
-        // 4. Decoder layers
+        // 4. Decoder layers (1-layer-ahead host prefetch overlapped with pinned DMA + Marlin repack)
         let mut layers = Vec::with_capacity(cfg.num_hidden_layers);
         let mut full_attn_layer_ids = Vec::new();
         let mut gdn_layer_ids = Vec::new();
@@ -1151,229 +1480,295 @@ impl Qwen3_5ModelRank {
         let gdn_v_local = gdn_v_total / tp_size;
         let local_v_heads = cfg.linear_num_value_heads / tp_size;
 
-        for layer_id in 0..cfg.num_hidden_layers {
-            let preloaded = prepare_layer_linear_shards(archive, cfg, layer_id, rank, tp_size)?;
-            {
-                let pfx = format!("model.layers.{layer_id}");
-                let residual = if cfg.uses_hyper_connection() {
-                    let attn_hc = load_hc_block_weights(
-                        archive,
-                        cfg,
-                        &format!("{pfx}.attn_hyper_connection"),
-                        true,
-                        &mut weight_arena,
-                        &stream,
-                        &repack_staging,
-                    )?;
-                    let mlp_hc = load_hc_block_weights(
-                        archive,
-                        cfg,
-                        &format!("{pfx}.mlp_hyper_connection"),
-                        true,
-                        &mut weight_arena,
-                        &stream,
-                        &repack_staging,
-                    )?;
-                    LayerResidual::HyperConnection { attn_hc, mlp_hc }
-                } else {
-                    let in_ln_key = archive
-                        .resolve_name(&format!("{pfx}.input_layernorm.weight"))
-                        .ok_or_else(|| loader_err("missing input_layernorm"))?;
-                    let in_ln = archive
-                        .read_f16_bits(&in_ln_key)
-                        .map_err(|_| loader_err("read input_layernorm"))?;
-                    let input_layernorm_ptr = weight_arena.upload_slice(&in_ln, &stream)?;
-
-                    let post_ln_key = archive
-                        .resolve_name(&format!("{pfx}.post_attention_layernorm.weight"))
-                        .ok_or_else(|| loader_err("missing post_attention_layernorm"))?;
-                    let post_ln = archive
-                        .read_f16_bits(&post_ln_key)
-                        .map_err(|_| loader_err("read post_attention_layernorm"))?;
-                    let post_attention_layernorm_ptr =
-                        weight_arena.upload_slice(&post_ln, &stream)?;
-                    LayerResidual::SingleStream {
-                        input_layernorm_ptr,
-                        post_attention_layernorm_ptr,
+        std::thread::scope(|layer_scope| -> Result<()> {
+            let (tx, rx) =
+                std::sync::mpsc::sync_channel::<Result<(usize, PreloadedLayerShards)>>(1);
+            let num_layers = cfg.num_hidden_layers;
+            let producer = layer_scope.spawn(move || {
+                for lid in 0..num_layers {
+                    let res = prepare_layer_linear_shards(archive, cfg, lid, rank, tp_size)
+                        .map(|p| (lid, p));
+                    let is_err = res.is_err();
+                    if tx.send(res).is_err() || is_err {
+                        break;
                     }
-                };
-                let ple = if cfg.uses_ple() && cfg.ple_layer_ids.contains(&(layer_id + 1)) {
-                    Some(load_ple_layer_weights(
-                        archive,
-                        cfg,
-                        &pfx,
-                        &mut weight_arena,
-                        &stream,
-                        &repack_staging,
-                    )?)
-                } else {
-                    None
-                };
+                }
+            });
 
-                let block = match preloaded.attn {
-                    PreloadedAttnShards::FullAttention { qkv_shard, o_shard } => {
-                        let kv_ord = full_attn_layer_ids.len();
-                        full_attn_layer_ids.push(layer_id);
+            let consume_res = (|| -> Result<()> {
+                for expected_lid in 0..num_layers {
+                    let (layer_id, preloaded) = rx
+                        .recv()
+                        .map_err(|_| loader_err("layer shard prefetch channel closed"))??;
+                    debug_assert_eq!(layer_id, expected_lid);
+                    let pfx = format!("model.layers.{layer_id}");
+                    let residual = if cfg.uses_hyper_connection() {
+                        let attn_hc = load_hc_block_weights(
+                            archive,
+                            cfg,
+                            &format!("{pfx}.attn_hyper_connection"),
+                            true,
+                            &mut weight_arena,
+                            &stream,
+                            &mut upload_ring,
+                        )?;
+                        let mlp_hc = load_hc_block_weights(
+                            archive,
+                            cfg,
+                            &format!("{pfx}.mlp_hyper_connection"),
+                            true,
+                            &mut weight_arena,
+                            &stream,
+                            &mut upload_ring,
+                        )?;
+                        LayerResidual::HyperConnection { attn_hc, mlp_hc }
+                    } else {
+                        let in_ln_key = archive
+                            .resolve_name(&format!("{pfx}.input_layernorm.weight"))
+                            .ok_or_else(|| loader_err("missing input_layernorm"))?;
+                        let in_ln = archive
+                            .read_f16_bits(&in_ln_key)
+                            .map_err(|_| loader_err("read input_layernorm"))?;
+                        let input_layernorm_ptr =
+                            upload_ring.upload_slice(&mut weight_arena, &in_ln, &stream)?;
 
-                        let qkv_proj =
-                            qkv_shard.upload(&mut weight_arena, &stream, &repack_staging)?;
-                        let o_proj = o_shard.upload(&mut weight_arena, &stream, &repack_staging)?;
+                        let post_ln_key = archive
+                            .resolve_name(&format!("{pfx}.post_attention_layernorm.weight"))
+                            .ok_or_else(|| loader_err("missing post_attention_layernorm"))?;
+                        let post_ln = archive
+                            .read_f16_bits(&post_ln_key)
+                            .map_err(|_| loader_err("read post_attention_layernorm"))?;
+                        let post_attention_layernorm_ptr =
+                            upload_ring.upload_slice(&mut weight_arena, &post_ln, &stream)?;
+                        LayerResidual::SingleStream {
+                            input_layernorm_ptr,
+                            post_attention_layernorm_ptr,
+                        }
+                    };
+                    let ple = if cfg.uses_ple() && cfg.ple_layer_ids.contains(&(layer_id + 1)) {
+                        Some(load_ple_layer_weights(
+                            archive,
+                            cfg,
+                            &pfx,
+                            &mut weight_arena,
+                            &stream,
+                            &mut upload_ring,
+                        )?)
+                    } else {
+                        None
+                    };
 
-                        let q_norm_key = archive
-                            .resolve_name(&format!("{pfx}.self_attn.q_norm.weight"))
-                            .ok_or_else(|| loader_err("missing q_norm"))?;
-                        let q_norm = archive
-                            .read_f16_bits(&q_norm_key)
-                            .map_err(|_| loader_err("read q_norm"))?;
-                        let q_norm_ptr = weight_arena.upload_slice(&q_norm, &stream)?;
+                    let block = match preloaded.attn {
+                        PreloadedAttnShards::FullAttention { qkv_shard, o_shard } => {
+                            let kv_ord = full_attn_layer_ids.len();
+                            full_attn_layer_ids.push(layer_id);
 
-                        let k_norm_key = archive
-                            .resolve_name(&format!("{pfx}.self_attn.k_norm.weight"))
-                            .ok_or_else(|| loader_err("missing k_norm"))?;
-                        let k_norm = archive
-                            .read_f16_bits(&k_norm_key)
-                            .map_err(|_| loader_err("read k_norm"))?;
-                        let k_norm_ptr = weight_arena.upload_slice(&k_norm, &stream)?;
-
-                        let qsa_indexer = if cfg.uses_qsa() {
-                            Some(load_qsa_indexer_weights(
-                                archive,
-                                cfg,
-                                &pfx,
+                            let qkv_proj = qkv_shard.upload_pipelined(
                                 &mut weight_arena,
                                 &stream,
-                                &repack_staging,
-                            )?)
-                        } else {
-                            None
-                        };
+                                &mut upload_ring,
+                            )?;
+                            let o_proj = o_shard.upload_pipelined(
+                                &mut weight_arena,
+                                &stream,
+                                &mut upload_ring,
+                            )?;
 
-                        LayerBlockWeights::FullAttention(FullAttentionLayerWeights {
-                            layer_id,
-                            kv_layer_ordinal: kv_ord,
-                            qkv_proj,
-                            o_proj,
-                            q_norm_ptr,
-                            k_norm_ptr,
-                            qsa_indexer,
-                        })
-                    }
-                    PreloadedAttnShards::LinearAttention {
-                        qkvz_shard,
-                        ba_shard,
-                        out_shard,
-                    } => {
-                        let gdn_ord = gdn_layer_ids.len();
-                        gdn_layer_ids.push(layer_id);
+                            let q_norm_key = archive
+                                .resolve_name(&format!("{pfx}.self_attn.q_norm.weight"))
+                                .ok_or_else(|| loader_err("missing q_norm"))?;
+                            let q_norm = archive
+                                .read_f16_bits(&q_norm_key)
+                                .map_err(|_| loader_err("read q_norm"))?;
+                            let q_norm_ptr =
+                                upload_ring.upload_slice(&mut weight_arena, &q_norm, &stream)?;
 
-                        let in_proj_qkvz =
-                            qkvz_shard.upload(&mut weight_arena, &stream, &repack_staging)?;
-                        let in_proj_ba =
-                            ba_shard.upload(&mut weight_arena, &stream, &repack_staging)?;
-                        let out_proj =
-                            out_shard.upload(&mut weight_arena, &stream, &repack_staging)?;
+                            let k_norm_key = archive
+                                .resolve_name(&format!("{pfx}.self_attn.k_norm.weight"))
+                                .ok_or_else(|| loader_err("missing k_norm"))?;
+                            let k_norm = archive
+                                .read_f16_bits(&k_norm_key)
+                                .map_err(|_| loader_err("read k_norm"))?;
+                            let k_norm_ptr =
+                                upload_ring.upload_slice(&mut weight_arena, &k_norm, &stream)?;
 
-                        let conv_key = archive
-                            .resolve_name(&format!("{pfx}.linear_attn.conv1d.weight"))
-                            .ok_or_else(|| loader_err("missing conv1d.weight"))?;
-                        let conv_all = archive
-                            .read_f16_bits(&conv_key)
-                            .map_err(|_| loader_err("read conv1d.weight"))?;
-                        let k_sz = cfg.linear_conv_kernel_dim;
-                        let mut conv_local =
-                            Vec::with_capacity((2 * gdn_k_local + gdn_v_local) * k_sz);
-                        conv_local.extend_from_slice(
-                            &conv_all[rank * gdn_k_local * k_sz..(rank + 1) * gdn_k_local * k_sz],
-                        );
-                        conv_local.extend_from_slice(
-                            &conv_all[(gdn_k_total + rank * gdn_k_local) * k_sz
-                                ..(gdn_k_total + (rank + 1) * gdn_k_local) * k_sz],
-                        );
-                        conv_local.extend_from_slice(
-                            &conv_all[(2 * gdn_k_total + rank * gdn_v_local) * k_sz
-                                ..(2 * gdn_k_total + (rank + 1) * gdn_v_local) * k_sz],
-                        );
-                        let conv_weight_ptr = weight_arena.upload_slice(&conv_local, &stream)?;
+                            let qsa_indexer = if cfg.uses_qsa() {
+                                Some(load_qsa_indexer_weights(
+                                    archive,
+                                    cfg,
+                                    &pfx,
+                                    &mut weight_arena,
+                                    &stream,
+                                    &mut upload_ring,
+                                )?)
+                            } else {
+                                None
+                            };
 
-                        let a_log_key = archive
-                            .resolve_name(&format!("{pfx}.linear_attn.A_log"))
-                            .ok_or_else(|| loader_err("missing A_log"))?;
-                        let a_log_all = archive
-                            .read_f32(&a_log_key)
-                            .map_err(|_| loader_err("read A_log"))?;
-                        let a_log_local =
-                            &a_log_all[rank * local_v_heads..(rank + 1) * local_v_heads];
-                        let a_log_ptr = weight_arena.upload_slice(a_log_local, &stream)?;
+                            LayerBlockWeights::FullAttention(FullAttentionLayerWeights {
+                                layer_id,
+                                kv_layer_ordinal: kv_ord,
+                                qkv_proj,
+                                o_proj,
+                                q_norm_ptr,
+                                k_norm_ptr,
+                                qsa_indexer,
+                            })
+                        }
+                        PreloadedAttnShards::LinearAttention {
+                            qkvz_shard,
+                            ba_shard,
+                            out_shard,
+                        } => {
+                            let gdn_ord = gdn_layer_ids.len();
+                            gdn_layer_ids.push(layer_id);
 
-                        let dt_bias_key = archive
-                            .resolve_name(&format!("{pfx}.linear_attn.dt_bias"))
-                            .ok_or_else(|| loader_err("missing dt_bias"))?;
-                        let dt_bias_all = archive
-                            .read_f32(&dt_bias_key)
-                            .map_err(|_| loader_err("read dt_bias"))?;
-                        let dt_bias_local =
-                            &dt_bias_all[rank * local_v_heads..(rank + 1) * local_v_heads];
-                        let dt_bias_ptr = weight_arena.upload_slice(dt_bias_local, &stream)?;
+                            let in_proj_qkvz = qkvz_shard.upload_pipelined(
+                                &mut weight_arena,
+                                &stream,
+                                &mut upload_ring,
+                            )?;
+                            let in_proj_ba = ba_shard.upload_pipelined(
+                                &mut weight_arena,
+                                &stream,
+                                &mut upload_ring,
+                            )?;
+                            let out_proj = out_shard.upload_pipelined(
+                                &mut weight_arena,
+                                &stream,
+                                &mut upload_ring,
+                            )?;
 
-                        let norm_w_key = archive
-                            .resolve_name(&format!("{pfx}.linear_attn.norm.weight"))
-                            .ok_or_else(|| loader_err("missing linear_attn.norm.weight"))?;
-                        let norm_w_all = archive
-                            .read_f16_bits(&norm_w_key)
-                            .map_err(|_| loader_err("read linear_attn.norm.weight"))?;
-                        let norm_weight_ptr = weight_arena.upload_slice(&norm_w_all, &stream)?;
+                            let conv_key = archive
+                                .resolve_name(&format!("{pfx}.linear_attn.conv1d.weight"))
+                                .ok_or_else(|| loader_err("missing conv1d.weight"))?;
+                            let conv_all = archive
+                                .read_f16_bits(&conv_key)
+                                .map_err(|_| loader_err("read conv1d.weight"))?;
+                            let k_sz = cfg.linear_conv_kernel_dim;
+                            let mut conv_local =
+                                Vec::with_capacity((2 * gdn_k_local + gdn_v_local) * k_sz);
+                            conv_local.extend_from_slice(
+                                &conv_all
+                                    [rank * gdn_k_local * k_sz..(rank + 1) * gdn_k_local * k_sz],
+                            );
+                            conv_local.extend_from_slice(
+                                &conv_all[(gdn_k_total + rank * gdn_k_local) * k_sz
+                                    ..(gdn_k_total + (rank + 1) * gdn_k_local) * k_sz],
+                            );
+                            conv_local.extend_from_slice(
+                                &conv_all[(2 * gdn_k_total + rank * gdn_v_local) * k_sz
+                                    ..(2 * gdn_k_total + (rank + 1) * gdn_v_local) * k_sz],
+                            );
+                            let conv_weight_ptr = upload_ring.upload_slice(
+                                &mut weight_arena,
+                                &conv_local,
+                                &stream,
+                            )?;
 
-                        LayerBlockWeights::LinearAttention(GdnLayerWeights {
-                            layer_id,
-                            gdn_layer_ordinal: gdn_ord,
-                            in_proj_qkvz,
-                            in_proj_ba,
-                            out_proj,
-                            conv_weight_ptr,
-                            a_log_ptr,
-                            dt_bias_ptr,
-                            norm_weight_ptr,
-                        })
-                    }
-                };
+                            let a_log_key = archive
+                                .resolve_name(&format!("{pfx}.linear_attn.A_log"))
+                                .ok_or_else(|| loader_err("missing A_log"))?;
+                            let a_log_all = archive
+                                .read_f32(&a_log_key)
+                                .map_err(|_| loader_err("read A_log"))?;
+                            let a_log_local =
+                                &a_log_all[rank * local_v_heads..(rank + 1) * local_v_heads];
+                            let a_log_ptr = upload_ring.upload_slice(
+                                &mut weight_arena,
+                                a_log_local,
+                                &stream,
+                            )?;
 
-                let ffn = if let Some((gate_up_shard, down_shard)) = preloaded.dense_ffn {
-                    let gate_up_proj =
-                        gate_up_shard.upload(&mut weight_arena, &stream, &repack_staging)?;
-                    let down_proj =
-                        down_shard.upload(&mut weight_arena, &stream, &repack_staging)?;
-                    FfnBlockWeights::Dense {
-                        gate_up_proj,
-                        down_proj,
-                    }
-                } else {
-                    FfnBlockWeights::Moe(Box::new(load_moe_layer_weights(
-                        archive,
-                        cfg,
-                        cfg.uses_tiered_moe().then_some(layer_id),
-                        &pfx,
-                        [rank, tp_size],
-                        &mut weight_arena,
-                        (&stream, &repack_staging),
-                    )?))
-                };
+                            let dt_bias_key = archive
+                                .resolve_name(&format!("{pfx}.linear_attn.dt_bias"))
+                                .ok_or_else(|| loader_err("missing dt_bias"))?;
+                            let dt_bias_all = archive
+                                .read_f32(&dt_bias_key)
+                                .map_err(|_| loader_err("read dt_bias"))?;
+                            let dt_bias_local =
+                                &dt_bias_all[rank * local_v_heads..(rank + 1) * local_v_heads];
+                            let dt_bias_ptr = upload_ring.upload_slice(
+                                &mut weight_arena,
+                                dt_bias_local,
+                                &stream,
+                            )?;
 
-                layers.push(DecoderLayerWeights {
-                    layer_id,
-                    residual,
-                    ple,
-                    block,
-                    ffn,
-                });
-            }
-        }
+                            let norm_w_key = archive
+                                .resolve_name(&format!("{pfx}.linear_attn.norm.weight"))
+                                .ok_or_else(|| loader_err("missing linear_attn.norm.weight"))?;
+                            let norm_w_all = archive
+                                .read_f16_bits(&norm_w_key)
+                                .map_err(|_| loader_err("read linear_attn.norm.weight"))?;
+                            let norm_weight_ptr = upload_ring.upload_slice(
+                                &mut weight_arena,
+                                &norm_w_all,
+                                &stream,
+                            )?;
 
-        drop(repack_staging);
+                            LayerBlockWeights::LinearAttention(GdnLayerWeights {
+                                layer_id,
+                                gdn_layer_ordinal: gdn_ord,
+                                in_proj_qkvz,
+                                in_proj_ba,
+                                out_proj,
+                                conv_weight_ptr,
+                                a_log_ptr,
+                                dt_bias_ptr,
+                                norm_weight_ptr,
+                            })
+                        }
+                    };
+
+                    let ffn = if let Some((gate_up_shard, down_shard)) = preloaded.dense_ffn {
+                        let gate_up_proj = gate_up_shard.upload_pipelined(
+                            &mut weight_arena,
+                            &stream,
+                            &mut upload_ring,
+                        )?;
+                        let down_proj = down_shard.upload_pipelined(
+                            &mut weight_arena,
+                            &stream,
+                            &mut upload_ring,
+                        )?;
+                        FfnBlockWeights::Dense {
+                            gate_up_proj,
+                            down_proj,
+                        }
+                    } else {
+                        FfnBlockWeights::Moe(Box::new(load_moe_layer_weights(
+                            archive,
+                            cfg,
+                            cfg.uses_tiered_moe().then_some(layer_id),
+                            &pfx,
+                            [rank, tp_size],
+                            &mut weight_arena,
+                            (&stream, &mut upload_ring),
+                        )?))
+                    };
+
+                    layers.push(DecoderLayerWeights {
+                        layer_id,
+                        residual,
+                        ple,
+                        block,
+                        ffn,
+                    });
+                }
+                Ok(())
+            })();
+            drop(rx);
+            let _ = producer.join();
+            consume_res
+        })?;
+
+        drop(upload_ring);
         let aux_stream = CudaStream::new(device_id)?;
-        let aux_marlin_ws = DeviceBuffer::alloc(device_id, marlin_ws_bytes)?;
+        let aux_marlin_ws = DeviceBuffer::alloc_on_stream(device_id, marlin_ws_bytes, &aux_stream)?;
         let aux_fork_event = crate::cuda::CudaEvent::new(device_id, false)?;
         let aux_join_event = crate::cuda::CudaEvent::new(device_id, false)?;
         stream.synchronize()?;
+        aux_stream.synchronize()?;
 
         Ok(PrePoolModelRank {
             rank,
@@ -1498,22 +1893,20 @@ impl PrePoolModelRank {
             0
         };
         let min_state_slots_for_moe = if capacity.state_slots.is_some() {
-            let cap = if tp_size >= 2 {
-                if capacity.dflash_reserve_bytes > 0 {
-                    capacity.dflash_min_state_slots.max(14)
-                } else if capacity.native_mtp && default_pages.unwrap_or(0) < 2048 {
-                    16
-                } else {
-                    18
-                }
-            } else {
-                PLE_OR_LARGE_MODEL_DEFAULT_STATE_SLOTS
-            };
-            requested_state_slots.clamp(MIN_ACTIVE_STATE_SLOTS, cap)
+            tiered_moe_min_state_slots_for_budget(
+                tp_size,
+                capacity.native_mtp,
+                default_pages.unwrap_or(0),
+                requested_state_slots,
+                capacity.dflash_reserve_bytes,
+                capacity.dflash_min_state_slots,
+            )
         } else if tp_size >= 2 {
             requested_state_slots
         } else {
-            requested_state_slots.min(SINGLE_GPU_DFLASH2_MIN_STATE_SLOTS)
+            requested_state_slots
+                .min(SINGLE_GPU_DFLASH2_MIN_STATE_SLOTS)
+                .max(capacity.dflash_min_state_slots)
         };
 
         // 2. Plan and allocate `RankTieredMoe` (GPU `HotExpertCache` + double-buffered H2D
@@ -1521,15 +1914,23 @@ impl PrePoolModelRank {
         let (tiered_moe, tiered_moe_hot_per_layer, actual_tiered_moe_bytes, post_pool_moe_reserve) =
             if cfg.uses_tiered_moe() {
                 let post_weight_available = device.mem_info()?.0;
-                let (hot_per_layer, total_moe_reserve) = plan_tiered_moe_hot_per_layer_with_dflash(
+                let moe_vision_extra = vision_lazy_extra_headroom(
+                    &cfg,
+                    tp_size,
+                    capacity.state_slots.is_some() && has_vision_weights(&cfg, archive),
+                    base_headroom,
+                );
+                let (hot_per_layer, total_moe_reserve) = plan_tiered_moe_hot_per_layer_with_options(
                     &cfg,
                     tp_size,
                     post_weight_available,
                     base_headroom
+                        .saturating_add(moe_vision_extra)
                         .saturating_add(req_kv_bytes)
                         .saturating_add(capacity.lora_reserve.device_bytes_per_rank)
                         .saturating_add(rank0_extra_headroom),
                     bytes_per_state_slot.saturating_mul(min_state_slots_for_moe),
+                    capacity.native_mtp,
                     capacity.dflash_reserve_bytes,
                 );
                 let stage_cap = select_tiered_moe_stage_capacity(&cfg, tp_size, hot_per_layer);
@@ -1612,51 +2013,69 @@ impl PrePoolModelRank {
                     } else {
                         18
                     }
+                } else if capacity.dflash_reserve_bytes > 0 {
+                    // Preserve `>= 384 MiB` post-drafter VRAM headroom on 24 GiB TP=1 cards so all
+                    // `m_verify = 1..=8` speculative verification CUDA Graphs fit without OOM.
+                    16
                 } else {
                     20
-                };
-                requested_state_slots.min(max_tiered_serving_slots)
-            } else {
+                }
+                .max(capacity.dflash_min_state_slots);
                 requested_state_slots
-            };
-        let (state_budget_free, state_budget_fixed) = if capacity.state_slots.is_some() {
-            // Serving can request many more slots than single-request defaults.
-            // `available_for_pools` already reflects live arena capacity, `PleRankRuntime`,
-            // and `RankTieredMoe`. `Qwen3VisionEncoder` is loaded lazily on the first
-            // multimodal request (`ensure_vision_encoder_loaded`) and fits inside
-            // `MIN_HEADROOM_BYTES` (1 GiB) when needed; only reserve dedicated ViT VRAM when
-            // `vision_reserve` still leaves room for `effective_requested_state_slots`.
-            let base_reserved = required_headroom.saturating_add(req_kv_bytes);
-            let protected_state_slots = effective_requested_state_slots.max(MIN_ACTIVE_STATE_SLOTS);
-            let min_state_bytes = bytes_per_state_slot.saturating_mul(protected_state_slots);
-            let vision_reserve = if rank == 0
-                && has_vision_weights(&cfg, archive)
-                && default_pages.unwrap_or(0) < EXTREME_LONGCTX_MIN_PAGES
-            {
-                available_for_pools
-                    .saturating_sub(base_reserved.saturating_add(min_state_bytes))
-                    .min(VISION_ENCODER_LAZY_RESERVE_BYTES)
+                    .min(max_tiered_serving_slots)
+                    .max(capacity.dflash_min_state_slots)
             } else {
-                0
+                requested_state_slots.max(capacity.dflash_min_state_slots)
             };
-            let reserved = base_reserved.saturating_add(vision_reserve);
-            if available_for_pools
-                < reserved
-                    .saturating_add(bytes_per_state_slot.saturating_mul(MIN_ACTIVE_STATE_SLOTS))
-            {
-                return Err(loader_err(
-                    "insufficient VRAM for serving state pool and headroom",
-                ));
-            }
-            (available_for_pools, reserved)
-        } else if cfg.uses_tiered_moe() {
-            (
-                available_for_pools,
-                required_headroom.saturating_add(req_kv_bytes),
-            )
-        } else {
-            (free_vram, base_fixed)
-        };
+        let (state_budget_free, state_budget_fixed, vision_reserve) =
+            if capacity.state_slots.is_some() {
+                // Serving can request many more slots than single-request defaults.
+                // `available_for_pools` already reflects live arena capacity, `PleRankRuntime`,
+                // and `RankTieredMoe`. `Qwen3VisionEncoder` is loaded lazily on the first
+                // multimodal request (`ensure_vision_encoder_loaded`) and requires up to
+                // `VISION_ENCODER_LAZY_RESERVE_BYTES` (1.5 GiB) total free VRAM (weights +
+                // ViT activations). Always reserve the delta above `base_headroom` ahead of
+                // optional extra GDN state slots symmetrically across TP ranks (preventing
+                // non-zero ranks from allocating extra state/checkpoint buffers that
+                // `truncate_slots` cannot free), protecting only `min_state_floor`.
+                let base_reserved = required_headroom.saturating_add(req_kv_bytes);
+                let min_state_floor = if capacity.dflash_reserve_bytes != 0 {
+                    capacity.dflash_min_state_slots
+                } else if capacity.native_mtp {
+                    8.min(effective_requested_state_slots)
+                        .max(MIN_ACTIVE_STATE_SLOTS)
+                } else {
+                    MIN_ACTIVE_STATE_SLOTS
+                };
+                let min_state_bytes = bytes_per_state_slot.saturating_mul(min_state_floor);
+                let desired_vision_extra = vision_lazy_extra_headroom(
+                    &cfg,
+                    tp_size,
+                    has_vision_weights(&cfg, archive),
+                    base_headroom,
+                );
+                let vision_reserve = available_for_pools
+                    .saturating_sub(base_reserved.saturating_add(min_state_bytes))
+                    .min(desired_vision_extra);
+                let reserved = base_reserved.saturating_add(vision_reserve);
+                if available_for_pools
+                    < reserved
+                        .saturating_add(bytes_per_state_slot.saturating_mul(MIN_ACTIVE_STATE_SLOTS))
+                {
+                    return Err(loader_err(
+                        "insufficient VRAM for serving state pool and headroom",
+                    ));
+                }
+                (available_for_pools, reserved, vision_reserve)
+            } else if cfg.uses_tiered_moe() {
+                (
+                    available_for_pools,
+                    required_headroom.saturating_add(req_kv_bytes),
+                    0,
+                )
+            } else {
+                (free_vram, base_fixed, 0)
+            };
         let total_state_slots = clamp_state_slots(
             effective_requested_state_slots,
             state_budget_free,
@@ -1665,9 +2084,26 @@ impl PrePoolModelRank {
         );
         if total_state_slots < capacity.dflash_min_state_slots {
             return Err(loader_err_msg(format!(
-                "insufficient memory for DFlash2: requires at least {} target state slots plus draft resident reserve; reduce KV capacity",
+                "insufficient memory for DFlash2: got {} target state slots (requires at least {} plus {:.2} GiB draft reserve; pool_free={:.2} GiB, fixed={:.2} GiB, kv={:.2} GiB, hot_per_layer={}); reduce KV capacity",
+                total_state_slots,
                 capacity.dflash_min_state_slots,
+                capacity.dflash_reserve_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
+                state_budget_free as f64 / (1024.0 * 1024.0 * 1024.0),
+                state_budget_fixed as f64 / (1024.0 * 1024.0 * 1024.0),
+                req_kv_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
+                tiered_moe_hot_per_layer,
             )));
+        }
+        if rank == 0
+            && capacity.state_slots.is_some()
+            && total_state_slots < effective_requested_state_slots
+        {
+            eprintln!(
+                "warning: serving GDN state pool clamped from {} to {} slots (~{} concurrent active sequences) due to VRAM budget",
+                effective_requested_state_slots,
+                total_state_slots,
+                (total_state_slots / 3).max(1),
+            );
         }
         let conv_dim = 2 * gdn_k_local + gdn_v_local;
         let mut state_pool = StateBundlePool::new(
@@ -1700,6 +2136,7 @@ impl PrePoolModelRank {
         let fixed_without_kv = plan_weight_bytes
             .saturating_add(scratch_arena.capacity())
             .saturating_add(state_pool_bytes);
+        let pool_headroom = required_headroom.saturating_add(vision_reserve);
         let planned_kv_pages = plan_target_kv_pages(
             requested_kv_pages,
             capacity.state_slots.is_some(),
@@ -1707,7 +2144,7 @@ impl PrePoolModelRank {
             capacity.native_mtp,
             plan_free_vram,
             fixed_without_kv,
-            required_headroom,
+            pool_headroom,
             bytes_per_kv_page_all_layers,
         );
         let capacity_plan = CapacityPlanner::plan_with_headroom(
@@ -1718,7 +2155,7 @@ impl PrePoolModelRank {
             state_pool_bytes,
             bytes_per_kv_page_all_layers,
             Some(planned_kv_pages),
-            required_headroom,
+            pool_headroom,
         )
         .map_err(|e| loader_err_ctx("CapacityPlanner failed", e))?;
 
@@ -1734,6 +2171,24 @@ impl PrePoolModelRank {
         if cfg.uses_qsa() {
             kv_pool.init_qsa_indexer_caches(cfg.indexer_head_dim, cfg.indexer_compress_ratio)?;
         }
+        if capacity.enable_checkpoint_pool {
+            let host_kv_pages = crate::cache::plan_auto_host_kv_swap_pages(
+                kv_pool.page_bundle_bytes(),
+                tp_size,
+                crate::cache::detect_available_host_ram_bytes(),
+            );
+            kv_pool.enable_host_swap(host_kv_pages);
+        }
+
+        let checkpoint_pool = Self::build_rank_checkpoint_pool(
+            &device,
+            &stream,
+            &state_pool,
+            !gdn_layer_ids.is_empty(),
+            tp_size,
+            pool_headroom,
+            capacity,
+        )?;
 
         let decode_io =
             DecodeGraphIo::new(device_id, capacity_plan.max_kv_pages_per_layer, &stream)?;
@@ -1764,6 +2219,7 @@ impl PrePoolModelRank {
             layers,
             kv_pool,
             state_pool,
+            checkpoint_pool,
             decode_io,
             decode_graph: Vec::new(),
             spec_verify_io,
@@ -1801,5 +2257,57 @@ impl PrePoolModelRank {
             lora_runtime: None,
             is_capturing_graph: false,
         })
+    }
+
+    fn build_rank_checkpoint_pool(
+        device: &CudaDevice,
+        stream: &CudaStream,
+        state_pool: &StateBundlePool,
+        has_gdn_layers: bool,
+        tp_size: usize,
+        required_headroom: usize,
+        capacity: PoolCapacity,
+    ) -> Result<Option<crate::cache::GdnCheckpointPool>> {
+        if !has_gdn_layers
+            || (!capacity.enable_checkpoint_pool
+                && capacity.checkpoint_vram_slots.is_none()
+                && capacity.checkpoint_host_slots.is_none())
+        {
+            return Ok(None);
+        }
+        let explicit_pool =
+            capacity.checkpoint_vram_slots.is_some() || capacity.checkpoint_host_slots.is_some();
+        let ckpt_layout = crate::cache::GdnCheckpointLayout::from_state_pool(state_pool);
+        let vram_slots = match capacity.checkpoint_vram_slots {
+            Some(v) => v,
+            None => match device.mem_info() {
+                Ok((live_free_after_kv, _)) => {
+                    let safety_floor = required_headroom.saturating_add(256 * 1024 * 1024);
+                    let spare_vram = live_free_after_kv.saturating_sub(safety_floor);
+                    (spare_vram / ckpt_layout.bundle_bytes.max(1))
+                        .min(crate::cache::MAX_AUTO_VRAM_CHECKPOINT_SLOTS)
+                }
+                Err(_) => 0,
+            },
+        };
+        let host_slots = match capacity.checkpoint_host_slots {
+            Some(h) => h,
+            None => crate::cache::plan_auto_host_checkpoint_slots(
+                ckpt_layout.bundle_bytes,
+                tp_size,
+                crate::cache::detect_available_host_ram_bytes(),
+            ),
+        };
+        if vram_slots + host_slots == 0 {
+            return Ok(None);
+        }
+        match crate::cache::GdnCheckpointPool::new(state_pool, vram_slots, host_slots, stream) {
+            Ok(pool) => Ok(Some(pool)),
+            Err(e) if explicit_pool => Err(e),
+            Err(_) if vram_slots > 0 && host_slots > 0 => {
+                Ok(crate::cache::GdnCheckpointPool::new(state_pool, 0, host_slots, stream).ok())
+            }
+            Err(_) => Ok(None),
+        }
     }
 }

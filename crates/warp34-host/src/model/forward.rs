@@ -611,6 +611,21 @@ impl Qwen3_5ModelRank {
         mut dump_out: Option<&mut ForwardDump>,
     ) -> Result<()> {
         let h = self.cfg.hidden_size;
+        let allow_w4a8_prefill = !self.is_capturing_graph
+            && dump_out.is_none()
+            && rows >= 128
+            && attn.max_q_len >= 128
+            && gdn_batch.max_verify_tokens == 0
+            && gdn_batch.spec_state_indices.is_null();
+        let layer_ex = Warp34Exec {
+            flags: if allow_w4a8_prefill {
+                ex.flags | ffi::WARP34_EXEC_FLAG_ALLOW_W4A8_PREFILL
+            } else {
+                ex.flags
+            },
+            ..*ex
+        };
+        let ex = &layer_ex;
         let hc = self.final_residual.is_hyper_connection();
         let streams = if hc { self.cfg.hc_count.max(1) } else { 1 };
         let lowrank = self.cfg.hc_lowrank;
@@ -783,6 +798,7 @@ impl Qwen3_5ModelRank {
                     .iter()
                     .any(|&(_, b, passes)| passes > 1 && b + 1 == layer_idx);
             let norm_layer_idx = if redo_input_norm { 0 } else { layer_idx };
+            let hc_pre_normed = tp2.is_none() && !redo_input_norm && layer_idx > 0;
             let hc_ctx = super::HcStepContext {
                 ex,
                 cublas: &self.cublas,
@@ -798,10 +814,18 @@ impl Qwen3_5ModelRank {
                 h_dim: h,
                 eps,
             };
-            let pre_attn_targets = layer.block.pre_attn_norm_targets(s.normed, ex, rows, h);
-            layer
-                .residual
-                .pre_attn_with_targets(norm_layer_idx, &hc_ctx, pre_attn_targets)?;
+            let allow_h512_norm =
+                tp2.is_none() && layer.residual.single_stream_input_norm_ptr().is_some();
+            let (pre_attn_targets, pre_attn_had_block) = layer
+                .block
+                .pre_attn_norm_targets_with_block(s.normed, ex, rows, h, allow_h512_norm);
+            layer.residual.pre_attn_with_targets_block(
+                norm_layer_idx,
+                hc_pre_normed,
+                &hc_ctx,
+                pre_attn_targets,
+                pre_attn_had_block,
+            )?;
             self.run_attention_block(
                 ex,
                 layer_idx,
@@ -812,13 +836,21 @@ impl Qwen3_5ModelRank {
                 s,
                 pre_attn_targets,
             )?;
-            let pre_mlp_targets = layer.ffn.pre_mlp_norm_targets(s.normed, s.mlp, ex, rows, h);
-            layer.residual.post_attn_pre_mlp_with_targets(
+            let (pre_mlp_targets, pre_mlp_had_block) = layer.ffn.pre_mlp_norm_targets_with_block(
+                s.normed,
+                s.mlp,
+                ex,
+                rows,
+                h,
+                allow_h512_norm,
+            );
+            layer.residual.post_attn_pre_mlp_with_targets_block(
                 &hc_ctx,
                 tp2,
                 self.rank,
                 s.block,
                 pre_mlp_targets,
+                pre_mlp_had_block,
                 dump_out.is_some(),
             )?;
             if let Some(dump) = dump_out.as_deref_mut()
@@ -832,8 +864,11 @@ impl Qwen3_5ModelRank {
                     dump,
                 )?;
             }
-            layer.ffn.forward_with_prerotated_input(
+            layer.ffn.forward_and_execute_tiered_overlapped(
+                self.tiered_moe.as_mut(),
                 ex,
+                &self.stream,
+                self.is_capturing_graph,
                 &self.cublas,
                 mw,
                 mi,
@@ -854,33 +889,33 @@ impl Qwen3_5ModelRank {
                 shgate,
                 pre_mlp_targets[1],
             )?;
-            layer.ffn.execute_tiered(
-                self.tiered_moe.as_mut(),
-                &self.stream,
-                self.is_capturing_graph,
-                if pre_mlp_targets[1] != 0 {
-                    pre_mlp_targets[1]
-                } else {
-                    s.normed
-                },
-                [topids, topw, shout, shgate, s.mlp],
-                rows,
-            )?;
-            let [next_weight, next_out, next_had64] =
+            let is_midloop_end = active_midloop.is_some_and(|(_, b, _, _)| layer_idx == b);
+            let ([next_weight, next_out, next_had64], next_had_block) =
                 if let Some(next) = self.layers.get(layer_idx + 1) {
-                    let w = next.residual.single_stream_input_norm_ptr().unwrap_or(0);
-                    let [no, nh] = if next.ple.is_some() {
-                        [s.normed, 0]
+                    if let Some(w) = next.residual.single_stream_input_norm_ptr() {
+                        let ([no, nh], hb) = if next.ple.is_some() {
+                            ([s.normed, 0], 0)
+                        } else {
+                            next.block.pre_attn_norm_targets_with_block(
+                                s.normed,
+                                ex,
+                                rows,
+                                h,
+                                allow_h512_norm,
+                            )
+                        };
+                        ([w, no, nh], hb)
+                    } else if tp2.is_none() && !is_midloop_end && next.ple.is_none() {
+                        ([next.residual.hc_input_norm_ptr().unwrap_or(0), pa, 0], 0)
                     } else {
-                        next.block.pre_attn_norm_targets(s.normed, ex, rows, h)
-                    };
-                    [w, no, nh]
+                        ([0, 0, 0], 0)
+                    }
+                } else if let Some(w) = self.final_residual.single_stream_norm_ptr() {
+                    ([w, final_out, 0], 0)
+                } else if tp2.is_none() && !is_midloop_end {
+                    ([self.final_residual.hc_norm_ptr().unwrap_or(0), pa, 0], 0)
                 } else {
-                    [
-                        self.final_residual.single_stream_norm_ptr().unwrap_or(0),
-                        final_out,
-                        0,
-                    ]
+                    ([0, 0, 0], 0)
                 };
             let is_final_midloop_pass =
                 active_midloop.is_none_or(|(_, _, passes, pass_idx)| pass_idx + 1 == passes);
@@ -889,18 +924,21 @@ impl Qwen3_5ModelRank {
             } else {
                 (0, 0, 0)
             };
-            self.layers[layer_idx].residual.post_mlp_with_targets(
-                &hc_ctx,
-                tp2,
-                self.rank,
-                s.mlp,
-                [next_weight, next_out, next_had64],
-                super::TapExport {
-                    dst,
-                    stride,
-                    offset,
-                },
-            )?;
+            self.layers[layer_idx]
+                .residual
+                .post_mlp_with_targets_block(
+                    &hc_ctx,
+                    tp2,
+                    self.rank,
+                    s.mlp,
+                    [next_weight, next_out, next_had64],
+                    next_had_block,
+                    super::TapExport {
+                        dst,
+                        stride,
+                        offset,
+                    },
+                )?;
             if let Some((a, b, passes, pass_idx)) = active_midloop
                 && layer_idx == b
             {
@@ -1029,7 +1067,13 @@ impl Qwen3_5ModelRank {
             h_dim: h,
             eps,
         };
-        self.final_residual.finish_stack(
+        let final_hc_pre_normed = tp2.is_none()
+            && !self.layers.is_empty()
+            && !self
+                .active_midloop_specs()
+                .iter()
+                .any(|&(_, b, passes)| passes > 1 && b + 1 == self.layers.len());
+        self.final_residual.finish_stack_ex(
             &final_hc_ctx,
             &self.stream,
             final_out,
@@ -1038,6 +1082,7 @@ impl Qwen3_5ModelRank {
             } else {
                 None
             },
+            final_hc_pre_normed,
         )?;
         self.last_norm_hidden_ptr = final_out;
         self.last_norm_hidden_rows = rows;
@@ -1136,6 +1181,7 @@ impl Qwen3_5ModelRank {
                     "warp34_kv_cache_write_strided",
                 )?;
                 let fuse_o_h64 = fa.o_proj.can_fuse_h64_from_producer();
+                let fuse_o_h512 = !fuse_o_h64 && fa.o_proj.can_fuse_h512_from_producer();
                 if let Some(indexer) = &fa.qsa_indexer {
                     fa.forward_qsa_attention(
                         indexer,
@@ -1176,6 +1222,8 @@ impl Qwen3_5ModelRank {
                     )?;
                     let gate_fn = if fuse_o_h64 {
                         ffi::warp34_apply_attn_output_gate_hadamard_f16
+                    } else if fuse_o_h512 {
+                        ffi::warp34_apply_attn_output_gate_hadamard512_f16
                     } else {
                         ffi::warp34_apply_attn_output_gate_f16
                     };
@@ -1195,7 +1243,7 @@ impl Qwen3_5ModelRank {
                         "warp34_apply_attn_output_gate_f16",
                     )?;
                 }
-                if fuse_o_h64 {
+                if fuse_o_h64 || fuse_o_h512 {
                     fa.o_proj
                         .forward_prerotated(ex, &self.cublas, mw, mi, gated, s.block, rows)?;
                 } else {
@@ -1272,15 +1320,17 @@ impl Qwen3_5ModelRank {
                 if fork {
                     self.stream.wait_event(&self.aux_join_event)?;
                 }
-                // Never borrow the overlay tail while persistent HC/PLE/QSA data can be live.
-                let tail = if self.cfg.uses_hyper_connection()
-                    || self.cfg.uses_ple()
-                    || self.cfg.uses_qsa()
-                {
-                    0
+                // Borrow the contiguous scratch arena tail `[normed .. arena_end)` for the
+                // parallel 3-stage split-WY workspace (`pa/pb/pv` in `s.ple`, post-stack
+                // `logits`, and `ex.scratch_ptr` are not live during `warp34_gdn_recurrent_strided_f16`).
+                let arena_end = if ex.scratch_ptr == 0 {
+                    s.overlay_end
                 } else {
-                    s.overlay_end.saturating_sub(normed) as usize
+                    ex.scratch_ptr
+                        .saturating_add(ex.scratch_size as u64)
+                        .max(s.overlay_end)
                 };
+                let tail = arena_end.saturating_sub(normed) as usize;
                 let recurrent_ex = if tail > ex.scratch_size {
                     self.stream.exec(normed, tail)
                 } else {

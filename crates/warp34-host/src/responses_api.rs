@@ -27,6 +27,8 @@ pub enum ResponsesErrorKind {
 pub struct ResponsesApiError {
     pub kind: ResponsesErrorKind,
     pub message: String,
+    pub param: Option<&'static str>,
+    pub code: Option<&'static str>,
 }
 
 impl ResponsesApiError {
@@ -34,6 +36,19 @@ impl ResponsesApiError {
         Self {
             kind: ResponsesErrorKind::InvalidRequest,
             message: msg.into(),
+            param: None,
+            code: None,
+        }
+    }
+
+    pub fn context_length_exceeded(prompt_tokens: usize, max_model_len: usize) -> Self {
+        Self {
+            kind: ResponsesErrorKind::InvalidRequest,
+            message: format!(
+                "This model's maximum context length is {max_model_len} tokens (serving context limit). However, your input contains {prompt_tokens} tokens, leaving no room for generation. Please reduce the length of the input."
+            ),
+            param: Some("input"),
+            code: Some("context_length_exceeded"),
         }
     }
 
@@ -41,6 +56,8 @@ impl ResponsesApiError {
         Self {
             kind: ResponsesErrorKind::NotFound,
             message: msg.into(),
+            param: None,
+            code: None,
         }
     }
 
@@ -53,8 +70,8 @@ impl ResponsesApiError {
             "error": {
                 "message": self.message,
                 "type": err_type,
-                "param": Value::Null,
-                "code": Value::Null,
+                "param": self.param,
+                "code": self.code,
             }
         })
     }
@@ -68,9 +85,9 @@ pub struct StoredResponse {
     pub history_messages: Vec<Value>,
 }
 
-/// Generates a 128-bit cryptographically random response identifier (`resp_<32 hex>`) from OS
-/// CSPRNG (`/dev/urandom`), preventing response-ID enumeration across callers.
-pub fn generate_unguessable_response_id(seq_fallback: u64) -> String {
+/// Generates a 128-bit cryptographically random identifier (`<prefix><32 hex>`) from OS
+/// CSPRNG (`/dev/urandom`), preventing request/response-ID collisions and enumeration across restarts.
+pub fn generate_unguessable_prefixed_id(prefix: &str, seq_fallback: u64) -> String {
     let mut buf = [0u8; 16];
     let ok = std::fs::File::open("/dev/urandom")
         .and_then(|mut f| std::io::Read::read_exact(&mut f, &mut buf))
@@ -92,13 +109,19 @@ pub fn generate_unguessable_response_id(seq_fallback: u64) -> String {
         buf[..8].copy_from_slice(&h1.finish().to_le_bytes());
         buf[8..].copy_from_slice(&h2.finish().to_le_bytes());
     }
-    let mut out = String::with_capacity(5 + 32);
-    out.push_str("resp_");
+    let mut out = String::with_capacity(prefix.len() + 32);
+    out.push_str(prefix);
     for b in buf {
         use std::fmt::Write;
         let _ = write!(&mut out, "{b:02x}");
     }
     out
+}
+
+/// Generates a 128-bit cryptographically random response identifier (`resp_<32 hex>`) from OS
+/// CSPRNG (`/dev/urandom`), preventing response-ID enumeration across callers.
+pub fn generate_unguessable_response_id(seq_fallback: u64) -> String {
+    generate_unguessable_prefixed_id("resp_", seq_fallback)
 }
 
 /// Bounded store for explicit opt-in (`"store": true`) responses and active cancellation handles.
@@ -357,6 +380,46 @@ pub struct ResponsesPreparedMeta {
     pub truncation: String,
     pub metadata: Value,
     pub input_messages: Vec<Value>,
+    /// Maps flattened model-facing tool names (`"{namespace}__{name}"`) back to their
+    /// Responses API `(namespace, name)` pair for `function_call` output items.
+    pub namespaced_tools: HashMap<String, (String, String)>,
+}
+
+fn qualify_namespaced_tool(namespace: &str, name: &str) -> String {
+    format!("{namespace}__{name}")
+}
+
+fn resolve_wire_tool_name<'a>(
+    meta: &'a ResponsesPreparedMeta,
+    raw_name: &'a str,
+) -> (&'a str, Option<&'a str>) {
+    if let Some((ns, name)) = meta.namespaced_tools.get(raw_name) {
+        (name.as_str(), Some(ns.as_str()))
+    } else {
+        (raw_name, None)
+    }
+}
+
+fn build_function_call_item(
+    meta: &ResponsesPreparedMeta,
+    item_id: &str,
+    call_id: &str,
+    status: &str,
+    raw_name: &str,
+    arguments: &str,
+) -> Value {
+    let (wire_name, wire_namespace) = resolve_wire_tool_name(meta, raw_name);
+    let mut item = Map::new();
+    item.insert("id".into(), json!(item_id));
+    item.insert("type".into(), json!("function_call"));
+    item.insert("status".into(), json!(status));
+    item.insert("call_id".into(), json!(call_id));
+    item.insert("name".into(), json!(wire_name));
+    if let Some(ns) = wire_namespace {
+        item.insert("namespace".into(), json!(ns));
+    }
+    item.insert("arguments".into(), json!(arguments));
+    Value::Object(item)
 }
 
 fn unix_timestamp_secs() -> u64 {
@@ -366,19 +429,10 @@ fn unix_timestamp_secs() -> u64 {
         .as_secs()
 }
 
-fn normalize_tool_def(tool: &Value) -> Result<(Value, Value), ResponsesApiError> {
-    let obj = tool
-        .as_object()
-        .ok_or_else(|| ResponsesApiError::bad_request("each tool must be a JSON object"))?;
-    let tool_type = obj
-        .get("type")
-        .and_then(Value::as_str)
-        .unwrap_or("function");
-    if tool_type != "function" {
-        return Err(ResponsesApiError::bad_request(format!(
-            "unsupported Responses tool type '{tool_type}': only 'function' tools are supported"
-        )));
-    }
+fn normalize_function_tool(
+    obj: &Map<String, Value>,
+    namespace: Option<&str>,
+) -> Result<(String, Value, Value), ResponsesApiError> {
     let (name, description, parameters, strict) =
         if let Some(func) = obj.get("function").and_then(Value::as_object) {
             (
@@ -402,8 +456,13 @@ fn normalize_tool_def(tool: &Value) -> Result<(Value, Value), ResponsesApiError>
         || json!({"type": "object", "properties": {}, "additionalProperties": false}),
     );
 
+    let model_name = match namespace {
+        Some(ns) => qualify_namespaced_tool(ns, name),
+        None => name.to_string(),
+    };
+
     let mut fn_obj = Map::new();
-    fn_obj.insert("name".into(), json!(name));
+    fn_obj.insert("name".into(), json!(model_name));
     if let Some(desc) = description.clone().filter(|v| !v.is_null()) {
         fn_obj.insert("description".into(), desc);
     }
@@ -422,7 +481,80 @@ fn normalize_tool_def(tool: &Value) -> Result<(Value, Value), ResponsesApiError>
     resp_tool.insert("description".into(), description.unwrap_or(Value::Null));
     resp_tool.insert("parameters".into(), params);
     resp_tool.insert("strict".into(), strict.unwrap_or(json!(true)));
-    Ok((chat_tool, Value::Object(resp_tool)))
+    Ok((name.to_string(), chat_tool, Value::Object(resp_tool)))
+}
+
+fn normalize_tool_def(
+    tool: &Value,
+    chat_tools: &mut Vec<Value>,
+    resp_tools: &mut Vec<Value>,
+    namespaced_tools: &mut HashMap<String, (String, String)>,
+) -> Result<(), ResponsesApiError> {
+    let obj = tool
+        .as_object()
+        .ok_or_else(|| ResponsesApiError::bad_request("each tool must be a JSON object"))?;
+    let tool_type = obj
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or("function");
+    match tool_type {
+        "function" => {
+            let (_, ct, rt) = normalize_function_tool(obj, None)?;
+            chat_tools.push(ct);
+            resp_tools.push(rt);
+            Ok(())
+        }
+        "namespace" => {
+            let ns_name = obj
+                .get("name")
+                .and_then(Value::as_str)
+                .filter(|s| !s.trim().is_empty())
+                .ok_or_else(|| {
+                    ResponsesApiError::bad_request("namespace tool missing non-empty 'name'")
+                })?;
+            let inner = obj.get("tools").and_then(Value::as_array).ok_or_else(|| {
+                ResponsesApiError::bad_request("namespace tool missing 'tools' array")
+            })?;
+            let mut echoed_inner = Vec::with_capacity(inner.len());
+            for sub in inner {
+                let sub_obj = sub.as_object().ok_or_else(|| {
+                    ResponsesApiError::bad_request("each namespace sub-tool must be a JSON object")
+                })?;
+                let sub_type = sub_obj
+                    .get("type")
+                    .and_then(Value::as_str)
+                    .unwrap_or("function");
+                if sub_type != "function" {
+                    return Err(ResponsesApiError::bad_request(format!(
+                        "unsupported tool type '{sub_type}' inside namespace '{ns_name}': only 'function' tools are supported"
+                    )));
+                }
+                let (fn_name, ct, rt) = normalize_function_tool(sub_obj, Some(ns_name))?;
+                let qualified = qualify_namespaced_tool(ns_name, &fn_name);
+                namespaced_tools.insert(qualified, (ns_name.to_string(), fn_name));
+                chat_tools.push(ct);
+                echoed_inner.push(rt);
+            }
+            let mut resp_ns = Map::new();
+            resp_ns.insert("type".into(), json!("namespace"));
+            resp_ns.insert("name".into(), json!(ns_name));
+            if let Some(desc) = obj.get("description") {
+                resp_ns.insert("description".into(), desc.clone());
+            }
+            resp_ns.insert("tools".into(), Value::Array(echoed_inner));
+            resp_tools.push(Value::Object(resp_ns));
+            Ok(())
+        }
+        // Hosted OpenAI web search tools (sent by default by Codex CLI): not executed
+        // server-side by a local engine, so preserve in echo without exposing as callable functions.
+        "web_search" | "web_search_preview" | "web_search_preview_2025_03_11" => {
+            resp_tools.push(tool.clone());
+            Ok(())
+        }
+        _ => Err(ResponsesApiError::bad_request(format!(
+            "unsupported Responses tool type '{tool_type}': only 'function' and 'namespace' tools are supported"
+        ))),
+    }
 }
 
 fn normalize_tool_choice(
@@ -450,9 +582,23 @@ fn normalize_tool_choice(
                 .ok_or_else(|| {
                     ResponsesApiError::bad_request("function tool_choice requires non-empty 'name'")
                 })?;
+            let namespace = obj
+                .get("namespace")
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty());
+            let model_name = match namespace {
+                Some(ns) => qualify_namespaced_tool(ns, name),
+                None => name.to_string(),
+            };
+            let mut echo = Map::new();
+            echo.insert("type".into(), json!("function"));
+            echo.insert("name".into(), json!(name));
+            if let Some(ns) = namespace {
+                echo.insert("namespace".into(), json!(ns));
+            }
             return Ok((
-                Some(json!({"type": "function", "function": {"name": name}})),
-                json!({"type": "function", "name": name}),
+                Some(json!({"type": "function", "function": {"name": model_name}})),
+                Value::Object(echo),
             ));
         }
     }
@@ -602,7 +748,10 @@ fn parse_input_items(
                                     text.push_str(t);
                                 }
                             }
-                        } else if let Some(arr) = obj.get("summary").and_then(Value::as_array) {
+                        }
+                        if text.is_empty()
+                            && let Some(arr) = obj.get("summary").and_then(Value::as_array)
+                        {
                             for p in arr {
                                 if let Some(t) = p.get("text").and_then(Value::as_str) {
                                     text.push_str(t);
@@ -610,13 +759,7 @@ fn parse_input_items(
                             }
                         }
                         if !text.is_empty() {
-                            if let Some(last) = turns.last_mut().filter(|m| {
-                                m.get("role").and_then(Value::as_str) == Some("assistant")
-                            }) {
-                                last["reasoning_content"] = json!(text);
-                            } else {
-                                pending_reasoning = Some(text);
-                            }
+                            pending_reasoning = Some(text);
                         }
                     }
                     "function_call" => {
@@ -629,6 +772,14 @@ fn parse_input_items(
                                     "function_call item missing non-empty 'name'",
                                 )
                             })?;
+                        let model_name = match obj
+                            .get("namespace")
+                            .and_then(Value::as_str)
+                            .filter(|s| !s.is_empty())
+                        {
+                            Some(ns) => qualify_namespaced_tool(ns, name),
+                            None => name.to_string(),
+                        };
                         let args_val = obj.get("arguments").ok_or_else(|| {
                             ResponsesApiError::bad_request("function_call item missing 'arguments'")
                         })?;
@@ -661,7 +812,7 @@ fn parse_input_items(
                             "id": call_id,
                             "type": "function",
                             "function": {
-                                "name": name,
+                                "name": model_name,
                                 "arguments": parsed_args,
                             }
                         });
@@ -726,6 +877,21 @@ fn parse_input_items(
                     }
                 }
             }
+            if let Some(r) = pending_reasoning.take() {
+                if let Some(last) = turns
+                    .last_mut()
+                    .filter(|m| m.get("role").and_then(Value::as_str) == Some("assistant"))
+                    && last.get("reasoning_content").is_none()
+                {
+                    last["reasoning_content"] = json!(r);
+                } else {
+                    turns.push(json!({
+                        "role": "assistant",
+                        "content": "",
+                        "reasoning_content": r,
+                    }));
+                }
+            }
             Ok(())
         }
         _ => Err(ResponsesApiError::bad_request(
@@ -734,10 +900,42 @@ fn parse_input_items(
     }
 }
 
+fn forward_optional_reasoning_budget_fields(
+    chat_req: &mut Map<String, Value>,
+    obj: &Map<String, Value>,
+) {
+    for key in [
+        "thinking_token_budget",
+        "reasoning_budget_tokens",
+        "thinking_budget_tokens",
+        "reasoning_budget_message",
+        "thinking_budget_message",
+    ] {
+        if !chat_req.contains_key(key)
+            && let Some(val) = obj.get(key).filter(|v| !v.is_null())
+        {
+            chat_req.insert(key.into(), val.clone());
+        }
+    }
+}
+
+#[allow(clippy::type_complexity)]
 fn parse_reasoning_and_text_config(
     obj: &Map<String, Value>,
-) -> Result<(Option<bool>, Value, Option<Value>, Value), ResponsesApiError> {
+) -> Result<
+    (
+        Option<bool>,
+        Option<String>,
+        Option<i64>,
+        Value,
+        Option<Value>,
+        Value,
+    ),
+    ResponsesApiError,
+> {
     let mut enable_thinking: Option<bool> = None;
+    let mut reasoning_effort: Option<String> = None;
+    let mut reasoning_budget: Option<i64> = None;
     let reasoning_echo = if let Some(r_val) = obj.get("reasoning").filter(|v| !v.is_null()) {
         let r_obj = r_val
             .as_object()
@@ -747,13 +945,30 @@ fn parse_reasoning_and_text_config(
                 ResponsesApiError::bad_request("'reasoning.effort' must be a string")
             })?;
             match eff {
-                "none" | "minimal" => enable_thinking = Some(false),
-                "low" | "medium" | "high" | "xhigh" | "max" => enable_thinking = Some(true),
+                "none" => {
+                    enable_thinking = Some(false);
+                    reasoning_effort = Some("none".to_string());
+                }
+                "minimal" | "low" | "medium" | "high" | "xhigh" | "max" => {
+                    enable_thinking = Some(true);
+                    reasoning_effort = Some(eff.to_string());
+                }
                 other => {
                     return Err(ResponsesApiError::bad_request(format!(
                         "unsupported reasoning.effort '{other}'"
                     )));
                 }
+            }
+        }
+        if let Some(max_tok) = r_obj.get("max_tokens").filter(|v| !v.is_null()) {
+            let n = max_tok.as_i64().filter(|&n| n >= -1).ok_or_else(|| {
+                ResponsesApiError::bad_request(
+                    "'reasoning.max_tokens' must be an integer >= -1 (-1 for unlimited)",
+                )
+            })?;
+            reasoning_budget = Some(n);
+            if enable_thinking.is_none() {
+                enable_thinking = Some(n != 0);
             }
         }
         json!({
@@ -813,7 +1028,14 @@ fn parse_reasoning_and_text_config(
     } else {
         json!({"format": {"type": "text"}})
     };
-    Ok((enable_thinking, reasoning_echo, response_format, text_echo))
+    Ok((
+        enable_thinking,
+        reasoning_effort,
+        reasoning_budget,
+        reasoning_echo,
+        response_format,
+        text_echo,
+    ))
 }
 
 /// Translates an OpenAI Responses API request body into `(canonical_chat_request, meta)`.
@@ -892,39 +1114,47 @@ pub fn translate_responses_to_chat(
     // Tools & tool_choice
     let mut chat_tools = Vec::new();
     let mut resp_tools = Vec::new();
+    let mut namespaced_tools = HashMap::new();
     if let Some(tools_val) = obj.get("tools").filter(|v| !v.is_null()) {
         let arr = tools_val
             .as_array()
             .ok_or_else(|| ResponsesApiError::bad_request("'tools' must be an array"))?;
         for t in arr {
-            let (ct, rt) = normalize_tool_def(t)?;
-            chat_tools.push(ct);
-            resp_tools.push(rt);
+            normalize_tool_def(t, &mut chat_tools, &mut resp_tools, &mut namespaced_tools)?;
         }
     }
     let (chat_tool_choice, tool_choice_echo) = normalize_tool_choice(obj.get("tool_choice"))?;
-    let (enable_thinking, reasoning_echo, response_format, text_echo) =
-        parse_reasoning_and_text_config(obj)?;
+    let (
+        enable_thinking,
+        reasoning_effort,
+        reasoning_budget,
+        reasoning_echo,
+        response_format,
+        text_echo,
+    ) = parse_reasoning_and_text_config(obj)?;
 
-    let max_output_tokens = match obj
+    let explicit_max_output_tokens = match obj
         .get("max_output_tokens")
         .or_else(|| obj.get("max_tokens"))
         .filter(|v| !v.is_null())
     {
-        None => 256usize,
+        None => None,
         Some(v) => {
             let n = v
                 .as_u64()
                 .and_then(|n| usize::try_from(n).ok())
                 .ok_or_else(|| ResponsesApiError::bad_request("invalid max_output_tokens"))?;
-            if n == 0 || n > 4096 {
-                return Err(ResponsesApiError::bad_request(
-                    "max_output_tokens must be in 1..=4096",
-                ));
+            if n == 0 || n > crate::server::MAX_OUTPUT_TOKENS {
+                return Err(ResponsesApiError::bad_request(format!(
+                    "max_output_tokens must be in 1..={}",
+                    crate::server::MAX_OUTPUT_TOKENS
+                )));
             }
-            n
+            Some(n)
         }
     };
+    let max_output_tokens =
+        explicit_max_output_tokens.unwrap_or(crate::server::DEFAULT_COMPLETION_MAX_TOKENS);
 
     let stream = obj
         .get("stream")
@@ -987,15 +1217,15 @@ pub fn translate_responses_to_chat(
     let mut chat_req = Map::new();
     chat_req.insert("model".into(), json!(model));
     chat_req.insert("messages".into(), Value::Array(messages.clone()));
-    chat_req.insert("max_tokens".into(), json!(max_output_tokens));
+    if let Some(max_out) = explicit_max_output_tokens {
+        chat_req.insert("max_tokens".into(), json!(max_out));
+    }
     chat_req.insert("stream".into(), json!(stream));
     chat_req.insert("parallel_tool_calls".into(), json!(parallel_tool_calls));
-    chat_req.insert("temperature".into(), json!(temperature));
-    chat_req.insert("top_p".into(), json!(top_p));
-    if let Some(top_k) = obj.get("top_k").filter(|v| !v.is_null()) {
-        chat_req.insert("top_k".into(), top_k.clone());
-    }
     for key in [
+        "temperature",
+        "top_p",
+        "top_k",
         "lora",
         "adapter",
         "min_p",
@@ -1040,6 +1270,13 @@ pub fn translate_responses_to_chat(
     if let Some(rf) = response_format {
         chat_req.insert("response_format".into(), rf);
     }
+    if let Some(eff) = reasoning_effort {
+        chat_req.insert("reasoning_effort".into(), json!(eff));
+    }
+    if let Some(budget) = reasoning_budget {
+        chat_req.insert("thinking_token_budget".into(), json!(budget));
+    }
+    forward_optional_reasoning_budget_fields(&mut chat_req, obj);
     let mut template_kwargs = match obj.get("chat_template_kwargs").filter(|v| !v.is_null()) {
         None => Map::new(),
         Some(v) => v.as_object().cloned().ok_or_else(|| {
@@ -1077,6 +1314,7 @@ pub fn translate_responses_to_chat(
         truncation,
         metadata,
         input_messages: messages,
+        namespaced_tools,
     };
     Ok((Value::Object(chat_req), meta))
 }
@@ -1203,14 +1441,14 @@ pub fn build_response_object(
         } else {
             tc.id.clone()
         };
-        output.push(json!({
-            "id": format!("fc_{suffix}_{idx}"),
-            "type": "function_call",
-            "status": "completed",
-            "call_id": call_id,
-            "name": tc.function.name,
-            "arguments": tc.function.arguments,
-        }));
+        output.push(build_function_call_item(
+            meta,
+            &format!("fc_{suffix}_{idx}"),
+            &call_id,
+            "completed",
+            &tc.function.name,
+            &tc.function.arguments,
+        ));
     }
 
     let is_incomplete = finish_reason == "length";
@@ -1254,8 +1492,16 @@ pub fn build_response_object(
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ActiveItem {
     None,
-    Reasoning { output_index: usize },
-    Message { output_index: usize },
+    Reasoning {
+        output_index: usize,
+    },
+    Message {
+        output_index: usize,
+    },
+    FunctionCall {
+        output_index: usize,
+        tool_index: usize,
+    },
 }
 
 /// Deterministic SSE event state machine for `POST /v1/responses` (`stream: true`).
@@ -1267,10 +1513,15 @@ pub struct ResponsesSseFormatter {
     next_output_index: usize,
     next_msg_index: usize,
     next_fc_index: usize,
+    completed_fc_count: usize,
     active: ActiveItem,
     reasoning_accum: String,
     current_msg_id: String,
     current_msg_accum: String,
+    current_fc_item_id: String,
+    current_fc_call_id: String,
+    current_fc_name: String,
+    current_fc_args_accum: String,
     text_accum: String,
     emitted_items: Vec<Value>,
 }
@@ -1285,10 +1536,15 @@ impl ResponsesSseFormatter {
             next_output_index: 0,
             next_msg_index: 0,
             next_fc_index: 0,
+            completed_fc_count: 0,
             active: ActiveItem::None,
             reasoning_accum: String::new(),
             current_msg_id: String::new(),
             current_msg_accum: String::new(),
+            current_fc_item_id: String::new(),
+            current_fc_call_id: String::new(),
+            current_fc_name: String::new(),
+            current_fc_args_accum: String::new(),
             text_accum: String::new(),
             emitted_items: Vec::new(),
         }
@@ -1325,6 +1581,10 @@ impl ResponsesSseFormatter {
     }
 
     fn close_active(&mut self, out: &mut Vec<(String, Value)>) {
+        self.close_active_with_fc_status(true, out);
+    }
+
+    fn close_active_with_fc_status(&mut self, fc_completed: bool, out: &mut Vec<(String, Value)>) {
         match self.active {
             ActiveItem::None => {}
             ActiveItem::Reasoning { output_index } => {
@@ -1344,7 +1604,7 @@ impl ResponsesSseFormatter {
                 d2.insert("output_index".into(), json!(output_index));
                 d2.insert("content_index".into(), json!(0));
                 d2.insert("part".into(), part.clone());
-                out.push(self.emit("response.reasoning_part.done", d2));
+                out.push(self.emit("response.content_part.done", d2));
 
                 let item = json!({
                     "id": item_id,
@@ -1397,6 +1657,114 @@ impl ResponsesSseFormatter {
                 self.current_msg_accum.clear();
                 self.active = ActiveItem::None;
             }
+            ActiveItem::FunctionCall { output_index, .. } => {
+                let item_id = self.current_fc_item_id.clone();
+                let call_id = self.current_fc_call_id.clone();
+                let name = self.current_fc_name.clone();
+                let arguments = self.current_fc_args_accum.clone();
+
+                if fc_completed {
+                    let (wire_name, _) = resolve_wire_tool_name(&self.meta, &name);
+                    let mut done_args = Map::new();
+                    done_args.insert("item_id".into(), json!(item_id));
+                    done_args.insert("output_index".into(), json!(output_index));
+                    done_args.insert("call_id".into(), json!(call_id));
+                    done_args.insert("name".into(), json!(wire_name));
+                    done_args.insert("arguments".into(), json!(arguments));
+                    out.push(self.emit("response.function_call_arguments.done", done_args));
+                }
+
+                let done_item = build_function_call_item(
+                    &self.meta,
+                    &item_id,
+                    &call_id,
+                    if fc_completed {
+                        "completed"
+                    } else {
+                        "incomplete"
+                    },
+                    &name,
+                    &arguments,
+                );
+                let mut done_ev = Map::new();
+                done_ev.insert("output_index".into(), json!(output_index));
+                done_ev.insert("item".into(), done_item.clone());
+                out.push(self.emit("response.output_item.done", done_ev));
+
+                self.emitted_items.push(done_item);
+                self.current_fc_args_accum.clear();
+                self.active = ActiveItem::None;
+            }
+        }
+    }
+
+    fn emit_tool_call_delta(
+        &mut self,
+        tc_delta: &crate::parser::StreamToolCallDelta,
+        out: &mut Vec<(String, Value)>,
+    ) {
+        let output_index = match self.active {
+            ActiveItem::FunctionCall {
+                output_index,
+                tool_index,
+            } if tool_index == tc_delta.index => output_index,
+            _ => {
+                self.close_active(out);
+                let output_index = self.next_output_index;
+                self.next_output_index += 1;
+                let fc_idx = self.next_fc_index;
+                self.next_fc_index += 1;
+                let suffix = self
+                    .meta
+                    .response_id
+                    .strip_prefix("resp_")
+                    .unwrap_or(&self.meta.response_id);
+                let item_id = format!("fc_{suffix}_{fc_idx}");
+                let call_id = tc_delta
+                    .id
+                    .as_deref()
+                    .filter(|s| !s.is_empty())
+                    .map_or_else(|| format!("call_{suffix}_{fc_idx}"), str::to_owned);
+                let name = tc_delta.name.clone().unwrap_or_default();
+
+                self.current_fc_item_id.clone_from(&item_id);
+                self.current_fc_call_id.clone_from(&call_id);
+                self.current_fc_name.clone_from(&name);
+                self.current_fc_args_accum.clear();
+
+                let added_item = build_function_call_item(
+                    &self.meta,
+                    &item_id,
+                    &call_id,
+                    "in_progress",
+                    &name,
+                    "",
+                );
+                let mut a = Map::new();
+                a.insert("output_index".into(), json!(output_index));
+                a.insert("item".into(), added_item);
+                out.push(self.emit("response.output_item.added", a));
+
+                self.active = ActiveItem::FunctionCall {
+                    output_index,
+                    tool_index: tc_delta.index,
+                };
+                output_index
+            }
+        };
+
+        if let Some(arg_chunk) = tc_delta
+            .arguments_delta
+            .as_deref()
+            .filter(|s| !s.is_empty())
+        {
+            self.current_fc_args_accum.push_str(arg_chunk);
+            let mut d = Map::new();
+            d.insert("item_id".into(), json!(self.current_fc_item_id));
+            d.insert("output_index".into(), json!(output_index));
+            d.insert("call_id".into(), json!(self.current_fc_call_id));
+            d.insert("delta".into(), json!(arg_chunk));
+            out.push(self.emit("response.function_call_arguments.delta", d));
         }
     }
 
@@ -1419,14 +1787,14 @@ impl ResponsesSseFormatter {
             tc.id.clone()
         };
 
-        let added_item = json!({
-            "id": item_id,
-            "type": "function_call",
-            "status": "in_progress",
-            "call_id": call_id,
-            "name": tc.function.name,
-            "arguments": "",
-        });
+        let added_item = build_function_call_item(
+            &self.meta,
+            &item_id,
+            &call_id,
+            "in_progress",
+            &tc.function.name,
+            "",
+        );
         let mut a = Map::new();
         a.insert("output_index".into(), json!(output_index));
         a.insert("item".into(), added_item);
@@ -1439,22 +1807,23 @@ impl ResponsesSseFormatter {
         d.insert("delta".into(), json!(tc.function.arguments));
         out.push(self.emit("response.function_call_arguments.delta", d));
 
+        let (wire_name, _) = resolve_wire_tool_name(&self.meta, &tc.function.name);
         let mut done_args = Map::new();
         done_args.insert("item_id".into(), json!(item_id));
         done_args.insert("output_index".into(), json!(output_index));
         done_args.insert("call_id".into(), json!(call_id));
-        done_args.insert("name".into(), json!(tc.function.name));
+        done_args.insert("name".into(), json!(wire_name));
         done_args.insert("arguments".into(), json!(tc.function.arguments));
         out.push(self.emit("response.function_call_arguments.done", done_args));
 
-        let done_item = json!({
-            "id": item_id,
-            "type": "function_call",
-            "status": "completed",
-            "call_id": call_id,
-            "name": tc.function.name,
-            "arguments": tc.function.arguments,
-        });
+        let done_item = build_function_call_item(
+            &self.meta,
+            &item_id,
+            &call_id,
+            "completed",
+            &tc.function.name,
+            &tc.function.arguments,
+        );
         let mut done_ev = Map::new();
         done_ev.insert("output_index".into(), json!(output_index));
         done_ev.insert("item".into(), done_item.clone());
@@ -1465,40 +1834,55 @@ impl ResponsesSseFormatter {
 
     pub fn push_delta(&mut self, delta: StreamParseDelta) -> Vec<(String, Value)> {
         let mut out = Vec::new();
+        self.completed_fc_count += delta.completed_tool_calls.len();
+        let mut tc_slice = delta.tool_call_deltas.as_slice();
+
+        if let ActiveItem::FunctionCall {
+            tool_index: active_idx,
+            ..
+        } = self.active
+        {
+            while let Some(first) = tc_slice.first().filter(|d| d.index == active_idx) {
+                self.emit_tool_call_delta(first, &mut out);
+                tc_slice = &tc_slice[1..];
+            }
+            if active_idx < self.completed_fc_count {
+                self.close_active(&mut out);
+            }
+        }
 
         if let Some(r_chunk) = delta.reasoning_delta.filter(|s| !s.is_empty()) {
-            let output_index = match self.active {
-                ActiveItem::Reasoning { output_index } => output_index,
-                _ => {
-                    self.close_active(&mut out);
-                    let idx = self.next_output_index;
-                    self.next_output_index += 1;
-                    let item_id = self.ids.reasoning_id.clone();
+            let output_index = if let ActiveItem::Reasoning { output_index } = self.active {
+                output_index
+            } else {
+                self.close_active(&mut out);
+                let idx = self.next_output_index;
+                self.next_output_index += 1;
+                let item_id = self.ids.reasoning_id.clone();
 
-                    let mut a1 = Map::new();
-                    a1.insert("output_index".into(), json!(idx));
-                    a1.insert(
-                        "item".into(),
-                        json!({
-                            "id": item_id,
-                            "type": "reasoning",
-                            "status": "in_progress",
-                            "summary": [],
-                            "content": [],
-                        }),
-                    );
-                    out.push(self.emit("response.output_item.added", a1));
+                let mut a1 = Map::new();
+                a1.insert("output_index".into(), json!(idx));
+                a1.insert(
+                    "item".into(),
+                    json!({
+                        "id": item_id,
+                        "type": "reasoning",
+                        "status": "in_progress",
+                        "summary": [],
+                        "content": [],
+                    }),
+                );
+                out.push(self.emit("response.output_item.added", a1));
 
-                    let mut a2 = Map::new();
-                    a2.insert("item_id".into(), json!(self.ids.reasoning_id));
-                    a2.insert("output_index".into(), json!(idx));
-                    a2.insert("content_index".into(), json!(0));
-                    a2.insert("part".into(), json!({"type": "reasoning_text", "text": ""}));
-                    out.push(self.emit("response.reasoning_part.added", a2));
+                let mut a2 = Map::new();
+                a2.insert("item_id".into(), json!(self.ids.reasoning_id));
+                a2.insert("output_index".into(), json!(idx));
+                a2.insert("content_index".into(), json!(0));
+                a2.insert("part".into(), json!({"type": "reasoning_text", "text": ""}));
+                out.push(self.emit("response.content_part.added", a2));
 
-                    self.active = ActiveItem::Reasoning { output_index: idx };
-                    idx
-                }
+                self.active = ActiveItem::Reasoning { output_index: idx };
+                idx
             };
             self.reasoning_accum.push_str(&r_chunk);
             let mut dm = Map::new();
@@ -1517,49 +1901,48 @@ impl ResponsesSseFormatter {
                 (!trimmed.is_empty()).then(|| trimmed.to_owned())
             };
             if let Some(c_chunk) = c_chunk {
-                let output_index = match self.active {
-                    ActiveItem::Message { output_index } => output_index,
-                    _ => {
-                        self.close_active(&mut out);
-                        let idx = self.next_output_index;
-                        self.next_output_index += 1;
-                        let msg_idx = self.next_msg_index;
-                        self.next_msg_index += 1;
-                        let item_id = if msg_idx == 0 {
-                            self.ids.message_id.clone()
-                        } else {
-                            format!("{}_{msg_idx}", self.ids.message_id)
-                        };
-                        self.current_msg_id = item_id.clone();
-                        self.current_msg_accum.clear();
+                let output_index = if let ActiveItem::Message { output_index } = self.active {
+                    output_index
+                } else {
+                    self.close_active(&mut out);
+                    let idx = self.next_output_index;
+                    self.next_output_index += 1;
+                    let msg_idx = self.next_msg_index;
+                    self.next_msg_index += 1;
+                    let item_id = if msg_idx == 0 {
+                        self.ids.message_id.clone()
+                    } else {
+                        format!("{}_{msg_idx}", self.ids.message_id)
+                    };
+                    self.current_msg_id.clone_from(&item_id);
+                    self.current_msg_accum.clear();
 
-                        let mut a1 = Map::new();
-                        a1.insert("output_index".into(), json!(idx));
-                        a1.insert(
-                            "item".into(),
-                            json!({
-                                "id": item_id,
-                                "type": "message",
-                                "status": "in_progress",
-                                "role": "assistant",
-                                "content": [],
-                            }),
-                        );
-                        out.push(self.emit("response.output_item.added", a1));
+                    let mut a1 = Map::new();
+                    a1.insert("output_index".into(), json!(idx));
+                    a1.insert(
+                        "item".into(),
+                        json!({
+                            "id": item_id,
+                            "type": "message",
+                            "status": "in_progress",
+                            "role": "assistant",
+                            "content": [],
+                        }),
+                    );
+                    out.push(self.emit("response.output_item.added", a1));
 
-                        let mut a2 = Map::new();
-                        a2.insert("item_id".into(), json!(self.current_msg_id));
-                        a2.insert("output_index".into(), json!(idx));
-                        a2.insert("content_index".into(), json!(0));
-                        a2.insert(
-                            "part".into(),
-                            json!({"type": "output_text", "text": "", "annotations": []}),
-                        );
-                        out.push(self.emit("response.content_part.added", a2));
+                    let mut a2 = Map::new();
+                    a2.insert("item_id".into(), json!(self.current_msg_id));
+                    a2.insert("output_index".into(), json!(idx));
+                    a2.insert("content_index".into(), json!(0));
+                    a2.insert(
+                        "part".into(),
+                        json!({"type": "output_text", "text": "", "annotations": []}),
+                    );
+                    out.push(self.emit("response.content_part.added", a2));
 
-                        self.active = ActiveItem::Message { output_index: idx };
-                        idx
-                    }
+                    self.active = ActiveItem::Message { output_index: idx };
+                    idx
                 };
                 self.current_msg_accum.push_str(&c_chunk);
                 self.text_accum.push_str(&c_chunk);
@@ -1573,8 +1956,19 @@ impl ResponsesSseFormatter {
             }
         }
 
-        for tc in &delta.completed_tool_calls {
-            self.emit_tool_call(tc, &mut out);
+        if !delta.tool_call_deltas.is_empty() {
+            for tc_delta in tc_slice {
+                self.emit_tool_call_delta(tc_delta, &mut out);
+                if let ActiveItem::FunctionCall { tool_index, .. } = self.active
+                    && tool_index < self.completed_fc_count
+                {
+                    self.close_active(&mut out);
+                }
+            }
+        } else {
+            for tc in &delta.completed_tool_calls {
+                self.emit_tool_call(tc, &mut out);
+            }
         }
 
         out
@@ -1613,7 +2007,11 @@ impl ResponsesSseFormatter {
         reasoning_tokens: usize,
     ) -> (Vec<(String, Value)>, Value, Vec<Value>) {
         let mut out = Vec::new();
-        self.close_active(&mut out);
+        let fc_completed = !matches!(
+            self.active,
+            ActiveItem::FunctionCall { tool_index, .. } if tool_index >= turn.tool_calls.len()
+        );
+        self.close_active_with_fc_status(fc_completed, &mut out);
 
         // Emit any tool calls that were not yet emitted incrementally
         if self.next_fc_index < turn.tool_calls.len() {
@@ -1639,7 +2037,7 @@ impl ResponsesSseFormatter {
             } else {
                 format!("{}_{msg_idx}", self.ids.message_id)
             };
-            self.current_msg_id = item_id.clone();
+            self.current_msg_id.clone_from(&item_id);
             self.current_msg_accum.clear();
 
             let mut a1 = Map::new();

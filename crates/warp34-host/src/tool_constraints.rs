@@ -68,7 +68,8 @@ pub fn tool_structural_tag_with_parallel(
         {
             continue;
         }
-        crate::constraints::validate_json_schema(schema)?;
+        let schema = crate::constraints::sanitize_tool_schema(schema)?;
+        crate::constraints::validate_json_schema(&schema)?;
         tags.push(json!({
             "type":"tag", "begin":format!("<tool_call>\n<function={name}>\n"),
             "content":{"type":"json_schema","json_schema":schema,"style":"qwen_xml","max_whitespace_cnt":1},
@@ -81,7 +82,7 @@ pub fn tool_structural_tag_with_parallel(
     let body = match choice {
         ToolChoice::Named(_) => tags.remove(0),
         _ => json!({
-            "type":"triggered_tags", "triggers":["<tool_call>\n<function="],
+            "type":"triggered_tags", "triggers":["<tool_call>"],
             "tags":tags, "at_least_one":*choice == ToolChoice::Required,
             "stop_after_first":!parallel, "excludes":["<think>","</think>"]
         }),

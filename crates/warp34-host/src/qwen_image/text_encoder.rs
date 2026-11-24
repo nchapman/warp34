@@ -346,14 +346,12 @@ impl Qwen3VlConditioningEncoder {
             .cfg
             .vision_config
             .as_ref()
-            .map(|v| v.image_token_id)
-            .unwrap_or(crate::qwen_image::IMAGE_PAD_TOKEN_ID);
+            .map_or(crate::qwen_image::IMAGE_PAD_TOKEN_ID, |v| v.image_token_id);
         let spatial_merge_size = self
             .cfg
             .vision_config
             .as_ref()
-            .map(|v| v.spatial_merge_size)
-            .unwrap_or(2);
+            .map_or(2, |v| v.spatial_merge_size);
 
         // 1. Optional ViT + DeepStack encoding
         let (vis_pooler, deepstack_embeds, vis_token_indices, image_grids) = if !images.is_empty() {
@@ -427,24 +425,20 @@ impl Qwen3VlConditioningEncoder {
             }
             addr
         };
-        let had_scratch_bytes = self
-            .layers
-            .first()
-            .map(|l| {
-                [
-                    &l.q_proj,
-                    &l.k_proj,
-                    &l.v_proj,
-                    &l.o_proj,
-                    &l.gate_up_proj,
-                    &l.down_proj,
-                ]
-                .into_iter()
-                .filter_map(|p| p.input_transform_workspace_bytes(seq_len))
-                .max()
-                .unwrap_or(0)
-            })
-            .unwrap_or(0);
+        let had_scratch_bytes = self.layers.first().map_or(0, |l| {
+            [
+                &l.q_proj,
+                &l.k_proj,
+                &l.v_proj,
+                &l.o_proj,
+                &l.gate_up_proj,
+                &l.down_proj,
+            ]
+            .into_iter()
+            .filter_map(|p| p.input_transform_workspace_bytes(seq_len))
+            .max()
+            .unwrap_or(0)
+        });
         let exec_scratch_bytes = lse_scratch_bytes.max(had_scratch_bytes).max(64 * 1024);
         let exec_scratch_addr =
             Qwen3VlWorkspace::ensure_buf(&mut ws.exec_scratch, self.device_id, exec_scratch_bytes)?;

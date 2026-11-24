@@ -15,9 +15,97 @@ pub(super) fn require(valid: bool, message: impl Into<String>) -> Result<()> {
 /// EP partitions expert IDs, never the intermediate dimension. Retain this
 /// store until every stream reading its mapped address or DMA source completes.
 static TOTAL_PINNED_BYTES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static WARNED_HEAP_FALLBACK: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+const MAX_PROCESS_PINNED_BYTES: usize = 80 * 1024 * 1024 * 1024;
+
+fn warn_pinned_heap_fallback_once() {
+    if !WARNED_HEAP_FALLBACK.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        eprintln!(
+            "warning: pinned host MoE allocation fell back to pageable heap (check memlock / ulimit -l or 80 GiB pinned limit); H2D expert streaming may be slower"
+        );
+    }
+}
+
+pub(super) struct SharedPinnedSlab(MappedHostBuffer);
+
+impl Drop for SharedPinnedSlab {
+    fn drop(&mut self) {
+        TOTAL_PINNED_BYTES.fetch_sub(self.0.len_bytes, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+pub(super) struct PinnedSlabPool {
+    current: Option<(std::sync::Arc<SharedPinnedSlab>, usize)>,
+    max_slab_layers: usize,
+}
+
+impl PinnedSlabPool {
+    pub(super) fn new(max_slab_layers: usize) -> Self {
+        Self {
+            current: None,
+            max_slab_layers: max_slab_layers.max(1),
+        }
+    }
+
+    pub(super) fn alloc_layer(
+        &mut self,
+        layer_bytes: usize,
+        remaining_layers: usize,
+        prefer_mapped: bool,
+    ) -> Result<HostPackStorage> {
+        if !prefer_mapped || layer_bytes == 0 {
+            return Ok(HostPackStorage::alloc_unzeroed(layer_bytes, false));
+        }
+        if let Some((ref slab, used)) = self.current
+            && used.saturating_add(layer_bytes) <= slab.0.len_bytes
+        {
+            let slab_arc = slab.clone();
+            let offset = used;
+            self.current = Some((slab_arc.clone(), used + layer_bytes));
+            return Ok(HostPackStorage::MappedSlice {
+                slab: slab_arc,
+                offset,
+                len: layer_bytes,
+            });
+        }
+        self.current = None;
+        let mut try_layers = remaining_layers.clamp(1, self.max_slab_layers);
+        while try_layers >= 1 {
+            if let Some(slab_bytes) = layer_bytes.checked_mul(try_layers) {
+                let cur = TOTAL_PINNED_BYTES.load(std::sync::atomic::Ordering::Relaxed);
+                if cur.saturating_add(slab_bytes) <= MAX_PROCESS_PINNED_BYTES
+                    && let Ok(m) = MappedHostBuffer::alloc_unzeroed(slab_bytes)
+                {
+                    TOTAL_PINNED_BYTES.fetch_add(slab_bytes, std::sync::atomic::Ordering::Relaxed);
+                    let slab_arc = std::sync::Arc::new(SharedPinnedSlab(m));
+                    if try_layers > 1 {
+                        self.current = Some((slab_arc.clone(), layer_bytes));
+                    }
+                    return Ok(HostPackStorage::MappedSlice {
+                        slab: slab_arc,
+                        offset: 0,
+                        len: layer_bytes,
+                    });
+                }
+            }
+            if try_layers == 1 {
+                break;
+            }
+            try_layers /= 2;
+        }
+        warn_pinned_heap_fallback_once();
+        Ok(HostPackStorage::Heap(vec![0u8; layer_bytes]))
+    }
+}
 
 pub(super) enum HostPackStorage {
     Mapped(MappedHostBuffer),
+    MappedSlice {
+        slab: std::sync::Arc<SharedPinnedSlab>,
+        offset: usize,
+        len: usize,
+    },
     Heap(Vec<u8>),
 }
 
@@ -30,36 +118,46 @@ impl Drop for HostPackStorage {
 }
 
 impl HostPackStorage {
-    fn alloc(bytes: usize, prefer_mapped: bool) -> Result<Self> {
-        const MAX_PROCESS_PINNED_BYTES: usize = 80 * 1024 * 1024 * 1024;
+    /// Allocates unzeroed pinned storage (or zeroed heap fallback).
+    /// Callers MUST initialize all `0..bytes` via `raw_mut_ptr()` before calling `as_slice()`.
+    fn alloc_unzeroed(bytes: usize, prefer_mapped: bool) -> Self {
         let cur = TOTAL_PINNED_BYTES.load(std::sync::atomic::Ordering::Relaxed);
         if prefer_mapped
+            && bytes > 0
             && cur.saturating_add(bytes) <= MAX_PROCESS_PINNED_BYTES
-            && let Ok(m) = MappedHostBuffer::alloc(bytes)
+            && let Ok(m) = MappedHostBuffer::alloc_unzeroed(bytes)
         {
             TOTAL_PINNED_BYTES.fetch_add(bytes, std::sync::atomic::Ordering::Relaxed);
-            return Ok(Self::Mapped(m));
+            return Self::Mapped(m);
         }
-        Ok(Self::Heap(vec![0u8; bytes]))
+        if prefer_mapped && bytes > 0 {
+            warn_pinned_heap_fallback_once();
+        }
+        Self::Heap(vec![0u8; bytes])
     }
 
-    fn as_mut_slice(&mut self) -> &mut [u8] {
+    fn raw_mut_ptr(&mut self) -> *mut u8 {
         match self {
-            // SAFETY: `m.host_ptr` points to a valid `m.len_bytes`-byte allocation
-            // owned exclusively by `self` while `&mut self` is borrowed.
-            Self::Mapped(m) => unsafe {
-                std::slice::from_raw_parts_mut(m.host_ptr.cast::<u8>(), m.len_bytes)
+            Self::Mapped(m) => m.host_ptr.cast::<u8>(),
+            // SAFETY: `offset + len <= slab.0.len_bytes` by `PinnedSlabPool` construction.
+            Self::MappedSlice { slab, offset, .. } => unsafe {
+                slab.0.host_ptr.cast::<u8>().add(*offset)
             },
-            Self::Heap(v) => v.as_mut_slice(),
+            Self::Heap(v) => v.as_mut_ptr(),
         }
     }
 
     fn as_slice(&self) -> &[u8] {
         match self {
-            // SAFETY: `m.host_ptr` points to a valid `m.len_bytes`-byte allocation
+            // SAFETY: `m.host_ptr` points to a fully initialized `m.len_bytes`-byte allocation
             // alive for the lifetime of `&self`.
             Self::Mapped(m) => unsafe {
                 std::slice::from_raw_parts(m.host_ptr.cast::<u8>(), m.len_bytes)
+            },
+            // SAFETY: `offset + len <= slab.0.len_bytes` and all `len` bytes are initialized
+            // before `HostExpertStore` exposes `&self`.
+            Self::MappedSlice { slab, offset, len } => unsafe {
+                std::slice::from_raw_parts(slab.0.host_ptr.cast::<u8>().add(*offset), *len)
             },
             Self::Heap(v) => v.as_slice(),
         }
@@ -68,6 +166,7 @@ impl HostPackStorage {
     fn len_bytes(&self) -> usize {
         match self {
             Self::Mapped(m) => m.len_bytes,
+            Self::MappedSlice { len, .. } => *len,
             Self::Heap(v) => v.len(),
         }
     }
@@ -75,10 +174,19 @@ impl HostPackStorage {
     fn mapped_dev_ptr(&self) -> u64 {
         match self {
             Self::Mapped(m) => m.dev_ptr as u64,
+            Self::MappedSlice { slab, offset, .. } => {
+                (slab.0.dev_ptr as u64).wrapping_add(*offset as u64)
+            }
             Self::Heap(_) => 0,
         }
     }
 }
+
+#[derive(Clone, Copy)]
+struct SendMutPtr(*mut u8);
+// SAFETY: Used only to send disjoint `[offset .. offset + len]` non-overlapping raw pointers
+// across scoped loader worker threads.
+unsafe impl Send for SendMutPtr {}
 
 #[derive(Clone)]
 pub struct HostExpertStore {
@@ -125,6 +233,35 @@ impl HostExpertStore {
         ep_size: usize,
         max_pinned_bytes: usize,
         prefer_mapped: bool,
+    ) -> Result<Self> {
+        let store = Self::load_with_storage(
+            archive,
+            experts_prefix,
+            quant,
+            layout,
+            num_experts,
+            ep_rank,
+            ep_size,
+            max_pinned_bytes,
+            prefer_mapped,
+            None,
+        )?;
+        archive.drop_page_cache();
+        Ok(store)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn load_with_storage(
+        archive: &SafetensorsArchive,
+        experts_prefix: &str,
+        quant: &QuantScheme,
+        layout: ExpertPackLayout,
+        num_experts: usize,
+        ep_rank: usize,
+        ep_size: usize,
+        max_pinned_bytes: usize,
+        prefer_mapped: bool,
+        preallocated: Option<HostPackStorage>,
     ) -> Result<Self> {
         require(
             matches!(ep_size, 1 | 2 | 4)
@@ -185,29 +322,7 @@ impl HostExpertStore {
                     || layout.down_hadamard_block_size == down_had),
             "inconsistent or unsupported input Hadamard block size on routed MoE down_proj",
         )?;
-        let mut check_name = String::with_capacity(resolved_prefix_ref.len() + 24);
-        for expert_id in 0..num_experts {
-            use std::fmt::Write as _;
-            check_name.clear();
-            let _ = write!(
-                &mut check_name,
-                "{resolved_prefix_ref}.{expert_id}.gate_proj"
-            );
-            let e_gate = quant.input_hadamard(&check_name)?.unwrap_or(0);
-            check_name.clear();
-            let _ = write!(&mut check_name, "{resolved_prefix_ref}.{expert_id}.up_proj");
-            let e_up = quant.input_hadamard(&check_name)?.unwrap_or(0);
-            check_name.clear();
-            let _ = write!(
-                &mut check_name,
-                "{resolved_prefix_ref}.{expert_id}.down_proj"
-            );
-            let e_down = quant.input_hadamard(&check_name)?.unwrap_or(0);
-            require(
-                e_gate == gate_had && e_up == up_had && e_down == down_had,
-                "routed MoE experts within a layer must share uniform input Hadamard transforms",
-            )?;
-        }
+        let check_hadamard_all = quant.has_transforms();
         let layout = layout.with_down_hadamard(down_had)?;
         let expert_quant = quant
             .for_linear(&first_gate_name)
@@ -226,8 +341,11 @@ impl HostExpertStore {
             bytes <= max_pinned_bytes,
             format!("expert store needs {bytes} pinned bytes, budget is {max_pinned_bytes}"),
         )?;
-        let mut storage = HostPackStorage::alloc(bytes, prefer_mapped)?;
-        let dst = storage.as_mut_slice();
+        let mut storage = match preallocated {
+            Some(pre) if pre.len_bytes() == bytes => pre,
+            _ => HostPackStorage::alloc_unzeroed(bytes, prefer_mapped),
+        };
+        let dst_base_ptr = storage.raw_mut_ptr();
 
         // Validate qzeros and g_idx on the first local expert (plus dimensions on all experts in parallel).
         if let Some(first_expert_id) = expert_ids.clone().next() {
@@ -258,10 +376,11 @@ impl HostExpertStore {
         }
 
         let num_threads = std::thread::available_parallelism()
-            .map(|n| (n.get() / ep_size.max(1)).clamp(1, 16))
-            .unwrap_or(8)
+            .map_or(8, |n| (n.get() / ep_size.max(1)).clamp(1, 16))
             .min(count.max(1));
         let experts_per_chunk = count.div_ceil(num_threads).max(1);
+        let num_chunks = count.div_ceil(experts_per_chunk);
+        let had_experts_per_chunk = num_experts.div_ceil(num_chunks.max(1));
         let stride = layout.stride;
         let base_expert = expert_ids.start;
         let layout_ref = &layout;
@@ -269,21 +388,64 @@ impl HostExpertStore {
         let gu_half_scales = layout.gate_up_scales.len() / 2;
 
         std::thread::scope(|s| -> Result<()> {
-            let mut handles = Vec::new();
-            for (chunk_idx, dst_chunk) in dst.chunks_mut(experts_per_chunk * stride).enumerate() {
+            let mut handles = Vec::with_capacity(num_chunks);
+            for chunk_idx in 0..num_chunks {
                 let local_start = chunk_idx * experts_per_chunk;
-                let chunk_count = dst_chunk.len() / stride;
+                let chunk_count = (count - local_start).min(experts_per_chunk);
+                // SAFETY: `local_start * stride + chunk_count * stride <= bytes`, and chunks are disjoint.
+                let chunk_ptr = SendMutPtr(unsafe { dst_base_ptr.add(local_start * stride) });
+                let had_start = chunk_idx * had_experts_per_chunk;
+                let had_end = (had_start + had_experts_per_chunk).min(num_experts);
                 handles.push(s.spawn(move || -> Result<()> {
-                    let mut raw_qw_bytes =
-                        vec![0u8; gu_half_packed.max(layout_ref.down_packed.len())];
+                    let chunk_ptr = chunk_ptr;
+                    let mut key_buf = String::with_capacity(96);
+                    if check_hadamard_all && had_start < had_end {
+                        use std::fmt::Write as _;
+                        for expert_id in had_start..had_end {
+                            key_buf.clear();
+                            let _ =
+                                write!(&mut key_buf, "{resolved_prefix_ref}.{expert_id}.gate_proj");
+                            let e_gate = quant.input_hadamard(&key_buf)?.unwrap_or(0);
+                            key_buf.clear();
+                            let _ =
+                                write!(&mut key_buf, "{resolved_prefix_ref}.{expert_id}.up_proj");
+                            let e_up = quant.input_hadamard(&key_buf)?.unwrap_or(0);
+                            key_buf.clear();
+                            let _ =
+                                write!(&mut key_buf, "{resolved_prefix_ref}.{expert_id}.down_proj");
+                            let e_down = quant.input_hadamard(&key_buf)?.unwrap_or(0);
+                            require(
+                                e_gate == gate_had && e_up == up_had && e_down == down_had,
+                                "routed MoE experts within a layer must share uniform input Hadamard transforms",
+                            )?;
+                        }
+                    }
+
+                    let mut raw_qw_bytes = if is_compressed_tensors && layout_ref.bits != 4 {
+                        Vec::new()
+                    } else {
+                        vec![0u8; gu_half_packed.max(layout_ref.down_packed.len())]
+                    };
                     let mut raw_sc_words =
                         vec![0u16; (gu_half_scales / 2).max(layout_ref.down_scales.len() / 2)];
-                    let mut key_buf = String::with_capacity(96);
+                    let mut gptq_sc_bytes = if is_compressed_tensors {
+                        Vec::new()
+                    } else {
+                        vec![0u8; gu_half_scales.max(layout_ref.down_scales.len())]
+                    };
                     for i in 0..chunk_count {
                         let local_id = local_start + i;
                         let expert_id = base_expert + local_id;
-                        let pack = &mut dst_chunk[i * stride..(i + 1) * stride];
-                        pack[layout_ref.down_scales.end..stride].fill(0);
+                        // SAFETY: `i < chunk_count`, so `pack_ptr..pack_ptr + stride` is exclusively owned by this thread.
+                        let pack_ptr = unsafe { chunk_ptr.0.add(i * stride) };
+                        // SAFETY: `down_scales.end <= stride` by `ExpertPackLayout`, and `pack_ptr` owns `stride` writable bytes.
+                        unsafe {
+                            core::ptr::write_bytes(
+                                pack_ptr.add(layout_ref.down_scales.end),
+                                0,
+                                stride - layout_ref.down_scales.end,
+                            );
+                        }
                         for (proj_name, n_exp, k_exp, w_range, s_range) in [
                             (
                                 "gate_proj",
@@ -343,15 +505,25 @@ impl HostExpertStore {
                                         wp_info.shape, ws_info.shape
                                     ),
                                 )?;
+                                let mut u2_dilated_half_offset = false;
                                 if is_u2 && layout_ref.bits == 4 {
-                                    let u2_buf = &mut raw_qw_bytes[..w_range.len() / 2];
+                                    key_buf.clear();
+                                    let _ = write!(
+                                        key_buf,
+                                        "{resolved_prefix_ref}.{expert_id}.{proj_name}"
+                                    );
+                                    u2_dilated_half_offset =
+                                        quant.for_linear(&key_buf)?.u2_code_offset_half();
+                                    let u2_len = w_range.len() / 2;
+                                    if raw_qw_bytes.len() < u2_len {
+                                        raw_qw_bytes.resize(u2_len, 0);
+                                    }
+                                    let u2_buf = &mut raw_qw_bytes[..u2_len];
                                     archive.read_exact_info(wp_info, u2_buf)?;
-                                    let dst_w = &mut pack[w_range];
-                                    for (dst_pair, src_word) in dst_w
-                                        .as_chunks_mut::<8>()
-                                        .0
-                                        .iter_mut()
-                                        .zip(u2_buf.as_chunks::<4>().0.iter())
+                                    // SAFETY: `w_range` lies within `0..stride` of `pack_ptr`.
+                                    let dst_w_ptr = unsafe { pack_ptr.add(w_range.start) };
+                                    for (word_idx, src_word) in
+                                        u2_buf.as_chunks::<4>().0.iter().enumerate()
                                     {
                                         let w = u32::from_le_bytes(*src_word);
                                         for (half_idx, half) in
@@ -361,23 +533,62 @@ impl HostExpertStore {
                                             x = (x | (x << 8)) & 0x00FF_00FF;
                                             x = (x | (x << 4)) & 0x0F0F_0F0F;
                                             x = (x | (x << 2)) & 0x3333_3333;
-                                            x = x.wrapping_add(0x6666_6666);
-                                            dst_pair[half_idx * 4..(half_idx + 1) * 4]
-                                                .copy_from_slice(&x.to_le_bytes());
+                                            x = if u2_dilated_half_offset {
+                                                (x << 1).wrapping_add(0x5555_5555)
+                                            } else {
+                                                x.wrapping_add(0x6666_6666)
+                                            };
+                                            // SAFETY: `word_idx * 8 + half_idx * 4 + 4 <= w_range.len()` inside `dst_w_ptr`.
+                                            unsafe {
+                                                core::ptr::copy_nonoverlapping(
+                                                    x.to_le_bytes().as_ptr(),
+                                                    dst_w_ptr.add(word_idx * 8 + half_idx * 4),
+                                                    4,
+                                                );
+                                            }
                                         }
                                     }
                                 } else {
                                     // `weight_packed` is already N-major (`[n_exp, k8 / 2]` for 2-bit or `[n_exp, k8]` for 4-bit).
-                                    archive.read_exact_info(wp_info, &mut pack[w_range])?;
+                                    // SAFETY: `w_range` lies within `0..stride` of `pack_ptr`.
+                                    unsafe {
+                                        archive.read_exact_info_raw(
+                                            wp_info,
+                                            pack_ptr.add(w_range.start),
+                                            w_range.len(),
+                                        )?;
+                                    }
                                 }
                                 // `weight_scale` is already N-major `[n_exp, num_groups]`.
                                 let sc_words = &mut raw_sc_words[..n_exp * num_groups];
                                 archive.read_f16_bits_info_into(ws_info, sc_words)?;
-                                let dst_s = &mut pack[s_range];
-                                for (dst, &s) in
-                                    dst_s.as_chunks_mut::<2>().0.iter_mut().zip(&*sc_words)
-                                {
-                                    dst.copy_from_slice(&s.to_le_bytes());
+                                if u2_dilated_half_offset {
+                                    for s in sc_words.iter_mut() {
+                                        *s = crate::cuda::f32_to_f16(
+                                            crate::cuda::f16_to_f32(*s) * 0.5,
+                                        );
+                                    }
+                                }
+                                #[cfg(target_endian = "little")]
+                                // SAFETY: `sc_words` has `s_range.len() / 2` `u16` elements (`s_range.len()` LE bytes),
+                                // and `s_range` lies within `0..stride` of `pack_ptr`.
+                                unsafe {
+                                    core::ptr::copy_nonoverlapping(
+                                        sc_words.as_ptr().cast::<u8>(),
+                                        pack_ptr.add(s_range.start),
+                                        s_range.len(),
+                                    );
+                                }
+                                #[cfg(not(target_endian = "little"))]
+                                unsafe {
+                                    let dst_s_ptr = pack_ptr.add(s_range.start);
+                                    for (idx_s, &s) in sc_words.iter().enumerate() {
+                                        core::ptr::copy_nonoverlapping(
+                                            s.to_le_bytes().as_ptr(),
+                                            dst_s_ptr.add(idx_s * 2),
+                                            2,
+                                        );
+                                    }
                                 }
                             } else {
                                 key_buf.clear();
@@ -410,9 +621,10 @@ impl HostExpertStore {
                                 )?;
                                 let qw_buf = &mut raw_qw_bytes[..w_range.len()];
                                 archive.read_exact_info(qw_info, qw_buf)?;
-                                let dst_w = &mut pack[w_range];
+                                // SAFETY: `w_range` lies within `0..stride` of `pack_ptr`.
+                                let dst_w_ptr = unsafe { pack_ptr.add(w_range.start) };
                                 // Cache-blocked transpose `[k8, n_exp]` u32 words -> `[n_exp, k8]` u32 words
-                                // with sequential destination writes into pinned `dst_w`.
+                                // with sequential destination writes into pinned `dst_w_ptr`.
                                 const TILE: usize = 32;
                                 let mut tile = [[[0u8; 4]; TILE]; TILE];
                                 for col_base in (0..k8).step_by(TILE) {
@@ -431,25 +643,23 @@ impl HostExpertStore {
                                         for (r, tile_row) in tile.iter().enumerate().take(row_len) {
                                             let dst_row_off =
                                                 ((row_base + r) * k8 + col_base) * 4;
-                                            let dst_slice = &mut dst_w
-                                                [dst_row_off..dst_row_off + col_len * 4];
-                                            for (dst_word, src_word) in dst_slice
-                                                .as_chunks_mut::<4>()
-                                                .0
-                                                .iter_mut()
-                                                .zip(&tile_row[..col_len])
-                                            {
-                                                *dst_word = *src_word;
+                                            // SAFETY: `dst_row_off + col_len * 4 <= w_range.len()` inside `dst_w_ptr`.
+                                            unsafe {
+                                                core::ptr::copy_nonoverlapping(
+                                                    tile_row.as_ptr().cast::<u8>(),
+                                                    dst_w_ptr.add(dst_row_off),
+                                                    col_len * 4,
+                                                );
                                             }
                                         }
                                     }
                                 }
                                 let sc_words = &mut raw_sc_words[..num_groups * n_exp];
                                 archive.read_f16_bits_info_into(sc_info, sc_words)?;
-                                let dst_s = &mut pack[s_range];
+                                let sc_out = &mut gptq_sc_bytes[..s_range.len()];
                                 for row in 0..n_exp {
                                     let dst_row =
-                                        &mut dst_s[row * num_groups * 2..(row + 1) * num_groups * 2];
+                                        &mut sc_out[row * num_groups * 2..(row + 1) * num_groups * 2];
                                     for (g, dst_elem) in
                                         dst_row.as_chunks_mut::<2>().0.iter_mut().enumerate()
                                     {
@@ -457,6 +667,14 @@ impl HostExpertStore {
                                             &sc_words[g * n_exp + row].to_le_bytes(),
                                         );
                                     }
+                                }
+                                // SAFETY: `sc_out` has `s_range.len()` initialized bytes and `s_range` lies within `pack_ptr`.
+                                unsafe {
+                                    core::ptr::copy_nonoverlapping(
+                                        sc_out.as_ptr(),
+                                        pack_ptr.add(s_range.start),
+                                        s_range.len(),
+                                    );
                                 }
                             }
                         }
@@ -470,7 +688,6 @@ impl HostExpertStore {
             }
             Ok(())
         })?;
-        archive.drop_page_cache();
         Ok(Self {
             storage: std::sync::Arc::new(storage),
             layout,
@@ -509,8 +726,11 @@ impl HostExpertStore {
             bytes <= max_pinned_bytes,
             format!("expert store needs {bytes} pinned bytes, budget is {max_pinned_bytes}"),
         )?;
-        let mut storage = HostPackStorage::alloc(bytes, true)?;
-        storage.as_mut_slice().copy_from_slice(raw_packs);
+        let mut storage = HostPackStorage::alloc_unzeroed(bytes, true);
+        // SAFETY: `raw_packs` has `bytes` initialized bytes and `storage.raw_mut_ptr()` points to `bytes` writable bytes.
+        unsafe {
+            core::ptr::copy_nonoverlapping(raw_packs.as_ptr(), storage.raw_mut_ptr(), bytes);
+        }
         Ok(Self {
             storage: std::sync::Arc::new(storage),
             layout,
@@ -592,8 +812,7 @@ impl HostExpertStore {
             vec![acc]
         } else {
             let max_workers = std::thread::available_parallelism()
-                .map(|n| n.get().min(16))
-                .unwrap_or(4)
+                .map_or(4, |n| n.get().min(16))
                 .min(tasks.len());
             let chunk_len = tasks.len().div_ceil(max_workers);
             let mut out_vecs = vec![Vec::new(); tasks.len()];
@@ -667,6 +886,41 @@ impl DeviceExpertSlotTable {
             DeviceBuffer::alloc(device_id, capacity * layout.gate_up_scales.len())?;
         let down_packed = DeviceBuffer::alloc(device_id, capacity * layout.down_packed.len())?;
         let down_scales = DeviceBuffer::alloc(device_id, capacity * layout.down_scales.len())?;
+        Ok(Self {
+            device_id,
+            capacity,
+            layout,
+            gate_up_packed,
+            gate_up_scales,
+            down_packed,
+            down_scales,
+        })
+    }
+
+    pub fn alloc_on_stream(
+        device_id: i32,
+        capacity: usize,
+        layout: ExpertPackLayout,
+        stream: &crate::cuda::CudaStream,
+    ) -> crate::cuda::Result<Self> {
+        use crate::cuda::{CudaError, DeviceBuffer};
+        if capacity == 0 || capacity > 65535 {
+            return Err(CudaError::new(-1, "invalid DeviceExpertSlotTable capacity"));
+        }
+        let gate_up_packed = DeviceBuffer::alloc_on_stream(
+            device_id,
+            capacity * layout.gate_up_packed.len(),
+            stream,
+        )?;
+        let gate_up_scales = DeviceBuffer::alloc_on_stream(
+            device_id,
+            capacity * layout.gate_up_scales.len(),
+            stream,
+        )?;
+        let down_packed =
+            DeviceBuffer::alloc_on_stream(device_id, capacity * layout.down_packed.len(), stream)?;
+        let down_scales =
+            DeviceBuffer::alloc_on_stream(device_id, capacity * layout.down_scales.len(), stream)?;
         Ok(Self {
             device_id,
             capacity,
@@ -792,10 +1046,17 @@ impl DeviceExpertSlotTable {
             i32,
         ) -> i32;
         let (mlp_fn, label): (MoeMlpExFn, &str) = if self.layout.bits == 2 {
-            (
-                warp34_kernels::ffi::warp34_moe_w2a16_mlp_ex_f16,
-                "warp34_moe_w2a16_mlp_ex_f16 (tiered)",
-            )
+            if self.layout.u2_code_offset_half {
+                (
+                    warp34_kernels::ffi::warp34_moe_w2a16_sym_mlp_ex_f16,
+                    "warp34_moe_w2a16_sym_mlp_ex_f16 (tiered)",
+                )
+            } else {
+                (
+                    warp34_kernels::ffi::warp34_moe_w2a16_mlp_ex_f16,
+                    "warp34_moe_w2a16_mlp_ex_f16 (tiered)",
+                )
+            }
         } else {
             (
                 warp34_kernels::ffi::warp34_moe_w4a16_mlp_ex_f16,
@@ -830,6 +1091,108 @@ impl DeviceExpertSlotTable {
             label,
         )
     }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn launch_moe_w4a16_pulled_add(
+        &self,
+        ex: &warp34_kernels::ffi::Warp34Exec,
+        x_addr: u64,
+        pulled_topk_ids_addr: u64,
+        topk_weights_addr: u64,
+        active_count_addr: u64,
+        interm_buf_addr: u64,
+        out_addr: u64,
+        num_tokens: usize,
+        top_k: usize,
+    ) -> crate::cuda::Result<()> {
+        let (rc, label) = if self.layout.bits == 2 {
+            type MoePulledAddFn = unsafe extern "C" fn(
+                *const warp34_kernels::ffi::Warp34Exec,
+                *const core::ffi::c_void,
+                *const u32,
+                *const core::ffi::c_void,
+                *const u32,
+                *const core::ffi::c_void,
+                *const i32,
+                *const f32,
+                *const i32,
+                *mut core::ffi::c_void,
+                *mut core::ffi::c_void,
+                i32,
+                i32,
+                i32,
+                i32,
+                i32,
+                i32,
+                i32,
+            ) -> i32;
+            let (pulled_fn, label): (MoePulledAddFn, &str) = if self.layout.u2_code_offset_half {
+                (
+                    warp34_kernels::ffi::warp34_moe_w2a16_sym_pulled_add_f16,
+                    "warp34_moe_w2a16_sym_pulled_add_f16",
+                )
+            } else {
+                (
+                    warp34_kernels::ffi::warp34_moe_w2a16_pulled_add_f16,
+                    "warp34_moe_w2a16_pulled_add_f16",
+                )
+            };
+            (
+                // SAFETY: all device addresses are valid for `num_tokens` and `top_k`.
+                unsafe {
+                    pulled_fn(
+                        ex,
+                        x_addr as *const core::ffi::c_void,
+                        self.gate_up_packed.addr() as *const u32,
+                        self.gate_up_scales.addr() as *const core::ffi::c_void,
+                        self.down_packed.addr() as *const u32,
+                        self.down_scales.addr() as *const core::ffi::c_void,
+                        pulled_topk_ids_addr as *const i32,
+                        topk_weights_addr as *const f32,
+                        active_count_addr as *const i32,
+                        interm_buf_addr as *mut core::ffi::c_void,
+                        out_addr as *mut core::ffi::c_void,
+                        num_tokens as i32,
+                        top_k as i32,
+                        self.capacity as i32,
+                        self.layout.intermediate as i32,
+                        self.layout.hidden as i32,
+                        self.layout.group_size as i32,
+                        self.layout.down_hadamard_block_size as i32,
+                    )
+                },
+                label,
+            )
+        } else {
+            (
+                // SAFETY: all device addresses are valid for `num_tokens` and `top_k`.
+                unsafe {
+                    warp34_kernels::ffi::warp34_moe_w4a16_pulled_add_f16(
+                        ex,
+                        x_addr as *const core::ffi::c_void,
+                        self.gate_up_packed.addr() as *const u32,
+                        self.gate_up_scales.addr() as *const core::ffi::c_void,
+                        self.down_packed.addr() as *const u32,
+                        self.down_scales.addr() as *const core::ffi::c_void,
+                        pulled_topk_ids_addr as *const i32,
+                        topk_weights_addr as *const f32,
+                        active_count_addr as *const i32,
+                        interm_buf_addr as *mut core::ffi::c_void,
+                        out_addr as *mut core::ffi::c_void,
+                        num_tokens as i32,
+                        top_k as i32,
+                        self.capacity as i32,
+                        self.layout.intermediate as i32,
+                        self.layout.hidden as i32,
+                        self.layout.group_size as i32,
+                        self.layout.down_hadamard_block_size as i32,
+                    )
+                },
+                "warp34_moe_w4a16_pulled_add_f16",
+            )
+        };
+        crate::cuda::check_rc(rc, label)
+    }
 }
 
 /// Per-layer VRAM hot expert cache (`K_hot` slots) with LRU eviction tracking and telemetry.
@@ -841,13 +1204,16 @@ pub struct HotExpertCache {
     /// Global expert ID resident in each VRAM slot (`-1` if empty).
     pub slot_to_expert: Vec<i32>,
     pub slot_last_used: Vec<u64>,
+    pub expert_freq: Vec<u8>,
     pub d_expert_to_slot: crate::cuda::DeviceBuffer,
     pub d_prefill_expert_to_slot: crate::cuda::DeviceBuffer,
     pub d_slot_to_expert: crate::cuda::DeviceBuffer,
     pub d_slot_last_used: crate::cuda::DeviceBuffer,
     pub d_step_counter: crate::cuda::DeviceBuffer,
+    pub d_expert_freq: crate::cuda::DeviceBuffer,
     pub(crate) bridge_runtime: Option<std::sync::Arc<crate::moe_cpu_bridge::Runtime>>,
     pub(crate) bridge_mailbox: Option<std::sync::Arc<crate::moe_cpu_bridge::Mailbox>>,
+    pub ep_size: usize,
     pub k_static: usize,
     pub initial_slot_to_expert: Vec<i32>,
     pub adapted_slots_dirty: bool,
@@ -885,6 +1251,7 @@ impl HotExpertCache {
             crate::cuda::DeviceBuffer::alloc(device_id, k_hot * core::mem::size_of::<u64>())?;
         let d_step_counter =
             crate::cuda::DeviceBuffer::alloc(device_id, core::mem::size_of::<u64>())?;
+        let d_expert_freq = crate::cuda::DeviceBuffer::alloc(device_id, local_count.max(1))?;
         Ok(Self {
             slots,
             expert_ids,
@@ -892,13 +1259,88 @@ impl HotExpertCache {
             prefill_expert_to_slot: vec![-1; local_count],
             slot_to_expert: vec![-1; k_hot],
             slot_last_used: vec![0; k_hot],
+            expert_freq: vec![0; local_count],
             d_expert_to_slot,
             d_prefill_expert_to_slot,
             d_slot_to_expert,
             d_slot_last_used,
             d_step_counter,
+            d_expert_freq,
             bridge_runtime: None,
             bridge_mailbox: None,
+            ep_size: 1,
+            k_static: k_hot,
+            initial_slot_to_expert: Vec::new(),
+            adapted_slots_dirty: false,
+            device_lru_dirty: false,
+            step_clock: 1,
+            hits: 0,
+            misses: 0,
+            evictions: 0,
+            dma_experts_loaded: 0,
+            cpu_cold_evals: 0,
+        })
+    }
+
+    pub fn new_on_stream(
+        device_id: i32,
+        k_hot: usize,
+        expert_ids: Range<usize>,
+        layout: ExpertPackLayout,
+        stream: &crate::cuda::CudaStream,
+    ) -> crate::cuda::Result<Self> {
+        let local_count = expert_ids.len();
+        if k_hot == 0 || k_hot > local_count {
+            return Err(crate::cuda::CudaError::new(
+                -1,
+                "invalid HotExpertCache k_hot",
+            ));
+        }
+        let slots = DeviceExpertSlotTable::alloc_on_stream(device_id, k_hot, layout, stream)?;
+        let d_expert_to_slot = crate::cuda::DeviceBuffer::alloc_on_stream(
+            device_id,
+            local_count * core::mem::size_of::<i32>(),
+            stream,
+        )?;
+        let d_prefill_expert_to_slot = crate::cuda::DeviceBuffer::alloc_on_stream(
+            device_id,
+            local_count * core::mem::size_of::<i32>(),
+            stream,
+        )?;
+        let d_slot_to_expert = crate::cuda::DeviceBuffer::alloc_on_stream(
+            device_id,
+            k_hot * core::mem::size_of::<i32>(),
+            stream,
+        )?;
+        let d_slot_last_used = crate::cuda::DeviceBuffer::alloc_on_stream(
+            device_id,
+            k_hot * core::mem::size_of::<u64>(),
+            stream,
+        )?;
+        let d_step_counter = crate::cuda::DeviceBuffer::alloc_on_stream(
+            device_id,
+            core::mem::size_of::<u64>(),
+            stream,
+        )?;
+        let d_expert_freq =
+            crate::cuda::DeviceBuffer::alloc_on_stream(device_id, local_count.max(1), stream)?;
+        Ok(Self {
+            slots,
+            expert_ids,
+            expert_to_slot: vec![-1; local_count],
+            prefill_expert_to_slot: vec![-1; local_count],
+            slot_to_expert: vec![-1; k_hot],
+            slot_last_used: vec![0; k_hot],
+            expert_freq: vec![0; local_count],
+            d_expert_to_slot,
+            d_prefill_expert_to_slot,
+            d_slot_to_expert,
+            d_slot_last_used,
+            d_step_counter,
+            d_expert_freq,
+            bridge_runtime: None,
+            bridge_mailbox: None,
+            ep_size: 1,
             k_static: k_hot,
             initial_slot_to_expert: Vec::new(),
             adapted_slots_dirty: false,
@@ -931,12 +1373,28 @@ impl HotExpertCache {
             .copy_from_host(&self.slot_to_expert, stream)?;
         self.d_slot_last_used
             .copy_from_host(&self.slot_last_used, stream)?;
+        if !self.expert_freq.is_empty() {
+            self.d_expert_freq
+                .copy_from_host(&self.expert_freq, stream)?;
+        }
         self.d_step_counter
             .copy_from_host(std::slice::from_ref(&self.step_clock), stream)
     }
 
     /// Populates the `K_hot` VRAM slots with `initial_experts` (or the first `K_hot` local experts).
     pub fn populate_initial(
+        &mut self,
+        store: &HostExpertStore,
+        initial_experts: Option<&[usize]>,
+        ws: &mut TieredMoeWorkspace,
+        stream: &crate::cuda::CudaStream,
+    ) -> crate::cuda::Result<()> {
+        self.populate_initial_async(store, initial_experts, ws, stream)?;
+        stream.synchronize()
+    }
+
+    /// Enqueues population of the `K_hot` VRAM slots on `stream` without a trailing `stream.synchronize()`.
+    pub(super) fn populate_initial_async(
         &mut self,
         store: &HostExpertStore,
         initial_experts: Option<&[usize]>,
@@ -959,15 +1417,28 @@ impl HotExpertCache {
         self.initial_slot_to_expert = chosen.iter().map(|&ge| ge as i32).collect();
         self.adapted_slots_dirty = false;
         self.expert_to_slot.fill(-1);
+        self.expert_freq.fill(0);
         for (slot, &ge) in chosen.iter().enumerate() {
             let le = ge - self.expert_ids.start;
             self.expert_to_slot[le] = slot as i32;
             self.slot_to_expert[slot] = ge as i32;
-            // Preserve ranking order so the least-hot initial slot (`k_hot - 1`) is evicted
-            // before the hottest initial slot (`0`).
+            self.expert_freq[le] = if slot == 0 {
+                16
+            } else if slot < 24 {
+                8
+            } else if slot < 56 {
+                5
+            } else if slot < 88 {
+                3
+            } else {
+                1
+            };
+            // Preserve ranking order (`k_hot - slot`) while keeping `step_clock` >= 40 steps
+            // ahead of slots `24..k_hot` so unused non-core static slots can be smoothly
+            // replaced by active conversation experts without waiting 32 decode rounds.
             self.slot_last_used[slot] = (k_hot - slot) as u64;
         }
-        self.step_clock = (k_hot as u64) + 1;
+        self.step_clock = (k_hot as u64) + 40;
 
         // Upload in chunks of `ws.stage_capacity`.
         let chunk_cap = ws.stage_capacity;
@@ -984,7 +1455,7 @@ impl HotExpertCache {
         }
         self.upload_lru_metadata(stream)?;
         self.device_lru_dirty = false;
-        stream.synchronize()
+        Ok(())
     }
 
     #[inline]
@@ -992,7 +1463,11 @@ impl HotExpertCache {
         if self.slots.capacity >= self.expert_ids.len() {
             self.slots.capacity
         } else if self.has_cpu_bridge() {
-            self.k_static
+            if self.k_static <= 1 {
+                self.slots.capacity
+            } else {
+                self.k_static
+            }
         } else if self.slots.capacity > TIERED_MOE_GPU_LRU_TAIL_SLOTS {
             self.slots.capacity - TIERED_MOE_GPU_LRU_TAIL_SLOTS
         } else {
@@ -1041,6 +1516,16 @@ impl HotExpertCache {
         k_static: usize,
         stream: &crate::cuda::CudaStream,
     ) -> crate::cuda::Result<()> {
+        self.register_cpu_bridge_async(store, k_static, stream)?;
+        stream.synchronize()
+    }
+
+    pub(super) fn register_cpu_bridge_async(
+        &mut self,
+        store: &HostExpertStore,
+        k_static: usize,
+        stream: &crate::cuda::CudaStream,
+    ) -> crate::cuda::Result<()> {
         let k_hot = self.slots.capacity;
         let k_static = k_static.clamp(1, k_hot);
         if !Self::cpu_bridge_supported() {
@@ -1058,9 +1543,7 @@ impl HotExpertCache {
         let runtime = self.bridge_runtime.as_ref().unwrap();
         self.bridge_mailbox = Some(runtime.register(store)?);
         self.k_static = k_static;
-        self.sync_prefill_expert_to_slot(stream)?;
-        stream.synchronize()?;
-        Ok(())
+        self.sync_prefill_expert_to_slot(stream)
     }
 
     /// Pulls updated LRU metadata from device before host-side `execute_layer` runs.
@@ -1078,11 +1561,15 @@ impl HotExpertCache {
             .copy_to_host(&mut self.slot_to_expert, stream)?;
         self.d_slot_last_used
             .copy_to_host(&mut self.slot_last_used, stream)?;
+        if !self.expert_freq.is_empty() {
+            self.d_expert_freq
+                .copy_to_host(&mut self.expert_freq, stream)?;
+        }
         self.d_step_counter.copy_to_host(&mut step_arr, stream)?;
         stream.synchronize()?;
         self.step_clock = step_arr[0].saturating_add(1).max(1);
         let check_limit = if self.has_cpu_bridge() {
-            self.k_static
+            if self.k_static <= 1 { 0 } else { self.k_static }
         } else {
             self.prefill_hot_limit()
         }
@@ -1189,16 +1676,22 @@ pub struct TieredMoeWorkspace {
     pub d_stage_packs: [crate::cuda::DeviceBuffer; 2],
     pub d_stage_src_local_experts: [crate::cuda::DeviceBuffer; 2],
     pub d_stage_slots: [crate::cuda::DeviceBuffer; 2],
-    pub stage_tables: [DeviceExpertSlotTable; 2],
+    pub stage_table: DeviceExpertSlotTable,
     pub h2d_stream: crate::cuda::CudaStream,
     pub h2d_done_events: [crate::cuda::CudaEvent; 2],
     pub compute_done_events: [crate::cuda::CudaEvent; 2],
+    pub hybrid_plan_event: crate::cuda::CudaEvent,
+    pub hybrid_pull_done_event: crate::cuda::CudaEvent,
     pub d_remapped_topk_ids: [crate::cuda::DeviceBuffer; 2],
     pub d_interm_buf: crate::cuda::DeviceBuffer,
     pub d_chunk_out: crate::cuda::DeviceBuffer,
     pub d_scratch: crate::cuda::DeviceBuffer,
+    /// Optional larger caller-owned scratch tail `(addr, len_bytes)` borrowed for the duration of
+    /// a single `execute_layer_auto` call so large prefill chunks avoid `sparse_chunks` splitting.
+    pub external_scratch: (u64, usize),
     pub d_miss_local_experts: crate::cuda::DeviceBuffer,
     pub d_miss_victim_slots: crate::cuda::DeviceBuffer,
+    pub d_chunk_slot_tables: crate::cuda::DeviceBuffer,
     pub d_num_misses: crate::cuda::DeviceBuffer,
     pub h_prefill_x: MappedHostBuffer,
     pub h_prefill_out: MappedHostBuffer,
@@ -1224,27 +1717,45 @@ impl TieredMoeWorkspace {
         let stage_cap = stage_capacity.max(1);
         let stage_bytes = stage_cap * layout.stride;
         let pairs = (max_tokens * top_k).max(1);
+        let h2d_stream = CudaStream::new(device_id)?;
         let h_stage_packs = [
             MappedHostBuffer::alloc(stage_bytes)?,
             MappedHostBuffer::alloc(stage_bytes)?,
         ];
         let d_stage_packs = [
-            DeviceBuffer::alloc(device_id, stage_bytes)?,
-            DeviceBuffer::alloc(device_id, stage_bytes)?,
+            DeviceBuffer::alloc_on_stream(device_id, stage_bytes, &h2d_stream)?,
+            DeviceBuffer::alloc_on_stream(device_id, stage_bytes, &h2d_stream)?,
         ];
         let d_stage_src_local_experts = [
-            DeviceBuffer::alloc(device_id, stage_cap * core::mem::size_of::<i32>())?,
-            DeviceBuffer::alloc(device_id, stage_cap * core::mem::size_of::<i32>())?,
+            DeviceBuffer::alloc_on_stream(
+                device_id,
+                stage_cap * core::mem::size_of::<i32>(),
+                &h2d_stream,
+            )?,
+            DeviceBuffer::alloc_on_stream(
+                device_id,
+                stage_cap * core::mem::size_of::<i32>(),
+                &h2d_stream,
+            )?,
         ];
         let d_stage_slots = [
-            DeviceBuffer::alloc(device_id, stage_cap * core::mem::size_of::<i32>())?,
-            DeviceBuffer::alloc(device_id, stage_cap * core::mem::size_of::<i32>())?,
+            DeviceBuffer::alloc_on_stream(
+                device_id,
+                stage_cap * core::mem::size_of::<i32>(),
+                &h2d_stream,
+            )?,
+            DeviceBuffer::alloc_on_stream(
+                device_id,
+                stage_cap * core::mem::size_of::<i32>(),
+                &h2d_stream,
+            )?,
         ];
-        let stage_tables = [
-            DeviceExpertSlotTable::alloc(device_id, stage_cap, layout.clone())?,
-            DeviceExpertSlotTable::alloc(device_id, stage_cap, layout.clone())?,
-        ];
-        let h2d_stream = CudaStream::new(device_id)?;
+        let stage_table = DeviceExpertSlotTable::alloc_on_stream(
+            device_id,
+            stage_cap,
+            layout.clone(),
+            &h2d_stream,
+        )?;
         let identity_slots: Vec<i32> = (0..stage_cap as i32).collect();
         d_stage_slots[0].copy_from_host(&identity_slots, &h2d_stream)?;
         d_stage_slots[1].copy_from_host(&identity_slots, &h2d_stream)?;
@@ -1256,30 +1767,54 @@ impl TieredMoeWorkspace {
             CudaEvent::new(device_id, false)?,
             CudaEvent::new(device_id, false)?,
         ];
+        let hybrid_plan_event = CudaEvent::new(device_id, false)?;
+        let hybrid_pull_done_event = CudaEvent::new(device_id, false)?;
         // Record initial compute_done_events so the first wait_event is immediately satisfied.
         compute_done_events[0].record(&h2d_stream)?;
         compute_done_events[1].record(&h2d_stream)?;
 
         let d_remapped_topk_ids = [
-            DeviceBuffer::alloc(device_id, pairs * core::mem::size_of::<i32>())?,
-            DeviceBuffer::alloc(device_id, pairs * core::mem::size_of::<i32>())?,
+            DeviceBuffer::alloc_on_stream(
+                device_id,
+                pairs * core::mem::size_of::<i32>(),
+                &h2d_stream,
+            )?,
+            DeviceBuffer::alloc_on_stream(
+                device_id,
+                pairs * core::mem::size_of::<i32>(),
+                &h2d_stream,
+            )?,
         ];
-        let d_interm_buf = DeviceBuffer::alloc(
+        let d_interm_buf = DeviceBuffer::alloc_on_stream(
             device_id,
             pairs * layout.intermediate * core::mem::size_of::<u16>(),
+            &h2d_stream,
         )?;
-        let d_chunk_out = DeviceBuffer::alloc(
+        let d_chunk_out = DeviceBuffer::alloc_on_stream(
             device_id,
             max_tokens.max(1) * layout.hidden * core::mem::size_of::<u16>(),
+            &h2d_stream,
         )?;
         // Scratch for grouped-MMA token-expert sorting inside `warp34_moe_w4a16_mlp_f16`.
-        let d_scratch = DeviceBuffer::alloc(device_id, 16 * 1024 * 1024)?;
+        let d_scratch = DeviceBuffer::alloc_on_stream(device_id, 16 * 1024 * 1024, &h2d_stream)?;
         let max_misses = 512usize;
-        let d_miss_local_experts =
-            DeviceBuffer::alloc(device_id, max_misses * core::mem::size_of::<i32>())?;
-        let d_miss_victim_slots =
-            DeviceBuffer::alloc(device_id, max_misses * core::mem::size_of::<i32>())?;
-        let d_num_misses = DeviceBuffer::alloc(device_id, 2 * core::mem::size_of::<i32>())?;
+        let d_miss_local_experts = DeviceBuffer::alloc_on_stream(
+            device_id,
+            max_misses * core::mem::size_of::<i32>(),
+            &h2d_stream,
+        )?;
+        let d_miss_victim_slots = DeviceBuffer::alloc_on_stream(
+            device_id,
+            max_misses * core::mem::size_of::<i32>(),
+            &h2d_stream,
+        )?;
+        let d_chunk_slot_tables = DeviceBuffer::alloc_on_stream(
+            device_id,
+            512 * 512 * core::mem::size_of::<i32>(),
+            &h2d_stream,
+        )?;
+        let d_num_misses =
+            DeviceBuffer::alloc_on_stream(device_id, 2 * core::mem::size_of::<i32>(), &h2d_stream)?;
         let prefill_buf_bytes = max_tokens.max(1) * layout.hidden * core::mem::size_of::<u16>();
         let h_prefill_x = MappedHostBuffer::alloc(prefill_buf_bytes)?;
         let h_prefill_out = MappedHostBuffer::alloc(prefill_buf_bytes)?;
@@ -1302,16 +1837,20 @@ impl TieredMoeWorkspace {
             d_stage_packs,
             d_stage_src_local_experts,
             d_stage_slots,
-            stage_tables,
+            stage_table,
             h2d_stream,
             h2d_done_events,
             compute_done_events,
+            hybrid_plan_event,
+            hybrid_pull_done_event,
             d_remapped_topk_ids,
             d_interm_buf,
             d_chunk_out,
             d_scratch,
+            external_scratch: (0, 0),
             d_miss_local_experts,
             d_miss_victim_slots,
+            d_chunk_slot_tables,
             d_num_misses,
             h_prefill_x,
             h_prefill_out,

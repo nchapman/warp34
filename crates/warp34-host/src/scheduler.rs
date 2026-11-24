@@ -47,9 +47,9 @@ pub const DEFAULT_SCRATCH_ARENA_BYTES: usize = 512 * 1024 * 1024;
 /// (e.g. [`EXTREME_LONGCTX_SCRATCH_ARENA_BYTES`] or [`LARGE_MODEL_TP1_SCRATCH_ARENA_BYTES`]).
 pub const MEDIUM_SCRATCH_MAX_BATCHED_TOKENS: usize = 1024;
 
-/// Expanded transient `scratch_arena` size (`1,056 MiB`) for tiered-MoE checkpoints (`qwen4_exp`)
-/// when `requested_kv_pages <= TIERED_MOE_FULL_SCRATCH_MAX_KV_PAGES`.
-pub const TIERED_MOE_SCRATCH_ARENA_BYTES: usize = 1056 * 1024 * 1024;
+/// Expanded transient `scratch_arena` size (`880 MiB`) for tiered-MoE checkpoints (`qwen4_exp`)
+/// when `requested_kv_pages <= TIERED_MOE_FULL_SCRATCH_MAX_KV_PAGES` (`6,144`-token prefill needs `835.9 MiB`).
+pub const TIERED_MOE_SCRATCH_ARENA_BYTES: usize = 880 * 1024 * 1024;
 
 /// Maximum requested KV pages (`8,192` pages = `128K` tokens) for allocating [`TIERED_MOE_SCRATCH_ARENA_BYTES`].
 pub const TIERED_MOE_FULL_SCRATCH_MAX_KV_PAGES: usize = 8192;
@@ -142,8 +142,19 @@ pub struct WaitingReq {
     pub lora_id: i32,
 }
 
+/// Snapshot of the initial radix probe and the prefix actually used at admission.
+#[derive(serde::Serialize, Debug, Default, Clone, Copy)]
+pub struct CacheLookup {
+    pub lookup_tokens: usize,
+    pub kv_matched_tokens: usize,
+    pub checkpoint_tokens: usize,
+    pub restored_tokens: usize,
+    pub reason: &'static str,
+}
+
 #[derive(Clone, Debug)]
 pub struct SeqEntry {
+    pub cache_lookup: CacheLookup,
     pub req_id: u64,
     pub prompt_tokens: Vec<i32>,
     pub radix_key_tokens: Vec<i32>,
@@ -208,6 +219,7 @@ pub struct SchedulerV1 {
     pub radix: MambaRadixCache,
     pub active: Vec<SeqEntry>,
     pub waiting: VecDeque<WaitingReq>,
+    pub use_checkpoint_pool: bool,
     next_req_id: u64,
 }
 
@@ -235,6 +247,7 @@ impl SchedulerV1 {
             cfg,
             active: Vec::new(),
             waiting: VecDeque::new(),
+            use_checkpoint_pool: false,
             next_req_id: 1,
         }
     }
@@ -410,7 +423,7 @@ impl SchedulerV1 {
         self.radix.active_lora_id = crate::lora::BASE_MODEL_LORA_ID;
         let evictions = Vec::new();
         while self.active.len() < self.cfg.max_num_seqs {
-            let (lookup_len, mut match_res, pinned_hit, unshareable) = {
+            let (mut cache_lookup, mut match_res, pinned_hit, unshareable) = {
                 let Some(w) = self.waiting.front() else {
                     break;
                 };
@@ -426,14 +439,40 @@ impl SchedulerV1 {
                     .max_prefix_lookup_len
                     .map_or(default_lookup, |cap| cap.min(default_lookup));
                 let mut hit = self.radix.match_prefix(&w.radix_key_tokens[..lookup_len]);
+                let page_size = self.radix.page_size;
+                let aligned_lookup = lookup_len - lookup_len % page_size;
+                let reached_cap =
+                    lookup_len < default_lookup && hit.matched_tokens == aligned_lookup;
+                let mut cache_lookup = CacheLookup {
+                    lookup_tokens: lookup_len,
+                    kv_matched_tokens: hit.kv_matched_tokens,
+                    checkpoint_tokens: hit.matched_tokens,
+                    restored_tokens: 0,
+                    reason: if self.radix.disable {
+                        "cache_disabled"
+                    } else if reached_cap {
+                        "capped_lookup"
+                    } else if lookup_len == 0 {
+                        "empty_lookup"
+                    } else if hit.kv_matched_tokens == 0 {
+                        "no_page_match"
+                    } else if hit.matched_tokens == 0 {
+                        "no_checkpoint"
+                    } else if hit.matched_tokens < hit.kv_matched_tokens {
+                        "checkpoint_boundary"
+                    } else {
+                        "hit"
+                    },
+                };
                 // Each step trims below `hit.matched_tokens` (a 64-token Mamba checkpoint
                 // boundary), jumping directly to the next ancestor checkpoint. Cap the walk
-                // at 32 ancestor hops so admission work remains strictly O(1) bounded.
-                const MAX_ANCESTOR_FALLBACK_STEPS: usize = 32;
+                // at 64 ancestor hops so admission work remains strictly O(1) bounded.
+                const MAX_ANCESTOR_FALLBACK_STEPS: usize = 64;
                 let mut steps = 0usize;
                 while hit.matched_tokens > 0
                     && !allow_prefix_hit(w.req_id, &w.radix_key_tokens, hit.matched_tokens)
                 {
+                    cache_lookup.reason = "admission_filter";
                     if steps >= MAX_ANCESTOR_FALLBACK_STEPS {
                         let branch = hit.mamba_branching_seqlen;
                         hit = self.radix.match_prefix(&[]);
@@ -449,9 +488,8 @@ impl SchedulerV1 {
                     hit = shorter;
                 }
                 let pinned_hit = hit.matched_tokens > 0 && hit.mamba_slot.is_some();
-                (lookup_len, hit, pinned_hit, unshareable)
+                (cache_lookup, hit, pinned_hit, unshareable)
             };
-            let _ = lookup_len;
             if pinned_hit {
                 self.radix.inc_lock_ref(match_res.last_node);
             }
@@ -466,6 +504,7 @@ impl SchedulerV1 {
                         break;
                     };
                     match_res = self.radix.match_prefix(&[]);
+                    cache_lookup.reason = "state_slot_pressure";
                     fallback_slots
                 }
                 None => break,
@@ -480,7 +519,9 @@ impl SchedulerV1 {
             );
             radix_state.restore_prefix_hit(&mut self.radix, &w.radix_key_tokens, &match_res);
 
+            cache_lookup.restored_tokens = match_res.matched_tokens;
             self.active.push(SeqEntry {
+                cache_lookup,
                 req_id: w.req_id,
                 prompt_tokens: w.prompt_tokens,
                 radix_key_tokens: w.radix_key_tokens,
@@ -504,6 +545,21 @@ impl SchedulerV1 {
             });
         }
         evictions
+    }
+
+    /// Propagates any L2 Host -> L1 VRAM page promotions recorded in `self.radix` across all
+    /// active sequences so sibling requests admitted in the same tick never reference a freed
+    /// L2 `host_pid` that could be reused by a subsequent swap-out (`ABA` prevention).
+    pub fn resolve_promoted_host_kv_pages(&mut self) {
+        for peer in &mut self.active {
+            for pid in &mut peer.radix_state.kv_pages {
+                if crate::cache::is_host_kv_page(*pid)
+                    && let Some(vram_pid) = self.radix.get_promoted_vram_page(*pid)
+                {
+                    *pid = vram_pid;
+                }
+            }
+        }
     }
 
     /// Schedules the next batch of decode steps and chunk-aligned prefill slices within
@@ -541,19 +597,40 @@ impl SchedulerV1 {
         }
 
         // 2. Schedule chunked prefill slices aligned to `mamba_chunk_size = 64`.
-        // Bound total co-scheduled prefill even for long prompts and low decode concurrency:
-        // a larger chunk would stall active decode streams for its entire execution time.
+        // Bound mixed-step prefill to `mixed_chunk_prefill_size` (256) so long prompts
+        // do not stall active decodes; only scale the aggregate mixed budget when
+        // multiple eligible short causal prompts (`rem <= mixed_cap`) are queued so
+        // short-prompt bursts (e.g. C=16) pack into 1-2 steps without inflating bulk
+        // mixed prefills or counting incompatible noncausal requests.
         let has_active_decodes = !batch.is_empty();
-        let mut prefill_budget = if has_active_decodes {
-            budget.min(self.cfg.effective_mixed_prefill_budget())
-        } else {
-            budget
-        };
         let mut pending_prefills = self
             .active
             .iter()
             .filter(|seq| !seq.finished && !seq.is_prefill_complete() && !seq.custom_prefill)
             .count();
+        let mixed_cap = self.cfg.effective_mixed_prefill_budget();
+        let eligible_short_mixed_prefills = if has_active_decodes {
+            self.active
+                .iter()
+                .filter(|seq| {
+                    if seq.finished || seq.is_prefill_complete() || seq.custom_prefill {
+                        return false;
+                    }
+                    let start = seq.prefilled_tokens;
+                    let is_noncausal = seq
+                        .prefix_bidir_len
+                        .is_some_and(|bidir_end| start < bidir_end || seq.max_new_tokens <= 1);
+                    !is_noncausal && (seq.prompt_tokens.len() - start) <= mixed_cap
+                })
+                .count()
+        } else {
+            0
+        };
+        let mut prefill_budget = if has_active_decodes {
+            budget.min(mixed_cap.saturating_mul(eligible_short_mixed_prefills.max(1)))
+        } else {
+            budget
+        };
         let mut batch_noncausal: Option<bool> = (!batch.is_empty()).then_some(false);
         let mut batch_noncausal_lora: Option<i32> = None;
         for seq in &self.active {
@@ -600,13 +677,15 @@ impl SchedulerV1 {
                 pending_prefills -= 1;
                 need
             } else {
-                // Share pure-prefill waves so one bulk request does not enter decode while
-                // another is still starved, forcing the remainder through the mixed-step cap.
-                // Active decodes always retain their existing latency-bounded policy.
-                let share = if !has_active_decodes && pending_prefills > 1 {
+                // Share pure-prefill waves across long bulk requests so one does not finish
+                // early and starve another, without pointlessly splitting short prompts
+                // (<= `mixed_cap`) into two chunks and doubling GDN state traffic.
+                let share = if !has_active_decodes && pending_prefills > 1 && rem > mixed_cap {
                     let aligned = (prefill_budget / pending_prefills / self.cfg.mamba_chunk_size)
                         * self.cfg.mamba_chunk_size;
                     aligned.max(self.cfg.mamba_chunk_size).min(prefill_budget)
+                } else if has_active_decodes {
+                    prefill_budget.min(mixed_cap)
                 } else {
                     prefill_budget
                 };
@@ -678,6 +757,18 @@ impl SchedulerV1 {
     where
         F: FnMut() -> Option<i32>,
     {
+        self.commit_slice_with_radix(slice, emitted_token, |_| alloc_replacement_slot())
+    }
+
+    pub fn commit_slice_with_radix<F>(
+        &mut self,
+        slice: &ScheduledReqSlice,
+        emitted_token: Option<i32>,
+        mut alloc_replacement_slot: F,
+    ) -> Option<RadixDonationOutcome>
+    where
+        F: FnMut(&mut MambaRadixCache) -> Option<i32>,
+    {
         let seq = self.active.iter_mut().find(|s| s.req_id == slice.req_id)?;
         let radix_slice = if slice.is_prefill_chunk {
             &seq.radix_key_tokens
@@ -709,6 +800,24 @@ impl SchedulerV1 {
             seq.resources_released = true;
             if seq.prefix_bidir_len.is_some() {
                 Some(seq.radix_state.abort_and_release(&mut self.radix))
+            } else if self.use_checkpoint_pool {
+                let can_recycle_ckpt = self
+                    .radix
+                    .can_recycle_locked_checkpoint_mamba(seq.radix_state.last_locked_node);
+                let ckpt = if seq.radix_state.has_donatable_checkpoint() {
+                    alloc_replacement_slot(&mut self.radix)
+                } else {
+                    None
+                };
+                if ckpt.is_none() && !can_recycle_ckpt && seq.radix_state.has_donatable_checkpoint()
+                {
+                    Some(seq.radix_state.abort_and_release(&mut self.radix))
+                } else {
+                    Some(
+                        seq.radix_state
+                            .donate_committed_checkpoint(&mut self.radix, ckpt, true),
+                    )
+                }
             } else {
                 Some(
                     seq.radix_state
@@ -717,16 +826,30 @@ impl SchedulerV1 {
             }
         } else if slice.is_prefill_chunk
             && seq.prefix_bidir_len.is_none()
-            && seq.radix_state.last_track_seqlen.is_some()
+            && seq.radix_state.has_donatable_checkpoint()
+            && (slice.is_final_prefill_chunk
+                || seq.radix_state.uncommitted_donatable_tokens() >= self.cfg.chunk_prefill_size)
         {
-            // Donate intermediate chunked-prefill checkpoint immediately so concurrent
-            // requests in the next step can hit the warm prefix!
-            let rep = alloc_replacement_slot();
-            if rep.is_some()
-                || self
-                    .radix
+            // Donate intermediate or completed prefill checkpoint so concurrent
+            // requests and retries can hit the warm prompt prefix. Within an
+            // 8,192-token (`ANCHOR_CHECKPOINT_STRIDE_PAGES`) window, recycle this
+            // request's own intermediate prefill checkpoint slot in-place rather
+            // than allocating a fresh checkpoint slot on every prefill chunk.
+            let recycle_in_place = self.use_checkpoint_pool
+                && seq.radix_state.can_recycle_prefill_checkpoint(&self.radix);
+            let rep = if recycle_in_place {
+                None
+            } else {
+                alloc_replacement_slot(&mut self.radix)
+            };
+            let can_recycle = if self.use_checkpoint_pool {
+                self.radix
+                    .can_recycle_locked_checkpoint_mamba(seq.radix_state.last_locked_node)
+            } else {
+                self.radix
                     .can_recycle_locked_mamba(seq.radix_state.last_locked_node)
-            {
+            };
+            if rep.is_some() || can_recycle {
                 Some(
                     seq.radix_state
                         .donate_committed_checkpoint(&mut self.radix, rep, false),
@@ -757,6 +880,17 @@ impl SchedulerV1 {
     /// Marks an active sequence finished early (e.g. due to a `stop` string match) and
     /// donates its committed checkpoints to `self.radix` if not already donated.
     pub fn finish_request_early(&mut self, req_id: u64) -> Option<RadixDonationOutcome> {
+        self.finish_request_early_with(req_id, |_| None)
+    }
+
+    pub fn finish_request_early_with<F>(
+        &mut self,
+        req_id: u64,
+        mut alloc_ckpt_slot: F,
+    ) -> Option<RadixDonationOutcome>
+    where
+        F: FnMut(&mut MambaRadixCache) -> Option<i32>,
+    {
         let seq = self.active.iter_mut().find(|s| s.req_id == req_id)?;
         if seq.resources_released {
             return None;
@@ -765,6 +899,23 @@ impl SchedulerV1 {
         seq.resources_released = true;
         if seq.prefix_bidir_len.is_some() {
             Some(seq.radix_state.abort_and_release(&mut self.radix))
+        } else if self.use_checkpoint_pool {
+            let can_recycle_ckpt = self
+                .radix
+                .can_recycle_locked_checkpoint_mamba(seq.radix_state.last_locked_node);
+            let ckpt = if seq.radix_state.has_donatable_checkpoint() {
+                alloc_ckpt_slot(&mut self.radix)
+            } else {
+                None
+            };
+            if ckpt.is_none() && !can_recycle_ckpt && seq.radix_state.has_donatable_checkpoint() {
+                Some(seq.radix_state.abort_and_release(&mut self.radix))
+            } else {
+                Some(
+                    seq.radix_state
+                        .donate_committed_checkpoint(&mut self.radix, ckpt, true),
+                )
+            }
         } else {
             Some(
                 seq.radix_state
@@ -805,6 +956,7 @@ mod tests {
     #[test]
     fn test_seq_entry_stop_token_logic() {
         let mut entry = SeqEntry {
+            cache_lookup: CacheLookup::default(),
             req_id: 1,
             prompt_tokens: vec![1, 2, 3],
             radix_key_tokens: vec![1, 2, 3],
@@ -1051,6 +1203,87 @@ mod tests {
     }
 
     #[test]
+    fn test_short_prompt_burst_packs_without_splitting_and_scales_mixed_wave() {
+        let mut sched = SchedulerV1::new(SchedulerConfig::default());
+        for i in 0..16i32 {
+            let base = i * 1000;
+            sched.submit_request((base..base + 165).collect(), 16, vec![]);
+        }
+        let mut slot = 0;
+        sched.admit_waiting(|_| {
+            let slots = (slot, [slot + 1, slot + 2]);
+            slot += 3;
+            Some(slots)
+        });
+        for (i, seq) in sched.active.iter_mut().enumerate() {
+            seq.radix_state.kv_pages = ((i * 16) as i32..((i + 1) * 16) as i32).collect();
+        }
+
+        // Step 1 (pure prefill): 12 complete 165-token prompts (1,980 <= 2,048) finish
+        // whole without splitting all 16 into 128+37 chunks.
+        let step1 = sched.schedule_step();
+        let complete_s1: Vec<_> = step1.iter().filter(|s| s.is_final_prefill_chunk).collect();
+        assert_eq!(complete_s1.len(), 12);
+        assert!(complete_s1.iter().all(|s| s.query_tokens.len() == 165));
+        for slice in &step1 {
+            let tok = if slice.is_final_prefill_chunk {
+                Some(900)
+            } else {
+                None
+            };
+            sched.commit_slice(slice, tok, || {
+                let s = slot;
+                slot += 1;
+                Some(s)
+            });
+        }
+
+        // Step 2 (mixed decode + 4 pending prefills): mixed budget scales with
+        // pending_prefills (4 * 256 = 1,024 >= 660) so all 4 remaining prompts finish
+        // in one mixed step rather than serializing 1-by-1 under a flat 256-token cap.
+        let step2 = sched.schedule_step();
+        let decodes_s2 = step2.iter().filter(|s| !s.is_prefill_chunk).count();
+        let prefills_s2: Vec<_> = step2.iter().filter(|s| s.is_prefill_chunk).collect();
+        assert_eq!(decodes_s2, 12);
+        assert_eq!(prefills_s2.len(), 4);
+        assert!(prefills_s2.iter().all(|s| s.is_final_prefill_chunk));
+
+        // Multiple long/bulk prefills arriving behind active decodes remain bounded
+        // to `mixed_chunk_prefill_size` (256) total tokens so decodes are not stalled.
+        let mut long_sched = SchedulerV1::new(SchedulerConfig::default());
+        long_sched.submit_request((0..64).collect(), 10, vec![]);
+        let mut lslot = 0;
+        long_sched.admit_waiting(|_| {
+            let s = (lslot, [lslot + 1, lslot + 2]);
+            lslot += 3;
+            Some(s)
+        });
+        long_sched.active[0].radix_state.kv_pages = (0..8).collect();
+        let init = long_sched.schedule_step();
+        long_sched.commit_slice(&init[0], Some(901), || {
+            let s = lslot;
+            lslot += 1;
+            Some(s)
+        });
+        long_sched.submit_request((1000..5096).collect(), 10, vec![]);
+        long_sched.submit_request((10000..14096).collect(), 10, vec![]);
+        long_sched.admit_waiting(|_| {
+            let s = (lslot, [lslot + 1, lslot + 2]);
+            lslot += 3;
+            Some(s)
+        });
+        long_sched.active[1].radix_state.kv_pages = (100..400).collect();
+        long_sched.active[2].radix_state.kv_pages = (500..800).collect();
+        let mixed_bulk = long_sched.schedule_step();
+        let mixed_prefill_tokens: usize = mixed_bulk
+            .iter()
+            .filter(|s| s.is_prefill_chunk)
+            .map(|s| s.query_tokens.len())
+            .sum();
+        assert_eq!(mixed_prefill_tokens, DEFAULT_MIXED_CHUNK_PREFILL_TOKENS);
+    }
+
+    #[test]
     fn test_model_token_capacity_clamp() {
         let mut cfg = SchedulerConfig::default();
         cfg.clamp_for_token_capacity(1471);
@@ -1175,6 +1408,9 @@ mod tests {
         assert_eq!(sched.active[0].req_id, req_id);
         assert_eq!(sched.active[0].cached_prefix_tokens, 0);
         assert_eq!(sched.active[0].prefilled_tokens, 0);
+        let lookup = sched.active[0].cache_lookup;
+        assert_eq!((lookup.checkpoint_tokens, lookup.restored_tokens), (64, 0));
+        assert_eq!(lookup.reason, "state_slot_pressure");
         assert!(free_pool.is_empty());
     }
 
@@ -1403,6 +1639,39 @@ mod tests {
     }
 
     #[test]
+    fn admission_reports_initial_lookup_depths() {
+        for (prompt_len, cap, lookup, kv, checkpoint, reason) in [
+            (1, None, 0, 0, 0, "empty_lookup"),
+            (129, Some(0), 0, 0, 0, "capped_lookup"),
+            (129, Some(64), 64, 64, 64, "capped_lookup"),
+            (8, None, 7, 0, 0, "no_page_match"),
+            (49, None, 48, 48, 0, "no_checkpoint"),
+            (97, None, 96, 96, 64, "checkpoint_boundary"),
+            (129, None, 128, 128, 128, "hit"),
+        ] {
+            let mut sched = SchedulerV1::new(SchedulerConfig::default());
+            let prompt: Vec<i32> = (0..129).collect();
+            sched.radix.insert(&prompt[..64], &[1, 2, 3, 4], &[], 10, 0);
+            sched
+                .radix
+                .insert(&prompt[..128], &[1, 2, 3, 4, 5, 6, 7, 8], &[], 11, 4);
+            sched.submit_request(prompt[..prompt_len].to_vec(), 1, Vec::new());
+            sched.waiting.front_mut().unwrap().max_prefix_lookup_len = cap;
+            sched.admit_waiting(|_| Some((1, [2, 3])));
+            let result = sched.active[0].cache_lookup;
+            assert_eq!(
+                (result.lookup_tokens, result.kv_matched_tokens),
+                (lookup, kv)
+            );
+            assert_eq!(
+                (result.checkpoint_tokens, result.restored_tokens),
+                (checkpoint, checkpoint)
+            );
+            assert_eq!(result.reason, reason);
+        }
+    }
+
+    #[test]
     fn test_admit_waiting_with_filter_steps_down_to_ancestor_checkpoint() {
         let mut sched = SchedulerV1::new(SchedulerConfig::default());
         let prompt: Vec<i32> = (0..192).collect();
@@ -1414,6 +1683,58 @@ mod tests {
         sched.admit_waiting_with_filter(|_| Some((1, [2, 3])), |_, _, matched| matched <= 64);
         assert_eq!(sched.active.len(), 1);
         assert_eq!(sched.active[0].cached_prefix_tokens, 64);
+        let lookup = sched.active[0].cache_lookup;
+        assert_eq!((lookup.lookup_tokens, lookup.kv_matched_tokens), (191, 128));
+        assert_eq!(
+            (lookup.checkpoint_tokens, lookup.restored_tokens),
+            (128, 64)
+        );
+        assert_eq!(lookup.reason, "admission_filter");
         assert_eq!(sched.active[0].radix_state.cow_src_state_slot, Some(10));
+    }
+
+    #[test]
+    fn test_chunked_prefill_recycles_intermediate_checkpoint_within_anchor_stride() {
+        let mut sched = SchedulerV1::new(SchedulerConfig::default());
+        sched.use_checkpoint_pool = true;
+
+        // Submit a 20,480-token prompt (10 chunks of 2,048 tokens = 1,280 pages).
+        let prompt: Vec<i32> = (0..20_480).collect();
+        sched.submit_request(prompt.clone(), 4, Vec::new());
+        sched.admit_waiting(|_| Some((1, [2, 3])));
+        sched.active[0].radix_state.kv_pages = (0..1285).collect();
+
+        let mut next_ckpt_idx = 0usize;
+        let mut allocated_ckpts = Vec::new();
+        for chunk_idx in 0..10 {
+            let slices = sched.schedule_step();
+            assert_eq!(slices.len(), 1);
+            assert!(slices[0].is_prefill_chunk);
+            assert_eq!(slices[0].is_final_prefill_chunk, chunk_idx == 9);
+            let emitted = (chunk_idx == 9).then_some(42);
+            let don = sched.commit_slice_with_radix(&slices[0], emitted, |_| {
+                let slot = crate::cache::encode_checkpoint_pool_slot(next_ckpt_idx);
+                next_ckpt_idx += 1;
+                allocated_ckpts.push(slot);
+                Some(slot)
+            });
+            assert!(don.is_some());
+        }
+
+        // Across 10 chunks of 2,048 tokens (20,480 tokens):
+        // - Chunks 0..=3 (2,048 -> 8,192 tokens = 512 pages) allocate 1 slot and recycle it to 8,192.
+        // - Chunks 4..=7 (10,240 -> 16,384 tokens = 512 pages) allocate a 2nd slot and recycle it to 16,384.
+        // - Chunks 8..=9 (18,432 -> 20,480 tokens = 256 pages) allocate a 3rd slot and recycle it to 20,480.
+        assert_eq!(allocated_ckpts.len(), 3);
+        assert_eq!(
+            sched.radix.match_prefix(&prompt[..8192]).matched_tokens,
+            8192
+        );
+        assert_eq!(
+            sched.radix.match_prefix(&prompt[..16_384]).matched_tokens,
+            16_384
+        );
+        assert_eq!(sched.radix.match_prefix(&prompt).matched_tokens, 20_480);
+        assert!(sched.radix.sanity_check().is_ok());
     }
 }

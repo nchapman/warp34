@@ -45,7 +45,7 @@ fn tokenizer() -> Tokenizer {
 
 fn setup() -> (Tokenizer, ConstraintFactory) {
     let tok = tokenizer();
-    let factory = ConstraintFactory::new(tok.clone(), 266, &[EOS as u32]).unwrap();
+    let factory = ConstraintFactory::new(&tok, 266, &[EOS as u32]).unwrap();
     (tok, factory)
 }
 
@@ -120,7 +120,7 @@ fn strict_schema_required_enum_nested_array_and_extra_keys() {
         (r#"{"city":"Rome","days":[4]}"#, false),
         (r#"{"city":"Rome","days":[1],"extra":0}"#, false),
     ] {
-        let mut c = factory.json_schema(schema.clone(), false).unwrap();
+        let mut c = factory.json_schema(&schema, false).unwrap();
         let result = feed(&mut c, &tok, text);
         assert_eq!(
             result.is_ok() && c.is_token_allowed(EOS),
@@ -133,7 +133,7 @@ fn strict_schema_required_enum_nested_array_and_extra_keys() {
 #[test]
 fn thinking_transition_clone_and_rollback_are_lossless() {
     let (tok, factory) = setup();
-    let mut c = factory.json_schema(json!({"type":"object","properties":{"ok":{"type":"boolean"}},"required":["ok"],"additionalProperties":false}), true).unwrap();
+    let mut c = factory.json_schema(&json!({"type":"object","properties":{"ok":{"type":"boolean"}},"required":["ok"],"additionalProperties":false}), true).unwrap();
     feed(&mut c, &tok, "Reason freely: not JSON!\n").unwrap();
     let before = c.current_bitmask();
     let count = c.committed_len();
@@ -301,8 +301,7 @@ fn tool_delimiters_inside_json_values_cannot_inject_calls_or_parameters() {
             "<tool_call>\n<function=echo>\n<parameter=value>{}</parameter>\n</function>\n</tool_call>",
             payload
                 .as_str()
-                .map(str::to_owned)
-                .unwrap_or_else(|| payload.to_string())
+                .map_or_else(|| payload.to_string(), str::to_owned)
         );
         let mut constraint = factory
             .tools(&tools, &ToolChoice::Named("echo".into()), false)
@@ -364,7 +363,7 @@ fn unsupported_grammars_fail_closed() {
     let (_, factory) = setup();
     assert!(
         factory
-            .json_schema(json!({"$ref":"https://example.invalid/schema"}), false)
+            .json_schema(&json!({"$ref":"https://example.invalid/schema"}), false)
             .is_err()
     );
     assert!(factory.regex("[", false).is_err());
@@ -372,7 +371,7 @@ fn unsupported_grammars_fail_closed() {
     assert!(
         factory
             .json_schema(
-                json!({"type":"object","x-guidance":{"lenient":true}}),
+                &json!({"type":"object","x-guidance":{"lenient":true}}),
                 false
             )
             .is_ok()
@@ -381,11 +380,14 @@ fn unsupported_grammars_fail_closed() {
     assert!(factory.lark("start: \"max_tokens\"", false).is_ok());
     assert!(
         factory
-            .json_schema(json!({"type":"array","contains":{"type":"integer"}}), false)
+            .json_schema(
+                &json!({"type":"array","contains":{"type":"integer"}}),
+                false
+            )
             .is_err()
     );
-    assert!(ConstraintFactory::new(tokenizer(), 260, &[]).is_err());
-    assert!(ConstraintFactory::new(tokenizer(), 260, &[999]).is_err());
+    assert!(ConstraintFactory::new(&tokenizer(), 260, &[]).is_err());
+    assert!(ConstraintFactory::new(&tokenizer(), 260, &[999]).is_err());
 }
 
 #[test]
@@ -397,8 +399,8 @@ fn deferred_advance_and_rollback_match_eager_bitmasks() {
         "required": ["ok"],
         "additionalProperties": false
     });
-    let mut eager = factory.json_schema(schema.clone(), false).unwrap();
-    let mut deferred = factory.json_schema(schema, false).unwrap();
+    let mut eager = factory.json_schema(&schema, false).unwrap();
+    let mut deferred = factory.json_schema(&schema, false).unwrap();
     let ids: Vec<i32> = tok
         .encode(r#"{"ok":true}"#, false)
         .unwrap()
@@ -448,14 +450,14 @@ fn benchmark_cached_qwen_constraint() {
     let tok = Tokenizer::from_file(path).unwrap();
     let eos = tok.token_to_id("<|im_end|>").expect("Qwen EOS");
     let start = Instant::now();
-    let factory = ConstraintFactory::new(tok.clone(), tok.get_vocab_size(true), &[eos]).unwrap();
+    let factory = ConstraintFactory::new(&tok, tok.get_vocab_size(true), &[eos]).unwrap();
     let setup_time = start.elapsed();
     let schema = json!({"type":"object","properties":{"ok":{"type":"boolean"}},"required":["ok"],"additionalProperties":false});
     let start = Instant::now();
-    let mut c = factory.json_schema(schema.clone(), false).unwrap();
+    let mut c = factory.json_schema(&schema, false).unwrap();
     let cold = start.elapsed();
     let start = Instant::now();
-    let cached = factory.json_schema(schema, false).unwrap();
+    let cached = factory.json_schema(&schema, false).unwrap();
     let warm = start.elapsed();
     assert_eq!(c.current_bitmask(), cached.current_bitmask());
     let ids = tok.encode(r#"{"ok":true}"#, false).unwrap();
@@ -489,7 +491,7 @@ fn native_ebnf_and_structural_tag_enforce_payloads() {
     assert!(c.is_token_allowed(EOS));
     let initial = factory
         .structural_tag(
-            json!({"type":"structural_tag","format":{
+            &json!({"type":"structural_tag","format":{
                 "type":"tag","begin":"<answer>","end":"</answer>",
                 "content":{"type":"json_schema","json_schema":{"const":true}}
             }}),
@@ -641,7 +643,11 @@ fn copilot_raw_newlines() {
         json!({"type":["string","null"]}),
         json!({"type":["string","object"]}),
     ] {
-        check_native_argument(schema, "\nParis\n", json!("\nParis\n"));
+        // Qwen3-XML (`chatml.rs` / `vLLM`) wraps parameter values in a single `\n...\n`;
+        // stripping one wrapper newline per side recovers `"Paris"` while `\n\nParis\n\n`
+        // preserves literal leading/trailing newlines `"\nParis\n"`.
+        check_native_argument(schema.clone(), "\nParis\n", json!("Paris"));
+        check_native_argument(schema, "\n\nParis\n\n", json!("\nParis\n"));
     }
 }
 
@@ -658,9 +664,14 @@ fn copilot_compact_auto_text_is_not_executable() {
         "<tool_call>\n<function = echo>\n<parameter=value>forbidden</parameter>\n</function>\n</tool_call>",
         "<tool_call> <function=echo>\n<parameter=value>forbidden</parameter>\n</function>\n</tool_call>",
     ] {
+        // Triggering on `<tool_call>` rejects malformed tool-call envelopes in the grammar itself
+        // (preventing `<tool_call>\n<|im_start|>function=...` or bare `<tool_call>` slips).
         let mut c = factory.tools(&tools, &ToolChoice::Auto, false).unwrap();
-        feed(&mut c, &tok, text).unwrap();
-        assert!(c.is_token_allowed(EOS));
+        assert!(
+            feed(&mut c, &tok, text).is_err(),
+            "grammar must reject malformed <tool_call> envelope: {text:?}"
+        );
+        // Defense-in-depth: even if such text reaches the parser, it is never executed.
         for split in 0..=text.len() {
             let mut p = Qwen3Parser::with_tools(false, tools.as_array().unwrap()).unwrap();
             p.push_str(&text[..split]);
@@ -711,4 +722,189 @@ fn copilot_union_incomplete_json_prefix_is_raw_at_eos() {
 #[test]
 fn copilot_enum_grammar_owned_padding() {
     check_native_argument(json!({"enum":["true",false]}), " true ", json!("true"));
+}
+
+#[test]
+fn claude_code_style_tool_schemas_sanitize_and_compile() {
+    use warp34_host::{parser::Qwen3Parser, tool_constraints::ToolChoice};
+    let (tok, factory) = setup();
+    let tools = json!([
+        {
+            "type": "function",
+            "function": {
+                "name": "Artifact",
+                "parameters": {
+                    "$schema": "https://json-schema.org/draft/2020-12/schema",
+                    "type": "object",
+                    "properties": {
+                        "files": {
+                            "anyOf": [
+                                {
+                                    "type": "array",
+                                    "maxItems": 255,
+                                    "items": {
+                                        "type": "object",
+                                        "properties": {"path": {"type": "string", "minLength": 1, "maxLength": 512}},
+                                        "required": ["path"],
+                                        "additionalProperties": false
+                                    }
+                                },
+                                {
+                                    "type": "object",
+                                    "propertyNames": {"type": "string", "minLength": 1, "maxLength": 512},
+                                    "additionalProperties": {
+                                        "anyOf": [
+                                            {"type": "string", "minLength": 1, "maxLength": 512},
+                                            {"type": "null"}
+                                        ]
+                                    }
+                                }
+                            ]
+                        },
+                        "capabilities": {
+                            "type": "object",
+                            "propertyNames": {"type": "string", "minLength": 1, "maxLength": 64},
+                            "additionalProperties": {}
+                        }
+                    },
+                    "additionalProperties": false
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "ArtifactData",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "collection": {
+                            "type": "string",
+                            "maxLength": 1000,
+                            "pattern": "^(?!\\.\\.?(?:\\/|$))[A-Za-z0-9_\\-.~:@+]{1,200}(?:\\/(?!\\.\\.?(?:\\/|$))[A-Za-z0-9_\\-.~:@+]{1,200}){0,14}$"
+                        },
+                        "doc_id": {
+                            "type": "string",
+                            "pattern": "^(?!\\.\\.?(?:\\/|$))[A-Za-z0-9_\\-.~:@+]{1,200}$"
+                        },
+                        "data": {
+                            "type": "object",
+                            "propertyNames": {"type": "string"},
+                            "additionalProperties": {}
+                        }
+                    },
+                    "required": ["collection"],
+                    "additionalProperties": false
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "SendMessage",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "to": {
+                            "type": "string",
+                            "allOf": [
+                                {"pattern": "^[^\\n\\r]*$"},
+                                {"pattern": "^[\\s\\S]{0,300}$"}
+                            ]
+                        },
+                        "message": {"type": "string"}
+                    },
+                    "required": ["to", "message"],
+                    "additionalProperties": false
+                }
+            }
+        }
+    ]);
+
+    let mut c = factory.tools(&tools, &ToolChoice::Auto, false).unwrap();
+    let call = "<tool_call>\n<function=ArtifactData>\n<parameter=collection>\nboards/b1/columns\n</parameter>\n<parameter=data>\n{\"title\":\"hello\"}\n</parameter>\n</function>\n</tool_call>";
+    feed(&mut c, &tok, call).unwrap();
+    assert!(c.is_token_allowed(EOS));
+
+    let mut parser = Qwen3Parser::with_tools(false, tools.as_array().unwrap()).unwrap();
+    parser.push_str(call);
+    let turn = parser.finish().1;
+    assert_eq!(turn.tool_calls.len(), 1);
+    assert_eq!(turn.tool_calls[0].function.name, "ArtifactData");
+    let args: serde_json::Value =
+        serde_json::from_str(&turn.tool_calls[0].function.arguments).unwrap();
+    assert_eq!(
+        args,
+        json!({"collection": "boards/b1/columns", "data": {"title": "hello"}})
+    );
+}
+
+#[test]
+fn thinking_budget_and_xgrammar_named_tool_and_implicit_tool_call() {
+    use warp34_host::tool_constraints::ToolChoice;
+    let tok = tokenizer();
+    let factory = ConstraintFactory::new(&tok, tok.get_vocab_size(true), &[EOS as u32]).unwrap();
+    let tools = json!([{
+        "type": "function",
+        "function": {
+            "name": "ping",
+            "parameters": {
+                "type": "object",
+                "properties": { "host": { "type": "string" } },
+                "required": ["host"]
+            }
+        }
+    }]);
+
+    let think_id = tok.token_to_id("<think>").unwrap() as i32;
+    let end_think_id = tok.token_to_id("</think>").unwrap() as i32;
+    let tool_call_id = tok.token_to_id("<tool_call>").unwrap() as i32;
+    let a_id = tok.encode("a", false).unwrap().get_ids()[0] as i32;
+    let b_id = tok.encode("b", false).unwrap().get_ids()[0] as i32;
+
+    // 1. Named tool choice + ThinkingBudgetConfig (forcing stops at `</think>` with no trailing `\n`):
+    //    forcing `</think>` must transition cleanly into byte 0 of `<tool_call>` without grammar error.
+    let named_c = factory
+        .tools(&tools, &ToolChoice::Named("ping".into()), true)
+        .unwrap();
+    let cfg = warp34_host::parser::ThinkingBudgetConfig {
+        budget: 1,
+        start_token_ids: vec![think_id],
+        end_token_ids: vec![end_think_id],
+        forced_token_ids: vec![b_id, end_think_id],
+        extra_end_token_ids: vec![vec![tool_call_id]],
+    };
+    let mut sampler = warp34_host::parser::SamplerV1::new(
+        warp34_host::parser::SamplingParams {
+            temperature: 0.0,
+            thinking_budget: Some(cfg.clone()),
+            ..Default::default()
+        },
+        &[think_id],
+        Some(named_c),
+    );
+    sampler.try_commit_token(a_id).unwrap(); // exhausts budget=1
+    assert_eq!(sampler.forced_thinking_token(), Some(b_id));
+    sampler.try_commit_token(b_id).unwrap();
+    assert_eq!(sampler.forced_thinking_token(), Some(end_think_id));
+    sampler.try_commit_token(end_think_id).unwrap(); // exits reasoning gate into ToolChoice::Named
+    assert_eq!(sampler.forced_thinking_token(), None);
+    // Byte 0 of ToolChoice::Named requires `<tool_call>` (must succeed, not crash).
+    sampler.try_commit_token(tool_call_id).unwrap();
+
+    // 2. Implicit `<tool_call>` inside `<think>` exits the reasoning gate & ThinkingBudgetTracker
+    //    so remaining budget never injects cutoff tokens mid-tool-call.
+    let auto_c = factory.tools(&tools, &ToolChoice::Auto, true).unwrap();
+    let mut auto_sampler = warp34_host::parser::SamplerV1::new(
+        warp34_host::parser::SamplingParams {
+            temperature: 0.0,
+            thinking_budget: Some(warp34_host::parser::ThinkingBudgetConfig { budget: 2, ..cfg }),
+            ..Default::default()
+        },
+        &[think_id],
+        Some(auto_c),
+    );
+    auto_sampler.try_commit_token(a_id).unwrap();
+    auto_sampler.try_commit_token(tool_call_id).unwrap(); // implicit </think>
+    assert_eq!(auto_sampler.forced_thinking_token(), None);
 }

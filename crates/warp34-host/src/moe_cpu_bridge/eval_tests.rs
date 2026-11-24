@@ -614,3 +614,97 @@ fn expert_u2b2_g64_hadamard64_scalar_and_tile_agreement() {
         }
     }
 }
+
+#[test]
+fn expert_vnni_u4_accuracy_and_speedup() {
+    if !has_vnni() {
+        return;
+    }
+    let h = 256;
+    let i = 256;
+    let gu = words(2 * i * h / 8, 17);
+    let dn = words(h * i / 8, 37);
+    let gs: Vec<u16> = (0..(2 * i * h / 64))
+        .map(|k| if k % 2 == 0 { 0x2000 } else { 0x2400 })
+        .collect();
+    let ds: Vec<u16> = (0..(h * i / 64))
+        .map(|k| if k % 2 == 0 { 0x2000 } else { 0x1c00 })
+        .collect();
+    for (group_size, down_hadamard) in [(64, 64), (64, 0), (128, 64), (128, 0)] {
+        let d = ExpertLayout {
+            hidden: h,
+            intermediate: i,
+            group_size,
+            bits: 4,
+            down_hadamard,
+            gate_up_words: &gu,
+            gate_up_scales: &gs,
+            down_words: &dn,
+            down_scales: &ds,
+        };
+        for nt in [1, 2, 3, 4, 5, 8, 17, 96] {
+            let x_f16: Vec<u16> = (0..nt * h)
+                .map(|j| crate::cuda::f32_to_f16(((j * 17 % 101) as f32 - 50.0) / 100.0))
+                .collect();
+            let x: Vec<f32> = x_f16.iter().map(|&b| crate::cuda::f16_to_f32(b)).collect();
+            let wt: Vec<f32> = (0..nt)
+                .map(|t| if t % 2 == 0 { 0.7 } else { -0.2 })
+                .collect();
+            let mut xp = vec![0.0; nt * h];
+            let mut xg = vec![0.0; nt * h / group_size];
+            let mut xq = vec![0.0; nt * (h / 4)];
+            let mut xm = vec![0.0; nt * (h / 32)];
+            let mut xq16 = vec![0.0; nt * (h / 4)];
+            let mut xm16 = vec![0.0; nt * (h / 32)];
+            for t in 0..nt {
+                prepare_x_perm_grouped(
+                    &x[t * h..(t + 1) * h],
+                    group_size,
+                    &mut xp[t * h..(t + 1) * h],
+                    &mut xg[t * (h / group_size)..(t + 1) * (h / group_size)],
+                )
+                .unwrap();
+                prepare_x_vnni_f32(
+                    &x[t * h..(t + 1) * h],
+                    &mut xq[t * (h / 4)..(t + 1) * (h / 4)],
+                    &mut xm[t * (h / 32)..(t + 1) * (h / 32)],
+                )
+                .unwrap();
+                prepare_x_vnni_f16(
+                    &x_f16[t * h..(t + 1) * h],
+                    &mut xq16[t * (h / 4)..(t + 1) * (h / 4)],
+                    &mut xm16[t * (h / 32)..(t + 1) * (h / 32)],
+                )
+                .unwrap();
+            }
+            assert_eq!(
+                xq.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                xq16.iter().map(|v| v.to_bits()).collect::<Vec<_>>()
+            );
+            assert_eq!(xm, xm16);
+            let mut scratch = vec![0.0; scratch_len(nt, 2).unwrap()];
+            let mut out_ref = vec![0.0; nt * h];
+            let mut out_vnni = vec![0.0; nt * h];
+            eval_expert_prefill(d, &xp, &xg, &wt, &mut out_ref, &mut scratch).unwrap();
+            eval_expert_vnni_u4(d, 0..2, &xq, &xm, &wt, &mut out_vnni, &mut scratch, 512).unwrap();
+            let max_diff = out_ref
+                .iter()
+                .zip(&out_vnni)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0f32, f32::max);
+            assert!(
+                max_diff < 5e-3,
+                "VNNI gs={group_size} had={down_hadamard} nt={nt} max_diff={max_diff} >= 5e-3"
+            );
+            if nt <= 8 {
+                let mut a = vec![0.0; nt * h];
+                let mut b = vec![0.0; nt * h];
+                eval_expert_vnni_u4(d, 0..1, &xq, &xm, &wt, &mut a, &mut scratch, 8).unwrap();
+                eval_expert_vnni_u4(d, 1..2, &xq, &xm, &wt, &mut b, &mut scratch, 8).unwrap();
+                for j in 0..out_vnni.len() {
+                    assert!((a[j] + b[j] - out_vnni[j]).abs() < 5e-5);
+                }
+            }
+        }
+    }
+}

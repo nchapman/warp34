@@ -53,6 +53,7 @@ struct MtpBatchSlot {
     tail: Vec<DeviceBuffer>,
     captured_verify_hidden: Vec<DeviceBuffer>,
     resident_tokens: Vec<i32>,
+    resident_valid_from: usize,
     processed: usize,
     current: Option<PrefixMemo>,
     last_used_tick: u64,
@@ -71,6 +72,7 @@ pub struct NativeProposer {
     current: Option<PrefixMemo>,
     memo_pinned_staging: Option<crate::cuda::MappedHostBuffer>,
     resident_tokens: Vec<i32>,
+    resident_valid_from: usize,
     processed: usize,
     mtp_batch_active_slot: usize,
     active_slot_last_used_tick: u64,
@@ -82,10 +84,28 @@ pub struct NativeProposer {
     pub(crate) last_verified_draft_tokens: usize,
     pub last_restored_tokens: usize,
 }
-const MEMO_BUDGET: usize = 2 * 1024 * 1024 * 1024;
+const MEMO_BUDGET: usize = 4 * 1024 * 1024 * 1024;
 const MAX_MEMO_ENTRIES: usize = 64;
 const MEMO_GROWTH_ROWS: usize = 512;
 const SERVING_PROPOSER_MAX_TAP_ROWS: usize = 2048;
+/// Maximum sequence length (`4,096` tokens = `<= 80 MiB`) recorded in host `PrefixMemo` for
+/// `DFlash2` (`20 KiB/row`). Longer prompts (`code-context-r64`, `60K/120K`) rely on the
+/// O(1) `prompt_len - cached >= sliding_window` ring shortcut without pageable `Vec` churn.
+const DFLASH_MEMO_MAX_TOKENS: usize = 4096;
+
+#[cfg(any(test, feature = "cuda"))]
+#[inline]
+pub(crate) fn memo_fits_budget(
+    kind: SpeculativeKind,
+    cur_tokens: usize,
+    add_tokens: usize,
+    row_bytes: usize,
+) -> bool {
+    let total_tokens = cur_tokens.saturating_add(add_tokens);
+    let within_dflash_cap =
+        kind != SpeculativeKind::DFlash2 || total_tokens <= DFLASH_MEMO_MAX_TOKENS;
+    within_dflash_cap && total_tokens.saturating_mul(row_bytes) <= MEMO_BUDGET
+}
 
 fn grow_memo_features(buf: &mut Vec<u8>, new_len: usize, row_bytes: usize) {
     if new_len > buf.capacity() {
@@ -96,20 +116,50 @@ fn grow_memo_features(buf: &mut Vec<u8>, new_len: usize, row_bytes: usize) {
     buf.resize(new_len, 0);
 }
 
-pub(crate) fn dflash_slot_has_prefix(
-    res: &[i32],
-    tokens: &[i32],
+pub(crate) fn dflash_effective_valid_from(
+    res_len: usize,
+    valid_from: usize,
     ring_pages: Option<usize>,
+) -> usize {
+    if let Some(phys_pages) = ring_pages
+        && phys_pages > 0
+    {
+        let l_pages = res_len.div_ceil(16);
+        let ring_floor = l_pages.saturating_sub(phys_pages) * 16;
+        valid_from.max(ring_floor)
+    } else {
+        valid_from
+    }
+}
+
+pub(crate) fn dflash_slot_has_prefix_for_prompt(
+    res: &[i32],
+    valid_from: usize,
+    tokens: &[i32],
+    prompt_len: usize,
+    ring_pages: Option<usize>,
+    window: usize,
 ) -> bool {
     if !res.starts_with(tokens) {
         return false;
     }
     if let Some(phys_pages) = ring_pages {
+        let w = if window > 0 { window } else { 2048 };
+        let effective_len = prompt_len.max(tokens.len());
+        let win_start_page = effective_len.saturating_sub(w) / 16;
+        let win_start_tok = win_start_page * 16;
+        if tokens.len() <= win_start_tok {
+            return true;
+        }
+        if valid_from > win_start_tok {
+            return false;
+        }
         let l_pages = res.len().div_ceil(16);
-        let win_start_page = tokens.len().saturating_sub(2048) / 16;
         if l_pages.saturating_sub(win_start_page) > phys_pages {
             return false;
         }
+    } else if valid_from > 0 {
+        return false;
     }
     true
 }
@@ -144,6 +194,27 @@ fn push_mtp_memo(memos: &mut Vec<PrefixMemo>, memo: PrefixMemo) {
 const MTP_STAGE_ROWS: usize = 256;
 const TIERED_MOE_MTP_MAX_TAP_ROWS: usize = 6144;
 const TIERED_MOE_DFLASH2_MAX_TAP_ROWS: usize = 2048;
+pub(crate) fn plan_proposer_max_rows(
+    uses_tiered_moe: bool,
+    kind: SpeculativeKind,
+    tp_size: usize,
+    num_pages: usize,
+) -> usize {
+    let capacity = num_pages.saturating_mul(16);
+    if uses_tiered_moe {
+        match kind {
+            SpeculativeKind::Mtp => capacity.min(TIERED_MOE_MTP_MAX_TAP_ROWS),
+            SpeculativeKind::DFlash2 => capacity.min(TIERED_MOE_DFLASH2_MAX_TAP_ROWS),
+        }
+    } else if num_pages >= 4096 && (num_pages < 14336 || tp_size > 1) {
+        capacity.min(SERVING_PROPOSER_MAX_TAP_ROWS)
+    } else if num_pages >= 14336 {
+        capacity.min(crate::scheduler::MEDIUM_SCRATCH_MAX_BATCHED_TOKENS)
+    } else {
+        capacity.min(DFLASH2_MAX_BATCH_ROWS)
+    }
+}
+
 impl NativeProposer {
     pub fn set_mtp_k(&mut self, k: usize) -> Result<()> {
         if !matches!(self.ranks, Ranks::Mtp(_)) || !(1..=self.max_k).contains(&k) {
@@ -175,16 +246,18 @@ impl NativeProposer {
         }
         let num_pages = engine.ranks[0].kv_pool.num_pages;
         let capacity = num_pages * 16;
-        let max_rows = if engine.cfg.uses_tiered_moe() {
-            match config.kind {
-                SpeculativeKind::Mtp => capacity.min(TIERED_MOE_MTP_MAX_TAP_ROWS),
-                SpeculativeKind::DFlash2 => capacity.min(TIERED_MOE_DFLASH2_MAX_TAP_ROWS),
+        let mut max_rows = plan_proposer_max_rows(
+            engine.cfg.uses_tiered_moe(),
+            config.kind,
+            engine.tp_size,
+            num_pages,
+        );
+        if let Ok(prefill_cap) = engine.ranks[0].ordinary_prefill_token_capacity(1) {
+            let aligned_cap = (prefill_cap / 16) * 16;
+            if aligned_cap >= DFLASH2_MAX_BATCH_ROWS {
+                max_rows = max_rows.min(aligned_cap);
             }
-        } else if (4096..14336).contains(&num_pages) {
-            capacity.min(SERVING_PROPOSER_MAX_TAP_ROWS)
-        } else {
-            capacity.min(DFLASH2_MAX_BATCH_ROWS)
-        };
+        }
         if max_rows < 16 {
             return Err(loader_err("insufficient speculative context capacity"));
         }
@@ -294,15 +367,27 @@ impl NativeProposer {
             .iter()
             .map(|t| DeviceBuffer::alloc(t.device.device_id, (k + 1) * t.local_vocab_size * 2))
             .collect::<Result<Vec<_>>>()?;
-        for rank in 0..engine.ranks.len() {
-            if let Err(e) = engine.ranks[rank].configure_speculative_taps(
-                &taps,
-                config.kind == SpeculativeKind::Mtp,
-                max_rows,
-            ) {
-                for t in &mut engine.ranks {
-                    let _ = t.configure_speculative_taps(&[], false, 0);
+        let try_configure_taps = |engine: &mut Qwen3_5Engine, rows: usize| -> Result<()> {
+            for rank in 0..engine.ranks.len() {
+                if let Err(e) = engine.ranks[rank].configure_speculative_taps(
+                    &taps,
+                    config.kind == SpeculativeKind::Mtp,
+                    rows,
+                ) {
+                    for t in &mut engine.ranks {
+                        let _ = t.configure_speculative_taps(&[], false, 0);
+                    }
+                    return Err(e);
                 }
+            }
+            Ok(())
+        };
+        if let Err(e) = try_configure_taps(engine, max_rows) {
+            let fallback_rows = capacity.min(DFLASH2_MAX_BATCH_ROWS);
+            if max_rows > fallback_rows {
+                max_rows = fallback_rows;
+                try_configure_taps(engine, max_rows)?;
+            } else {
                 return Err(e);
             }
         }
@@ -333,17 +418,18 @@ impl NativeProposer {
                     tail: slot_tail,
                     captured_verify_hidden,
                     resident_tokens: vec![],
+                    resident_valid_from: 0,
                     processed: 0,
                     current: None,
                     last_used_tick: 0,
                 })
             })
             .collect::<Result<Vec<_>>>()?;
-        let memo_pinned_staging = if matches!(ranks, Ranks::Mtp(_)) {
-            Some(crate::cuda::MappedHostBuffer::alloc(256 * 1024)?)
-        } else {
-            None
-        };
+        let pinned_stage_bytes = max_rows
+            .min(MTP_STAGE_ROWS)
+            .saturating_mul(row_bytes)
+            .max(256 * 1024);
+        let memo_pinned_staging = crate::cuda::MappedHostBuffer::alloc(pinned_stage_bytes).ok();
         Ok(Self {
             ranks,
             capacity,
@@ -358,6 +444,7 @@ impl NativeProposer {
             current: None,
             memo_pinned_staging,
             resident_tokens: vec![],
+            resident_valid_from: 0,
             processed: 0,
             mtp_batch_active_slot: 0,
             active_slot_last_used_tick: 0,
@@ -369,13 +456,20 @@ impl NativeProposer {
         })
     }
     pub(crate) fn clear_all_caches(&mut self) -> Result<()> {
+        let _ = self.set_mtp_batch_mode(false);
+        if let Ranks::Mtp(rs) = &mut self.ranks {
+            for r in rs {
+                r.reset_batch_slot_count();
+            }
+        }
         self.abort_scheduled();
         self.memos.clear();
         self.current = None;
         self.reset()
     }
-    fn reset(&mut self) -> Result<()> {
+    pub(crate) fn reset(&mut self) -> Result<()> {
         self.resident_tokens.clear();
+        self.resident_valid_from = 0;
         self.processed = 0;
         self.last_accepted.clear();
         self.last_restored_tokens = 0;
@@ -402,7 +496,7 @@ impl NativeProposer {
         }
         push_mtp_memo(&mut self.memos, memo);
     }
-    fn can_restore(&self, tokens: &[i32]) -> bool {
+    pub(crate) fn can_restore_for_prompt(&self, tokens: &[i32], prompt_len: usize) -> bool {
         if tokens.is_empty() {
             return true;
         }
@@ -410,11 +504,45 @@ impl NativeProposer {
             Ranks::DFlash(rs) => {
                 let slot_count = rs.first().map_or(0, |r| r.batch_slot_count());
                 let ring_pages = rs.first().and_then(|r| r.ring_phys_pages_per_slot());
-                dflash_slot_has_prefix(&self.resident_tokens, tokens, ring_pages)
-                    || (rs.first().is_some_and(|r| r.is_batch_mode())
-                        && self.mtp_batch_slots.iter().take(slot_count).any(|s| {
-                            dflash_slot_has_prefix(&s.resident_tokens, tokens, ring_pages)
-                        }))
+                let window = rs.first().map_or(0, |r| r.sliding_window());
+                if window > 0
+                    && ring_pages.is_some()
+                    && prompt_len.saturating_sub(tokens.len()) >= window
+                {
+                    return tokens.len() <= self.capacity;
+                }
+                let need_bytes = tokens.len().saturating_mul(self.row_bytes);
+                dflash_slot_has_prefix_for_prompt(
+                    &self.resident_tokens,
+                    self.resident_valid_from,
+                    tokens,
+                    prompt_len,
+                    ring_pages,
+                    window,
+                ) || (rs.first().is_some_and(|r| r.is_batch_mode())
+                    && self.mtp_batch_slots.iter().take(slot_count).any(|s| {
+                        dflash_slot_has_prefix_for_prompt(
+                            &s.resident_tokens,
+                            s.resident_valid_from,
+                            tokens,
+                            prompt_len,
+                            ring_pages,
+                            window,
+                        )
+                    }))
+                    || (tokens.len() <= self.capacity
+                        && self
+                            .memos
+                            .iter()
+                            .chain(self.current.iter())
+                            .chain(
+                                self.mtp_batch_slots
+                                    .iter()
+                                    .filter_map(|s| s.current.as_ref()),
+                            )
+                            .any(|m| {
+                                m.tokens.starts_with(tokens) && m.features.len() >= need_bytes
+                            }))
             }
             Ranks::Mtp(_) => {
                 let need_bytes = tokens.len().saturating_mul(self.row_bytes);
@@ -430,6 +558,346 @@ impl NativeProposer {
             }
         }
     }
+}
+
+struct StagedMemoAppend {
+    prev_lens: Option<(usize, usize)>,
+    pending_pinned: Option<(usize, usize)>,
+}
+
+impl NativeProposer {
+    fn stage_current_memo_append(
+        current: &mut Option<PrefixMemo>,
+        pinned_staging: Option<&crate::cuda::MappedHostBuffer>,
+        t0: &crate::model::Qwen3_5ModelRank,
+        feature0_ptr: u64,
+        tokens: &[i32],
+        row_bytes: usize,
+    ) -> Result<StagedMemoAppend> {
+        if let Some(memo) = current {
+            let aligned = memo.features.len() == memo.tokens.len().saturating_mul(row_bytes);
+            if !aligned
+                || !memo_fits_budget(
+                    SpeculativeKind::DFlash2,
+                    memo.tokens.len(),
+                    tokens.len(),
+                    row_bytes,
+                )
+            {
+                *current = None;
+            }
+        }
+        let prev_lens = current.as_ref().map(|m| (m.tokens.len(), m.features.len()));
+        let mut pending_pinned = None;
+        if let Some(memo) = current {
+            if let Err(e) = t0.device.make_current() {
+                *current = None;
+                return Err(e);
+            }
+            let len_bytes = tokens.len() * row_bytes;
+            let old_len = memo.features.len();
+            grow_memo_features(&mut memo.features, old_len + len_bytes, row_bytes);
+            let copy_res = if let Some(pinned) = pinned_staging
+                && len_bytes > 0
+                && len_bytes <= pinned.len_bytes
+            {
+                let r = check_rc(
+                    // SAFETY: `feature0_ptr` spans `len_bytes` on `t0.stream`, and `pinned`
+                    // remains live until `t0.stream` synchronizes before `commit_staged_memo_append`.
+                    unsafe {
+                        ffi::warp34_memcpy_d2h_async(
+                            pinned.host_ptr,
+                            feature0_ptr as *const _,
+                            len_bytes,
+                            t0.stream.handle,
+                        )
+                    },
+                    "proposer pinned memo copy",
+                );
+                if r.is_ok() {
+                    pending_pinned = Some((old_len, len_bytes));
+                }
+                r
+            } else {
+                check_rc(
+                    // SAFETY: `feature0_ptr` spans `len_bytes` on `t0.stream`, which
+                    // synchronizes before returning to caller.
+                    unsafe {
+                        ffi::warp34_memcpy_d2h_async(
+                            memo.features[old_len..].as_mut_ptr().cast(),
+                            feature0_ptr as *const _,
+                            len_bytes,
+                            t0.stream.handle,
+                        )
+                    },
+                    "proposer memo copy",
+                )
+            };
+            if let Err(e) = copy_res {
+                *current = None;
+                return Err(e);
+            }
+            memo.tokens.extend_from_slice(tokens);
+        }
+        Ok(StagedMemoAppend {
+            prev_lens,
+            pending_pinned,
+        })
+    }
+
+    fn commit_staged_memo_append(
+        current: &mut Option<PrefixMemo>,
+        pinned_staging: Option<&crate::cuda::MappedHostBuffer>,
+        pending_pinned: Option<(usize, usize)>,
+    ) {
+        if let Some((old_len, len_bytes)) = pending_pinned
+            && let (Some(memo), Some(pinned)) = (current, pinned_staging)
+        {
+            // SAFETY: caller synchronized `engine.ranks[0].stream`, completing the D2H into `pinned`.
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    pinned.host_ptr.cast::<u8>(),
+                    memo.features.as_mut_ptr().add(old_len),
+                    len_bytes,
+                );
+            }
+        }
+    }
+
+    fn rollback_staged_memo_append(
+        current: &mut Option<PrefixMemo>,
+        prev_lens: Option<(usize, usize)>,
+    ) {
+        if let (Some(memo), Some((pt, pf))) = (current, prev_lens) {
+            memo.tokens.truncate(pt);
+            memo.features.truncate(pf);
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn replay_dflash_memo_window(
+        rs: &mut [DFlash2Rank],
+        engine: &Qwen3_5Engine,
+        features: &[u8],
+        start_tok: usize,
+        n: usize,
+        row_bytes: usize,
+        max_rows: usize,
+    ) -> Result<()> {
+        for r in rs.iter_mut() {
+            r.truncate(0)?;
+            r.set_committed(start_tok)?;
+        }
+        let step = max_rows.clamp(1, DFLASH2_MAX_BATCH_ROWS);
+        let pool = engine.tp_workers.clone();
+        for c0 in (start_tok..n).step_by(step) {
+            let c1 = (c0 + step).min(n);
+            let chunk_rows = c1 - c0;
+            let bytes = &features[c0 * row_bytes..c1 * row_bytes];
+            let mut ptrs = Vec::with_capacity(engine.tp_size);
+            for t in &engine.ranks {
+                let stage = t
+                    .tap_aux_bf16
+                    .as_ref()
+                    .ok_or_else(|| loader_err("missing target feature capture"))?;
+                stage.copy_from_host(bytes, &t.stream)?;
+                ptrs.push(stage.addr());
+            }
+            crate::coordinated::run_tp_closures(
+                pool.as_deref(),
+                rs.iter_mut()
+                    .zip(&engine.ranks)
+                    .zip(&ptrs)
+                    .map(|((r, t), &ptr)| move || r.ingest(t, ptr, chunk_rows)),
+            )
+            .into_iter()
+            .collect::<Result<Vec<_>>>()?;
+        }
+        Ok(())
+    }
+
+    fn clone_aligned_memo_prefix(
+        memos: &mut Vec<PrefixMemo>,
+        tokens: &[i32],
+        need_bytes: usize,
+        row_bytes: usize,
+    ) -> PrefixMemo {
+        let n = tokens.len();
+        if let Some(idx) = memos
+            .iter()
+            .rposition(|m| m.tokens.starts_with(tokens) && m.features.len() >= need_bytes)
+        {
+            let mut memo = memos.remove(idx);
+            if n > 2048 && memo.tokens.len().saturating_sub(n) <= 256 {
+                memo.tokens.truncate(n);
+                memo.features.truncate(need_bytes);
+                return memo;
+            }
+            let mut f = Vec::new();
+            grow_memo_features(&mut f, need_bytes, row_bytes);
+            f.copy_from_slice(&memo.features[..need_bytes]);
+            push_mtp_memo(memos, memo);
+            PrefixMemo {
+                tokens: tokens.to_vec(),
+                features: f,
+            }
+        } else {
+            PrefixMemo {
+                tokens: tokens.to_vec(),
+                features: vec![],
+            }
+        }
+    }
+
+    fn restore_dflash(&mut self, engine: &mut Qwen3_5Engine, tokens: &[i32]) -> Result<()> {
+        let Ranks::DFlash(rs) = &mut self.ranks else {
+            return Err(loader_err("expected DFlash2 ranks"));
+        };
+        let n = tokens.len();
+        let need_dflash_bytes = n.saturating_mul(self.row_bytes);
+        if !self
+            .memos
+            .iter()
+            .any(|m| m.tokens.starts_with(tokens) && m.features.len() >= need_dflash_bytes)
+            && let Some(donor_memo) = self
+                .mtp_batch_slots
+                .iter()
+                .filter_map(|s| s.current.as_ref())
+                .find(|m| m.tokens.starts_with(tokens) && m.features.len() >= need_dflash_bytes)
+        {
+            let mut f = Vec::new();
+            grow_memo_features(&mut f, need_dflash_bytes, self.row_bytes);
+            f.copy_from_slice(&donor_memo.features[..need_dflash_bytes]);
+            push_mtp_memo(
+                &mut self.memos,
+                PrefixMemo {
+                    tokens: tokens.to_vec(),
+                    features: f,
+                },
+            );
+        }
+        let ring_pages = rs.first().and_then(|r| r.ring_phys_pages_per_slot());
+        let window = rs.first().map_or(0, |r| r.sliding_window());
+        let self_eff = self.resident_tokens.starts_with(tokens).then(|| {
+            dflash_effective_valid_from(
+                self.resident_tokens.len(),
+                self.resident_valid_from,
+                ring_pages,
+            )
+        });
+        let slot_count = rs.first().map_or(0, |r| r.batch_slot_count());
+        let best_donor = rs
+            .first()
+            .is_some_and(|r| r.is_batch_mode())
+            .then(|| {
+                (0..slot_count)
+                    .filter(|&s| {
+                        s != self.mtp_batch_active_slot
+                            && self.mtp_batch_slots[s].resident_tokens.starts_with(tokens)
+                    })
+                    .map(|s| {
+                        let eff = dflash_effective_valid_from(
+                            self.mtp_batch_slots[s].resident_tokens.len(),
+                            self.mtp_batch_slots[s].resident_valid_from,
+                            ring_pages,
+                        );
+                        (s, eff)
+                    })
+                    .min_by_key(|&(_, eff)| eff)
+            })
+            .flatten();
+        if let Some((donor, donor_eff)) = best_donor
+            && donor_eff < n
+            && self_eff.is_none_or(|se| donor_eff < se)
+        {
+            let dst = self.mtp_batch_active_slot;
+            for (r, t) in rs.iter_mut().zip(&engine.ranks) {
+                r.copy_kv_from_slot(t, donor, dst, n)?;
+            }
+            self.resident_tokens.clear();
+            self.resident_tokens.extend_from_slice(tokens);
+            self.resident_valid_from = donor_eff;
+            self.current = Some(Self::clone_aligned_memo_prefix(
+                &mut self.memos,
+                tokens,
+                need_dflash_bytes,
+                self.row_bytes,
+            ));
+        } else if let Some(se) = self_eff
+            && se < n
+        {
+            for r in rs {
+                r.truncate(n)?;
+            }
+            self.resident_tokens.truncate(n);
+            self.resident_valid_from = se;
+            self.current = Some(Self::clone_aligned_memo_prefix(
+                &mut self.memos,
+                tokens,
+                need_dflash_bytes,
+                self.row_bytes,
+            ));
+        } else if let Some(idx) = self
+            .memos
+            .iter()
+            .rposition(|m| m.tokens.starts_with(tokens) && m.features.len() >= need_dflash_bytes)
+        {
+            let mut memo = self.memos.remove(idx);
+            let start_tok = if window > 0 && ring_pages.is_some() {
+                (n.saturating_sub(window) / 16) * 16
+            } else {
+                0
+            };
+            if let Err(e) = Self::replay_dflash_memo_window(
+                rs,
+                engine,
+                &memo.features,
+                start_tok,
+                n,
+                self.row_bytes,
+                self.max_rows,
+            ) {
+                push_mtp_memo(&mut self.memos, memo);
+                let _ = self.reset();
+                return Err(e);
+            }
+            self.resident_tokens.clear();
+            self.resident_tokens.extend_from_slice(tokens);
+            self.resident_valid_from = start_tok;
+            if n > 2048 && memo.tokens.len().saturating_sub(n) <= 256 {
+                memo.tokens.truncate(n);
+                memo.features.truncate(need_dflash_bytes);
+                self.current = Some(memo);
+            } else {
+                let mut f = Vec::new();
+                grow_memo_features(&mut f, need_dflash_bytes, self.row_bytes);
+                f.copy_from_slice(&memo.features[..need_dflash_bytes]);
+                push_mtp_memo(&mut self.memos, memo);
+                self.current = Some(PrefixMemo {
+                    tokens: tokens.to_vec(),
+                    features: f,
+                });
+            }
+        } else if window > 0 && ring_pages.is_some() {
+            for r in rs {
+                r.set_committed(n)?;
+            }
+            self.resident_tokens.clear();
+            self.resident_tokens.extend_from_slice(tokens);
+            self.resident_valid_from = n;
+            self.current = Some(PrefixMemo {
+                tokens: tokens.to_vec(),
+                features: vec![],
+            });
+        } else {
+            return Err(loader_err("missing DFlash2 resident prefix"));
+        }
+        self.processed = n;
+        self.last_accepted.clear();
+        self.last_restored_tokens = n;
+        Ok(())
+    }
+
     fn restore(&mut self, engine: &mut Qwen3_5Engine, tokens: &[i32]) -> Result<()> {
         self.commit_current_memo();
         if tokens.is_empty() {
@@ -440,41 +908,8 @@ impl NativeProposer {
             });
             return Ok(());
         }
-        if let Ranks::DFlash(rs) = &mut self.ranks {
-            let n = tokens.len();
-            let ring_pages = rs.first().and_then(|r| r.ring_phys_pages_per_slot());
-            if !dflash_slot_has_prefix(&self.resident_tokens, tokens, ring_pages) {
-                let slot_count = rs.first().map_or(0, |r| r.batch_slot_count());
-                let donor = (0..slot_count)
-                    .find(|&s| {
-                        s != self.mtp_batch_active_slot
-                            && dflash_slot_has_prefix(
-                                &self.mtp_batch_slots[s].resident_tokens,
-                                tokens,
-                                ring_pages,
-                            )
-                    })
-                    .ok_or_else(|| loader_err("missing DFlash2 resident prefix"))?;
-                let dst = self.mtp_batch_active_slot;
-                for (r, t) in rs.iter_mut().zip(&engine.ranks) {
-                    r.copy_kv_from_slot(t, donor, dst, n)?;
-                }
-                self.resident_tokens.clear();
-                self.resident_tokens.extend_from_slice(tokens);
-            } else {
-                for r in rs {
-                    r.truncate(n)?;
-                }
-                self.resident_tokens.truncate(n);
-            }
-            self.processed = n;
-            self.last_accepted.clear();
-            self.last_restored_tokens = n;
-            self.current = Some(PrefixMemo {
-                tokens: tokens.to_vec(),
-                features: vec![],
-            });
-            return Ok(());
+        if matches!(self.ranks, Ranks::DFlash(_)) {
+            return self.restore_dflash(engine, tokens);
         }
         let need_mtp_bytes = matches!(self.ranks, Ranks::Mtp(_))
             .then(|| tokens.len().saturating_mul(self.row_bytes))
@@ -729,6 +1164,122 @@ impl NativeProposer {
             })
             .collect()
     }
+    pub(crate) fn ingest_for_prompt_len(
+        &mut self,
+        engine: &mut Qwen3_5Engine,
+        tokens: &[i32],
+        features: &[u64],
+        prompt_len: usize,
+    ) -> Result<()> {
+        if tokens.is_empty() {
+            return Ok(());
+        }
+        if prompt_len > DFLASH_MEMO_MAX_TOKENS && matches!(self.ranks, Ranks::DFlash(_)) {
+            self.current = None;
+        }
+        let dflash_win = match &self.ranks {
+            Ranks::DFlash(rs) => rs
+                .first()
+                .and_then(|r| r.ring_phys_pages_per_slot().map(|_| r.sliding_window()))
+                .filter(|&w| w > 0),
+            Ranks::Mtp(_) => None,
+        };
+        if let Some(window) = dflash_win {
+            let win_keep_tok = (prompt_len.saturating_sub(window) / 16) * 16;
+            let chunk_start = self.processed;
+            if chunk_start < win_keep_tok {
+                if features.len() != engine.tp_size
+                    || tokens.len() > self.max_rows
+                    || self.processed + tokens.len() > self.capacity
+                {
+                    return Err(loader_err("invalid committed proposer span"));
+                }
+                let chunk_end = chunk_start + tokens.len();
+                let skip_end = chunk_end.min(win_keep_tok);
+                let skip_rows = skip_end - chunk_start;
+                if let Some(memo) = &mut self.current {
+                    let aligned =
+                        memo.features.len() == memo.tokens.len().saturating_mul(self.row_bytes);
+                    let within_cap = memo_fits_budget(
+                        SpeculativeKind::DFlash2,
+                        memo.tokens.len(),
+                        skip_rows,
+                        self.row_bytes,
+                    );
+                    if aligned && within_cap {
+                        let t0 = &engine.ranks[0];
+                        let copy_res: Result<()> = (|| {
+                            t0.device.make_current()?;
+                            let len_bytes = skip_rows * self.row_bytes;
+                            let old_len = memo.features.len();
+                            grow_memo_features(
+                                &mut memo.features,
+                                old_len + len_bytes,
+                                self.row_bytes,
+                            );
+                            check_rc(
+                                // SAFETY: `features[0]` spans `len_bytes` on `t0.stream`, synchronized immediately below.
+                                unsafe {
+                                    ffi::warp34_memcpy_d2h_async(
+                                        memo.features[old_len..].as_mut_ptr().cast(),
+                                        features[0] as *const _,
+                                        len_bytes,
+                                        t0.stream.handle,
+                                    )
+                                },
+                                "DFlash prefill memo copy",
+                            )?;
+                            t0.stream.synchronize()
+                        })();
+                        if let Err(e) = copy_res {
+                            self.current = None;
+                            return Err(e);
+                        }
+                        memo.tokens.extend_from_slice(&tokens[..skip_rows]);
+                    } else {
+                        self.current = None;
+                    }
+                }
+                let prev_processed = self.processed;
+                let prev_valid_from = self.resident_valid_from;
+                let prev_res_len = self.resident_tokens.len();
+                if let Ranks::DFlash(rs) = &mut self.ranks
+                    && let Err(e) = rs.iter_mut().try_for_each(|r| r.set_committed(skip_end))
+                {
+                    for r in rs.iter_mut() {
+                        let _ = r.set_committed(prev_processed);
+                    }
+                    self.current = None;
+                    return Err(e);
+                }
+                self.resident_tokens.extend_from_slice(&tokens[..skip_rows]);
+                self.processed = skip_end;
+                self.resident_valid_from = self.resident_valid_from.max(skip_end);
+                if skip_rows == tokens.len() {
+                    return Ok(());
+                }
+                let tail_features: Vec<u64> = features
+                    .iter()
+                    .map(|&p| p + (skip_rows * self.row_bytes) as u64)
+                    .collect();
+                if let Err(e) = self.ingest(engine, &tokens[skip_rows..], &tail_features) {
+                    if let Ranks::DFlash(rs) = &mut self.ranks {
+                        for r in rs.iter_mut() {
+                            let _ = r.set_committed(prev_processed);
+                        }
+                    }
+                    self.resident_tokens.truncate(prev_res_len);
+                    self.processed = prev_processed;
+                    self.resident_valid_from = prev_valid_from;
+                    self.current = None;
+                    return Err(e);
+                }
+                return Ok(());
+            }
+        }
+        self.ingest(engine, tokens, features)
+    }
+
     fn ingest(
         &mut self,
         engine: &mut Qwen3_5Engine,
@@ -738,7 +1289,10 @@ impl NativeProposer {
         if tokens.is_empty() {
             return Ok(());
         }
-        let stage_cap = self.max_rows.min(MTP_STAGE_ROWS);
+        let stage_cap = match self.ranks {
+            Ranks::DFlash(_) => self.max_rows.min(DFLASH2_MAX_BATCH_ROWS),
+            Ranks::Mtp(_) => self.max_rows.min(MTP_STAGE_ROWS),
+        };
         if tokens.len() > stage_cap {
             let mut offset = 0;
             while offset < tokens.len() {
@@ -758,57 +1312,69 @@ impl NativeProposer {
         {
             return Err(loader_err("invalid committed proposer span"));
         }
-        // Host feature memo is only needed by MTP to restore its 1-row hidden tail or replay
-        // non-resident prefixes; DFlash2 keeps its full draft KV cache resident on GPU and
-        // restores warm radix hits in O(1) via `r.truncate(n)` without host D2H copies.
-        let need_host_features = matches!(self.ranks, Ranks::Mtp(_));
-        if let Some(memo) = &self.current
-            && need_host_features
-            && (memo.tokens.len() + tokens.len()) * self.row_bytes > MEMO_BUDGET
-        {
-            self.current = None;
+        // Both MTP and DFlash2 record aligned host feature memos up to `MEMO_BUDGET` so
+        // multi-prefix workloads (`prefix-primed`, multi-session agents) never reject a warm
+        // target `MambaRadixCache` hit when the drafter's active GPU slot switched prefixes.
+        if let Some(memo) = &self.current {
+            let kind = match self.ranks {
+                Ranks::DFlash(_) => SpeculativeKind::DFlash2,
+                Ranks::Mtp(_) => SpeculativeKind::Mtp,
+            };
+            let aligned = memo.features.len() == memo.tokens.len().saturating_mul(self.row_bytes);
+            if !aligned || !memo_fits_budget(kind, memo.tokens.len(), tokens.len(), self.row_bytes)
+            {
+                self.current = None;
+            }
         }
         let mut pending_pinned_memo_copy: Option<(usize, usize)> = None;
         if let Some(memo) = &mut self.current {
-            if need_host_features {
-                let t0 = &engine.ranks[0];
-                t0.device.make_current()?;
-                let len_bytes = tokens.len() * self.row_bytes;
-                let old_len = memo.features.len();
-                grow_memo_features(&mut memo.features, old_len + len_bytes, self.row_bytes);
-                if let Some(pinned) = &self.memo_pinned_staging
-                    && len_bytes > 0
-                    && len_bytes <= pinned.len_bytes
-                {
-                    check_rc(
-                        // SAFETY: `features[0]` spans `len_bytes` on `t0.stream`, and `pinned`
-                        // remains live until `t0.stream` synchronizes at the end of `ingest`.
-                        unsafe {
-                            ffi::warp34_memcpy_d2h_async(
-                                pinned.host_ptr,
-                                features[0] as *const _,
-                                len_bytes,
-                                t0.stream.handle,
-                            )
-                        },
-                        "proposer pinned memo copy",
-                    )?;
+            let t0 = &engine.ranks[0];
+            if let Err(e) = t0.device.make_current() {
+                self.current = None;
+                return Err(e);
+            }
+            let len_bytes = tokens.len() * self.row_bytes;
+            let old_len = memo.features.len();
+            grow_memo_features(&mut memo.features, old_len + len_bytes, self.row_bytes);
+            let copy_res = if let Some(pinned) = &self.memo_pinned_staging
+                && len_bytes > 0
+                && len_bytes <= pinned.len_bytes
+            {
+                let r = check_rc(
+                    // SAFETY: `features[0]` spans `len_bytes` on `t0.stream`, and `pinned`
+                    // remains live until `t0.stream` synchronizes at the end of `ingest`.
+                    unsafe {
+                        ffi::warp34_memcpy_d2h_async(
+                            pinned.host_ptr,
+                            features[0] as *const _,
+                            len_bytes,
+                            t0.stream.handle,
+                        )
+                    },
+                    "proposer pinned memo copy",
+                );
+                if r.is_ok() {
                     pending_pinned_memo_copy = Some((old_len, len_bytes));
-                } else {
-                    check_rc(
-                        // SAFETY: features[0] spans rows*row_bytes on rank 0's stream, and
-                        // rank 0's stream is synchronized before ingest returns below.
-                        unsafe {
-                            ffi::warp34_memcpy_d2h_async(
-                                memo.features[old_len..].as_mut_ptr().cast(),
-                                features[0] as *const _,
-                                len_bytes,
-                                t0.stream.handle,
-                            )
-                        },
-                        "proposer memo copy",
-                    )?;
                 }
+                r
+            } else {
+                check_rc(
+                    // SAFETY: features[0] spans rows*row_bytes on rank 0's stream, and
+                    // rank 0's stream is synchronized before ingest returns below.
+                    unsafe {
+                        ffi::warp34_memcpy_d2h_async(
+                            memo.features[old_len..].as_mut_ptr().cast(),
+                            features[0] as *const _,
+                            len_bytes,
+                            t0.stream.handle,
+                        )
+                    },
+                    "proposer memo copy",
+                )
+            };
+            if let Err(e) = copy_res {
+                self.current = None;
+                return Err(e);
             }
             memo.tokens.extend_from_slice(tokens);
         }
@@ -899,6 +1465,7 @@ impl NativeProposer {
             }
         };
         if let Err(e) = ingest_res {
+            self.current = None;
             let _ = engine.ranks[0].device.make_current();
             let _ = engine.ranks[0].stream.synchronize();
             return Err(e);
@@ -944,9 +1511,20 @@ impl NativeProposer {
         }
         match &mut self.ranks {
             Ranks::DFlash(rs) => {
-                if let Some(memo) = &mut self.current {
-                    memo.tokens.extend_from_slice(tokens);
+                if tokens.len() > self.max_rows.min(DFLASH2_MAX_BATCH_ROWS) {
+                    self.ingest(engine, tokens, features)?;
+                    return self.propose(engine, anchor, k);
                 }
+                let staged_memo = Self::stage_current_memo_append(
+                    &mut self.current,
+                    self.memo_pinned_staging.as_ref(),
+                    &engine.ranks[0],
+                    features[0],
+                    tokens,
+                    self.row_bytes,
+                )?;
+                let (memo_prev_lens, pending_pinned_memo_copy) =
+                    (staged_memo.prev_lens, staged_memo.pending_pinned);
                 let n = tokens.len();
                 let use_graph = engine.use_cuda_graph;
                 for r in rs.iter_mut() {
@@ -961,9 +1539,15 @@ impl NativeProposer {
                         Err(e) => {
                             let _ = engine.ranks[0].device.make_current();
                             let _ = engine.ranks[0].stream.synchronize();
+                            Self::rollback_staged_memo_append(&mut self.current, memo_prev_lens);
                             return Err(e);
                         }
                     };
+                    Self::commit_staged_memo_append(
+                        &mut self.current,
+                        self.memo_pinned_staging.as_ref(),
+                        pending_pinned_memo_copy,
+                    );
                     self.resident_tokens.extend_from_slice(tokens);
                     self.processed += tokens.len();
                     ids.truncate(k);
@@ -1029,12 +1613,19 @@ impl NativeProposer {
                             let _ = t.device.make_current();
                             let _ = t.stream.synchronize();
                         }
+                        Self::rollback_staged_memo_append(&mut self.current, memo_prev_lens);
                         return Err(e);
                     }
                 };
                 if outputs.windows(2).any(|p| p[0] != p[1]) {
+                    Self::rollback_staged_memo_append(&mut self.current, memo_prev_lens);
                     return Err(loader_err("DFlash TP token disagreement"));
                 }
+                Self::commit_staged_memo_append(
+                    &mut self.current,
+                    self.memo_pinned_staging.as_ref(),
+                    pending_pinned_memo_copy,
+                );
                 self.resident_tokens.extend_from_slice(tokens);
                 self.processed += tokens.len();
                 let mut ids = outputs.swap_remove(0);
@@ -1861,8 +2452,7 @@ impl NativeProposer {
     ) -> Result<RadixBenchMetrics> {
         let total = prompt
             .len()
-            .checked_add(max_new)
-            .and_then(|n| n.checked_add(self.k + 1))
+            .checked_add(max_new.max(1))
             .ok_or_else(|| loader_err("speculative length overflow"))?;
         if prompt.is_empty()
             || total > self.capacity
@@ -1878,7 +2468,9 @@ impl NativeProposer {
         let lookup = engine
             .radix
             .match_prefix(&radix_prompt[..radix_prompt.len() - 1]);
-        let hit = if self.can_restore(&radix_prompt[..lookup.matched_tokens]) {
+        let hit = if self
+            .can_restore_for_prompt(&radix_prompt[..lookup.matched_tokens], radix_prompt.len())
+        {
             lookup
         } else {
             let mut cold = engine.radix.match_prefix(&[]);
@@ -1887,9 +2479,12 @@ impl NativeProposer {
         };
         let cached = hit.matched_tokens;
         self.restore(engine, &radix_prompt[..cached])?;
-        let (active, pp) = engine
-            .alloc_three_state_slots()
-            .ok_or_else(|| loader_err("no speculative request state slots"))?;
+        engine.radix.inc_lock_ref(hit.last_node);
+        let Some((active, pp)) = engine.alloc_three_state_slots() else {
+            engine.radix.dec_lock_ref(hit.last_node);
+            return Err(loader_err("no speculative request state slots"));
+        };
+        engine.radix.dec_lock_ref(hit.last_node);
         let mut req = ReqRadixState::new(16, 64, active, pp);
         req.restore_prefix_hit(&mut engine.radix, &radix_prompt, &hit);
         let mut tx = StateTx::new(active);
@@ -1905,8 +2500,10 @@ impl NativeProposer {
                 None,
             )
         });
+        let mut prefill_donated_seq_len = 0usize;
         let started = Instant::now();
         let result = (|| -> Result<(Vec<i32>, Vec<crate::parser::StepLogprobs>, f64, f64)> {
+            engine.materialize_pending_checkpoint(&mut req)?;
             engine.ensure_kv_pages_for_len(&mut req, total)?;
             let mut anchor = 0;
             let mut cursor = cached;
@@ -1960,17 +2557,17 @@ impl NativeProposer {
                     anchor = out[0][0];
                 }
                 let features = self.captured(engine)?;
-                self.ingest(engine, radix_tokens, &features)?;
+                self.ingest_for_prompt_len(engine, radix_tokens, &features, prompt.len())?;
                 req.commit_tokens(radix_tokens, &planned);
                 cursor = end;
-                if (cursor < prompt.len() || max_new > 1)
-                    && req.last_track_seqlen.is_some()
-                    && let Some(rep) = engine.alloc_state_slot()
-                {
-                    let don = req.donate_committed_checkpoint(&mut engine.radix, Some(rep), false);
-                    engine.free_kv_pages(&don.freed_kv_pages);
-                    engine.free_state_slots(&don.freed_mamba_slots);
-                }
+                prefill_donated_seq_len =
+                    prefill_donated_seq_len.max(engine.donate_intermediate_prefill_checkpoint(
+                        &mut req,
+                        cursor,
+                        prompt.len(),
+                        max_new,
+                        false,
+                    )?);
             }
             tx.committed_slot = req.active_state_slot;
             tx.commit_prefill(prompt.len());
@@ -2021,6 +2618,14 @@ impl NativeProposer {
                 {
                     drafts.truncate(eos);
                 }
+                let mut extras = Vec::with_capacity(drafts.len());
+                for _ in 0..drafts.len() {
+                    let Some(s) = engine.alloc_state_slot() else {
+                        break;
+                    };
+                    extras.push(s);
+                }
+                drafts.truncate(extras.len());
                 let prepared_sampler = if processed_sampling {
                     Some(crate::model::PreparedSpecSamplerRows::prepare_drafts(
                         engine.cfg.vocab_size,
@@ -2031,19 +2636,13 @@ impl NativeProposer {
                 } else {
                     None
                 };
+                if extras.len() > drafts.len() {
+                    let surplus: Vec<_> = extras.drain(drafts.len()..).collect();
+                    engine.free_state_slots(&surplus);
+                }
                 let k = drafts.len();
                 let mut verify = vec![anchor];
                 verify.extend_from_slice(&drafts);
-                let mut extras = Vec::with_capacity(k);
-                for _ in 0..k {
-                    match engine.alloc_state_slot() {
-                        Some(s) => extras.push(s),
-                        None => {
-                            engine.free_state_slots(&extras);
-                            return Err(loader_err("no speculative verification state slots"));
-                        }
-                    }
-                }
                 let schedule = if k > 0 {
                     tx.begin_spec_verify(extras);
                     tx.verify_slot_schedule()
@@ -2130,15 +2729,21 @@ impl NativeProposer {
                 return Err(e);
             }
         };
-        let donation = req.donate_committed_checkpoint(&mut engine.radix, None, true);
-        engine.free_kv_pages(&donation.freed_kv_pages);
-        engine.free_state_slots(&donation.freed_mamba_slots);
+        let donation = {
+            let mut radix = std::mem::replace(
+                &mut engine.radix,
+                crate::radix::MambaRadixCache::new(16, 64),
+            );
+            let res = engine.donate_req_checkpoint(&mut radix, &mut req, true);
+            engine.radix = radix;
+            res?
+        };
         self.commit_current_memo();
         let steps = generated.len().saturating_sub(1);
         Ok(RadixBenchMetrics {
             prompt_len: prompt.len(),
             cached_prefix_tokens: cached,
-            donated_seq_len: donation.donated_seq_len,
+            donated_seq_len: donation.donated_seq_len.max(prefill_donated_seq_len),
             gen_len: generated.len(),
             ttft_ms: ttft,
             prefill_tok_per_s: if ttft > 0. {
@@ -2299,5 +2904,147 @@ mod tests {
             ),
             None,
         );
+    }
+
+    #[test]
+    fn dflash_slot_has_prefix_for_prompt_handles_ring_wrap_and_suffix_window() {
+        let res: Vec<i32> = (0..22_430).collect();
+        let prompt: Vec<i32> = (0..22_670).collect();
+        // When suffix prefill (`22,670 - 21,952 = 718`) advances decode past `22,670`,
+        // the sliding window `[22,670 - 2,048 .. 21,952]` (`pages 1,288 .. 1,372`) is still
+        // inside a 138-page (`2,208`-token) ring buffer (`1,402 - 1,288 = 114 <= 138`).
+        assert!(dflash_slot_has_prefix_for_prompt(
+            &res,
+            0,
+            &prompt[..21_952],
+            prompt.len(),
+            Some(138),
+            2048,
+        ));
+        // If a prior restore took the `set_committed(21_952)` shortcut without writing
+        // `[0..21_952]` into the ring buffer (`valid_from = 21_952`), a subsequent short-suffix
+        // request (`prompt_len = 22_670`, needing KV from `20_608..21_952`) must reject it,
+        // whereas a request whose suffix (`>= 2,048`) overwrites the entire window is allowed.
+        assert!(!dflash_slot_has_prefix_for_prompt(
+            &res,
+            21_952,
+            &prompt[..21_952],
+            prompt.len(),
+            Some(138),
+            2048,
+        ));
+        assert!(dflash_slot_has_prefix_for_prompt(
+            &res[..21_952],
+            21_952,
+            &prompt[..21_952],
+            21_952 + 2_048,
+            Some(138),
+            2048,
+        ));
+        assert_eq!(
+            dflash_effective_valid_from(22_430, 0, Some(138)),
+            (22_430usize.div_ceil(16) - 138) * 16
+        );
+        // In single-slot mode (`!batch_mode`, e.g. `--max-num-seqs 1`), `DFlash2Rank::pages_dev`
+        // wraps modulo `all_pages.len()` (`8 * 138 = 1,104` pages = `17,664` tokens on TP=1).
+        // When a turn at `103,552` generates `2,680` tokens (`resident_len = 106,248`) and the
+        // follow-up prompt (`104,528` tokens) strips `<think>...</think>` back to `103,552`,
+        // the 1,104-page single-slot ring still holds `[88,592 .. 106,248]`, so `103,552` is
+        // restored directly without stepping back to `102,464` (`admission_filter`).
+        let long_res: Vec<i32> = (0..106_248).collect();
+        let next_prompt: Vec<i32> = (0..104_528).collect();
+        assert!(!dflash_slot_has_prefix_for_prompt(
+            &long_res,
+            0,
+            &next_prompt[..103_552],
+            next_prompt.len(),
+            Some(138),
+            2048,
+        ));
+        assert!(dflash_slot_has_prefix_for_prompt(
+            &long_res,
+            0,
+            &next_prompt[..103_552],
+            next_prompt.len(),
+            Some(8 * 138),
+            2048,
+        ));
+    }
+
+    #[test]
+    fn proposer_max_rows_preserves_2048_chunk_prefill_for_tp2_262k_serving() {
+        for kind in [SpeculativeKind::Mtp, SpeculativeKind::DFlash2] {
+            // Small test pools (< 4096 pages) use 256-row tap buffers.
+            assert_eq!(plan_proposer_max_rows(false, kind, 1, 256), 256);
+            assert_eq!(plan_proposer_max_rows(false, kind, 2, 256), 256);
+
+            // Standard serving pools (4096..14336 pages = 64K..224K tokens) use 2048-row tap buffers.
+            assert_eq!(plan_proposer_max_rows(false, kind, 1, 4096), 2048);
+            assert_eq!(plan_proposer_max_rows(false, kind, 2, 8192), 2048);
+
+            // TP=1 extreme long-context (>= 14336 pages = 229K..262K on 1x 24GB GPU with 336 MiB scratch)
+            // uses 1024-row prefill chunks (with OOM fallback to 256), while TP>=2 262K serving keeps 2048.
+            assert_eq!(plan_proposer_max_rows(false, kind, 1, 16384), 1024);
+            assert_eq!(plan_proposer_max_rows(false, kind, 2, 16384), 2048);
+        }
+        assert_eq!(
+            plan_proposer_max_rows(true, SpeculativeKind::Mtp, 2, 4096),
+            6144
+        );
+        assert_eq!(
+            plan_proposer_max_rows(true, SpeculativeKind::DFlash2, 2, 4096),
+            2048
+        );
+    }
+
+    #[test]
+    fn dflash_prefill_window_skip_and_memo_cap_invariants() {
+        // Skipping `[0..1024]` during a `1,550`-token prefill (`window = 512`, `phys_pages = 42`)
+        // sets `valid_from = 1024`. Subsequent primed requests at `1,536` (`prompt_len = 1,550`,
+        // `win_start_tok = 1,024`) still hit resident GPU KV, whereas shorter branches (`900`)
+        // reject the partial GPU ring and replay from host `PrefixMemo`.
+        let res: Vec<i32> = (0..1550).collect();
+        assert!(dflash_slot_has_prefix_for_prompt(
+            &res,
+            1024,
+            &res[..1536],
+            1550,
+            Some(42),
+            512,
+        ));
+        assert!(!dflash_slot_has_prefix_for_prompt(
+            &res,
+            1024,
+            &res[..896],
+            900,
+            Some(42),
+            512,
+        ));
+
+        // `memo_fits_budget` caps wide DFlash features (`20,480 B/row`) at `DFLASH_MEMO_MAX_TOKENS`
+        // (`4,096` tokens) while allowing MTP features past `4,096` up to `MEMO_BUDGET`.
+        assert!(memo_fits_budget(SpeculativeKind::DFlash2, 0, 4096, 20_480));
+        assert!(!memo_fits_budget(SpeculativeKind::DFlash2, 0, 5000, 20_480));
+        assert!(memo_fits_budget(SpeculativeKind::Mtp, 0, 5000, 4_096));
+    }
+
+    #[test]
+    fn mtp_27b_wide_hidden_memo_fits_64k_and_120k_swe_agent() {
+        // Qwen3.8-27B MTP has `hidden_size = 5120` (`10,240 B/row` > `8,192 B/row`) and has no
+        // sliding-window ring shortcut, so `memo_fits_budget` must permit 64K and 120K prefix
+        // memos up to `MEMO_BUDGET` (`4 GiB`) instead of mistaking `row_bytes > 8192` for DFlash2.
+        let mtp_27b_row_bytes = 5120 * 2;
+        assert!(memo_fits_budget(
+            SpeculativeKind::Mtp,
+            0,
+            65_536,
+            mtp_27b_row_bytes
+        ));
+        assert!(memo_fits_budget(
+            SpeculativeKind::Mtp,
+            65_536,
+            65_536,
+            mtp_27b_row_bytes
+        ));
     }
 }

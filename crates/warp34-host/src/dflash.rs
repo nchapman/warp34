@@ -3,7 +3,9 @@
 //! A proposal writes only a private, disposable M-row suffix; it never advances
 //! committed context. Attention/MLP are TP-sharded; context FC and convs replicated.
 use crate::cache::{KvFormatPolicy, KvPool};
-use crate::cuda::{CudaGraph, DeviceArena, DeviceBuffer, Result, Tp2Collectives, check_rc};
+use crate::cuda::{
+    CudaGraph, DeviceArena, DeviceBuffer, MappedHostBuffer, Result, Tp2Collectives, check_rc,
+};
 use crate::loader::{
     ModelConfig, QuantScheme, SUPPORTED_HADAMARD_BLOCKS, SafetensorsArchive,
     marlin_permute_scales_from_n_major,
@@ -131,7 +133,7 @@ impl DFlash2Config {
             let value = body
                 .get("sliding_window")
                 .and_then(Value::as_u64)
-                .filter(|&v| v > 0 && v <= i32::MAX as u64)
+                .filter(|&v| v > 0 && i32::try_from(v).is_ok())
                 .ok_or_else(|| loader_err("invalid DFlash sliding window"))?;
             value as usize
         } else {
@@ -459,6 +461,21 @@ fn linear_metadata(
     }
 }
 
+/// Threshold (`32 MiB` per codebook) above which `DFlash2` selector codebooks
+/// (`predecessor_codebook` / `successor_codebook`, `242.5 MiB` combined on 248K-vocab models)
+/// are hosted in zero-copy pinned `MappedHostBuffer` instead of GPU VRAM. Each draft round
+/// reads only `~31.5 KiB` across `k = 7` slots (`~18 µs` over PCIe 4.0 x8) at 0-ULP BF16 parity.
+const DFLASH2_HOST_CODEBOOK_MIN_BYTES: usize = 32 * 1024 * 1024;
+
+#[inline]
+fn use_host_selector_codebooks(cfg: &DFlash2Config) -> bool {
+    cfg.model
+        .vocab_size
+        .saturating_mul(cfg.selector_rank)
+        .saturating_mul(2)
+        >= DFLASH2_HOST_CODEBOOK_MIN_BYTES
+}
+
 fn weight_arena_bytes(
     cfg: &DFlash2Config,
     a: &SafetensorsArchive,
@@ -473,7 +490,9 @@ fn weight_arena_bytes(
         || !c.num_key_value_heads.is_multiple_of(tp)
         || !c.intermediate_size.is_multiple_of(tp)
     {
-        return Err(loader_err("DFlash target/rank/capacity mismatch"));
+        return Err(loader_err(
+            "DFlash target/rank/capacity mismatch (max capacity 262144 tokens / 16384 pages)",
+        ));
     }
     let (h, d) = (c.hidden_size, c.head_dim);
     let q = product(&[c.num_attention_heads, d])?;
@@ -487,20 +506,29 @@ fn weight_arena_bytes(
     }
     let coeff = product(&[2, cfg.taps, h / cfg.group])?;
     let rows = sum(&[capacity, cfg.block_size])?;
+    let host_codebooks = use_host_selector_codebooks(cfg);
+    let use_inv_freq = rows > 8192;
     let mut bytes = vec![
         DFLASH2_WEIGHT_ARENA_SLACK_BYTES,
-        product(&[rows, d, 4])?,
+        if use_inv_freq {
+            product(&[d / 2, 4])?
+        } else {
+            product(&[rows, d, 4])?
+        },
         product(&[rows.div_ceil(16), 4])?,
     ];
     for name in ["hidden_norm.weight", "norm.weight"] {
         bytes.push(dense_metadata(a, name, &[h])?);
     }
     for name in ["predecessor_codebook", "successor_codebook"] {
-        bytes.push(dense_metadata(
+        let sz = dense_metadata(
             a,
             &format!("candidate_selector.{name}"),
             &[c.vocab_size, cfg.selector_rank],
-        )?);
+        )?;
+        if !host_codebooks {
+            bytes.push(sz);
+        }
     }
     let fc_k = product(&[h, cfg.target_layers.len()])?;
     bytes.push(linear_metadata(cfg, a, "fc", h, fc_k, h, fc_k)?);
@@ -606,8 +634,13 @@ fn dflash_ring_params(cfg: &DFlash2Config, tp: usize) -> (usize, usize) {
             ((cfg.window + cfg.block_size).div_ceil(DFLASH2_KV_PAGE_BLOCK_TOKENS) + 16).max(144),
         )
     } else {
+        let slots = if tp == 1 && cfg.model.hidden_size == 2560 {
+            4
+        } else {
+            8
+        };
         (
-            8,
+            slots,
             (cfg.window + cfg.block_size).div_ceil(DFLASH2_KV_PAGE_BLOCK_TOKENS) + 9,
         )
     }
@@ -704,6 +737,7 @@ pub(crate) fn serving_reserve(
 struct DFlashGraphIo {
     forward_graph: Option<CudaGraph>,
     select_greedy_graphs: [Option<CudaGraph>; MAX_DFLASH_BATCH_SLOTS],
+    oom_disabled: bool,
     forward_arena: DeviceArena,
     meta_dev: DeviceBuffer,
     topk_ids_dev: DeviceBuffer,
@@ -741,9 +775,12 @@ pub struct DFlash2Rank {
     layers: Vec<Layer>,
     rope: u64,
     rope_rows: usize,
+    rope_uses_inv_freq: bool,
     hp: Linear,
     pred: u64,
     succ: u64,
+    _host_pred: Option<MappedHostBuffer>,
+    _host_succ: Option<MappedHostBuffer>,
     pub hidden: DeviceBuffer,
     projected: DeviceBuffer,
 }
@@ -774,7 +811,9 @@ impl DFlash2Rank {
             || max_rows > DFLASH2_MAX_BATCH_ROWS
             || capacity < max_rows
         {
-            return Err(loader_err("DFlash target/rank/capacity mismatch"));
+            return Err(loader_err(
+                "DFlash target/rank/capacity mismatch (max capacity 262144 tokens / 16384 pages)",
+            ));
         }
         t.device.make_current()?;
         let archive = SafetensorsArchive::open(dir)
@@ -788,7 +827,14 @@ impl DFlash2Rank {
         );
         let coeff = 2 * cfg.taps * (h / cfg.group);
         let rope_rows = capacity + cfg.block_size;
-        let mut weights = DeviceArena::new(t.device.device_id, total_weight_bytes)?;
+        let mut weights =
+            DeviceArena::new_on_stream(t.device.device_id, total_weight_bytes, &t.stream)?;
+        let max_repack_bytes = (2 * i.max(q + 2 * kv))
+            .saturating_mul(h.saturating_mul(cfg.target_layers.len().max(1)))
+            .div_ceil(2)
+            .max(16 * 1024 * 1024);
+        let mut upload_ring =
+            crate::cuda::PinnedUploadRing::new(t.device.device_id, max_repack_bytes, &t.stream)?;
         fn read(a: &SafetensorsArchive, name: &str, shape: &[usize]) -> Result<Vec<u16>> {
             let info = a
                 .tensor_info(name)
@@ -830,6 +876,12 @@ impl DFlash2Rank {
             {
                 QuantScheme::Unquantized => {
                     let full = read(&archive, &format!("{name}.weight"), &[n, k])?;
+                    if rs == 0 && rn == n && cs == 0 && cn == k {
+                        return Ok(HostSlice::DenseBf16(full));
+                    }
+                    if cs == 0 && cn == k {
+                        return Ok(HostSlice::DenseBf16(full[rs * k..(rs + rn) * k].to_vec()));
+                    }
                     let values: Vec<u16> = full[rs * k..(rs + rn) * k]
                         .chunks_exact(k)
                         .flat_map(|row| row[cs..cs + cn].iter().copied())
@@ -947,19 +999,37 @@ impl DFlash2Rank {
                     let full_s = archive
                         .read_bf16_bits(&s_key)
                         .map_err(|e| loader_err_ctx("read DFlash weight_scale", e.to_string()))?;
+                    if rs == 0 && rn == n && cs == 0 && cn == k {
+                        return Ok(HostSlice::U4B8 {
+                            packed: full_p,
+                            scales: full_s,
+                            eff_gs,
+                            group_blocks,
+                            hadamard_block,
+                        });
+                    }
                     let words_k = k / U4_NIBBLES_PER_U32;
                     let ws = cs / U4_NIBBLES_PER_U32;
                     let wn = cn / U4_NIBBLES_PER_U32;
-                    let packed: Vec<u32> = full_p[rs * words_k..(rs + rn) * words_k]
-                        .chunks_exact(words_k)
-                        .flat_map(|row| row[ws..ws + wn].iter().copied())
-                        .collect();
                     let gs = cs / eff_gs;
                     let gn = cn / eff_gs;
-                    let scales: Vec<u16> = full_s[rs * num_groups..(rs + rn) * num_groups]
-                        .chunks_exact(num_groups)
-                        .flat_map(|row| row[gs..gs + gn].iter().copied())
-                        .collect();
+                    let (packed, scales) = if cs == 0 && cn == k {
+                        (
+                            full_p[rs * words_k..(rs + rn) * words_k].to_vec(),
+                            full_s[rs * num_groups..(rs + rn) * num_groups].to_vec(),
+                        )
+                    } else {
+                        (
+                            full_p[rs * words_k..(rs + rn) * words_k]
+                                .chunks_exact(words_k)
+                                .flat_map(|row| row[ws..ws + wn].iter().copied())
+                                .collect(),
+                            full_s[rs * num_groups..(rs + rn) * num_groups]
+                                .chunks_exact(num_groups)
+                                .flat_map(|row| row[gs..gs + gn].iter().copied())
+                                .collect(),
+                        )
+                    };
                     Ok(HostSlice::U4B8 {
                         packed,
                         scales,
@@ -971,61 +1041,69 @@ impl DFlash2Rank {
                 _ => Err(loader_err("unsupported DFlash linear quantization")),
             }
         };
-        let upload_slice_linear =
-            |a: &mut DeviceArena, slice: HostSlice, rn: usize, cn: usize| -> Result<Linear> {
-                match slice {
-                    HostSlice::DenseBf16(values) => Ok(Linear::DenseBf16 {
-                        weight: a.upload_slice(&values, &t.stream)?,
+        let upload_slice_linear = |a: &mut DeviceArena,
+                                   ring: &mut crate::cuda::PinnedUploadRing,
+                                   slice: HostSlice,
+                                   rn: usize,
+                                   cn: usize|
+         -> Result<Linear> {
+            match slice {
+                HostSlice::DenseBf16(values) => Ok(Linear::DenseBf16 {
+                    weight: ring.upload_slice(a, &values, &t.stream)?,
+                    n: rn,
+                    k: cn,
+                }),
+                HostSlice::U4B8 {
+                    packed,
+                    scales,
+                    eff_gs,
+                    group_blocks,
+                    hadamard_block,
+                } => {
+                    let (r_idx, staging_addr) = ring.stage_repack_input(&packed, &t.stream)?;
+                    let weight = a.alloc_aligned(packed.len() * 4)?;
+                    let ex = t.stream.exec(0, 0);
+                    check_rc(
+                        // SAFETY: staging_addr and weight are valid device allocations of packed.len() u32 words on t.stream.
+                        unsafe {
+                            ffi::warp34_marlin_repack_int4(
+                                &ex,
+                                staging_addr as *const u32,
+                                weight as *mut u32,
+                                cn as i64,
+                                rn as i64,
+                            )
+                        },
+                        "DFlash marlin_repack_int4",
+                    )?;
+                    ring.finish_repack_stage(r_idx, &t.stream)?;
+                    let perm_scales = marlin_permute_scales_from_n_major(
+                        &scales,
+                        cn,
+                        rn,
+                        if group_blocks == -1 { 0 } else { eff_gs },
+                    );
+                    let scales_ptr = ring.upload_slice(a, &perm_scales, &t.stream)?;
+                    Ok(Linear::MarlinBf16U4B8 {
+                        weight,
+                        scales: scales_ptr,
                         n: rn,
                         k: cn,
-                    }),
-                    HostSlice::U4B8 {
-                        packed,
-                        scales,
-                        eff_gs,
                         group_blocks,
                         hadamard_block,
-                    } => {
-                        let tmp = DeviceBuffer::alloc(t.device.device_id, packed.len() * 4)?;
-                        tmp.copy_from_host(&packed, &t.stream)?;
-                        let weight = a.alloc_aligned(packed.len() * 4)?;
-                        let ex = t.stream.exec(0, 0);
-                        check_rc(
-                            // SAFETY: tmp and weight are valid device allocations of packed.len() u32 words on t.stream.
-                            unsafe {
-                                ffi::warp34_marlin_repack_int4(
-                                    &ex,
-                                    tmp.addr() as *const u32,
-                                    weight as *mut u32,
-                                    cn as i64,
-                                    rn as i64,
-                                )
-                            },
-                            "DFlash marlin_repack_int4",
-                        )?;
-                        t.stream.synchronize()?;
-                        let perm_scales = marlin_permute_scales_from_n_major(
-                            &scales,
-                            cn,
-                            rn,
-                            if group_blocks == -1 { 0 } else { eff_gs },
-                        );
-                        let scales_ptr = a.upload_slice(&perm_scales, &t.stream)?;
-                        Ok(Linear::MarlinBf16U4B8 {
-                            weight,
-                            scales: scales_ptr,
-                            n: rn,
-                            k: cn,
-                            group_blocks,
-                            hadamard_block,
-                        })
-                    }
+                    })
                 }
-            };
-        let upload = |a: &mut DeviceArena, name: &str, shape: &[usize]| -> Result<u64> {
-            a.upload_slice(&read(&archive, name, shape)?, &t.stream)
+            }
+        };
+        let upload = |a: &mut DeviceArena,
+                      ring: &mut crate::cuda::PinnedUploadRing,
+                      name: &str,
+                      shape: &[usize]|
+         -> Result<u64> {
+            ring.upload_slice(a, &read(&archive, name, shape)?, &t.stream)
         };
         let matrix = |a: &mut DeviceArena,
+                      ring: &mut crate::cuda::PinnedUploadRing,
                       name: &str,
                       n: usize,
                       k: usize,
@@ -1035,50 +1113,54 @@ impl DFlash2Rank {
                       cn: usize|
          -> Result<Linear> {
             let slice = read_slice(name, n, k, rs, rn, cs, cn)?;
-            upload_slice_linear(a, slice, rn, cn)
+            upload_slice_linear(a, ring, slice, rn, cn)
         };
-        let concat_n_matrix =
-            |a: &mut DeviceArena, parts: &[(&str, usize)], k: usize| -> Result<Linear> {
-                let mut total_rn = 0usize;
-                let mut acc: Option<HostSlice> = None;
-                for &(name, local) in parts {
-                    let part = read_slice(name, local * tp, k, r * local, local, 0, k)?;
-                    total_rn += local;
-                    match (&mut acc, part) {
-                        (None, p) => acc = Some(p),
-                        (Some(HostSlice::DenseBf16(dst)), HostSlice::DenseBf16(src)) => {
-                            dst.extend_from_slice(&src);
-                        }
-                        (
-                            Some(HostSlice::U4B8 {
-                                packed: dp,
-                                scales: ds,
-                                eff_gs: dg,
-                                group_blocks: dgb,
-                                hadamard_block: dhb,
-                            }),
-                            HostSlice::U4B8 {
-                                packed: sp,
-                                scales: ss,
-                                eff_gs: sg,
-                                group_blocks: sgb,
-                                hadamard_block: shb,
-                            },
-                        ) if *dg == sg && *dgb == sgb && *dhb == shb => {
-                            dp.extend_from_slice(&sp);
-                            ds.extend_from_slice(&ss);
-                        }
-                        _ => {
-                            return Err(loader_err(
-                                "mismatched quantization schemes across fused DFlash projections",
-                            ));
-                        }
+        let concat_n_matrix = |a: &mut DeviceArena,
+                               ring: &mut crate::cuda::PinnedUploadRing,
+                               parts: &[(&str, usize)],
+                               k: usize|
+         -> Result<Linear> {
+            let mut total_rn = 0usize;
+            let mut acc: Option<HostSlice> = None;
+            for &(name, local) in parts {
+                let part = read_slice(name, local * tp, k, r * local, local, 0, k)?;
+                total_rn += local;
+                match (&mut acc, part) {
+                    (None, p) => acc = Some(p),
+                    (Some(HostSlice::DenseBf16(dst)), HostSlice::DenseBf16(src)) => {
+                        dst.extend_from_slice(&src);
+                    }
+                    (
+                        Some(HostSlice::U4B8 {
+                            packed: dp,
+                            scales: ds,
+                            eff_gs: dg,
+                            group_blocks: dgb,
+                            hadamard_block: shb_dst,
+                        }),
+                        HostSlice::U4B8 {
+                            packed: sp,
+                            scales: ss,
+                            eff_gs: sg,
+                            group_blocks: sgb,
+                            hadamard_block: shb,
+                        },
+                    ) if *dg == sg && *dgb == sgb && *shb_dst == shb => {
+                        dp.extend_from_slice(&sp);
+                        ds.extend_from_slice(&ss);
+                    }
+                    _ => {
+                        return Err(loader_err(
+                            "mismatched quantization schemes across fused DFlash projections",
+                        ));
                     }
                 }
-                upload_slice_linear(a, acc.expect("non-empty parts"), total_rn, k)
-            };
+            }
+            upload_slice_linear(a, ring, acc.expect("non-empty parts"), total_rn, k)
+        };
         let fc = matrix(
             &mut weights,
+            &mut upload_ring,
             "fc",
             h,
             h * cfg.target_layers.len(),
@@ -1087,19 +1169,23 @@ impl DFlash2Rank {
             0,
             h * cfg.target_layers.len(),
         )?;
-        let hidden_norm = upload(&mut weights, "hidden_norm.weight", &[h])?;
-        let final_norm = upload(&mut weights, "norm.weight", &[h])?;
+        let hidden_norm = upload(&mut weights, &mut upload_ring, "hidden_norm.weight", &[h])?;
+        let final_norm = upload(&mut weights, &mut upload_ring, "norm.weight", &[h])?;
         let mut layers = Vec::with_capacity(c.num_hidden_layers);
         for l in 0..c.num_hidden_layers {
             let prefix = format!("layers.{l}");
-            let norm = |arena: &mut DeviceArena, name: &str, size: usize| {
-                upload(arena, &format!("{prefix}.{name}.weight"), &[size])
+            let norm = |arena: &mut DeviceArena,
+                        ring: &mut crate::cuda::PinnedUploadRing,
+                        name: &str,
+                        size: usize| {
+                upload(arena, ring, &format!("{prefix}.{name}.weight"), &[size])
             };
             let q_name = format!("{prefix}.self_attn.q_proj");
             let k_name = format!("{prefix}.self_attn.k_proj");
             let v_name = format!("{prefix}.self_attn.v_proj");
             let qkv = concat_n_matrix(
                 &mut weights,
+                &mut upload_ring,
                 &[(&q_name, q), (&k_name, kv), (&v_name, kv)],
                 h,
             )?;
@@ -1109,12 +1195,16 @@ impl DFlash2Rank {
                     n: 2 * kv,
                     k: h,
                 },
-                Linear::MarlinBf16U4B8 { .. } => {
-                    concat_n_matrix(&mut weights, &[(&k_name, kv), (&v_name, kv)], h)?
-                }
+                Linear::MarlinBf16U4B8 { .. } => concat_n_matrix(
+                    &mut weights,
+                    &mut upload_ring,
+                    &[(&k_name, kv), (&v_name, kv)],
+                    h,
+                )?,
             };
             let out = matrix(
                 &mut weights,
+                &mut upload_ring,
                 &format!("{prefix}.self_attn.o_proj"),
                 h,
                 q * tp,
@@ -1125,9 +1215,15 @@ impl DFlash2Rank {
             )?;
             let gate_name = format!("{prefix}.mlp.gate_proj");
             let up_name = format!("{prefix}.mlp.up_proj");
-            let gate_up = concat_n_matrix(&mut weights, &[(&gate_name, i), (&up_name, i)], h)?;
+            let gate_up = concat_n_matrix(
+                &mut weights,
+                &mut upload_ring,
+                &[(&gate_name, i), (&up_name, i)],
+                h,
+            )?;
             let down = matrix(
                 &mut weights,
+                &mut upload_ring,
                 &format!("{prefix}.mlp.down_proj"),
                 h,
                 i * tp,
@@ -1136,10 +1232,14 @@ impl DFlash2Rank {
                 r * i,
                 i,
             )?;
-            let conv = |arena: &mut DeviceArena, name: &str| -> Result<Conv> {
+            let conv = |arena: &mut DeviceArena,
+                        ring: &mut crate::cuda::PinnedUploadRing,
+                        name: &str|
+             -> Result<Conv> {
                 Ok(Conv {
                     projection: matrix(
                         arena,
+                        ring,
                         &format!("{prefix}.{name}.kernel_projection"),
                         coeff,
                         h,
@@ -1150,27 +1250,40 @@ impl DFlash2Rank {
                     )?,
                     base: upload(
                         arena,
+                        ring,
                         &format!("{prefix}.{name}.base_kernel"),
                         &[2, cfg.taps, h],
                     )?,
                 })
             };
+            let input_norm = norm(&mut weights, &mut upload_ring, "input_layernorm", h)?;
+            let post_norm = norm(
+                &mut weights,
+                &mut upload_ring,
+                "post_attention_layernorm",
+                h,
+            )?;
+            let q_norm = norm(&mut weights, &mut upload_ring, "self_attn.q_norm", d)?;
+            let k_norm = norm(&mut weights, &mut upload_ring, "self_attn.k_norm", d)?;
+            let attn_conv = conv(&mut weights, &mut upload_ring, "attention_conv")?;
+            let mlp_conv = conv(&mut weights, &mut upload_ring, "mlp_conv")?;
             layers.push(Layer {
-                input_norm: norm(&mut weights, "input_layernorm", h)?,
-                post_norm: norm(&mut weights, "post_attention_layernorm", h)?,
-                q_norm: norm(&mut weights, "self_attn.q_norm", d)?,
-                k_norm: norm(&mut weights, "self_attn.k_norm", d)?,
+                input_norm,
+                post_norm,
+                q_norm,
+                k_norm,
                 qkv,
                 kv: kv_proj,
                 out,
                 gate_up,
                 down,
-                attn_conv: conv(&mut weights, "attention_conv")?,
-                mlp_conv: conv(&mut weights, "mlp_conv")?,
+                attn_conv,
+                mlp_conv,
             });
         }
         let hp = matrix(
             &mut weights,
+            &mut upload_ring,
             "candidate_selector.hidden_projection",
             cfg.selector_rank,
             h,
@@ -1179,28 +1292,61 @@ impl DFlash2Rank {
             0,
             h,
         )?;
-        let pred = upload(
-            &mut weights,
-            "candidate_selector.predecessor_codebook",
-            &[c.vocab_size, cfg.selector_rank],
-        )?;
-        let succ = upload(
-            &mut weights,
-            "candidate_selector.successor_codebook",
-            &[c.vocab_size, cfg.selector_rank],
-        )?;
-        // SGLang RotaryEmbedding deliberately retains its CUDA cache in FP32,
-        // even when Q/K and model weights are BF16. Quantizing this table loses
-        // ~0.2% at the first Q projection and amplifies across the five layers.
-        let mut table = vec![0f32; rope_rows * d];
-        for pos in 0..rope_rows {
-            for j in 0..d / 2 {
-                let angle = pos as f32 * (1.0 / c.rope_theta.powf((2 * j) as f32 / d as f32));
-                table[pos * d + j] = angle.cos();
-                table[pos * d + d / 2 + j] = angle.sin();
+        let (pred, succ, host_pred, host_succ) = if use_host_selector_codebooks(&cfg) {
+            let load_host_codebook = |name: &str| -> Result<(u64, MappedHostBuffer)> {
+                let bits = read(&archive, name, &[c.vocab_size, cfg.selector_rank])?;
+                let bytes = bits.len() * core::mem::size_of::<u16>();
+                let buf = MappedHostBuffer::alloc_unzeroed(bytes)?;
+                // SAFETY: `buf` is allocated for `bytes` contiguous bytes and `bits` has `bytes` bytes.
+                unsafe {
+                    core::ptr::copy_nonoverlapping(
+                        bits.as_ptr().cast::<u8>(),
+                        buf.host_ptr.cast::<u8>(),
+                        bytes,
+                    );
+                }
+                Ok((buf.dev_ptr as u64, buf))
+            };
+            let (p_ptr, p_buf) = load_host_codebook("candidate_selector.predecessor_codebook")?;
+            let (s_ptr, s_buf) = load_host_codebook("candidate_selector.successor_codebook")?;
+            (p_ptr, s_ptr, Some(p_buf), Some(s_buf))
+        } else {
+            let p_ptr = upload(
+                &mut weights,
+                &mut upload_ring,
+                "candidate_selector.predecessor_codebook",
+                &[c.vocab_size, cfg.selector_rank],
+            )?;
+            let s_ptr = upload(
+                &mut weights,
+                &mut upload_ring,
+                "candidate_selector.successor_codebook",
+                &[c.vocab_size, cfg.selector_rank],
+            )?;
+            (p_ptr, s_ptr, None, None)
+        };
+        drop(upload_ring);
+        // For compact contexts (`<= 8192` rows, `<= 4 MiB`), keep the exact host-computed FP32
+        // cos/sin table for 0-ULP SGLang donor parity; for long contexts (`> 8192` rows, e.g.
+        // 128K serving), store FP32 `inv_freq` [d / 2] and evaluate `sincosf` on the fly to save
+        // 64 MiB VRAM.
+        let rope_uses_inv_freq = rope_rows > 8192;
+        let rope = if rope_uses_inv_freq {
+            let inv_freq: Vec<f32> = (0..d / 2)
+                .map(|j| 1.0f32 / c.rope_theta.powf((2 * j) as f32 / d as f32))
+                .collect();
+            weights.upload_slice(&inv_freq, &t.stream)?
+        } else {
+            let mut table = vec![0f32; rope_rows * d];
+            for pos in 0..rope_rows {
+                for j in 0..d / 2 {
+                    let angle = pos as f32 * (1.0 / c.rope_theta.powf((2 * j) as f32 / d as f32));
+                    table[pos * d + j] = angle.cos();
+                    table[pos * d + d / 2 + j] = angle.sin();
+                }
             }
-        }
-        let rope = weights.upload_slice(&table, &t.stream)?;
+            weights.upload_slice(&table, &t.stream)?
+        };
         let layer_ids: Vec<usize> = (0..c.num_hidden_layers).collect();
         let logical_pages = rope_rows.div_ceil(DFLASH2_KV_PAGE_BLOCK_TOKENS);
         let (slot_count, ring_phys_per_slot) = dflash_ring_params(&cfg, tp);
@@ -1253,11 +1399,12 @@ impl DFlash2Rank {
         let graph_io = DFlashGraphIo {
             forward_graph: None,
             select_greedy_graphs: std::array::from_fn(|_| None),
+            oom_disabled: false,
             forward_arena: DeviceArena::new(t.device.device_id, DFLASH2_FORWARD_GRAPH_ARENA_BYTES)?,
             meta_dev: DeviceBuffer::alloc(t.device.device_id, (3 * cfg.block_size + 4) * 4)?,
             topk_ids_dev: DeviceBuffer::alloc(t.device.device_id, topk_elems * 4)?,
             topk_scores_dev: DeviceBuffer::alloc(t.device.device_id, topk_elems * 4)?,
-            out_path_dev: DeviceBuffer::alloc(t.device.device_id, k_draft * 4)?,
+            out_path_dev: DeviceBuffer::alloc(t.device.device_id, 2 * k_draft * 4)?,
         };
         t.stream.synchronize()?;
         let all_pages = raw_pages;
@@ -1291,15 +1438,30 @@ impl DFlash2Rank {
             layers,
             rope,
             rope_rows,
+            rope_uses_inv_freq,
             hp,
             pred,
             succ,
+            _host_pred: host_pred,
+            _host_succ: host_succ,
             hidden,
             projected,
         })
     }
     pub fn committed_len(&self) -> usize {
         self.committed
+    }
+    pub fn sliding_window(&self) -> usize {
+        self.cfg.window
+    }
+    pub fn set_committed(&mut self, len: usize) -> Result<()> {
+        if len > self.capacity {
+            return Err(loader_err("DFlash committed length exceeds capacity"));
+        }
+        self.committed = len;
+        self.slot_committed[self.active_slot] = len;
+        self.proposal_anchor = None;
+        Ok(())
     }
     pub fn kv_layouts(&self) -> Vec<ffi::Warp34KvLayerLayout> {
         self.kv.layers.iter().map(|l| l.layout).collect()
@@ -1326,9 +1488,13 @@ impl DFlash2Rank {
         self.batch_mode
     }
     pub fn ring_phys_pages_per_slot(&self) -> Option<usize> {
-        self.ring_pages_dev_buf
-            .as_ref()
-            .map(|_| self.all_pages.len() / self.ring_slot_count)
+        self.ring_pages_dev_buf.as_ref().map(|_| {
+            if self.batch_mode {
+                self.all_pages.len() / self.ring_slot_count
+            } else {
+                self.all_pages.len()
+            }
+        })
     }
     fn bind_slot_pages(&mut self, slot: usize) {
         if let Some(ref ring_buf) = self.ring_pages_dev_buf {
@@ -1522,7 +1688,7 @@ impl DFlash2Rank {
             total_tokens: rows as i32,
             max_blocks_per_req: self.pages.len() as i32,
             max_q_len: rows as i32,
-            max_seq_len: after as i32,
+            max_seq_len: (self.capacity + self.cfg.block_size) as i32,
             sliding_window: self.cfg.window as i32,
             mask_mode: ffi::WARP34_ATTN_MASK_NONCAUSAL_WINDOW,
             sm_scale: 1.0 / (self.cfg.model.head_dim as f32).sqrt(),
@@ -1572,23 +1738,42 @@ impl DFlash2Rank {
         check_rc(
             // SAFETY: device pointers and write_slot_mapping are valid allocations for rows BF16 QKV entries according to kv_layout.
             unsafe {
-                ffi::warp34_dflash_qk_norm_rope_kv_write_bf16_f32_table(
-                    &t.stream.exec(0, 0),
-                    qkv as *mut c_void,
-                    q_out as *mut c_void,
-                    pos as *const i32,
-                    layer.q_norm as *const c_void,
-                    layer.k_norm as *const c_void,
-                    self.rope as *const c_void,
-                    kv_layout,
-                    write_slot_mapping,
-                    rows as i32,
-                    qheads as i32,
-                    (self.cfg.model.num_key_value_heads / self.tp) as i32,
-                    self.cfg.model.head_dim as i32,
-                    self.rope_rows as i32,
-                    self.cfg.model.rms_norm_eps,
-                )
+                if self.rope_uses_inv_freq {
+                    ffi::warp34_dflash_qk_norm_rope_kv_write_bf16_inv_freq(
+                        &t.stream.exec(0, 0),
+                        qkv as *mut c_void,
+                        q_out as *mut c_void,
+                        pos as *const i32,
+                        layer.q_norm as *const c_void,
+                        layer.k_norm as *const c_void,
+                        self.rope as *const f32,
+                        kv_layout,
+                        write_slot_mapping,
+                        rows as i32,
+                        qheads as i32,
+                        (self.cfg.model.num_key_value_heads / self.tp) as i32,
+                        self.cfg.model.head_dim as i32,
+                        self.cfg.model.rms_norm_eps,
+                    )
+                } else {
+                    ffi::warp34_dflash_qk_norm_rope_kv_write_bf16_f32_table(
+                        &t.stream.exec(0, 0),
+                        qkv as *mut c_void,
+                        q_out as *mut c_void,
+                        pos as *const i32,
+                        layer.q_norm as *const c_void,
+                        layer.k_norm as *const c_void,
+                        self.rope as *const c_void,
+                        kv_layout,
+                        write_slot_mapping,
+                        rows as i32,
+                        qheads as i32,
+                        (self.cfg.model.num_key_value_heads / self.tp) as i32,
+                        self.cfg.model.head_dim as i32,
+                        self.rope_rows as i32,
+                        self.cfg.model.rms_norm_eps,
+                    )
+                }
             },
             "DFlash QK norm/RoPE + KV write",
         )
@@ -1717,7 +1902,7 @@ impl DFlash2Rank {
             total_tokens: m as i32,
             max_blocks_per_req: self.pages.len() as i32,
             max_q_len: m as i32,
-            max_seq_len: self.capacity as i32,
+            max_seq_len: (self.capacity + self.cfg.block_size) as i32,
             sliding_window: self.cfg.window as i32,
             mask_mode: ffi::WARP34_ATTN_MASK_NONCAUSAL_WINDOW,
             sm_scale: 1.0 / (self.cfg.model.head_dim as f32).sqrt(),
@@ -1730,7 +1915,7 @@ impl DFlash2Rank {
         let m = self.cfg.block_size;
         let before = self.committed;
         let after = before + m;
-        if after > self.capacity {
+        if before > self.capacity || after > self.capacity + m {
             return Err(loader_err("DFlash KV capacity exceeded"));
         }
         let mut meta = Vec::with_capacity(3 * m + 4);
@@ -1779,7 +1964,15 @@ impl DFlash2Rank {
             .graph_io
             .forward_arena
             .alloc_aligned(m * h.max(q).max(i) * 2)?;
+        let head_input = self.graph_io.forward_arena.alloc_aligned((m - 1) * h * 2)?;
+        let logits_bytes = (m - 1) * t.local_vocab_size * 2;
+        let attn_split_ws_bytes = logits_bytes.max(4 * 1024 * 1024);
+        let logits = self
+            .graph_io
+            .forward_arena
+            .alloc_aligned(attn_split_ws_bytes)?;
         let ex = t.stream.exec(0, 0);
+        let attn_ex = t.stream.exec(logits, attn_split_ws_bytes);
         check_rc(
             // SAFETY: ids_ptr contains m valid token IDs, embed_tokens_ptr is valid device memory of vocab_size * h half elements, residual has capacity for m * h BF16 elements.
             unsafe {
@@ -1818,10 +2011,10 @@ impl DFlash2Rank {
                 m,
             )?;
             check_rc(
-                // SAFETY: kv layout and attention batch describe valid paged memory, qb and attn are valid device buffers for m * q elements.
+                // SAFETY: kv layout and attention batch describe valid paged memory, qb and attn are valid device buffers for m * q elements, and attn_ex holds disjoint forward_arena scratch.
                 unsafe {
                     ffi::warp34_paged_attention_bf16(
-                        &ex,
+                        &attn_ex,
                         &self.kv.layers[l].layout,
                         batch,
                         qb as *const c_void,
@@ -1862,11 +2055,6 @@ impl DFlash2Rank {
         let draft_hidden = self.hidden.addr() + (h * 2) as u64;
         self.hp
             .run(t, draft_hidden, self.projected.addr(), m - 1, had_scratch)?;
-        let head_input = self.graph_io.forward_arena.alloc_aligned((m - 1) * h * 2)?;
-        let logits = self
-            .graph_io
-            .forward_arena
-            .alloc_aligned((m - 1) * t.local_vocab_size * 2)?;
         // Explicit dtype boundary into the target's single resident FP16 head.
         check_rc(
             // SAFETY: draft_hidden contains (m - 1) * h BF16 elements, head_input has capacity for (m - 1) * h FP16 elements.
@@ -1985,10 +2173,11 @@ impl DFlash2Rank {
                     n as i32,
                 )?;
             }
+            let out_confs = out_path + (k * 4) as u64;
             check_rc(
-                // SAFETY: device arrays topk_ids, topk_scores, projected, pred, succ, out_path, and ids_ptr are valid and sized for k proposals and n candidates.
+                // SAFETY: device arrays topk_ids, topk_scores, projected, pred, succ, out_path (+ out_confs), and ids_ptr are valid and sized for k proposals and n candidates.
                 unsafe {
-                    ffi::warp34_dflash_select_greedy_dev_anchor_bf16(
+                    ffi::warp34_dflash_select_greedy_dev_anchor_with_conf_bf16(
                         &ex,
                         topk_ids as *const i32,
                         topk_scores as *const f32,
@@ -1996,6 +2185,7 @@ impl DFlash2Rank {
                         pred as *const c_void,
                         succ as *const c_void,
                         out_path as *mut i32,
+                        out_confs as *mut f32,
                         ids_ptr as *const i32,
                         k as i32,
                         n as i32,
@@ -2031,18 +2221,96 @@ impl DFlash2Rank {
         graph.launch(&t.stream)
     }
 
+    /// Truncates a greedy DFlash2 draft path on offloaded (non-fully-resident) tiered MoE models
+    /// using conditioned post-trilinear step softmax probabilities (`confs[j]`):
+    /// - When `allow_zero_drafts` is `true` (TP=1 offloaded MoE), applies a pure cumulative
+    ///   confidence threshold `prod_{i=0..=j} confs[i] >= min_cum_conf` starting at `j = 0`,
+    ///   allowing `0` drafts (`T = 1` verify) on uncertain tokens so doomed speculative tokens
+    ///   never pay linear cold-expert DDR5 latency.
+    /// - When `allow_zero_drafts` is `false`, retains `j = 0` (`keep >= 1`) and stops at the
+    ///   first `j >= 1` where `confs[j] < min_step_conf` or `cum_conf < min_cum_conf`.
+    fn truncate_path_by_step_confidences(
+        path: &mut Vec<i32>,
+        confs: &[f32],
+        max_draft: usize,
+        min_step_conf: f32,
+        min_cum_conf: f32,
+        allow_zero_drafts: bool,
+    ) {
+        if path.is_empty() || (!allow_zero_drafts && path.len() <= 1) {
+            return;
+        }
+        let limit = path.len().min(max_draft).min(confs.len());
+        if limit == 0 {
+            if allow_zero_drafts {
+                path.clear();
+            }
+            return;
+        }
+        let mut keep = limit;
+        let mut cum_conf = 1.0f32;
+        for (j, &conf) in confs.iter().take(limit).enumerate() {
+            if !conf.is_finite() || conf <= 0.0 {
+                keep = if allow_zero_drafts { j } else { j.max(1) };
+                break;
+            }
+            cum_conf *= conf;
+            if allow_zero_drafts {
+                if conf < min_step_conf || cum_conf < min_cum_conf {
+                    keep = j;
+                    break;
+                }
+            } else if j >= 1 && (conf < min_step_conf || cum_conf < min_cum_conf) {
+                keep = j;
+                break;
+            }
+        }
+        path.truncate(if allow_zero_drafts { keep } else { keep.max(1) });
+    }
+
+    fn offloaded_moe_draft_confidence_gate(
+        t: &Qwen3_5ModelRank,
+    ) -> Option<(usize, f32, f32, bool)> {
+        t.tiered_moe.as_ref()?;
+        let local_experts = (t.cfg.num_experts / t.tp_size.max(1)).max(1);
+        if t.tiered_moe_hot_per_layer >= local_experts {
+            return None;
+        }
+        if t.tp_size >= 2 {
+            Some((7, 0.35, 0.20, false))
+        } else if crate::moe_cpu_bridge::has_avx512() && t.tiered_moe_hot_per_layer >= 64 {
+            Some((7, 0.35, 0.35, true))
+        } else {
+            Some((7, 0.0, 0.70, true))
+        }
+    }
+
     pub fn collect_select_greedy_host(
         &mut self,
         t: &Qwen3_5ModelRank,
         anchor: i32,
     ) -> Result<Vec<i32>> {
         let k = self.cfg.block_size - 1;
-        let mut path = vec![0i32; k];
+        let mut raw = vec![0u32; 2 * k];
         self.graph_io
             .out_path_dev
-            .copy_to_host(&mut path, &t.stream)?;
+            .copy_to_host(&mut raw, &t.stream)?;
+        let mut path: Vec<i32> = raw[..k].iter().map(|&w| w as i32).collect();
         if path.first().is_some_and(|&id| id < 0) {
             return Err(loader_err("nonfinite DFlash edges"));
+        }
+        if let Some((max_draft, min_step_conf, min_cum_conf, allow_zero_drafts)) =
+            Self::offloaded_moe_draft_confidence_gate(t)
+        {
+            let confs: Vec<f32> = raw[k..2 * k].iter().map(|&w| f32::from_bits(w)).collect();
+            Self::truncate_path_by_step_confidences(
+                &mut path,
+                &confs,
+                max_draft,
+                min_step_conf,
+                min_cum_conf,
+                allow_zero_drafts,
+            );
         }
         self.proposal_anchor = Some(anchor);
         Ok(path)
@@ -2123,13 +2391,27 @@ impl DFlash2Rank {
         }
         self.proposal_anchor = None;
         self.upload_forward_meta(t, anchor)?;
-        if self.use_cuda_graph {
-            self.ensure_forward_graph(t, comm)?;
-            self.graph_io
-                .forward_graph
-                .as_ref()
-                .unwrap()
-                .launch(&t.stream)?;
+        if self.use_cuda_graph && !self.graph_io.oom_disabled {
+            let graph_res = self.ensure_forward_graph(t, comm).and_then(|()| {
+                self.graph_io
+                    .forward_graph
+                    .as_ref()
+                    .unwrap()
+                    .launch(&t.stream)
+            });
+            match graph_res {
+                Ok(()) => {}
+                // `cudaErrorMemoryAllocation` (`code == 2`) on single-rank DFlash2 disables graph
+                // replay for the rank lifetime and falls back to eager execution without retrying
+                // `CudaGraph::capture` on every token.
+                Err(e) if self.tp == 1 && e.code == 2 => {
+                    self.graph_io.forward_graph = None;
+                    self.graph_io.oom_disabled = true;
+                    let (batch, ids_ptr, pos_ptr) = self.fixed_forward_batch_ptrs();
+                    self.enqueue_forward_device_topk(t, &batch, ids_ptr, pos_ptr, comm)?;
+                }
+                Err(e) => return Err(e),
+            }
         } else {
             let (batch, ids_ptr, pos_ptr) = self.fixed_forward_batch_ptrs();
             self.enqueue_forward_device_topk(t, &batch, ids_ptr, pos_ptr, comm)?;
@@ -2170,11 +2452,20 @@ impl DFlash2Rank {
         if (self.tp > 1) != comm.is_some() {
             return Err(loader_err("invalid DFlash forward"));
         }
-        if self.use_cuda_graph && self.can_capture_select_greedy() {
+        if self.use_cuda_graph && !self.graph_io.oom_disabled && self.can_capture_select_greedy() {
             self.prepare_select_greedy_graph_inputs_async(t, anchor)?;
-            self.ensure_select_greedy_graph(t, comm)?;
-            self.replay_select_greedy_graph_async(t)?;
-            return self.collect_select_greedy_host(t, anchor);
+            let graph_res = self
+                .ensure_select_greedy_graph(t, comm)
+                .and_then(|()| self.replay_select_greedy_graph_async(t));
+            match graph_res {
+                Ok(()) => return self.collect_select_greedy_host(t, anchor),
+                Err(e) if self.tp == 1 && e.code == 2 => {
+                    let slot_idx = if self.batch_mode { self.active_slot } else { 0 };
+                    self.graph_io.select_greedy_graphs[slot_idx] = None;
+                    self.graph_io.oom_disabled = true;
+                }
+                Err(e) => return Err(e),
+            }
         }
         let (ids_dev, scores_dev) = self.forward_device_topk(t, anchor, comm)?;
         if let Some(comm) = comm {
@@ -2203,11 +2494,12 @@ impl DFlash2Rank {
     ) -> Result<Vec<i32>> {
         let (k, n) = (self.cfg.block_size - 1, self.cfg.top_k);
         if self.cfg.selector_rank <= 256 && n <= 32 && k <= 16 {
-            let path_dev = self.scratch.alloc_aligned(k * 4)?;
+            let path_dev = self.scratch.alloc_aligned(2 * k * 4)?;
+            let conf_dev = path_dev + (k * 4) as u64;
             check_rc(
-                // SAFETY: ids, vals, projected, pred, succ, and path_dev are valid device buffers on t.stream.
+                // SAFETY: ids, vals, projected, pred, succ, path_dev, and conf_dev are valid device buffers on t.stream.
                 unsafe {
-                    ffi::warp34_dflash_select_greedy_bf16(
+                    ffi::warp34_dflash_select_greedy_with_conf_bf16(
                         &t.stream.exec(0, 0),
                         ids as *const i32,
                         vals as *const f32,
@@ -2215,6 +2507,7 @@ impl DFlash2Rank {
                         self.pred as *const c_void,
                         self.succ as *const c_void,
                         path_dev as *mut i32,
+                        conf_dev as *mut f32,
                         anchor,
                         k as i32,
                         n as i32,
@@ -2224,22 +2517,36 @@ impl DFlash2Rank {
                 },
                 "DFlash greedy selector",
             )?;
-            let mut path = vec![0i32; k];
+            let mut raw = vec![0u32; 2 * k];
             check_rc(
-                // SAFETY: path has capacity for k i32 elements, path_dev is valid device buffer of k * 4 bytes.
+                // SAFETY: raw has capacity for 2 * k u32 elements, path_dev is valid device buffer of 2 * k * 4 bytes.
                 unsafe {
                     ffi::warp34_memcpy_d2h_async(
-                        path.as_mut_ptr().cast(),
+                        raw.as_mut_ptr().cast(),
                         path_dev as *const c_void,
-                        k * 4,
+                        2 * k * 4,
                         t.stream.handle,
                     )
                 },
-                "DFlash greedy path copy",
+                "DFlash greedy path+conf copy",
             )?;
             t.stream.synchronize()?;
+            let mut path: Vec<i32> = raw[..k].iter().map(|&w| w as i32).collect();
             if path.first().is_some_and(|&id| id < 0) {
                 return Err(loader_err("nonfinite DFlash edges"));
+            }
+            if let Some((max_draft, min_step_conf, min_cum_conf, allow_zero_drafts)) =
+                Self::offloaded_moe_draft_confidence_gate(t)
+            {
+                let confs: Vec<f32> = raw[k..2 * k].iter().map(|&w| f32::from_bits(w)).collect();
+                Self::truncate_path_by_step_confidences(
+                    &mut path,
+                    &confs,
+                    max_draft,
+                    min_step_conf,
+                    min_cum_conf,
+                    allow_zero_drafts,
+                );
             }
             return Ok(path);
         }
@@ -2483,10 +2790,9 @@ mod memory_tests {
                 c.block_size = block;
                 let weights = weight_arena_bytes(&c, &a, tp, 262144).unwrap();
                 let short = weight_arena_bytes(&c, &a, tp, 256).unwrap();
-                assert_eq!(
-                    weights - short,
-                    (262144 - 256) * 128 * 4 + (262144 - 256) / 16 * 4
-                );
+                // `262144` uses `inv_freq` (`d/2 * 4B`) while `256` keeps the compact table (`(256+block)*d*4B`).
+                let rope_delta = (256 + block) * 128 * 4 - (128 / 2) * 4;
+                assert_eq!(weights + rope_delta - short, (262144 - 256) / 16 * 4);
                 assert!(
                     mandatory_bytes(&c, &c.model, tp, 262144, weights).unwrap()
                         > weights + 64 * 1024 * 1024
@@ -2601,6 +2907,58 @@ mod memory_tests {
         for tp in [1, 2, 4] {
             assert!(weight_arena_bytes(&c, &full, tp, 256).is_ok());
         }
+    }
+
+    #[test]
+    fn dflash2_config_load_validates_and_parses_temp_configs() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(DFlash2Config::load(dir.path()).is_err());
+
+        let valid_cfg = serde_json::json!({
+            "architectures": ["DFlashDraftModel"],
+            "hidden_size": 2560,
+            "num_hidden_layers": 5,
+            "num_attention_heads": 32,
+            "num_key_value_heads": 8,
+            "head_dim": 128,
+            "intermediate_size": 9216,
+            "vocab_size": 248320,
+            "use_sliding_window": true,
+            "sliding_window": 512,
+            "dflash_config": {
+                "block_size": 16,
+                "target_layer_ids": [1, 7, 13, 19, 25],
+                "conv_group_size": 8,
+                "conv_kernel_size": 4,
+                "selector_rank": 64,
+                "selector_top_k": 8,
+                "mask_token_id": 248070
+            }
+        });
+        std::fs::write(
+            dir.path().join("config.json"),
+            serde_json::to_vec(&valid_cfg).unwrap(),
+        )
+        .unwrap();
+        let parsed = DFlash2Config::load(dir.path()).unwrap();
+        assert_eq!(parsed.block_size, 16);
+        assert_eq!(parsed.window, 512);
+        assert_eq!(parsed.target_layers, vec![1, 7, 13, 19, 25]);
+
+        // Standalone quantize_config.json must be rejected
+        std::fs::write(dir.path().join("quantize_config.json"), b"{}").unwrap();
+        assert!(DFlash2Config::load(dir.path()).is_err());
+        std::fs::remove_file(dir.path().join("quantize_config.json")).unwrap();
+
+        // Invalid block_size (7) must be rejected
+        let mut bad = valid_cfg;
+        bad["dflash_config"]["block_size"] = serde_json::json!(7);
+        std::fs::write(
+            dir.path().join("config.json"),
+            serde_json::to_vec(&bad).unwrap(),
+        )
+        .unwrap();
+        assert!(DFlash2Config::load(dir.path()).is_err());
     }
 }
 

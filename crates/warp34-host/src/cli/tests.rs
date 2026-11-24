@@ -9,6 +9,111 @@ fn parse(values: &[&str]) -> CudaCliOptions {
 }
 
 #[test]
+fn serve_no_webui_is_accepted() {
+    let result = parse_cuda_options(&args(&["serve", "--no-webui"]));
+    assert!(result.is_ok(), "--no-webui rejected: {:?}", result.err());
+}
+
+#[test]
+fn serve_webui_defaults_scope_and_arity() {
+    let defaults = parse(&["serve"]);
+    assert!(defaults.serve.options.webui);
+    assert_eq!(defaults.host, "127.0.0.1");
+    assert!(!defaults.explicit_host);
+    assert_eq!(
+        resolve_serve_host(&defaults.host, defaults.explicit_host, None),
+        "127.0.0.1"
+    );
+    assert_eq!(
+        resolve_serve_host(&defaults.host, defaults.explicit_host, Some("  ")),
+        "127.0.0.1"
+    );
+    assert_eq!(
+        resolve_serve_host(&defaults.host, defaults.explicit_host, Some(" 0.0.0.0 ")),
+        "0.0.0.0"
+    );
+    let explicit = parse(&["serve", "--host", "127.0.0.1"]);
+    assert!(explicit.explicit_host);
+    assert_eq!(
+        resolve_serve_host(&explicit.host, explicit.explicit_host, Some("0.0.0.0")),
+        "127.0.0.1"
+    );
+    for argv in [
+        vec!["serve", "--no-webui"],
+        vec!["serve", "--no-webui", "--port", "9000"],
+        vec!["serve", "--no-webui", "model"],
+        vec!["serve", "--no-webui", "--no-webui"],
+    ] {
+        let options = parse(&argv);
+        assert!(!options.serve.options.webui);
+        assert!(validate_cuda_options(&options, "serve").is_ok());
+    }
+    assert_eq!(parse(&["serve", "--no-webui", "model"]).model, "model");
+    assert_eq!(parse(&["serve", "--no-webui", "--port", "9000"]).port, 9000);
+    for value in ["--no-webui=true", "--no-webui=false"] {
+        assert!(parse_cuda_options(&args(&["serve", value])).is_err());
+    }
+    // A boolean flag consumes no value; an extra positional after the model is invalid.
+    assert!(parse_cuda_options(&args(&["serve", "model", "--no-webui", "false"])).is_err());
+    for sub in [
+        "chat",
+        "generate",
+        "bench",
+        "greedy-diff",
+        "dump-diff",
+        "profile-diff",
+    ] {
+        let error = validate_cuda_options(&parse(&[sub, "--no-webui"]), sub).unwrap_err();
+        assert!(error.contains("require serve"), "{sub}: {error}");
+    }
+}
+
+#[test]
+fn serve_exposure_help_and_notices() {
+    for text in [
+        "--no-webui",
+        "all API operations",
+        "including aliases",
+        "not only /v1",
+        "/metrics and /api/metrics",
+        "minimal health",
+        "enabled webui remain unauthenticated",
+        "UI only; metrics and API remain available",
+    ] {
+        assert!(USAGE.contains(text), "missing help: {text}");
+    }
+    for address in [
+        "127.0.0.1:8000",
+        "[::1]:8000",
+        "0.0.0.0:8000",
+        "[::]:8000",
+        "192.0.2.1:8000",
+    ] {
+        let addr: std::net::SocketAddr = address.parse().unwrap();
+        for auth in [false, true] {
+            for webui in [false, true] {
+                let notice = crate::server::serve_exposure_notice(addr, auth, webui);
+                assert_eq!(notice.contains("WARNING"), !addr.ip().is_loopback());
+                assert!(notice.contains(&format!("http://{addr}")));
+                assert!(notice.contains(if auth {
+                    "API auth enabled"
+                } else {
+                    "API auth disabled"
+                }));
+                assert!(notice.contains(
+                    "metrics (/metrics and /api/metrics) and minimal health are unauthenticated"
+                ));
+                assert!(notice.contains(if webui {
+                    "webui enabled and unauthenticated"
+                } else {
+                    "webui disabled (API and metrics remain available)"
+                }));
+            }
+        }
+    }
+}
+
+#[test]
 fn serve_defaults_limits_and_alias() {
     let defaults = parse(&["serve"]);
     assert_eq!(defaults.serve.options.max_num_seqs, 16);
@@ -265,6 +370,8 @@ fn invalid_commands_and_options_never_resolve() {
         (&["generate", "--tp", "5"], "--tp must be 1, 2, or 4"),
         (&["greedy-diff"], "--golden"),
         (&["bench", "--batch-size", "0"], "--batch-size"),
+        (&["bench", "--prompt-len", "0"], "--prompt-len must be >= 1"),
+        (&["bench", "--gen-len", "0"], "--gen-len must be >= 1"),
         (&["generate", "--kv-format", "unknown"], "--kv-format"),
         (
             &["generate", "--revision", "--offline"],
@@ -277,12 +384,24 @@ fn invalid_commands_and_options_never_resolve() {
         (
             &[
                 "generate",
+                "--speculative",
+                "mtp",
                 "--draft-revision",
                 "draft-ref",
                 "--draft-model",
                 "org/draft",
             ],
             "--draft-model requires --speculative dflash2",
+        ),
+        (
+            &[
+                "generate",
+                "--speculative",
+                "off",
+                "--draft-model",
+                "org/draft",
+            ],
+            "--draft-model cannot be combined with --speculative off",
         ),
         (
             &["generate", "--speculative", "dflash2"],
@@ -794,6 +913,24 @@ fn token_counts_ctx_size_and_serve_effective_kv_pages() {
         &["serve", "--ctx-size", "16k", "--kv-pages", "1024"][..],
         &["serve", "-c", "4k", "--max-model-len", "8k"][..],
         &["serve", "--kv-pages", "256", "--max-model-len", "8192"][..],
+        &[
+            "serve",
+            "--speculative",
+            "dflash2",
+            "--draft-model",
+            "draft",
+            "-c",
+            "512k",
+        ][..],
+        &[
+            "serve",
+            "--speculative",
+            "dflash2",
+            "--draft-model",
+            "draft",
+            "--max-model-len",
+            "512k",
+        ][..],
         &["chat", "-i", "--image", "test.png"][..],
     ] {
         let res = prepare_cuda_cli(&args(bad_args), |_, _, _| {
@@ -802,8 +939,9 @@ fn token_counts_ctx_size_and_serve_effective_kv_pages() {
         assert!(res.is_err(), "{bad_args:?}");
     }
 
-    // ServeCliConfig::effective_kv_pages auto-expands target KV pages when --max-model-len
-    // exceeds the default serving budget or when --speculative is active.
+    // ServeCliConfig::effective_kv_pages returns None when neither --ctx-size/--kv-pages
+    // nor --max-model-len is set so the serving auto-fit planner sizes KV up to model max,
+    // and returns the required pages when --max-model-len or --kv-pages is explicitly set.
     let mtp = crate::proposer::SpeculativeConfig {
         kind: crate::proposer::SpeculativeKind::Mtp,
         draft_model: None,
@@ -812,7 +950,7 @@ fn token_counts_ctx_size_and_serve_effective_kv_pages() {
     assert_eq!(ServeCliConfig::effective_kv_pages(None, None, None), None);
     assert_eq!(
         ServeCliConfig::effective_kv_pages(None, Some(16_384), None),
-        None
+        Some(1024)
     );
     assert_eq!(
         ServeCliConfig::effective_kv_pages(None, Some(65_536), None),
@@ -820,7 +958,7 @@ fn token_counts_ctx_size_and_serve_effective_kv_pages() {
     );
     assert_eq!(
         ServeCliConfig::effective_kv_pages(None, None, Some(&mtp)),
-        Some(256)
+        None
     );
     assert_eq!(
         ServeCliConfig::effective_kv_pages(None, Some(16_384), Some(&mtp)),
@@ -830,6 +968,13 @@ fn token_counts_ctx_size_and_serve_effective_kv_pages() {
         ServeCliConfig::effective_kv_pages(Some(512), Some(65_536), Some(&mtp)),
         Some(512)
     );
+
+    // --kv-format auto (or omitted --kv-format) leaves explicit_kv_format=false so serve can
+    // step down tq4 -> tq4_all when needed; explicit --kv-format pins explicit_kv_format=true.
+    assert!(!parse(&["serve", "Qwen/Qwen3.5-4B"]).explicit_kv_format);
+    assert!(!parse(&["serve", "Qwen/Qwen3.5-4B", "--kv-format", "auto"]).explicit_kv_format);
+    assert!(parse(&["serve", "Qwen/Qwen3.5-4B", "--kv-format", "tq4"]).explicit_kv_format);
+    assert!(parse(&["serve", "Qwen/Qwen3.5-4B", "--kv-format", "tq4_all"]).explicit_kv_format);
 }
 
 #[cfg(feature = "cuda")]
@@ -849,9 +994,10 @@ fn positional_model_industry_aliases_and_sampling_validation() {
     assert!(extra_err.contains("unknown argument: extra"));
 
     // Subcommand-aware default max_tokens.
-    assert_eq!(parse(&["chat"]).max_tokens, 512);
-    assert_eq!(parse(&["generate"]).max_tokens, 256);
+    assert_eq!(parse(&["chat"]).max_tokens, 2048);
+    assert_eq!(parse(&["generate"]).max_tokens, 512);
     assert_eq!(parse(&["greedy-diff", "--golden", "g.json"]).max_tokens, 64);
+    assert!(super::options::USAGE.contains("2048 chat, 512 generate, 64 greedy-diff"));
 
     // Industry-standard flag aliases (vLLM, SGLang, llama.cpp).
     let serve_opts = parse(&[
@@ -1287,4 +1433,385 @@ fn gpu_qwen_image_cli_commands_and_dump_diff_end_to_end() {
             .unwrap_err()
             .contains("ModelKind::Image")
     );
+}
+
+#[test]
+fn bench_and_profile_diff_cli_validation_and_forwarding() {
+    for bad_bench in [
+        &[
+            "bench",
+            "--prompt-len",
+            "1024",
+            "--gen-len",
+            "128",
+            "--kv-pages",
+            "64",
+        ][..],
+        &[
+            "bench",
+            "--speculative",
+            "dflash2",
+            "--draft-model",
+            "org/draft",
+            "--prompt-len",
+            "200000",
+            "--gen-len",
+            "100000",
+        ][..],
+    ] {
+        assert!(
+            prepare_cuda_cli(&args(bad_bench), |_, _, _| {
+                panic!("invalid bench args must fail before download")
+            })
+            .is_err(),
+            "{bad_bench:?}"
+        );
+    }
+
+    let prof_opts = parse(&[
+        "profile-diff",
+        "--model",
+        "org/target",
+        "--stage",
+        "vision",
+        "--batch-size",
+        "4",
+        "--realistic-prompt",
+        "--image",
+        "rgb://https://warp34.test/sample.ppm",
+        "--allow-remote-images",
+    ]);
+    assert!(prof_opts.realistic_prompt);
+    let prof_args = super::oracle::profile_bench_args(&prof_opts, std::path::Path::new("warp34"));
+    assert!(prof_args.windows(2).any(|w| w == ["--stage", "vision"]));
+    assert!(prof_args.windows(2).any(|w| w == ["--batch-size", "4"]));
+    assert!(prof_args.iter().any(|a| a == "--realistic-prompt"));
+    assert!(
+        prof_args
+            .windows(2)
+            .any(|w| w == ["--image", "rgb://https://warp34.test/sample.ppm"])
+    );
+    assert!(prof_args.iter().any(|a| a == "--allow-remote-images"));
+
+    let summary = super::commands::ServeBootSummary {
+        served_model: "qwen3.8-27b-warp34".to_string(),
+        checkpoint_label: "nchapman/Qwen3.8-27B-W4A16-HGPTQ-g64".to_string(),
+        gpu_name: "NVIDIA GeForce RTX 3090 Ti".to_string(),
+        gpu_sm_tag: "sm_86".to_string(),
+        gpu_sm_count: 84,
+        tp_size: 1,
+        total_vram_bytes: 24 * 1024 * 1024 * 1024,
+        post_load_free_vram_bytes: 467 * 1024 * 1024,
+        kv_policy: KvFormatPolicy::Tq4All,
+        supports_fp8_kv: false,
+        kv_compression_ratio: 3.88,
+        kv_policy_explicit: false,
+        kv_policy_auto_adjusted: true,
+        kv_pages: 16_384,
+        context_limit: 262_144,
+        max_model_context_tokens: 262_144,
+        context_auto_fitted: true,
+        kv_pool_bytes_per_rank: 4_429_185_024,
+        state_slots: 13,
+        state_pool_bytes_per_rank: 1_969_225_728,
+        ckpt_vram_slots: 2,
+        ckpt_host_slots: 97,
+        ckpt_bytes_per_slot: 43_094_016,
+        weight_bytes_per_rank: 15_204_352_000,
+        scratch_bytes_per_rank: 336 * 1024 * 1024,
+        host_embed_offload: true,
+        embed_saved_bytes: 2_542_796_800,
+        speculative_label: "dflash2 (Qwen3.8-27B-DFlash2-W4A16-HGPTQ)".to_string(),
+        max_num_seqs: 1,
+        bind_addr: "0.0.0.0:8000".to_string(),
+        auth_enabled: false,
+        webui_enabled: true,
+        use_cuda_graph: true,
+        default_sampling_params: crate::parser::SamplingParams {
+            temperature: 1.0,
+            top_p: 0.95,
+            top_k: 20,
+            ..Default::default()
+        },
+        sampling_from_generation_config: true,
+        chat_template_source: "chat_template.jinja".to_string(),
+        preserve_thinking: true,
+        default_reasoning_effort: None,
+        reasoning_effort_budget: true,
+        default_reasoning_budget: None,
+        default_reasoning_budget_message: None,
+        vision_banner: Some(
+            "preprocessor_config.json (patch=16, merge=2, pixels=65536..16777216)".to_string(),
+        ),
+        lora_adapters: Vec::new(),
+    };
+    let banner = super::commands::format_serve_boot_banner(&summary);
+    assert!(banner.contains("|__/|__/\\__,_/_/  / .___/____/  /_/"));
+    assert!(banner.contains("qwen3.8-27b-warp34 (nchapman/Qwen3.8-27B-W4A16-HGPTQ-g64)"));
+    assert!(!banner.contains("LoRA         :"));
+    assert!(
+        banner.contains("Sampling     : temp=1, top_p=0.95, top_k=20 [generation_config.json]")
+    );
+    assert!(banner.contains("Template     : chat_template.jinja (preserve_thinking=true)"));
+    assert!(banner.contains("Thinking     : effort-budget=on (ceil=32768), budget=auto, cutoff="));
+    assert!(banner.contains(
+        "Vision       : preprocessor_config.json (patch=16, merge=2, pixels=65536..16777216)"
+    ));
+    assert!(banner.contains("tq4_all (3.88x, 132B/row TQ4 all attention layers) [auto: stepped down from tq4 to fit full context]"));
+    assert!(banner.contains("262144 tokens (16384 pages"));
+    assert!(banner.contains("[auto-fit: 100% of 262144 model max]"));
+    assert!(banner.contains("13 slots"));
+    assert!(banner.contains("99 WHT128-Q8_0 ckpts (2 VRAM + 97 Host, 41.1 MiB/slot)"));
+    assert!(banner.contains("host-mapped"));
+}
+
+#[cfg(feature = "cuda")]
+#[test]
+fn serve_boot_banner_formats_lora_and_tq4_tail_variants() {
+    let mut summary = super::commands::ServeBootSummary {
+        served_model: "qwen3.5-9b".to_string(),
+        checkpoint_label: "qwen3.5-9b".to_string(),
+        gpu_name: "NVIDIA GeForce RTX 3090 Ti".to_string(),
+        gpu_sm_tag: "sm_86".to_string(),
+        gpu_sm_count: 84,
+        tp_size: 1,
+        total_vram_bytes: 24 * 1024 * 1024 * 1024,
+        post_load_free_vram_bytes: 1024 * 1024 * 1024,
+        kv_policy: KvFormatPolicy::Tq4,
+        supports_fp8_kv: false,
+        kv_compression_ratio: 2.53,
+        kv_policy_explicit: false,
+        kv_policy_auto_adjusted: false,
+        kv_pages: 16_384,
+        context_limit: 262_144,
+        max_model_context_tokens: 262_144,
+        context_auto_fitted: true,
+        kv_pool_bytes_per_rank: 1_986_000_000,
+        state_slots: 64,
+        state_pool_bytes_per_rank: 4_500_000_000,
+        ckpt_vram_slots: 16,
+        ckpt_host_slots: 99,
+        ckpt_bytes_per_slot: 20_132_659,
+        weight_bytes_per_rank: 6_000_000_000,
+        scratch_bytes_per_rank: 512 * 1024 * 1024,
+        host_embed_offload: false,
+        embed_saved_bytes: 0,
+        speculative_label: "none".to_string(),
+        max_num_seqs: 64,
+        bind_addr: "127.0.0.1:8000".to_string(),
+        auth_enabled: false,
+        webui_enabled: true,
+        use_cuda_graph: true,
+        default_sampling_params: crate::parser::SamplingParams::default(),
+        sampling_from_generation_config: false,
+        chat_template_source: "tokenizer_config.json".to_string(),
+        preserve_thinking: false,
+        default_reasoning_effort: Some("high".to_string()),
+        reasoning_effort_budget: true,
+        default_reasoning_budget: None,
+        default_reasoning_budget_message: None,
+        vision_banner: None,
+        lora_adapters: vec!["sql-expert".to_string()],
+    };
+    let banner_sm86 = super::commands::format_serve_boot_banner(&summary);
+    assert!(banner_sm86.contains("  LoRA         : sql-expert\n"));
+    assert!(banner_sm86.contains("Thinking     : effort=high [configured], effort-budget=on"));
+    assert!(banner_sm86.contains("tq4 (2.53x, rotated TQ4 + Q8_0 tail) [auto]"));
+
+    summary.supports_fp8_kv = true;
+    summary.kv_compression_ratio = 3.10;
+    summary.lora_adapters.push("code-review".to_string());
+    let banner_sm89 = super::commands::format_serve_boot_banner(&summary);
+    assert!(banner_sm89.contains("  LoRA         : sql-expert, code-review (2 adapters)\n"));
+    assert!(banner_sm89.contains("tq4 (3.10x, rotated TQ4 + FP8 tail) [auto]"));
+
+    summary.kv_policy = KvFormatPolicy::Fp16;
+    summary.kv_policy_auto_adjusted = true;
+    let banner_fp16_fallback = super::commands::format_serve_boot_banner(&summary);
+    assert!(
+        banner_fp16_fallback
+            .contains("fp16 (1.00x, 512B/row) [auto: fp16 fallback for non-256 head_dim]")
+    );
+}
+
+#[cfg(feature = "cuda")]
+#[test]
+fn serve_cli_parses_reasoning_budget_and_effort_flags() {
+    let parse = |extra: &[&str]| -> crate::server::ServeOptions {
+        let mut args: Vec<String> = vec!["serve".into(), "model".into()];
+        args.extend(extra.iter().map(|s| (*s).to_string()));
+        let mut cfg = ServeCliConfig::default();
+        let mut i = 2;
+        while i < args.len() {
+            assert!(cfg.parse(&args, &mut i).unwrap(), "unparsed {}", args[i]);
+            i += 1;
+        }
+        cfg.validate("serve").unwrap();
+        cfg.options
+    };
+
+    let default_opts = parse(&[]);
+    assert!(default_opts.reasoning_effort_budget);
+    assert_eq!(default_opts.reasoning_budget, None);
+    assert_eq!(default_opts.reasoning_budget_message, None);
+
+    let unlimited = parse(&["--reasoning-budget", "-1"]);
+    assert_eq!(unlimited.reasoning_budget, None);
+    assert!(!unlimited.reasoning_effort_budget);
+
+    let empty_msg = parse(&[
+        "--reasoning-budget",
+        "0",
+        "--reasoning-budget-message",
+        "",
+        "--reasoning-effort",
+        "low",
+    ]);
+    assert_eq!(empty_msg.reasoning_budget, Some(0));
+    assert_eq!(empty_msg.reasoning_budget_message.as_deref(), Some(""));
+    assert_eq!(empty_msg.reasoning_effort.as_deref(), Some("low"));
+
+    let dash_msg = parse(&[
+        "--reasoning-budget-message",
+        "- time up -",
+        "--no-reasoning-effort-budget",
+    ]);
+    assert_eq!(
+        dash_msg.reasoning_budget_message.as_deref(),
+        Some("- time up -")
+    );
+    assert!(!dash_msg.reasoning_effort_budget);
+
+    let budget_off = parse(&["--reasoning-budget", "off", "--reasoning-effort", "off"]);
+    assert_eq!(budget_off.reasoning_budget, None);
+    assert!(!budget_off.reasoning_effort_budget);
+    assert_eq!(budget_off.reasoning_effort.as_deref(), Some("none"));
+
+    let budget_auto = parse(&["--reasoning-budget", "auto"]);
+    assert_eq!(budget_auto.reasoning_budget, None);
+    assert!(budget_auto.reasoning_effort_budget);
+
+    let budget_suffix = parse(&["--reasoning-budget", "4k"]);
+    assert_eq!(budget_suffix.reasoning_budget, Some(4096));
+}
+
+#[cfg(feature = "cuda")]
+fn write_minimal_safetensors(path: &std::path::Path, tensor_name: &str) {
+    let header =
+        format!(r#"{{"{tensor_name}":{{"dtype":"F16","shape":[2],"data_offsets":[0,4]}}}}"#);
+    let header_bytes = header.as_bytes();
+    let mut out = Vec::with_capacity(8 + header_bytes.len() + 4);
+    out.extend_from_slice(&(header_bytes.len() as u64).to_le_bytes());
+    out.extend_from_slice(header_bytes);
+    out.extend_from_slice(&[0u8; 4]);
+    std::fs::write(path, out).unwrap();
+}
+
+#[cfg(feature = "cuda")]
+#[test]
+fn speculative_auto_resolves_mtp_dflash2_and_off() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mtp_dir = tmp.path().join("mtp_model");
+    std::fs::create_dir_all(&mtp_dir).unwrap();
+    write_minimal_safetensors(&mtp_dir.join("model.safetensors"), "mtp.norm.weight");
+
+    let plain_dir = tmp.path().join("plain_model");
+    std::fs::create_dir_all(&plain_dir).unwrap();
+    write_minimal_safetensors(&plain_dir.join("model.safetensors"), "model.norm.weight");
+
+    let decision_dir = tmp.path().join("decision_model");
+    std::fs::create_dir_all(&decision_dir).unwrap();
+    write_minimal_safetensors(&decision_dir.join("model.safetensors"), "mtp.norm.weight");
+    std::fs::write(decision_dir.join("decision_config.json"), b"{}").unwrap();
+
+    // 1. Default in serve/chat/generate is auto -> picks MTP when checkpoint has MTP weights.
+    for sub in ["serve", "chat", "generate"] {
+        let args = vec![sub.to_string(), "org/mtp".to_string()];
+        let prepared = prepare_cuda_cli(&args, |_, _, _| Ok(mtp_dir.clone()))
+            .unwrap()
+            .unwrap();
+        assert_eq!(prepared.options.speculative_choice, SpeculativeChoice::Auto);
+        assert_eq!(
+            prepared.spec_config.as_ref().map(|s| (s.kind, s.mtp_k)),
+            Some((crate::proposer::SpeculativeKind::Mtp, 3)),
+            "sub={sub}"
+        );
+    }
+
+    // 2. Default in bench stays off even when checkpoint has MTP weights.
+    let bench_args = vec!["bench".to_string(), "org/mtp".to_string()];
+    let bench = prepare_cuda_cli(&bench_args, |_, _, _| Ok(mtp_dir.clone()))
+        .unwrap()
+        .unwrap();
+    assert_eq!(bench.options.speculative_choice, SpeculativeChoice::Off);
+    assert!(bench.spec_config.is_none());
+
+    // 3. Auto stays off for plain checkpoints and Decision-only checkpoints.
+    let plain = prepare_cuda_cli(
+        &["serve".to_string(), "org/plain".to_string()],
+        |_, _, _| Ok(plain_dir.clone()),
+    )
+    .unwrap()
+    .unwrap();
+    assert!(plain.spec_config.is_none());
+
+    let decision = prepare_cuda_cli(
+        &["serve".to_string(), "org/glide".to_string()],
+        |_, _, _| Ok(decision_dir.clone()),
+    )
+    .unwrap()
+    .unwrap();
+    assert!(decision.spec_config.is_none());
+
+    // 4. --speculative off disables MTP even when weights are present.
+    let disabled = prepare_cuda_cli(
+        &[
+            "serve".to_string(),
+            "org/mtp".to_string(),
+            "--speculative".to_string(),
+            "off".to_string(),
+        ],
+        |_, _, _| Ok(mtp_dir.clone()),
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(disabled.options.speculative_choice, SpeculativeChoice::Off);
+    assert!(disabled.spec_config.is_none());
+
+    // 5. Passing --draft-model with default auto promotes to DFlash2 without requiring --speculative dflash2.
+    let dflash = prepare_cuda_cli(
+        &[
+            "serve".to_string(),
+            "org/mtp".to_string(),
+            "--draft-model".to_string(),
+            "org/draft".to_string(),
+            "-c".to_string(),
+            "auto".to_string(),
+        ],
+        |model, _, _| Ok(tmp.path().join(model.replace('/', "_"))),
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(dflash.options.speculative_choice, SpeculativeChoice::Auto);
+    assert_eq!(
+        dflash.spec_config.as_ref().map(|s| s.kind),
+        Some(crate::proposer::SpeculativeKind::DFlash2)
+    );
+    assert_eq!(dflash.options.ctx_tokens, None);
+
+    // 6. --draft-model with --speculative off is rejected.
+    let err = prepare_cuda_cli(
+        &[
+            "serve".to_string(),
+            "org/mtp".to_string(),
+            "--speculative".to_string(),
+            "off".to_string(),
+            "--draft-model".to_string(),
+            "org/draft".to_string(),
+        ],
+        |_, _, _| panic!("must fail before resolution"),
+    )
+    .err()
+    .unwrap();
+    assert!(err.contains("--draft-model cannot be combined with --speculative off"));
 }

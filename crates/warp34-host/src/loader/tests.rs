@@ -53,6 +53,46 @@ fn test_model_config_from_json_parsing() {
     assert_eq!(cfg.vocab_size, 152064);
     assert_eq!(cfg.rms_norm_eps, 1e-6);
     assert_eq!(cfg.layer_types.len(), 4);
+    assert_eq!(cfg.max_position_embeddings, None);
+
+    let with_max_pos = serde_json::json!({
+        "model_type": "qwen3_5",
+        "hidden_size": 2560,
+        "num_hidden_layers": 32,
+        "num_attention_heads": 20,
+        "num_key_value_heads": 4,
+        "head_dim": 128,
+        "vocab_size": 152064,
+        "max_position_embeddings": 262144,
+        "layer_types": ["linear_attention", "full_attention"]
+    });
+    assert_eq!(
+        ModelConfig::from_json(&with_max_pos)
+            .unwrap()
+            .max_position_embeddings,
+        Some(262_144)
+    );
+
+    let nested_vl = serde_json::json!({
+        "model_type": "qwen3_5_vl",
+        "text_config": {
+            "model_type": "qwen3_5_text",
+            "hidden_size": 2560,
+            "num_hidden_layers": 32,
+            "num_attention_heads": 20,
+            "num_key_value_heads": 4,
+            "head_dim": 128,
+            "vocab_size": 152064,
+            "max_position_embeddings": 131072,
+            "layer_types": ["linear_attention", "full_attention"]
+        }
+    });
+    assert_eq!(
+        ModelConfig::from_json(&nested_vl)
+            .unwrap()
+            .max_position_embeddings,
+        Some(131_072)
+    );
 }
 
 #[test]
@@ -248,6 +288,7 @@ fn test_parse_quant_supported_schemes() {
                     num_bits: 4,
                     group_size: gs,
                     symmetric: sym,
+                    code_offset_half: false,
                     ignore: vec!["lm_head".into()],
                     rules: None,
                 }
@@ -446,8 +487,7 @@ fn test_parse_quant_rejects_unsupported_schemes_with_clear_diagnostics() {
         let err = cfg_with_quant(qcfg.clone()).expect_err(label);
         assert!(
             err.to_string().contains(needle),
-            "case '{label}' error '{}' did not contain '{needle}'",
-            err
+            "case '{label}' error '{err}' did not contain '{needle}'"
         );
     }
 }
@@ -597,6 +637,104 @@ fn test_awq_and_u8b128_unpack_and_dequant_roundtrip() {
             let q = (((k * 13 + n * 17) & 0xFF) as i32) - 128;
             let s = f16_to_f32(scales_n_kg[n * num_groups + g]);
             assert_eq!(deq_u8[n * size_k + k], f32_to_f16((q as f32) * s));
+        }
+    }
+}
+
+#[test]
+fn test_quantize_f16_n_major_to_u8b128_edge_cases_and_parallel_roundtrip() {
+    // 1. All-zero group, signed extrema, and ties-to-even rounding boundaries.
+    let size_n = 3usize;
+    let size_k = 8usize;
+    let group_size = 4usize;
+    let sc_exact = 0.25f32; // exact in FP16 (`max_abs = 31.75`, `31.75 / 127 = 0.25`)
+    let max_val = 127.0f32 * sc_exact;
+    let src_f32: [f32; 24] = [
+        // Row 0: group 0 = all zeros; group 1 = signed extrema + zero
+        0.0,
+        -0.0,
+        0.0,
+        0.0,
+        max_val,
+        -max_val,
+        0.0,
+        -max_val,
+        // Row 1: group 0 = positive ties-to-even boundaries (`0.5 -> 0`, `1.5 -> 2`, `2.5 -> 2`)
+        max_val,
+        0.5 * sc_exact,
+        1.5 * sc_exact,
+        2.5 * sc_exact,
+        // Row 1: group 1 = negative ties-to-even boundaries (`-0.5 -> 0`, `-1.5 -> -2`, `-2.5 -> -2`)
+        -max_val,
+        -0.5 * sc_exact,
+        -1.5 * sc_exact,
+        -2.5 * sc_exact,
+        // Row 2: subnormal / tiny group + mixed interior values
+        1e-4,
+        -0.5e-4,
+        0.25e-4,
+        0.0,
+        -1.75,
+        0.875,
+        -0.125,
+        1.25,
+    ];
+    let src_f16: Vec<u16> = src_f32.iter().map(|&v| f32_to_f16(v)).collect();
+    let (packed, scales) = quantize_f16_n_major_to_u8b128(&src_f16, size_n, size_k, group_size);
+
+    // Row 0 group 0: all-zero group emits scale 0 and neutral +128 bytes (`0x8080_8080`).
+    assert_eq!(f16_to_f32(scales[0]), 0.0);
+    assert_eq!(packed[0], 0x8080_8080);
+    // Row 0 group 1: `+max_val -> 255`, `-max_val -> 1`, `0.0 -> 128`.
+    assert_eq!(f16_to_f32(scales[1]), sc_exact);
+    assert_eq!(packed[1].to_le_bytes(), [255, 1, 128, 1]);
+    // Row 1 ties-to-even: `[+127, 0, +2, +2] + 128` and `[-127, 0, -2, -2] + 128`.
+    assert_eq!(packed[2].to_le_bytes(), [255, 128, 130, 130]);
+    assert_eq!(packed[3].to_le_bytes(), [1, 128, 126, 126]);
+
+    let deq = dequant_u8b128_n_major_to_f16(&packed, &scales, size_n, size_k, group_size);
+    for &bits in deq.iter().take(4) {
+        assert_eq!(f16_to_f32(bits), 0.0);
+    }
+    assert_eq!(f16_to_f32(deq[4]), max_val);
+    assert_eq!(f16_to_f32(deq[5]), -max_val);
+
+    // 2. Grouped (`32`, `128`) and channelwise (`0`) roundtrip accuracy + parallel equivalence
+    // (`size_n = 2048, size_k = 512 -> 1,048,576` elements crosses the multithreaded threshold).
+    let big_n = 2048usize;
+    let big_k = 512usize;
+    let big_f16: Vec<u16> = (0..big_n * big_k)
+        .map(|i| {
+            if (i / big_k) == 17 {
+                0u16 // exercise an all-zero row inside the parallel path
+            } else {
+                let s = (((i * 37 + (i / big_k) * 13) % 509) as f32 - 254.0) / 128.0;
+                f32_to_f16(s)
+            }
+        })
+        .collect();
+    for gs in [32usize, 128, 0] {
+        let (par_packed, par_scales) = quantize_f16_n_major_to_u8b128(&big_f16, big_n, big_k, gs);
+        // Compare selected slices against the single-threaded (<16 rows) path for bit-exact parity.
+        for row_off in [0usize, 16, 1020, 2040] {
+            let sub = &big_f16[row_off * big_k..(row_off + 8) * big_k];
+            let (seq_p, seq_s) = quantize_f16_n_major_to_u8b128(sub, 8, big_k, gs);
+            let wp = big_k / 4;
+            let gp = big_k.checked_div(gs).unwrap_or(1);
+            assert_eq!(&par_packed[row_off * wp..(row_off + 8) * wp], &seq_p[..]);
+            assert_eq!(&par_scales[row_off * gp..(row_off + 8) * gp], &seq_s[..]);
+        }
+        let eff_gs = if gs == 0 { big_k } else { gs };
+        let deq_big = dequant_u8b128_n_major_to_f16(&par_packed, &par_scales, big_n, big_k, eff_gs);
+        for (idx, (&orig_bits, &got_bits)) in big_f16.iter().zip(deq_big.iter()).enumerate() {
+            let orig = f16_to_f32(orig_bits);
+            let got = f16_to_f32(got_bits);
+            let g_idx = (idx / big_k) * (big_k / eff_gs) + (idx % big_k) / eff_gs;
+            let sc = f16_to_f32(par_scales[g_idx]);
+            assert!(
+                (orig - got).abs() <= 0.52 * sc + 2e-3,
+                "gs={gs} idx={idx}: orig={orig}, got={got}, scale={sc}"
+            );
         }
     }
 }
@@ -1084,4 +1222,231 @@ fn test_resolve_name_language_model_prefix_and_decision_config_midloop_validatio
     assert!(ModelConfig::from_dir(&tmp).is_err());
 
     let _ = std::fs::remove_dir_all(&tmp);
+}
+
+#[test]
+fn test_indexed_parallel_open_ple_detection_and_subslice_reads() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+
+    // Shard A: BF16 [4, 2] + I32 [4, 2]
+    let bf16_vals: [f32; 8] = [0.5, -1.0, 2.25, 4.0, -0.125, 8.5, 16.0, -3.5];
+    let mut shard_a_data = Vec::new();
+    for &v in &bf16_vals {
+        shard_a_data.extend_from_slice(&f32_to_bf16(v).to_le_bytes());
+    }
+    let u32_vals: [u32; 8] = [10, 20, 30, 40, 50, 60, 70, 80];
+    for &w in &u32_vals {
+        shard_a_data.extend_from_slice(&w.to_le_bytes());
+    }
+    let hdr_a = serde_json::json!({
+        "model.layers.0.bf16": {"dtype": "BF16", "shape": [4, 2], "data_offsets": [0, 16]},
+        "model.layers.0.packed": {"dtype": "I32", "shape": [4, 2], "data_offsets": [16, 48]},
+    })
+    .to_string();
+    let mut bytes_a = (hdr_a.len() as u64).to_le_bytes().to_vec();
+    bytes_a.extend_from_slice(hdr_a.as_bytes());
+    bytes_a.extend_from_slice(&shard_a_data);
+    std::fs::write(dir.join("model-00001-of-00002.safetensors"), &bytes_a).unwrap();
+
+    // Shard B: F32 [2, 2] + PLE ngram shard marker
+    let f32_vals: [f32; 4] = [1.5, -2.5, 3.5, -4.5];
+    let mut shard_b_data = Vec::new();
+    for &v in &f32_vals {
+        shard_b_data.extend_from_slice(&v.to_le_bytes());
+    }
+    shard_b_data.extend_from_slice(&[0u8; 8]);
+    let hdr_b = serde_json::json!({
+        "model.layers.1.f32": {"dtype": "F32", "shape": [2, 2], "data_offsets": [0, 16]},
+        "model.layers.1.ple.ple_embedding.ngram_embedding.shard_0.weight": {"dtype": "U8", "shape": [8], "data_offsets": [16, 24]},
+    })
+    .to_string();
+    let mut bytes_b = (hdr_b.len() as u64).to_le_bytes().to_vec();
+    bytes_b.extend_from_slice(hdr_b.as_bytes());
+    bytes_b.extend_from_slice(&shard_b_data);
+    std::fs::write(dir.join("model-00002-of-00002.safetensors"), &bytes_b).unwrap();
+
+    std::fs::write(
+        dir.join("model.safetensors.index.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "weight_map": {
+                "model.layers.0.bf16": "model-00001-of-00002.safetensors",
+                "model.layers.0.packed": "model-00001-of-00002.safetensors",
+                "model.layers.1.f32": "model-00002-of-00002.safetensors",
+                "model.layers.1.ple.ple_embedding.ngram_embedding.shard_0.weight": "model-00002-of-00002.safetensors"
+            }
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let archive = SafetensorsArchive::open(dir).unwrap();
+    assert!(
+        !archive
+            .ple_shards
+            .contains("model-00001-of-00002.safetensors")
+    );
+    assert!(
+        archive
+            .ple_shards
+            .contains("model-00002-of-00002.safetensors")
+    );
+    archive.drop_page_cache();
+
+    let full_bf16 = archive.read_f16_bits("model.layers.0.bf16").unwrap();
+    let mid_bf16 = archive
+        .read_f16_bits_subslice("model.layers.0.bf16", 2, 4)
+        .unwrap();
+    assert_eq!(&full_bf16[2..6], mid_bf16.as_slice());
+    assert!(
+        archive
+            .read_f16_bits_subslice("model.layers.0.bf16", 6, 3)
+            .is_err()
+    );
+
+    let mid_u32 = archive
+        .read_u32_subslice("model.layers.0.packed", 4, 4)
+        .unwrap();
+    assert_eq!(mid_u32, vec![50, 60, 70, 80]);
+    assert!(
+        archive
+            .read_u32_subslice("model.layers.0.packed", 7, 2)
+            .is_err()
+    );
+
+    let row1_f32 = archive
+        .read_f16_bits_subslice("model.layers.1.f32", 2, 2)
+        .unwrap();
+    assert_eq!(row1_f32, vec![f32_to_f16(3.5), f32_to_f16(-4.5)]);
+}
+
+#[test]
+fn compressed_tensors_hgptq_code_offset_half_and_h128_h512_rules() {
+    let q = cfg_with_quant(serde_json::json!({
+        "quant_method": "compressed-tensors",
+        "format": "pack-quantized",
+        "config_groups": {
+            "w4_g64_sym": {
+                "targets": [
+                    "re:.*mlp\\.gate_proj$",
+                    "re:.*visual\\.blocks\\.\\d+\\.mlp\\.linear_fc1$"
+                ],
+                "weights": {
+                    "num_bits": 4,
+                    "type": "int",
+                    "symmetric": true,
+                    "strategy": "group",
+                    "group_size": 64,
+                    "dynamic": false
+                }
+            },
+            "w2_g128_sym": {
+                "targets": ["re:.*mlp\\.down_proj$"],
+                "weights": {
+                    "num_bits": 2,
+                    "type": "int",
+                    "symmetric": true,
+                    "strategy": "group",
+                    "group_size": 128,
+                    "dynamic": false,
+                    "observer_kwargs": { "code_offset": 0.5 }
+                }
+            }
+        },
+        "transform_config": {
+            "config_groups": {
+                "v": {
+                    "type": "hadamard",
+                    "head_dim": 512,
+                    "randomize": false,
+                    "apply": [
+                        { "location": "input", "inverse": false, "targets": ["re:.*mlp\\.(gate|down)_proj$"] },
+                        { "location": "weight_input", "inverse": true, "targets": ["re:.*mlp\\.(gate|down)_proj$"] }
+                    ]
+                },
+                "v_vision": {
+                    "type": "hadamard",
+                    "head_dim": 128,
+                    "randomize": false,
+                    "apply": [
+                        { "location": "input", "inverse": false, "targets": ["re:.*visual\\.blocks\\.\\d+\\.mlp\\.linear_fc1$"] },
+                        { "location": "weight_input", "inverse": true, "targets": ["re:.*visual\\.blocks\\.\\d+\\.mlp\\.linear_fc1$"] }
+                    ]
+                }
+            }
+        },
+        "ignore": ["lm_head"]
+    }))
+    .unwrap();
+
+    let gate = q
+        .for_linear("model.language_model.layers.0.mlp.gate_proj")
+        .unwrap();
+    assert_eq!(gate.bits(), 4);
+    assert_eq!(gate.raw_group_size(), 64);
+    assert!(!gate.u2_code_offset_half());
+    assert_eq!(
+        q.input_hadamard("model.language_model.layers.0.mlp.gate_proj")
+            .unwrap(),
+        Some(512)
+    );
+
+    let down = q
+        .for_linear("model.language_model.layers.0.mlp.down_proj")
+        .unwrap();
+    assert_eq!(down.bits(), 2);
+    assert_eq!(down.raw_group_size(), 128);
+    assert!(down.u2_code_offset_half());
+    assert_eq!(
+        q.input_hadamard("model.language_model.layers.0.mlp.down_proj")
+            .unwrap(),
+        Some(512)
+    );
+    assert_eq!(
+        q.input_hadamard("model.visual.blocks.0.mlp.linear_fc1")
+            .unwrap(),
+        Some(128)
+    );
+
+    // Reject code_offset=0.5 on 4-bit weights.
+    let bad_w4 = cfg_with_quant(serde_json::json!({
+        "quant_method": "compressed-tensors",
+        "format": "pack-quantized",
+        "config_groups": {
+            "g0": {
+                "targets": ["Linear"],
+                "weights": {
+                    "num_bits": 4,
+                    "type": "int",
+                    "symmetric": true,
+                    "strategy": "group",
+                    "group_size": 128,
+                    "dynamic": false,
+                    "observer_kwargs": { "code_offset": 0.5 }
+                }
+            }
+        }
+    }));
+    assert!(bad_w4.is_err());
+
+    // Reject unknown code_offset values.
+    let bad_val = cfg_with_quant(serde_json::json!({
+        "quant_method": "compressed-tensors",
+        "format": "pack-quantized",
+        "config_groups": {
+            "g0": {
+                "targets": ["Linear"],
+                "weights": {
+                    "num_bits": 2,
+                    "type": "int",
+                    "symmetric": true,
+                    "strategy": "group",
+                    "group_size": 128,
+                    "dynamic": false,
+                    "observer_kwargs": { "code_offset": 0.25 }
+                }
+            }
+        }
+    }));
+    assert!(bad_val.is_err());
 }

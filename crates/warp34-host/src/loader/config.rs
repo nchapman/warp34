@@ -3,8 +3,9 @@ use super::*;
 #[path = "config_rules.rs"]
 mod config_rules;
 pub use config_rules::{
-    CompressedTensorRules, HADAMARD_BLOCK_16, HADAMARD_BLOCK_64, SUPPORTED_HADAMARD_BLOCKS,
-    SUPPORTED_MARLIN_U4_GROUP_SIZES, is_valid_hadamard_block_for_dim,
+    CompressedTensorRules, HADAMARD_BLOCK_16, HADAMARD_BLOCK_64, HADAMARD_BLOCK_128,
+    HADAMARD_BLOCK_512, SUPPORTED_HADAMARD_BLOCKS, SUPPORTED_MARLIN_U4_GROUP_SIZES,
+    is_valid_hadamard_block_for_dim,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -15,6 +16,9 @@ pub enum QuantScheme {
         /// `0` denotes per-channel quantization (`group_size == size_k`, `group_blocks == -1`).
         group_size: usize,
         symmetric: bool,
+        /// Half-integer 2-bit symmetric offset (`observer_kwargs.code_offset == 0.5`):
+        /// decodes `q in {0, 1, 2, 3}` as `(q - 1.5) * scale` instead of `(q - 2) * scale`.
+        code_offset_half: bool,
         ignore: Vec<String>,
         rules: Option<std::sync::Arc<CompressedTensorRules>>,
     },
@@ -68,6 +72,21 @@ impl QuantScheme {
     pub fn group_size_or(&self, fallback: usize) -> usize {
         let g = self.raw_group_size();
         if g == 0 { fallback } else { g }
+    }
+
+    /// Returns `true` when this scheme uses symmetric half-integer 2-bit codes
+    /// (`observer_kwargs.code_offset == 0.5`: `q in {0, 1, 2, 3} -> {-1.5, -0.5, +0.5, +1.5}`).
+    #[inline]
+    pub fn u2_code_offset_half(&self) -> bool {
+        matches!(
+            self,
+            Self::CompressedTensors {
+                num_bits: 2,
+                symmetric: true,
+                code_offset_half: true,
+                ..
+            }
+        )
     }
 
     pub fn is_awq_packing(&self) -> bool {
@@ -274,6 +293,7 @@ pub struct ModelConfig {
     pub num_key_value_heads: usize,
     pub head_dim: usize,
     pub vocab_size: usize,
+    pub max_position_embeddings: Option<usize>,
     pub rms_norm_eps: f32,
     pub rope_theta: f32,
     pub rotary_dim: usize,
@@ -325,6 +345,7 @@ pub struct ModelConfig {
     pub indexer_budget: usize,
     pub indexer_compress_ratio: usize,
     pub output_gate_type: String,
+    pub vision_preprocessor: crate::vision::VisionPreprocessorConfig,
 }
 
 impl ModelConfig {
@@ -336,6 +357,45 @@ impl ModelConfig {
         // This is the target-model loader. Drafter callers explicitly opt into
         // windowed attention through from_drafter_json, never artifact metadata.
         let mut cfg = Self::from_json(&root)?;
+        let gen_path = dir.join("generation_config.json");
+        if gen_path.is_file() {
+            let gen_text = fs::read_to_string(&gen_path).map_err(|e| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("read {}: {e}", gen_path.display()),
+                )
+            })?;
+            let gen_json: Json = serde_json::from_str(&gen_text).map_err(|e| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("bad {}: {e}", gen_path.display()),
+                )
+            })?;
+            if let Some(eos) = gen_json.get("eos_token_id") {
+                let mut push_eos = |id: i64| {
+                    if let Ok(tid) = i32::try_from(id)
+                        && tid >= 0
+                        && (tid as usize) < cfg.vocab_size
+                        && !cfg.eos_token_ids.contains(&tid)
+                    {
+                        cfg.eos_token_ids.push(tid);
+                    }
+                };
+                if let Some(id) = eos.as_i64() {
+                    push_eos(id);
+                } else if let Some(arr) = eos.as_array() {
+                    for x in arr {
+                        if let Some(id) = x.as_i64() {
+                            push_eos(id);
+                        }
+                    }
+                }
+            }
+        }
+        cfg.vision_preprocessor = crate::vision::VisionPreprocessorConfig::from_model_dir(
+            dir,
+            cfg.vision_config.as_ref(),
+        );
         let tc = root.get("text_config").unwrap_or(&root);
         if root.get("quantization_config").is_none_or(Json::is_null)
             && tc.get("quantization_config").is_none_or(Json::is_null)
@@ -762,6 +822,13 @@ impl ModelConfig {
             .unwrap_or(default_partial_rotary);
         let rotary_dim = ((head_dim as f64) * partial_rotary_factor).round() as usize;
 
+        let max_position_embeddings = tc
+            .get("max_position_embeddings")
+            .or_else(|| root.get("max_position_embeddings"))
+            .and_then(|v| v.as_u64())
+            .filter(|&n| n > 0)
+            .map(|n| n as usize);
+
         let tie_word_embeddings = tc
             .get("tie_word_embeddings")
             .or_else(|| root.get("tie_word_embeddings"))
@@ -972,10 +1039,10 @@ impl ModelConfig {
             .get("indexer_n_heads")
             .and_then(|v| v.as_u64())
             .unwrap_or(0) as usize;
-        let indexer_kv_heads =
-            tc.get("indexer_kv_heads")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(if indexer_n_heads > 0 { 1 } else { 0 }) as usize;
+        let indexer_kv_heads = tc
+            .get("indexer_kv_heads")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(u64::from(indexer_n_heads > 0)) as usize;
         let indexer_head_dim =
             tc.get("indexer_head_dim")
                 .and_then(|v| v.as_u64())
@@ -1112,6 +1179,7 @@ impl ModelConfig {
             num_key_value_heads,
             head_dim,
             vocab_size,
+            max_position_embeddings,
             rms_norm_eps,
             rope_theta,
             rotary_dim,
@@ -1160,6 +1228,7 @@ impl ModelConfig {
             indexer_budget,
             indexer_compress_ratio,
             output_gate_type,
+            vision_preprocessor: crate::vision::VisionPreprocessorConfig::default(),
         })
     }
 
@@ -1330,38 +1399,39 @@ impl ModelConfig {
         }
 
         let rules = CompressedTensorRules::parse(q)?;
-        let mut chosen_linear: Option<(usize, usize, bool)> = None;
-        let mut fallback_group: Option<(usize, usize, bool)> = None;
+        let mut chosen_linear: Option<(usize, usize, bool, bool)> = None;
+        let mut fallback_group: Option<(usize, usize, bool, bool)> = None;
         let mut group_keys: Vec<&String> = groups_obj.keys().collect();
         group_keys.sort();
         for gk in group_keys {
             let grp = &groups_obj[gk];
-            let (num_bits, group_size, symmetric, is_embedding_only) =
+            let (num_bits, group_size, symmetric, code_offset_half, is_embedding_only) =
                 Self::parse_compressed_tensors_group(gk, grp)?;
             if !is_embedding_only {
-                if let Some((prev_b, prev_g, prev_s)) = chosen_linear {
+                if let Some((prev_b, prev_g, prev_s, prev_co)) = chosen_linear {
                     if rules.is_none()
-                        && (prev_b, prev_g, prev_s) != (num_bits, group_size, symmetric)
+                        && (prev_b, prev_g, prev_s, prev_co)
+                            != (num_bits, group_size, symmetric, code_offset_half)
                     {
                         return Err(io::Error::new(
                             io::ErrorKind::InvalidData,
                             format!(
-                                "conflicting compressed-tensors quantization in '{}': ({num_bits}-bit, group_size={group_size}, symmetric={symmetric}) vs previous ({prev_b}-bit, group_size={prev_g}, symmetric={prev_s})",
+                                "conflicting compressed-tensors quantization in '{}': ({num_bits}-bit, group_size={group_size}, symmetric={symmetric}, code_offset_half={code_offset_half}) vs previous ({prev_b}-bit, group_size={prev_g}, symmetric={prev_s}, code_offset_half={prev_co})",
                                 sanitize_diag(gk)
                             ),
                         ));
                     }
                     if prev_b != 4 && num_bits == 4 {
-                        chosen_linear = Some((num_bits, group_size, symmetric));
+                        chosen_linear = Some((num_bits, group_size, symmetric, code_offset_half));
                     }
                 } else {
-                    chosen_linear = Some((num_bits, group_size, symmetric));
+                    chosen_linear = Some((num_bits, group_size, symmetric, code_offset_half));
                 }
             } else if fallback_group.is_none() {
-                fallback_group = Some((num_bits, group_size, symmetric));
+                fallback_group = Some((num_bits, group_size, symmetric, code_offset_half));
             }
         }
-        let (num_bits, group_size, symmetric) =
+        let (num_bits, group_size, symmetric, code_offset_half) =
             chosen_linear.or(fallback_group).ok_or_else(|| {
                 io::Error::new(
                     io::ErrorKind::InvalidData,
@@ -1381,6 +1451,7 @@ impl ModelConfig {
             num_bits,
             group_size,
             symmetric,
+            code_offset_half,
             ignore,
             rules: rules.map(std::sync::Arc::new),
         })
@@ -1389,7 +1460,7 @@ impl ModelConfig {
     fn parse_compressed_tensors_group(
         gk: &str,
         grp: &Json,
-    ) -> io::Result<(usize, usize, bool, bool)> {
+    ) -> io::Result<(usize, usize, bool, bool, bool)> {
         let is_embedding_only = grp
             .get("targets")
             .and_then(|v| v.as_array())
@@ -1501,7 +1572,54 @@ impl ModelConfig {
         if !(matches!(num_bits, 2 | 4) && group_size == 0 && strategy == "channel" && symmetric) {
             Self::validate_bits_and_group_size("compressed-tensors", num_bits, group_size, true)?;
         }
-        Ok((num_bits, group_size, symmetric, is_embedding_only))
+        let code_offset_half = match weights
+            .get("observer_kwargs")
+            .and_then(|v| v.as_object())
+            .and_then(|o| o.get("code_offset"))
+            .filter(|v| !v.is_null())
+        {
+            None => false,
+            Some(v) => {
+                let val = v.as_f64().ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "invalid compressed-tensors weights.observer_kwargs.code_offset in '{}'",
+                            sanitize_diag(gk)
+                        ),
+                    )
+                })?;
+                if val == 0.0 {
+                    false
+                } else if val == 0.5 {
+                    if num_bits != 2 || !symmetric {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!(
+                                "unsupported code_offset=0.5 on {num_bits}-bit (symmetric={symmetric}) group '{}' (only symmetric 2-bit supports code_offset=0.5)",
+                                sanitize_diag(gk)
+                            ),
+                        ));
+                    }
+                    true
+                } else {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "unsupported compressed-tensors weights.observer_kwargs.code_offset={val} in '{}' (expected 0.0 or 0.5)",
+                            sanitize_diag(gk)
+                        ),
+                    ));
+                }
+            }
+        };
+        Ok((
+            num_bits,
+            group_size,
+            symmetric,
+            code_offset_half,
+            is_embedding_only,
+        ))
     }
 
     fn parse_quant_gptq(q: &Json) -> io::Result<QuantScheme> {
@@ -1531,8 +1649,7 @@ impl ModelConfig {
                     let r_bits = ro
                         .get("bits")
                         .and_then(|v| v.as_u64())
-                        .map(|x| x as usize)
-                        .unwrap_or(bits);
+                        .map_or(bits, |x| x as usize);
                     let r_gs = if ro.contains_key("group_size") {
                         Self::parse_group_size_i64(ro.get("group_size"), 128)?
                     } else {
@@ -1699,8 +1816,7 @@ impl ModelConfig {
             let layer_bits = v
                 .get("bits")
                 .and_then(|x| x.as_u64())
-                .map(|x| x as usize)
-                .unwrap_or(bits);
+                .map_or(bits, |x| x as usize);
             if layer_bits >= 16 {
                 continue;
             }
@@ -1859,12 +1975,14 @@ impl ModelConfig {
             ignore,
             ..
         } = &self.quant
-            && let Some((bits, group_size, symmetric)) = rules.resolve_moe_layer_expert(layer_id)
+            && let Some((bits, group_size, symmetric, code_offset_half)) =
+                rules.resolve_moe_layer_expert(layer_id)
         {
             return QuantScheme::CompressedTensors {
                 num_bits: bits,
                 group_size,
                 symmetric,
+                code_offset_half,
                 ignore: ignore.clone(),
                 rules: Some(rules.clone()),
             };
@@ -1875,19 +1993,19 @@ impl ModelConfig {
     fn layer_routed_expert_bits_and_group_size(
         &self,
         layer_id: usize,
-    ) -> Option<(usize, usize, bool)> {
+    ) -> Option<(usize, usize, bool, bool)> {
         if let QuantScheme::CompressedTensors {
             rules: Some(rules), ..
         } = &self.quant
         {
-            if let Some((bits, gs, sym)) = rules.resolve_moe_layer_expert(layer_id) {
-                return Some((bits, gs, sym));
+            if let Some(info) = rules.resolve_moe_layer_expert(layer_id) {
+                return Some(info);
             }
             let first_moe_layer = (0..self.num_hidden_layers)
                 .find(|l| !self.mlp_only_layers.contains(l))
                 .unwrap_or(0);
-            if let Some((bits, gs, sym)) = rules.resolve_moe_layer_expert(first_moe_layer) {
-                return Some((bits, gs, sym));
+            if let Some(info) = rules.resolve_moe_layer_expert(first_moe_layer) {
+                return Some(info);
             }
         }
         match &self.quant {
@@ -1895,25 +2013,26 @@ impl ModelConfig {
                 num_bits,
                 group_size,
                 symmetric,
+                code_offset_half,
                 ..
-            } => Some((*num_bits, *group_size, *symmetric)),
+            } => Some((*num_bits, *group_size, *symmetric, *code_offset_half)),
             QuantScheme::Gptq {
                 bits,
                 group_size,
                 sym,
                 ..
-            } => Some((*bits, *group_size, *sym)),
+            } => Some((*bits, *group_size, *sym, false)),
             QuantScheme::AutoRound {
                 bits,
                 group_size,
                 sym,
                 awq_packing: false,
-            } => Some((*bits, *group_size, *sym)),
+            } => Some((*bits, *group_size, *sym, false)),
             _ => None,
         }
     }
 
-    /// Returns the per-layer `ExpertPackLayout` (`bits = 2` for `w2_g64` or `4` for `w4_g64`)
+    /// Returns the per-layer `ExpertPackLayout` (`bits = 2` or `4`)
     /// for decoder layer `layer_id`.
     pub fn layer_moe_expert_pack_layout(
         &self,
@@ -1922,13 +2041,14 @@ impl ModelConfig {
         if self.num_experts == 0 {
             return None;
         }
-        let (raw_bits, raw_gs, _sym) = self
+        let (raw_bits, raw_gs, _sym, code_offset_half) = self
             .layer_routed_expert_bits_and_group_size(layer_id)
             .unwrap_or_else(|| {
                 (
                     self.quant.bits(),
                     self.quant.group_size_or(32),
                     !self.quant.expects_zero_points(),
+                    self.quant.u2_code_offset_half(),
                 )
             });
         let group_size = if raw_gs > 0 { raw_gs } else { 32 };
@@ -1940,6 +2060,7 @@ impl ModelConfig {
             bits,
         )
         .ok()
+        .map(|lay| lay.with_u2_code_offset_half(bits == 2 && code_offset_half))
     }
 
     /// Returns the shared upper-bound `ExpertPackLayout` across all MoE layers if this model's
@@ -1966,9 +2087,10 @@ impl ModelConfig {
             }
         }
         let group_size = min_group_size.unwrap_or_else(|| {
-            self.layer_routed_expert_bits_and_group_size(0)
-                .map(|(_, gs, _)| if gs > 0 { gs } else { 32 })
-                .unwrap_or_else(|| self.quant.group_size_or(32))
+            self.layer_routed_expert_bits_and_group_size(0).map_or_else(
+                || self.quant.group_size_or(32),
+                |(_, gs, _, _)| if gs > 0 { gs } else { 32 },
+            )
         });
         crate::moe_offload::ExpertPackLayout::new_with_bits(
             self.moe_intermediate_size,
@@ -2012,7 +2134,7 @@ impl ModelConfig {
             && (self.is_qwen4_exp()
                 || (self
                     .layer_routed_expert_bits_and_group_size(0)
-                    .is_some_and(|(bits, gs, sym)| sym && matches!(bits, 2 | 4) && gs > 0)
+                    .is_some_and(|(bits, gs, sym, _)| sym && matches!(bits, 2 | 4) && gs > 0)
                     && self.routed_expert_total_bytes() > TIERED_MOE_MIN_TOTAL_EXPERT_BYTES))
     }
 

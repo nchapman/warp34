@@ -43,13 +43,18 @@ enum {
     WARP34_ATTN_MASK_NONCAUSAL_WINDOW = 1,
 };
 
+enum {
+    WARP34_EXEC_FLAG_ALLOW_W4A8_PREFILL = 1u << 0,
+};
+
 typedef struct {
     uintptr_t stream;       // cudaStream_t
     uint64_t  scratch_ptr;  // device workspace pointer
     size_t    scratch_size; // workspace capacity in bytes
+    uint64_t  flags;        // WARP34_EXEC_FLAG_* bitmask
 } warp34_exec;
 
-static_assert(sizeof(warp34_exec) == 24, "warp34_exec ABI size mismatch");
+static_assert(sizeof(warp34_exec) == 32, "warp34_exec ABI size mismatch");
 
 typedef struct {
     uint64_t k_base;
@@ -321,6 +326,10 @@ int warp34_marlin_gemm_f16u2(const warp34_exec* ex, const void* a, const void* b
                           const void* scales, void* c, int32_t* workspace,
                           int64_t m, int64_t n, int64_t k,
                           int64_t workspace_ints, int group_blocks);
+int warp34_marlin_gemm_f16u2_sym(const warp34_exec* ex, const void* a, const void* b,
+                              const void* scales, void* c, int32_t* workspace,
+                              int64_t m, int64_t n, int64_t k,
+                              int64_t workspace_ints, int group_blocks);
 int warp34_marlin_gemm_f16u4(const warp34_exec* ex, const void* a, const void* b,
                           const void* scales, void* c, int32_t* workspace,
                           int64_t m, int64_t n, int64_t k,
@@ -337,6 +346,13 @@ int warp34_marlin_gemm_f16u8(const warp34_exec* ex, const void* a, const void* b
                           const void* scales, void* c, int32_t* workspace,
                           int64_t m, int64_t n, int64_t k,
                           int64_t workspace_ints, int group_blocks);
+int warp34_per_token_quant_i8(const warp34_exec* ex, const void* x_f16,
+                              void* q_i8, float* scales_f32,
+                              int64_t m, int64_t k);
+int warp34_marlin_gemm_s8u4_shared(const warp34_exec* ex, const void* a, const void* b,
+                                   const void* scales, void* c, int32_t* workspace,
+                                   int64_t m, int64_t n, int64_t k,
+                                   int64_t workspace_ints, int group_blocks);
 
 // --- Descriptor-Driven KV Cache Write & Paged Attention (op_kv_cache.cu, op_paged_attn.cu) ---
 int warp34_kv_cache_write(const warp34_exec* ex, const warp34_kv_layer_layout* layout,
@@ -401,6 +417,41 @@ int warp34_gdn_recurrent_strided_f16(const warp34_exec* ex, const warp34_gdn_bat
                                   int num_k_heads, int head_k_dim,
                                   int num_v_heads, int head_v_dim,
                                   int ba_row_stride, int total_state_slots);
+
+// --- Compressed GDN Checkpoints (op_gdn_ckpt.cu) ---
+int warp34_gdn_checkpoint_pack_wht_q8(
+    const warp34_exec* ex,
+    const uint64_t* ssm_layer_ptrs,
+    const uint64_t* conv_layer_ptrs,
+    const void* ple_conv_pool,
+    int src_state_slot,
+    int total_state_slots,
+    int num_layers,
+    int rows_per_layer,
+    int head_k_dim,
+    int conv_elems_per_slot,
+    int ple_conv_elems_per_slot,
+    void* dst_qdata,
+    void* dst_scales_bf16,
+    void* dst_conv_f16,
+    void* dst_ple_conv_f16);
+
+int warp34_gdn_checkpoint_unpack_wht_q8(
+    const warp34_exec* ex,
+    const void* src_qdata,
+    const void* src_scales_bf16,
+    const void* src_conv_f16,
+    const void* src_ple_conv_f16,
+    const uint64_t* ssm_layer_ptrs,
+    const uint64_t* conv_layer_ptrs,
+    void* ple_conv_pool,
+    int dst_state_slot,
+    int total_state_slots,
+    int num_layers,
+    int rows_per_layer,
+    int head_k_dim,
+    int conv_elems_per_slot,
+    int ple_conv_elems_per_slot);
 
 // --- Pinned-Sysmem TP=2 Collectives (op_collectives.cu) ---
 size_t warp34_tp2_signal_bytes(void);
@@ -579,12 +630,23 @@ int warp34_dflash_qk_norm_rope_kv_write_bf16_f32_table(const warp34_exec* ex, vo
     const int32_t* positions, const void* qw, const void* kw, const void* table,
     const warp34_kv_layer_layout* kv_layout, const int32_t* write_slot_mapping,
     int rows, int q_heads, int kv_heads, int dim, int table_rows, float eps);
+int warp34_dflash_qk_norm_rope_kv_write_bf16_inv_freq(const warp34_exec* ex, void* qkv, void* q_out,
+    const int32_t* positions, const void* qw, const void* kw, const float* inv_freq,
+    const warp34_kv_layer_layout* kv_layout, const int32_t* write_slot_mapping,
+    int rows, int q_heads, int kv_heads, int dim, float eps);
 int warp34_dflash_select_greedy_bf16(const warp34_exec* ex, const int32_t* ids, const float* unary,
     const void* hidden, const void* pred, const void* succ, int32_t* out_path,
     int anchor, int k, int topk, int rank, int vocab);
+int warp34_dflash_select_greedy_with_conf_bf16(const warp34_exec* ex, const int32_t* ids,
+    const float* unary, const void* hidden, const void* pred, const void* succ,
+    int32_t* out_path, float* out_confs, int anchor, int k, int topk, int rank, int vocab);
 int warp34_dflash_select_greedy_dev_anchor_bf16(const warp34_exec* ex, const int32_t* ids,
     const float* unary, const void* hidden, const void* pred, const void* succ,
     int32_t* out_path, const int32_t* anchor_dev, int k, int topk, int rank, int vocab);
+int warp34_dflash_select_greedy_dev_anchor_with_conf_bf16(const warp34_exec* ex,
+    const int32_t* ids, const float* unary, const void* hidden, const void* pred,
+    const void* succ, int32_t* out_path, float* out_confs, const int32_t* anchor_dev,
+    int k, int topk, int rank, int vocab);
 int warp34_dflash_qk_norm_rope_bf16(const warp34_exec*, void* qkv, const int32_t* positions,
     const void* qw, const void* kw, const void* table, int rows, int q_heads, int kv_heads,
     int dim, int table_rows, float eps);
@@ -681,6 +743,16 @@ int warp34_moe_w2a16_mlp_ex_f16(const warp34_exec* ex, const void* x,
                              int num_tokens, int top_k, int num_experts,
                              int n_interm, int k_hidden, int group_size,
                              int down_hadamard_block_size);
+int warp34_moe_w2a16_sym_mlp_ex_f16(const warp34_exec* ex, const void* x,
+                                 const uint32_t* gate_up_packed, const void* gate_up_scales,
+                                 const uint32_t* down_packed, const void* down_scales,
+                                 const int32_t* topk_ids, const float* topk_weights,
+                                 const void* shared_expert_out,
+                                 const void* shared_expert_gate_logits,
+                                 void* interm_buf, void* out,
+                                 int num_tokens, int top_k, int num_experts,
+                                 int n_interm, int k_hidden, int group_size,
+                                 int down_hadamard_block_size);
 int warp34_moe_w4a16_mlp_zp_f16(const warp34_exec* ex, const void* x,
                              const uint32_t* gate_up_packed, const void* gate_up_scales,
                              const uint32_t* gate_up_qzeros,
@@ -743,6 +815,12 @@ int warp34_hc_combine_tap_f16(const warp34_exec* ex, const void* residual_in, co
                            const uint8_t* valid_token_mask, int num_tokens,
                            int hc_count, int hidden_size, int tap_stride_elems,
                            int tap_offset_elems);
+int warp34_hc_combine_tap_rmsnorm_f16(
+    const warp34_exec* ex, const void* residual_in, const void* block_out,
+    const float* inject_weights, const void* ple_delta, void* residual_out,
+    void* tap_bf16_out, const void* next_norm_weight, void* next_normed_out,
+    const uint8_t* valid_token_mask, int num_tokens, int hc_count,
+    int hidden_size, float eps, int tap_stride_elems, int tap_offset_elems);
 int warp34_qwen4_mtp_broadcast_add_f16(const warp34_exec* ex, const void* fc_embed,
                                     const void* fc_hidden, void* out_multi_hidden,
                                     int num_tokens, int hc_count, int hidden_size);
@@ -860,18 +938,95 @@ int warp34_moe_gpu_lru_update_and_pull(
     int local_num_experts, int k_hot, int max_misses,
     size_t pack_stride_bytes, int n_interm, int k_hidden, int group_size, int bits);
 
+typedef struct {
+    void*          d_req_slot;
+    const void*    x_f16;
+    const int32_t* global_topk_ids;
+    const float*   topk_weights;
+    int32_t*       expert_to_slot;
+    int32_t*       slot_to_expert;
+    uint64_t*      slot_last_used;
+    uint64_t*      step_counter;
+    uint8_t*       expert_freq;
+    int32_t*       remapped_topk_ids;
+    int32_t*       pulled_topk_ids;
+    int32_t*       miss_local_experts;
+    int32_t*       miss_victim_slots;
+    int32_t*       num_misses_buf;
+    const void*    mapped_host_packs;
+    uint32_t*      gate_up_packed_base;
+    void*          gate_up_scales_base;
+    uint32_t*      down_packed_base;
+    void*          down_scales_base;
+    void*          pull_stream;
+    void*          plan_event;
+    void*          pull_done_event;
+    size_t         pack_stride_bytes;
+    int32_t        num_tokens;
+    int32_t        top_k;
+    int32_t        global_expert_offset;
+    int32_t        local_num_experts;
+    int32_t        k_static;
+    int32_t        k_hot;
+    int32_t        n_interm;
+    int32_t        k_hidden;
+    int32_t        group_size;
+    int32_t        bits;
+    float          gpu_share_frac;
+    int32_t        reserved;
+} warp34_moe_hybrid_desc;
+
+static_assert(sizeof(warp34_moe_hybrid_desc) == 232, "warp34_moe_hybrid_desc ABI size mismatch");
+
+int warp34_moe_hybrid_submit_and_pull(
+    const warp34_exec* ex, const warp34_moe_hybrid_desc* desc);
+int warp34_moe_hybrid_wait_and_add(
+    const warp34_exec* ex, const void* d_req_slot, const void* d_resp_slot,
+    void* out_f16, const int32_t* num_misses_buf, int num_tokens, int k_hidden);
+int warp34_moe_w4a16_pulled_add_f16(
+    const warp34_exec* ex, const void* x, const uint32_t* gate_up_packed,
+    const void* gate_up_scales, const uint32_t* down_packed, const void* down_scales,
+    const int32_t* pulled_topk_ids, const float* topk_weights, const int32_t* active_count,
+    void* interm_buf, void* out, int num_tokens, int top_k, int num_experts,
+    int n_interm, int k_hidden, int group_size, int down_hadamard_block_size);
+int warp34_moe_w2a16_pulled_add_f16(
+    const warp34_exec* ex, const void* x, const uint32_t* gate_up_packed,
+    const void* gate_up_scales, const uint32_t* down_packed, const void* down_scales,
+    const int32_t* pulled_topk_ids, const float* topk_weights, const int32_t* active_count,
+    void* interm_buf, void* out, int num_tokens, int top_k, int num_experts,
+    int n_interm, int k_hidden, int group_size, int down_hadamard_block_size);
+int warp34_moe_w2a16_sym_pulled_add_f16(
+    const warp34_exec* ex, const void* x, const uint32_t* gate_up_packed,
+    const void* gate_up_scales, const uint32_t* down_packed, const void* down_scales,
+    const int32_t* pulled_topk_ids, const float* topk_weights, const int32_t* active_count,
+    void* interm_buf, void* out, int num_tokens, int top_k, int num_experts,
+    int n_interm, int k_hidden, int group_size, int down_hadamard_block_size);
+
 int warp34_gemma_rms_norm_hadamard_f16(
     const warp34_exec* ex, const void* x, const void* weight, void* out, void* out_had64,
+    const uint8_t* valid_token_mask, int num_tokens, int hidden_size, float eps);
+int warp34_gemma_rms_norm_hadamard512_f16(
+    const warp34_exec* ex, const void* x, const void* weight, void* out, void* out_had512,
     const uint8_t* valid_token_mask, int num_tokens, int hidden_size, float eps);
 int warp34_fused_add_gemma_rms_norm_tap_hadamard_f16(
     const warp34_exec* ex, const void* x, void* residual, const void* weight, void* out,
     void* out_had64, void* tap_dst_bf16, const uint8_t* valid_token_mask,
+    int num_tokens, int hidden_size, float eps, int tap_row_stride, int tap_col_offset);
+int warp34_fused_add_gemma_rms_norm_tap_hadamard512_f16(
+    const warp34_exec* ex, const void* x, void* residual, const void* weight, void* out,
+    void* out_had512, void* tap_dst_bf16, const uint8_t* valid_token_mask,
     int num_tokens, int hidden_size, float eps, int tap_row_stride, int tap_col_offset);
 int warp34_tp2_all_reduce_residual_gemma_rms_norm_hadamard_f16(
     const warp34_exec* ex, const void* local_in, void* ar_out, void* residual,
     const void* weight, void* out, void* out_had64, void* tap_dst_bf16,
     void* stage0, void* stage1, void* sig0, void* sig1, int rank, int num_tokens,
     int hidden_size, float eps, int tap_row_stride, int tap_col_offset);
+int warp34_tp2_all_reduce_residual_gemma_rms_norm_hadamard_pipelined_f16(
+    const warp34_exec* ex, const void* local_in, void* ar_out, void* residual,
+    const void* weight, void* out, void* out_had64, void* tap_dst_bf16,
+    void* stage0, void* stage1, void* sig0, void* sig1, int rank, int num_tokens,
+    int hidden_size, float eps, int tap_row_stride, int tap_col_offset,
+    uintptr_t dma_stream, uintptr_t ev_ready, const uintptr_t* ev_tx_done, int max_chunks);
 int warp34_tp4_all_reduce_residual_gemma_rms_norm_hadamard_f16(
     const warp34_exec* ex, const void* local_in, void* ar_out, void* residual,
     const void* weight, void* out, void* out_had64, void* tap_dst_bf16,
@@ -889,7 +1044,13 @@ int warp34_rms_norm_gated_sigmoid_strided_hadamard_f16(
 int warp34_silu_and_mul_hadamard_f16(
     const warp34_exec* ex, const void* gate_up, void* out, const uint8_t* valid_token_mask,
     int num_tokens, int intermediate_size);
+int warp34_silu_and_mul_hadamard512_f16(
+    const warp34_exec* ex, const void* gate_up, void* out, const uint8_t* valid_token_mask,
+    int num_tokens, int intermediate_size);
 int warp34_apply_attn_output_gate_hadamard_f16(
+    const warp34_exec* ex, const void* attn_out, const void* gate, void* out,
+    const uint8_t* valid_token_mask, int num_tokens, int total_dim);
+int warp34_apply_attn_output_gate_hadamard512_f16(
     const warp34_exec* ex, const void* attn_out, const void* gate, void* out,
     const uint8_t* valid_token_mask, int num_tokens, int total_dim);
 int warp34_tp2_all_gather_topk_f32_i32(
@@ -917,8 +1078,9 @@ int warp34_tp4_all_reduce_hc_combine_tap_f16(
 int warp34_lora_shrink_expand_f16(
     const warp34_exec* ex, const void* x_f16, const void* lora_a_stacked,
     const void* lora_b_stacked, const int32_t* token_lora_ids,
-    float* lowrank_f32_ws, void* y_inout_f16, int m, int size_n, int size_k,
-    int rank_pad, int num_adapters, int default_lora_id, uint64_t adapter_mask);
+    float* lowrank_f32_ws, size_t lowrank_ws_elems, void* y_inout_f16, int m,
+    int size_n, int size_k, int rank_pad, int num_adapters, int default_lora_id,
+    uint64_t adapter_mask, int num_b_slices, const int32_t* b_slices4);
 int warp34_sampler_shard_fast_greedy_f16(
     const warp34_exec* ex, const void* logits_f16, const warp34_sampler_row_cfg* row_cfgs,
     const uint32_t* bitmask_u32, const warp34_sampler_sparse_entry* sparse_entries,

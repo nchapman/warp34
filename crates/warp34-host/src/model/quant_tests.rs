@@ -66,6 +66,7 @@ fn ct(bits: usize, group_size: usize, symmetric: bool) -> QuantScheme {
         num_bits: bits,
         group_size,
         symmetric,
+        code_offset_half: false,
         ignore: vec![],
         rules: None,
     }
@@ -323,6 +324,52 @@ fn compressed_tensors_weight_shape_validates_and_resolves_embed_tokens_bits() {
 }
 
 #[cfg(feature = "cuda")]
+fn verify_engine_l2_host_kv_swap_roundtrip(engine: &mut Qwen3_5Engine) {
+    engine.reset_all_states().unwrap();
+    for r in &mut engine.ranks {
+        r.kv_pool.enable_host_swap(64);
+    }
+    let s1_prompt: Vec<i32> = (0..65).map(|i| (i % 12) + 1).collect();
+    let s1_cold = engine.generate_tokens(&s1_prompt, 2, false).unwrap();
+    let _ = engine
+        .generate_with_radix_cache(&s1_prompt, 1, 64, false)
+        .unwrap();
+    assert_eq!(engine.radix.full_evictable_pages(), 4);
+
+    // Drain all remaining free L1 VRAM pages + 2 more pages so `reserve_kv_pages_from` must
+    // non-destructively swap out 2 of Session 1's unlocked radix KV pages to L2 Host RAM.
+    let drain_count = engine.ranks[0].kv_pool.free_count() + 2;
+    let mut drained = Vec::new();
+    let mut dummy_radix = crate::radix::MambaRadixCache::new(16, 64);
+    std::mem::swap(&mut engine.radix, &mut dummy_radix);
+    assert!(engine.reserve_kv_pages_from(&mut dummy_radix, &mut drained, drain_count));
+    std::mem::swap(&mut engine.radix, &mut dummy_radix);
+    assert!(
+        engine.radix.total_kv_swap_out_pages >= 2,
+        "expected >= 2 pages swapped out to L2 Host RAM, got {}",
+        engine.radix.total_kv_swap_out_pages
+    );
+    engine.free_kv_pages(&drained);
+
+    // Now run Session 1 again through `generate_with_radix_cache`: it hits the 64-token
+    // prefix in `engine.radix`, promotes the swapped-out L2 Host pages back to L1 VRAM in
+    // `reserve_kv_pages_from`, and produces the exact same greedy continuation tokens.
+    let s1_swapped_in = engine
+        .generate_with_radix_cache(&s1_prompt, 2, 64, false)
+        .unwrap();
+    assert!(
+        engine.radix.total_kv_swap_in_pages >= 2,
+        "expected >= 2 pages swapped in from L2 Host RAM, got {}",
+        engine.radix.total_kv_swap_in_pages
+    );
+    assert_eq!(s1_swapped_in.cached_prefix_tokens, 64);
+    assert_eq!(
+        s1_swapped_in.generated_token_ids,
+        s1_cold.generated_token_ids
+    );
+    engine.reset_all_states().unwrap();
+}
+
 #[test]
 fn synthetic_hybrid_engine_forward_generate_and_diagnostics() {
     let _gpu_guard = crate::LIB_GPU_ENGINE_LOCK
@@ -692,6 +739,7 @@ fn synthetic_hybrid_engine_forward_generate_and_diagnostics() {
         .generate_with_radix_cache(&[1, 2, 3, 4, 5, 6], 2, 64, false)
         .unwrap();
     assert_eq!(radix_warm.generated_token_ids.len(), 2);
+    verify_engine_l2_host_kv_swap_roundtrip(&mut engine);
 
     // Exercise `step_batch_slices` with `emit_all_query_tokens: true`, `read_selected_row_candidate_logits`,
     // `read_norm_hidden_row_f32`, and `sample_single_gpu_step`.
@@ -901,4 +949,97 @@ fn synthetic_hybrid_engine_forward_generate_and_diagnostics() {
             let _ = tx.send(());
             srv.await.unwrap().unwrap();
         });
+}
+
+#[test]
+fn mtp_load_rows_validates_full_n_across_all_encodings() {
+    let (actual_n, wrong_expected_n, k, group) = (32usize, 16usize, 128usize, 128usize);
+    let ng = k / group;
+    // AWQ `qweight` `[K, N / 8]` + `scales` `[K / g, N]` + `qzeros` `[K / g, N / 8]`:
+    // neither `.weight_packed` nor `.weight` exists, and `row_end = 8 <= actual_n = 32`.
+    let awq_quant = QuantScheme::Awq {
+        bits: 4,
+        group_size: group,
+        zero_point: true,
+    };
+    let awq_fixture = Fixture::new(vec![
+        (
+            "mtp.layers.0.self_attn.q_proj.qweight",
+            "I32",
+            vec![k, actual_n / 8],
+            words(&vec![0u32; k * (actual_n / 8)]),
+        ),
+        (
+            "mtp.layers.0.self_attn.q_proj.scales",
+            "F16",
+            vec![ng, actual_n],
+            halves(&vec![f32_to_f16(1.0); ng * actual_n]),
+        ),
+        (
+            "mtp.layers.0.self_attn.q_proj.qzeros",
+            "I32",
+            vec![ng, actual_n / 8],
+            words(&vec![0u32; ng * (actual_n / 8)]),
+        ),
+    ]);
+    let err = crate::mtp::load_mtp_linear_rows(
+        &awq_fixture.archive(),
+        &awq_quant,
+        "layers.0.self_attn.q_proj",
+        wrong_expected_n,
+        k,
+        0,
+        8,
+    )
+    .err()
+    .expect("mismatched full_n on qweight shard must fail closed");
+    assert_eq!(err.code, -301);
+
+    // Valid AWQ shard with matching `full_n` succeeds.
+    let ok = crate::mtp::load_mtp_linear_rows(
+        &awq_fixture.archive(),
+        &awq_quant,
+        "layers.0.self_attn.q_proj",
+        actual_n,
+        k,
+        0,
+        8,
+    )
+    .unwrap();
+    assert_eq!(ok.dims(), (8, k));
+
+    // Ignored / unquantized 2D BF16 `.weight` alongside a 1D U8 `.weight_packed` sidecar
+    // validates `full_n` against the active `.weight` tensor rather than the 1D sidecar.
+    let bf16_val = (1.5f32.to_bits() >> 16) as u16;
+    let sidecar_fixture = Fixture::new(vec![
+        (
+            "mtp.layers.0.mlp.gate_proj.weight",
+            "BF16",
+            vec![16, k],
+            halves(&vec![bf16_val; 16 * k]),
+        ),
+        (
+            "mtp.layers.0.mlp.gate_proj.weight_packed",
+            "U8",
+            vec![16 * k / 2],
+            vec![0u8; 16 * k / 2],
+        ),
+        (
+            "mtp.layers.0.mlp.gate_proj.weight_scale",
+            "U8",
+            vec![16, 2],
+            vec![0u8; 16 * 2],
+        ),
+    ]);
+    let sidecar_ok = crate::mtp::load_mtp_linear_rows(
+        &sidecar_fixture.archive(),
+        &ct(4, 128, true),
+        "layers.0.mlp.gate_proj",
+        16,
+        k,
+        0,
+        8,
+    )
+    .unwrap();
+    assert_eq!(sidecar_ok.dims(), (8, k));
 }

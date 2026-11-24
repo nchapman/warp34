@@ -50,19 +50,22 @@ pub(crate) fn try_lookup_scheduled_suffix_drafts(
 impl NativeProposer {
     #[inline]
     pub(crate) fn fits_capacity(&self, prompt_len: usize, max_new: usize) -> Option<usize> {
-        let total = prompt_len
-            .checked_add(max_new)
-            .and_then(|n| n.checked_add(self.k + 1))?;
+        let total = prompt_len.checked_add(max_new.max(1))?;
         (total <= self.capacity).then_some(total)
     }
 
     #[inline]
-    pub(crate) fn can_restore_prefix(&self, prefix: &[i32]) -> bool {
-        self.can_restore(prefix)
+    pub(crate) fn can_restore_prefix(&self, prefix: &[i32], prompt_len: usize) -> bool {
+        self.can_restore_for_prompt(prefix, prompt_len)
     }
 
-    pub(crate) fn can_restore_batch_slot(&self, _slot: usize, prefix: &[i32]) -> bool {
-        self.can_restore(prefix)
+    pub(crate) fn can_restore_batch_slot(
+        &self,
+        _slot: usize,
+        prefix: &[i32],
+        prompt_len: usize,
+    ) -> bool {
+        self.can_restore_for_prompt(prefix, prompt_len)
     }
 
     pub(crate) fn restore_prefix(
@@ -75,8 +78,8 @@ impl NativeProposer {
 
     pub(crate) fn abort_scheduled(&mut self) {
         self.commit_current_memo();
-        let _ = self.reset();
         self.current = None;
+        self.last_accepted.clear();
     }
 
     pub(crate) fn finish_scheduled(
@@ -130,6 +133,7 @@ impl NativeProposer {
             .iter()
             .map(|p| (p.trigger_offset_1based, p.dst_slot))
             .collect();
+        engine.materialize_pending_checkpoint(&mut seq.radix_state)?;
         engine.set_active_lora_id(seq.lora_id);
         engine.clear_slice_lora_ids();
         let is_last_chunk = end == seq.prompt_tokens.len();
@@ -156,26 +160,31 @@ impl NativeProposer {
             0
         };
         let features = self.captured(engine)?;
-        self.ingest(engine, radix_tokens, &features)?;
+        self.ingest_for_prompt_len(engine, radix_tokens, &features, seq.prompt_tokens.len())?;
         seq.radix_state.commit_tokens(radix_tokens, &planned);
         seq.prefilled_tokens = end;
 
         if end < seq.prompt_tokens.len() {
-            if seq.radix_state.last_track_seqlen.is_some() {
-                let can_recycle = radix.can_recycle_locked_mamba(seq.radix_state.last_locked_node);
-                let rep = engine
-                    .alloc_state_slot_preserving_leaves(radix)
-                    .or_else(|| {
-                        (start < 2048 && !can_recycle)
-                            .then(|| engine.alloc_state_slot_from(radix))
-                            .flatten()
-                    });
-                if rep.is_some() || can_recycle {
-                    let don = seq
-                        .radix_state
-                        .donate_committed_checkpoint(radix, rep, false);
-                    engine.free_kv_pages(&don.freed_kv_pages);
-                    engine.free_state_slots(&don.freed_mamba_slots);
+            if seq.prefix_bidir_len.is_none() && seq.radix_state.has_donatable_checkpoint() {
+                if engine.has_checkpoint_pool() {
+                    engine.donate_req_checkpoint(radix, &mut seq.radix_state, false)?;
+                } else {
+                    let can_recycle =
+                        radix.can_recycle_locked_mamba(seq.radix_state.last_locked_node);
+                    let rep = engine
+                        .alloc_state_slot_preserving_leaves(radix)
+                        .or_else(|| {
+                            (start < 2048 && !can_recycle)
+                                .then(|| engine.alloc_state_slot_from(radix))
+                                .flatten()
+                        });
+                    if rep.is_some() || can_recycle {
+                        let don = seq
+                            .radix_state
+                            .donate_committed_checkpoint(radix, rep, false);
+                        engine.free_kv_pages(&don.freed_kv_pages);
+                        engine.free_state_slots(&don.freed_mamba_slots);
+                    }
                 }
             }
             return Ok(None);
@@ -203,21 +212,28 @@ impl NativeProposer {
         {
             seq.finished = true;
         }
-        if !seq.finished && seq.radix_state.last_track_seqlen.is_some() {
-            let can_recycle = radix.can_recycle_locked_mamba(seq.radix_state.last_locked_node);
-            let rep = engine
-                .alloc_state_slot_preserving_leaves(radix)
-                .or_else(|| {
-                    (!can_recycle)
-                        .then(|| engine.alloc_state_slot_from(radix))
-                        .flatten()
-                });
-            if rep.is_some() || can_recycle {
-                let don = seq
-                    .radix_state
-                    .donate_committed_checkpoint(radix, rep, false);
-                engine.free_kv_pages(&don.freed_kv_pages);
-                engine.free_state_slots(&don.freed_mamba_slots);
+        if !seq.finished
+            && seq.prefix_bidir_len.is_none()
+            && seq.radix_state.has_donatable_checkpoint()
+        {
+            if engine.has_checkpoint_pool() {
+                engine.donate_req_checkpoint(radix, &mut seq.radix_state, false)?;
+            } else {
+                let can_recycle = radix.can_recycle_locked_mamba(seq.radix_state.last_locked_node);
+                let rep = engine
+                    .alloc_state_slot_preserving_leaves(radix)
+                    .or_else(|| {
+                        (!can_recycle)
+                            .then(|| engine.alloc_state_slot_from(radix))
+                            .flatten()
+                    });
+                if rep.is_some() || can_recycle {
+                    let don = seq
+                        .radix_state
+                        .donate_committed_checkpoint(radix, rep, false);
+                    engine.free_kv_pages(&don.freed_kv_pages);
+                    engine.free_state_slots(&don.freed_mamba_slots);
+                }
             }
         }
         Ok(Some((anchor, lp)))
@@ -236,6 +252,7 @@ impl NativeProposer {
             .generated_tokens
             .last()
             .ok_or_else(|| loader_err("missing anchor in step_scheduled_verify_round"))?;
+        engine.materialize_pending_checkpoint(&mut seq.radix_state)?;
         engine.set_active_lora_id(seq.lora_id);
         engine.clear_slice_lora_ids();
         let mut tx = StateTx::new(seq.radix_state.active_state_slot);
@@ -365,31 +382,23 @@ impl NativeProposer {
                 }
             }
         } else {
-            (
-                match RejectionSampler::greedy(&drafts, &out[0]) {
-                    Ok(decision) => decision,
-                    Err(_) => {
-                        if !tx.spec_slots.is_empty() {
-                            engine.free_state_slots(&tx.resolve_spec_verify(1));
-                        }
-                        seq.radix_state.active_state_slot = tx.committed_slot;
-                        return Err(loader_err("greedy rejection geometry"));
-                    }
-                },
-                Vec::new(),
-            )
+            let Ok(decision) = RejectionSampler::greedy(&drafts, &out[0]) else {
+                if !tx.spec_slots.is_empty() {
+                    engine.free_state_slots(&tx.resolve_spec_verify(1));
+                }
+                seq.radix_state.active_state_slot = tx.committed_slot;
+                return Err(loader_err("greedy rejection geometry"));
+            };
+            (decision, Vec::new())
         };
         let processed = decision.processed_rows();
         if k > 0 {
-            let freed = match decision.commit(&mut tx, sampler, 0) {
-                Ok(freed) => freed,
-                Err(_) => {
-                    if !tx.spec_slots.is_empty() {
-                        engine.free_state_slots(&tx.resolve_spec_verify(1));
-                    }
-                    seq.radix_state.active_state_slot = tx.committed_slot;
-                    return Err(loader_err("speculative sampler commit"));
+            let Ok(freed) = decision.commit(&mut tx, sampler, 0) else {
+                if !tx.spec_slots.is_empty() {
+                    engine.free_state_slots(&tx.resolve_spec_verify(1));
                 }
+                seq.radix_state.active_state_slot = tx.committed_slot;
+                return Err(loader_err("speculative sampler commit"));
             };
             engine.free_state_slots(&freed);
         } else {
@@ -444,18 +453,48 @@ impl NativeProposer {
         }
     }
 
-    pub(crate) fn fits_mtp_batch_slot_capacity(&self, prompt_len: usize, max_new: usize) -> bool {
-        let slot_cap = match &self.ranks {
-            Ranks::Mtp(rs) => rs.first().map_or(0, |r| r.batch_slot_capacity()),
+    pub(crate) fn batch_slot_capacity_for(&self, slot: usize) -> usize {
+        match &self.ranks {
+            Ranks::Mtp(rs) => rs.first().map_or(0, |r| r.slot_capacity(slot)),
+            Ranks::DFlash(rs) => rs.first().map_or(0, |r| r.batch_slot_capacity()),
+        }
+    }
+
+    pub(crate) fn fits_mtp_batch_slot(&self, slot: usize, current_len: usize) -> bool {
+        let slot_cap = self.batch_slot_capacity_for(slot);
+        slot_cap >= 32 && current_len.saturating_add(self.k + 2) <= slot_cap
+    }
+
+    pub(crate) fn fits_free_mtp_batch_slot<T>(
+        &self,
+        active: &[Option<T>],
+        current_len: usize,
+    ) -> bool {
+        match &self.ranks {
+            Ranks::Mtp(_) => {
+                let slot_count = self
+                    .batch_slot_count()
+                    .min(self.mtp_batch_slots.len())
+                    .min(active.len());
+                (0..slot_count).any(|slot| {
+                    active[slot].is_none() && self.fits_mtp_batch_slot(slot, current_len)
+                })
+            }
+            Ranks::DFlash(_) => self.fits_mtp_batch_slot_capacity(current_len),
+        }
+    }
+
+    pub(crate) fn fits_mtp_batch_slot_capacity(&self, current_len: usize) -> bool {
+        let max_slot_cap = match &self.ranks {
+            Ranks::Mtp(rs) => rs
+                .first()
+                .map_or(0, |r| r.max_slot_page_count().saturating_mul(16)),
             Ranks::DFlash(rs) => rs.first().map_or(0, |r| r.batch_slot_capacity()),
         };
-        if slot_cap < 32 {
+        if max_slot_cap < 32 {
             return false;
         }
-        let need = prompt_len
-            .saturating_add(max_new.max(1))
-            .saturating_add(self.k);
-        need <= slot_cap
+        current_len.saturating_add(self.k + 2) <= max_slot_cap
     }
 
     pub(crate) fn set_mtp_batch_mode(&mut self, enable: bool) -> Result<()> {
@@ -494,11 +533,13 @@ impl NativeProposer {
         };
         for slot in &mut self.mtp_batch_slots {
             slot.resident_tokens.clear();
+            slot.resident_valid_from = 0;
             slot.processed = 0;
             slot.current = None;
             slot.last_used_tick = 0;
         }
         self.resident_tokens.clear();
+        self.resident_valid_from = 0;
         self.processed = 0;
         self.current = None;
         self.mtp_batch_active_slot = 0;
@@ -541,6 +582,7 @@ impl NativeProposer {
         for (idx, slot) in self.mtp_batch_slots.iter_mut().enumerate() {
             if idx != 0 {
                 slot.resident_tokens.clear();
+                slot.resident_valid_from = 0;
                 slot.processed = 0;
                 slot.current = None;
                 slot.last_used_tick = 0;
@@ -594,6 +636,7 @@ impl NativeProposer {
             }
         }
         if slot == self.mtp_batch_active_slot {
+            self.capacity = self.batch_slot_capacity_for(slot);
             return Ok(());
         }
         let prev = self.mtp_batch_active_slot;
@@ -603,6 +646,10 @@ impl NativeProposer {
         std::mem::swap(
             &mut self.resident_tokens,
             &mut self.mtp_batch_slots[prev].resident_tokens,
+        );
+        std::mem::swap(
+            &mut self.resident_valid_from,
+            &mut self.mtp_batch_slots[prev].resident_valid_from,
         );
         std::mem::swap(&mut self.current, &mut self.mtp_batch_slots[prev].current);
         self.mtp_batch_slots[prev].processed = self.processed;
@@ -616,10 +663,15 @@ impl NativeProposer {
             &mut self.resident_tokens,
             &mut self.mtp_batch_slots[slot].resident_tokens,
         );
+        std::mem::swap(
+            &mut self.resident_valid_from,
+            &mut self.mtp_batch_slots[slot].resident_valid_from,
+        );
         std::mem::swap(&mut self.current, &mut self.mtp_batch_slots[slot].current);
         self.processed = self.mtp_batch_slots[slot].processed;
         self.batch_slot_tick_counter += 1;
         self.active_slot_last_used_tick = self.batch_slot_tick_counter;
+        self.capacity = self.batch_slot_capacity_for(slot);
         Ok(())
     }
 
@@ -655,7 +707,7 @@ impl NativeProposer {
             .min(active.len());
         let mut best: Option<(usize, (u8, usize, u64))> = None;
         for (slot, entry) in active.iter().enumerate().take(slot_count) {
-            if entry.is_some() {
+            if entry.is_some() || !self.fits_mtp_batch_slot(slot, prompt.len()) {
                 continue;
             }
             let res = self.batch_slot_resident_tokens(slot);
@@ -717,9 +769,391 @@ impl NativeProposer {
             }
         }
         self.resident_tokens.clear();
+        self.resident_valid_from = 0;
         self.processed = 0;
         self.current = None;
         Ok(())
+    }
+
+    fn move_mtp_batch_slot_state<T>(
+        &mut self,
+        engine: &Qwen3_5Engine,
+        active: &mut [Option<T>],
+        src: usize,
+        dst: usize,
+    ) -> Result<()> {
+        if src == dst {
+            return Ok(());
+        }
+        self.select_mtp_batch_slot(0)?;
+        if let Ranks::Mtp(rs) = &mut self.ranks {
+            for (r, t) in rs.iter_mut().zip(&engine.ranks) {
+                let len = r.slot_len(src);
+                let comm = r.slot_committed(src);
+                r.copy_kv_from_slot(t, src, dst, len)?;
+                r.set_slot_state(dst, len, comm);
+                r.set_slot_state(src, 0, 0);
+            }
+        }
+        if dst == 0 {
+            self.commit_current_memo();
+            std::mem::swap(&mut self.tail, &mut self.mtp_batch_slots[src].tail);
+            std::mem::swap(
+                &mut self.resident_tokens,
+                &mut self.mtp_batch_slots[src].resident_tokens,
+            );
+            std::mem::swap(
+                &mut self.resident_valid_from,
+                &mut self.mtp_batch_slots[src].resident_valid_from,
+            );
+            std::mem::swap(&mut self.current, &mut self.mtp_batch_slots[src].current);
+            self.processed = self.mtp_batch_slots[src].processed;
+            self.active_slot_last_used_tick = self.mtp_batch_slots[src].last_used_tick;
+            let (left, right) = self.mtp_batch_slots.split_at_mut(src);
+            std::mem::swap(
+                &mut left[0].captured_verify_hidden,
+                &mut right[0].captured_verify_hidden,
+            );
+            self.mtp_batch_slots[src].resident_tokens.clear();
+            self.mtp_batch_slots[src].resident_valid_from = 0;
+            self.mtp_batch_slots[src].processed = 0;
+            self.mtp_batch_slots[src].current = None;
+            self.mtp_batch_slots[src].last_used_tick = 0;
+        } else if src == 0 {
+            if let Some(memo) = self.mtp_batch_slots[dst].current.take() {
+                super::push_mtp_memo(&mut self.memos, memo);
+            }
+            std::mem::swap(&mut self.tail, &mut self.mtp_batch_slots[dst].tail);
+            std::mem::swap(
+                &mut self.resident_tokens,
+                &mut self.mtp_batch_slots[dst].resident_tokens,
+            );
+            std::mem::swap(
+                &mut self.resident_valid_from,
+                &mut self.mtp_batch_slots[dst].resident_valid_from,
+            );
+            std::mem::swap(&mut self.current, &mut self.mtp_batch_slots[dst].current);
+            self.mtp_batch_slots[dst].processed = self.processed;
+            self.mtp_batch_slots[dst].last_used_tick = self.active_slot_last_used_tick;
+            let (left, right) = self.mtp_batch_slots.split_at_mut(dst);
+            std::mem::swap(
+                &mut left[0].captured_verify_hidden,
+                &mut right[0].captured_verify_hidden,
+            );
+            self.resident_tokens.clear();
+            self.resident_valid_from = 0;
+            self.processed = 0;
+            self.current = None;
+            self.active_slot_last_used_tick = 0;
+        } else {
+            if let Some(memo) = self.mtp_batch_slots[dst].current.take() {
+                super::push_mtp_memo(&mut self.memos, memo);
+            }
+            self.mtp_batch_slots.swap(src, dst);
+            self.mtp_batch_slots[src].resident_tokens.clear();
+            self.mtp_batch_slots[src].resident_valid_from = 0;
+            self.mtp_batch_slots[src].processed = 0;
+            self.mtp_batch_slots[src].current = None;
+            self.mtp_batch_slots[src].last_used_tick = 0;
+        }
+        if src < active.len() && dst < active.len() {
+            active[dst] = active[src].take();
+        }
+        Ok(())
+    }
+
+    fn compact_mtp_batch_slots_to<T>(
+        &mut self,
+        engine: &Qwen3_5Engine,
+        active: &mut [Option<T>],
+        slot_lens: &mut [usize; crate::mtp::MAX_PROPOSER_BATCH_SLOTS],
+        cur_slots: usize,
+        target_slots: usize,
+    ) -> Result<()> {
+        if !self.is_mtp_batch_mode() || target_slots >= cur_slots {
+            return Ok(());
+        }
+        self.select_mtp_batch_slot(0)?;
+        for src in target_slots..cur_slots.min(active.len()) {
+            if active[src].is_none() {
+                continue;
+            }
+            let dst = (0..target_slots)
+                .filter(|&d| active[d].is_none())
+                .min_by_key(|&d| {
+                    (
+                        !self.batch_slot_resident_tokens(d).is_empty(),
+                        self.batch_slot_last_used_tick(d),
+                    )
+                })
+                .ok_or_else(|| loader_err("no free MTP batch slot for compaction"))?;
+            self.move_mtp_batch_slot_state(engine, active, src, dst)?;
+            if src < slot_lens.len() && dst < slot_lens.len() {
+                slot_lens[dst] = std::mem::take(&mut slot_lens[src]);
+            }
+        }
+        for src in target_slots..cur_slots.min(self.mtp_batch_slots.len()) {
+            if self.batch_slot_resident_tokens(src).is_empty() {
+                continue;
+            }
+            if let Some(dst) = (0..target_slots).find(|&d| {
+                active.get(d).is_none_or(|e| e.is_none())
+                    && self.batch_slot_resident_tokens(d).is_empty()
+            }) {
+                self.move_mtp_batch_slot_state(engine, active, src, dst)?;
+            } else {
+                self.reset_mtp_batch_slot(src)?;
+            }
+        }
+        self.select_mtp_batch_slot(0)
+    }
+
+    fn build_mtp_batch_slot_page_plan(
+        &self,
+        total_pages: usize,
+        target_slots: usize,
+        sim_occupied: &[bool; crate::mtp::MAX_MTP_BATCH_SLOTS],
+        hard_pages: &[usize; crate::mtp::MAX_MTP_BATCH_SLOTS],
+    ) -> Vec<usize> {
+        let uniform_pages = total_pages / target_slots;
+        if hard_pages[..target_slots]
+            .iter()
+            .all(|&p| p <= uniform_pages)
+        {
+            return vec![uniform_pages; target_slots];
+        }
+        let mut pages = hard_pages[..target_slots].to_vec();
+        let hard_sum: usize = pages.iter().sum();
+        let mut rem = total_pages.saturating_sub(hard_sum);
+        let quantum = (total_pages / (target_slots * 8)).max(1);
+        for (&occ, p) in sim_occupied.iter().zip(pages.iter_mut()).take(target_slots) {
+            if occ && rem > 0 {
+                let target_q = (*p + quantum / 2).div_ceil(quantum) * quantum;
+                let add = target_q.saturating_sub(*p).min(rem);
+                *p += add;
+                rem -= add;
+            }
+        }
+        let mut warm_idle: Vec<usize> = (0..target_slots)
+            .filter(|&s| !sim_occupied[s] && !self.batch_slot_resident_tokens(s).is_empty())
+            .collect();
+        warm_idle.sort_by_key(|&s| std::cmp::Reverse(self.batch_slot_last_used_tick(s)));
+        for s in warm_idle {
+            if rem == 0 {
+                break;
+            }
+            let warm_need = self
+                .batch_slot_resident_tokens(s)
+                .len()
+                .saturating_add(self.k + 2)
+                .div_ceil(16)
+                .max(2);
+            let add = warm_need.saturating_sub(pages[s]).min(rem);
+            pages[s] += add;
+            rem -= add;
+        }
+        let occ_count = sim_occupied
+            .iter()
+            .take(target_slots)
+            .filter(|&&o| o)
+            .count();
+        if occ_count > 0 && rem > 0 {
+            let per_occ = rem / occ_count;
+            let mut extra = rem % occ_count;
+            for (&occ, p) in sim_occupied.iter().zip(pages.iter_mut()).take(target_slots) {
+                if occ {
+                    *p += per_occ + usize::from(extra > 0);
+                    extra = extra.saturating_sub(1);
+                }
+            }
+        } else if rem > 0 {
+            let per_slot = rem / target_slots;
+            let mut extra = rem % target_slots;
+            for p in &mut pages {
+                *p += per_slot + usize::from(extra > 0);
+                extra = extra.saturating_sub(1);
+            }
+        }
+        pages
+    }
+
+    /// Dynamically adapts both the MTP batch slot count (`16 <-> 8 <-> 4 <-> 2`) and the
+    /// per-slot page partition (`reconfigure_batch_slot_pages`) based on each active slot's
+    /// sequence length and any incoming waiting prompts. When one or more workers exceed the
+    /// uniform per-slot ceiling (e.g. `> 65,536` tokens with 4 active workers), unused pages
+    /// from shorter slots are assigned to the longer slots so all workers remain in batched
+    /// `MTP-3` as long as their combined page demand fits in the `262,144`-token MTP KV pool.
+    pub(crate) fn adapt_mtp_batch_slot_layout<T>(
+        &mut self,
+        engine: &Qwen3_5Engine,
+        active: &mut [Option<T>],
+        active_slot_lens: &[usize],
+        waiting_prompts: &[&[i32]],
+    ) -> Result<bool> {
+        let (cur_slots, max_slots, total_pages) = match &self.ranks {
+            Ranks::Mtp(rs) => {
+                let Some(r0) = rs.first() else {
+                    return Ok(false);
+                };
+                (
+                    r0.batch_slot_count(),
+                    r0.max_batch_slot_count(),
+                    r0.kv_pool().num_pages,
+                )
+            }
+            Ranks::DFlash(_) => {
+                let max_len = active_slot_lens
+                    .iter()
+                    .copied()
+                    .chain(waiting_prompts.iter().map(|p| p.len()))
+                    .max()
+                    .unwrap_or(0);
+                return Ok(self.fits_mtp_batch_slot_capacity(max_len));
+            }
+        };
+        let mut slot_lens = [0usize; crate::mtp::MAX_PROPOSER_BATCH_SLOTS];
+        for (i, &len) in active_slot_lens.iter().enumerate().take(slot_lens.len()) {
+            slot_lens[i] = len;
+        }
+        let active_count = active.iter().filter(|s| s.is_some()).count();
+        let desired_slots = (active_count + waiting_prompts.len()).max(1);
+        let min_slots = desired_slots
+            .max(active_count)
+            .clamp(2, max_slots)
+            .next_power_of_two()
+            .min(max_slots);
+        let max_seq_len = active
+            .iter()
+            .enumerate()
+            .filter_map(|(i, a)| a.as_ref().map(|_| slot_lens.get(i).copied().unwrap_or(0)))
+            .chain(waiting_prompts.iter().map(|p| p.len()))
+            .max()
+            .unwrap_or(0);
+        let max_req_tokens = max_seq_len.saturating_add(self.k + 2);
+        let target_slots = {
+            let Ranks::Mtp(rs) = &self.ranks else {
+                unreachable!()
+            };
+            if cur_slots >= min_slots
+                && rs[0].batch_slot_capacity_for_slots(cur_slots) >= max_req_tokens
+            {
+                cur_slots
+            } else if min_slots > cur_slots
+                && rs[0].batch_slot_capacity_for_slots(min_slots) >= max_req_tokens
+            {
+                min_slots
+            } else {
+                let mut candidate = cur_slots.max(min_slots);
+                while candidate > min_slots
+                    && rs[0].batch_slot_capacity_for_slots(candidate) < max_req_tokens
+                {
+                    candidate /= 2;
+                }
+                candidate
+            }
+        };
+        let open_for_waiting = target_slots.saturating_sub(active_count);
+        let active_pages_need: usize = active
+            .iter()
+            .enumerate()
+            .filter_map(|(i, a)| {
+                a.as_ref().map(|_| {
+                    slot_lens
+                        .get(i)
+                        .copied()
+                        .unwrap_or(0)
+                        .saturating_add(self.k + 2)
+                        .div_ceil(16)
+                        .max(2)
+                })
+            })
+            .sum();
+        let waiting_pages_need: usize = waiting_prompts
+            .iter()
+            .take(open_for_waiting)
+            .map(|p| p.len().saturating_add(self.k + 2).div_ceil(16).max(2))
+            .sum();
+        let used_slots = active_count + waiting_prompts.len().min(open_for_waiting);
+        let empty_pages_need = target_slots.saturating_sub(used_slots) * 2;
+        if active_pages_need + waiting_pages_need + empty_pages_need > total_pages {
+            return Ok(false);
+        }
+
+        self.compact_mtp_batch_slots_to(engine, active, &mut slot_lens, cur_slots, target_slots)?;
+
+        let mut sim_occupied = [false; crate::mtp::MAX_MTP_BATCH_SLOTS];
+        let mut hard_pages = [2usize; crate::mtp::MAX_MTP_BATCH_SLOTS];
+        for s in 0..target_slots {
+            if active.get(s).is_some_and(|e| e.is_some()) {
+                sim_occupied[s] = true;
+                hard_pages[s] = slot_lens[s].saturating_add(self.k + 2).div_ceil(16).max(2);
+            }
+        }
+        for &w_prompt in waiting_prompts.iter().take(open_for_waiting) {
+            let best = (0..target_slots)
+                .filter(|&s| !sim_occupied[s])
+                .max_by_key(|&s| {
+                    rank_batch_slot_candidate(
+                        self.batch_slot_resident_tokens(s),
+                        w_prompt,
+                        self.batch_slot_last_used_tick(s),
+                    )
+                });
+            if let Some(s) = best {
+                sim_occupied[s] = true;
+                hard_pages[s] = hard_pages[s].max(
+                    w_prompt
+                        .len()
+                        .saturating_add(self.k + 2)
+                        .div_ceil(16)
+                        .max(2),
+                );
+            }
+        }
+
+        let already_fits = match &self.ranks {
+            Ranks::Mtp(rs) => {
+                target_slots == cur_slots
+                    && (0..target_slots).all(|s| rs[0].slot_page_count(s) >= hard_pages[s])
+            }
+            Ranks::DFlash(_) => unreachable!(),
+        };
+        if already_fits {
+            return Ok(true);
+        }
+
+        let new_slot_pages = self.build_mtp_batch_slot_page_plan(
+            total_pages,
+            target_slots,
+            &sim_occupied,
+            &hard_pages,
+        );
+
+        if self.is_mtp_batch_mode() {
+            for s in 0..cur_slots.min(self.mtp_batch_slots.len()) {
+                let new_cap = new_slot_pages.get(s).copied().unwrap_or(0) * 16;
+                if active.get(s).is_none_or(|e| e.is_none())
+                    && self.batch_slot_resident_tokens(s).len() > new_cap
+                {
+                    self.reset_mtp_batch_slot(s)?;
+                }
+            }
+            self.select_mtp_batch_slot(0)?;
+        }
+
+        let new_cap = match &mut self.ranks {
+            Ranks::Mtp(rs) => {
+                for (r, t) in rs.iter_mut().zip(&engine.ranks) {
+                    r.reconfigure_batch_slot_pages(t, &new_slot_pages)?;
+                }
+                rs[0].batch_slot_capacity()
+            }
+            Ranks::DFlash(_) => unreachable!(),
+        };
+        if self.is_mtp_batch_mode() {
+            self.capacity = new_cap;
+        }
+        Ok(true)
     }
 
     /// Execute one batched `B = 2..=4` greedy MTP propose + shared target verification round.
@@ -759,12 +1193,14 @@ impl NativeProposer {
         let batch_len = items.len();
         let k_cap = match &self.ranks {
             Ranks::Mtp(_) => {
-                if batch_len >= 3 {
-                    if self.max_rows > 256 {
+                if batch_len >= 5 {
+                    if self.max_rows > 256 || engine.cfg.num_experts > 0 || engine.tp_size > 1 {
                         self.k.min(2)
                     } else {
                         self.k.min(1)
                     }
+                } else if batch_len >= 3 {
+                    self.k.min(2)
                 } else {
                     self.k
                 }
@@ -896,6 +1332,10 @@ impl NativeProposer {
                         }
                     }
                 };
+                if let Err(e) = engine.materialize_pending_checkpoint(&mut seq.radix_state) {
+                    engine.free_state_slots(&extras);
+                    return Err(e);
+                }
                 if let Some(eos) = drafts.iter().enumerate().position(|(idx, id)| {
                     let pos_before = seq.generated_tokens.len() + idx;
                     if pos_before < sampler.params.min_tokens {
@@ -1143,7 +1583,8 @@ pub(crate) fn rank_batch_slot_candidate(
 
 #[cfg(test)]
 mod tests {
-    use super::rank_batch_slot_candidate;
+    use super::{rank_batch_slot_candidate, try_lookup_scheduled_suffix_drafts};
+    use crate::parser::{SamplerV1, SamplingParams};
 
     #[test]
     fn batch_slot_ranking_prefers_session_continuation_then_empty_then_shared_prefix() {
@@ -1177,5 +1618,44 @@ mod tests {
         let stale_rank = rank_batch_slot_candidate(&stale_long, &new_session, 5);
         let recent_rank = rank_batch_slot_candidate(&recent_short, &new_session, 50);
         assert!(stale_rank > recent_rank);
+    }
+
+    #[test]
+    fn scheduled_suffix_lookup_respects_budget_min_tokens_and_stop_tokens() {
+        let mut history: Vec<i32> = (0..80).collect();
+        // Repeat a 4-token pattern followed by [200, 201, 202]
+        history.extend_from_slice(&[500, 501, 502, 503, 200, 201, 202]);
+        history.extend(1000..1020);
+        history.extend_from_slice(&[500, 501, 502]);
+
+        let params = SamplingParams {
+            min_tokens: 2,
+            ..SamplingParams::default()
+        };
+        let sampler = SamplerV1::new(params, &history, None);
+
+        // With EOS=999 (not in drafts), suffix lookup succeeds
+        let drafts =
+            try_lookup_scheduled_suffix_drafts(&history, 503, 3, 2, 0, &sampler, &[999]).unwrap();
+        assert_eq!(drafts, vec![200, 201, 202]);
+
+        // EOS 201 in drafts rejects the lookup both before min_tokens (soft-banned) and after
+        assert_eq!(
+            try_lookup_scheduled_suffix_drafts(&history, 503, 3, 2, 0, &sampler, &[201]),
+            None
+        );
+        assert_eq!(
+            try_lookup_scheduled_suffix_drafts(&history, 503, 3, 2, 2, &sampler, &[201]),
+            None
+        );
+        // k_budget == 0 or short history returns None
+        assert_eq!(
+            try_lookup_scheduled_suffix_drafts(&history, 503, 0, 2, 0, &sampler, &[]),
+            None
+        );
+        assert_eq!(
+            try_lookup_scheduled_suffix_drafts(&history[..32], 503, 3, 2, 0, &sampler, &[]),
+            None
+        );
     }
 }

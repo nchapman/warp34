@@ -108,6 +108,12 @@ fn single_client_27b_hgptq_serving_allocates_262k_tq4_context() {
     .expect("single-client 27B HGPTQ must preserve the 262k TQ4 capacity target");
     assert_eq!(engine.ranks[0].kv_pool.num_pages, 16_384);
     assert!(engine.ranks[0].state_pool.total_slots >= 3);
+    let ckpt = engine.ranks[0]
+        .checkpoint_pool
+        .as_ref()
+        .expect("serving must allocate tiered WHT128-Q8_0 checkpoint pool");
+    assert!(ckpt.total_slots >= 24);
+    assert_eq!(ckpt.allocated_host_slots(), 0);
 }
 
 #[test]
@@ -177,6 +183,43 @@ fn single_client_27b_dflash_serving_preserves_32k_context() {
     .expect("single-client DFlash must not require the preferred 24-slot state pool");
     assert_eq!(engine.ranks[0].kv_pool.num_pages, 2048);
     assert!(engine.ranks[0].state_pool.total_slots >= 11);
+    drop(engine);
+
+    let auto_engine = Qwen3_5Engine::load_for_serving_with_auto_fit(
+        target.to_str().unwrap(),
+        1,
+        KvFormatPolicy::Tq4,
+        true,
+        None,
+        true,
+        6,
+        Some(&SpeculativeConfig {
+            kind: SpeculativeKind::DFlash2,
+            draft_model: Some(draft.to_str().unwrap().to_owned()),
+            mtp_k: 3,
+        }),
+        &[],
+    )
+    .expect("single-client 27B DFlash2 auto-fit must select tq4_all and 262k context on 24 GiB");
+    let fit = auto_engine
+        .serving_fit
+        .expect("serving_fit must be populated");
+    assert_eq!(fit.kv_policy, KvFormatPolicy::Tq4All);
+    assert!(fit.kv_policy_auto_adjusted);
+    assert!(fit.kv_pages_auto_fitted);
+    assert_eq!(auto_engine.ranks[0].kv_pool.num_pages, 16_384);
+    assert!(auto_engine.ranks[0].state_pool.total_slots >= 11);
+    let auto_ckpt = auto_engine.ranks[0]
+        .checkpoint_pool
+        .as_ref()
+        .expect("27B DFlash2 at 262k context must allocate tiered WHT128-Q8_0 checkpoint pool");
+    assert!(
+        auto_ckpt.total_slots >= 24 && auto_ckpt.host_slots >= 16,
+        "27B DFlash2 at 262k context must retain tiered checkpoints without starving M=8 verify slots, got vram={} host={}",
+        auto_ckpt.vram_slots,
+        auto_ckpt.host_slots
+    );
+    assert_eq!(auto_ckpt.allocated_host_slots(), 0);
 }
 
 #[test]

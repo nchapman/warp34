@@ -1,5 +1,25 @@
 import { useEffect, useRef, useState } from "react";
 import {
+  Check,
+  Copy,
+  Clock,
+  Layers,
+  LayoutDashboard,
+  Plug,
+  SquareTerminal,
+} from "lucide-react";
+import { Button } from "./components/ui/button";
+import { Badge } from "./components/ui/badge";
+import {
+  Card,
+  CardHeader,
+  CardTitle,
+  CardContent,
+  CardDescription,
+} from "./components/ui/card";
+import { Alert, AlertTitle, AlertDescription } from "./components/ui/alert";
+import { Tabs, TabsList, TabsTrigger, TabsContent } from "./components/ui/tabs";
+import {
   BrowserRouter,
   Link,
   MemoryRouter,
@@ -9,7 +29,8 @@ import {
   Routes,
   useLocation,
 } from "react-router";
-import { Chart, type Point } from "./Chart";
+import { apiUrl, baseOriginUrl, detectBasePath } from "./basePath";
+import { Chart, type Point } from "./LazyChart";
 import { Playground } from "./Playground";
 import {
   counterRate,
@@ -25,11 +46,19 @@ import {
   type Snapshot,
 } from "./metrics";
 import { useMetrics, type MetricsState } from "./useMetrics";
+import warp34Logo from "./assets/warp34-logo.png";
 
 const number = (value: number | null | undefined) =>
   value === undefined || value === null
     ? "—"
     : value.toLocaleString(undefined, { maximumFractionDigits: 0 });
+
+const formatContextTokens = (tokens: number): string =>
+  tokens >= 1024 && tokens % 1024 === 0
+    ? `${tokens / 1024}k`
+    : tokens >= 1000
+      ? `${(tokens / 1000).toFixed(tokens >= 10_000 ? 0 : 1)}k`
+      : `${tokens}`;
 
 function PoolBar({
   name,
@@ -65,7 +94,11 @@ function PoolBar({
         <span className="pool-cached" style={{ width: `${cached}%` }} />
       </div>
       <div className="pool-detail">
-        <span>{number(pool?.free)} free</span>
+        <span>
+          {available
+            ? `${number(pool.cached)} cached · ${number(pool.free)} free`
+            : `${number(pool?.free)} free`}
+        </span>
         <span>
           {number(pool?.capacity)} {unit}
         </span>
@@ -126,10 +159,20 @@ function Status({ state }: { state: MetricsState }) {
     style = snapshot?.status === "ready" ? "healthy" : "danger";
   }
   return (
-    <span className={`status ${style}`} role="status">
-      <span className="status-dot" />
+    <Badge
+      variant="outline"
+      className={
+        style === "healthy"
+          ? "text-[var(--aqua)]"
+          : style === "danger"
+            ? "text-red-400"
+            : "text-muted-foreground"
+      }
+      role="status"
+    >
+      <span aria-hidden="true" className="size-1.5 rounded-full bg-current" />
       {label}
-    </span>
+    </Badge>
   );
 }
 
@@ -174,6 +217,7 @@ function Overview({ state }: { state: MetricsState }) {
     !["none", "off", "disabled"].includes(
       latest.config.speculation.toLowerCase(),
     );
+  const loraAdapters = latest?.config.lora_adapters ?? [];
   return (
     <>
       <div className="section-heading">
@@ -182,299 +226,351 @@ function Overview({ state }: { state: MetricsState }) {
           <p>Your inference engine, at a glance.</p>
         </div>
         <span className="window-label">
-          <svg
-            className="tiny-clock"
-            viewBox="0 0 16 16"
-            fill="none"
-            stroke="currentColor"
-            strokeWidth="1.4"
-            strokeLinecap="round"
-            strokeLinejoin="round"
-            aria-hidden="true"
-          >
-            <circle cx="8" cy="8" r="6.25" />
-            <path d="M8 4.5V8l2.4 1.5" />
-          </svg>
+          <Clock className="size-4" aria-hidden="true" />
           Last 5 minutes · local history
         </span>
       </div>
       {connection === "offline" && (
-        <div className="notice" role="alert">
-          <strong>Connection lost.</strong> {state.error}.{" "}
-          {latest
-            ? "Showing the last received snapshot; "
-            : "No metrics received yet; "}
-          retrying automatically.
-        </div>
+        <Alert variant="destructive" className="mb-5">
+          <AlertTitle>Connection lost.</AlertTitle>
+          <AlertDescription>
+            {state.error}.{" "}
+            {latest
+              ? "Showing the last received snapshot; "
+              : "No metrics received yet; "}
+            retrying automatically.
+          </AlertDescription>
+        </Alert>
       )}
       {latest && latest.status !== "ready" && (
-        <div className="notice" role="alert">
-          {latest.status === "stopping"
-            ? "The engine is shutting down."
-            : "The inference worker is unhealthy."}{" "}
-          Metrics remain available for diagnosis.
-        </div>
+        <Alert variant="destructive" className="mb-5">
+          <AlertTitle>
+            {latest.status === "stopping"
+              ? "The engine is shutting down."
+              : "The inference worker is unhealthy."}{" "}
+          </AlertTitle>
+          <AlertDescription>
+            Metrics remain available for diagnosis.
+          </AlertDescription>
+        </Alert>
       )}
       <section className="engine-strip" aria-label="Engine configuration">
         <div className="model-icon" aria-hidden="true">
-          <svg
-            viewBox="0 0 24 24"
-            fill="none"
-            stroke="currentColor"
-            strokeWidth="1.65"
-            strokeLinecap="round"
-            strokeLinejoin="round"
-          >
-            <polygon
-              points="12 3 3 7.5 12 12 21 7.5 12 3"
-              fill="currentColor"
-              fillOpacity="0.18"
-            />
-            <polyline points="3 12 12 16.5 21 12" />
-            <polyline points="3 16.5 12 21 21 16.5" />
-          </svg>
+          <Layers className="size-6" />
         </div>
         <div className="model-info">
           <span className="eyebrow">LOADED MODEL</span>
           <span className="model-name" title={latest?.model}>
             {latest?.model ?? "Waiting for engine…"}
           </span>
+          {loraAdapters.length > 1 && (
+            <span
+              className="model-adapters"
+              title={`Loaded LoRA adapters: ${loraAdapters.join(", ")}`}
+            >
+              LoRA: {loraAdapters.join(", ")}
+            </span>
+          )}
         </div>
-        <div className="model-tags">
-          <span>TP {latest?.config.tp_size ?? "—"}</span>
-          <span>{latest?.config.kv_format.toUpperCase() ?? "—"} KV</span>
-          {specEnabled && <span>{latest.config.speculation}</span>}
+        <div className="flex flex-wrap gap-2">
+          <Badge variant="secondary">TP {latest?.config.tp_size ?? "—"}</Badge>
+          <Badge variant="secondary">
+            {latest?.config.kv_format.toUpperCase() ?? "—"} KV
+          </Badge>
+          {latest?.config.max_model_len ? (
+            <Badge variant="secondary">
+              {formatContextTokens(latest.config.max_model_len)} ctx
+            </Badge>
+          ) : null}
+          {specEnabled && (
+            <Badge variant="secondary">{latest.config.speculation}</Badge>
+          )}
+          {loraAdapters.length > 0 && (
+            <Badge
+              variant="outline"
+              title={`Loaded LoRA adapters: ${loraAdapters.join(", ")}`}
+            >
+              {loraAdapters.length === 1
+                ? `LoRA: ${loraAdapters[0]}`
+                : `${loraAdapters.length} LoRAs`}
+            </Badge>
+          )}
         </div>
       </section>
       <div className="primary-grid">
-        <section
-          className="panel throughput-panel"
+        <Card
+          role="region"
+          className="min-w-0 gap-4"
           aria-labelledby="throughput-title"
         >
-          <div className="panel-heading">
-            <h2 id="throughput-title">Generation throughput</h2>
+          <CardHeader className="flex flex-row items-center justify-between gap-2">
+            <CardTitle>
+              <h2 id="throughput-title">Generation throughput</h2>
+            </CardTitle>
             <span className="legend">
               <i className="violet-dot" />
               {isDecisionWorkload ? "Prompt tokens" : "Output tokens"}
             </span>
-          </div>
-          <div className="hero-number numeric">
-            {rate === null ? "—" : number(rate)}
-            <span>tok/s</span>
-          </div>
-          <p className="metric-caption">
-            {isDecisionWorkload
-              ? "Aggregate prompt evaluation · trailing 10 seconds"
-              : "Aggregate engine output · trailing 10 seconds"}
-          </p>
-          <Chart
-            points={throughputPoints(history, isDecisionWorkload)}
-            label="Generation throughput"
-            unit="tokens per second"
-          />
-        </section>
-        <section
-          className="panel requests-panel"
+          </CardHeader>
+          <CardContent>
+            <div className="hero-number numeric">
+              {rate === null ? "—" : number(rate)}
+              <span>tok/s</span>
+            </div>
+            <p className="metric-caption">
+              {isDecisionWorkload
+                ? "Aggregate prompt evaluation · trailing 10 seconds"
+                : "Aggregate engine output · trailing 10 seconds"}
+            </p>
+            <Chart
+              points={throughputPoints(history, isDecisionWorkload)}
+              label="Generation throughput"
+              unit="tokens per second"
+            />
+          </CardContent>
+        </Card>
+        <Card
+          role="region"
+          className="min-w-0 gap-4"
           aria-labelledby="requests-title"
         >
-          <div className="panel-heading">
-            <h2 id="requests-title">Requests</h2>
+          <CardHeader className="flex flex-row items-center justify-between gap-2">
+            <CardTitle>
+              <h2 id="requests-title">Requests</h2>
+            </CardTitle>
             <span className="muted">Current</span>
-          </div>
-          <div className="request-numbers">
-            <div>
-              <strong className="numeric">
-                {number(latest?.requests.running)}
-              </strong>
-              <span>
-                <i className="aqua-dot" />
-                Running
-              </span>
+          </CardHeader>
+          <CardContent>
+            <div className="request-numbers">
+              <div>
+                <strong className="numeric">
+                  {number(latest?.requests.running)}
+                </strong>
+                <span>
+                  <i className="aqua-dot" />
+                  Running
+                </span>
+              </div>
+              <div>
+                <strong className="numeric">
+                  {number(latest?.requests.waiting)}
+                </strong>
+                <span>
+                  <i className="indigo-dot" />
+                  Queued
+                </span>
+              </div>
             </div>
-            <div>
-              <strong className="numeric">
-                {number(latest?.requests.waiting)}
-              </strong>
-              <span>
-                <i className="indigo-dot" />
-                Queued
-              </span>
+            <Chart
+              points={history.map((s) => ({
+                time: s.uptime_seconds,
+                value: s.requests.running + s.requests.waiting,
+              }))}
+              label="Running and queued requests"
+              unit="requests"
+              color="aqua"
+              compact
+            />
+            <div className="request-totals">
+              <div>
+                <span>Completed</span>
+                <strong>{number(latest?.requests.completed)}</strong>
+              </div>
+              <div>
+                <span>Cancelled</span>
+                <strong>{number(latest?.requests.cancelled)}</strong>
+              </div>
+              <div>
+                <span>Failed</span>
+                <strong className={latest?.requests.failed ? "error-text" : ""}>
+                  {number(latest?.requests.failed)}
+                </strong>
+              </div>
             </div>
-          </div>
-          <Chart
-            points={history.map((s) => ({
-              time: s.uptime_seconds,
-              value: s.requests.running + s.requests.waiting,
-            }))}
-            label="Running and queued requests"
-            unit="requests"
-            color="aqua"
-            compact
-          />
-          <div className="request-totals">
-            <div>
-              <span>Completed</span>
-              <strong>{number(latest?.requests.completed)}</strong>
-            </div>
-            <div>
-              <span>Cancelled</span>
-              <strong>{number(latest?.requests.cancelled)}</strong>
-            </div>
-            <div>
-              <span>Failed</span>
-              <strong className={latest?.requests.failed ? "error-text" : ""}>
-                {number(latest?.requests.failed)}
-              </strong>
-            </div>
-          </div>
-          <p className="footnote">Engine requests · totals since startup</p>
-        </section>
+            <p className="footnote">Engine requests · totals since startup</p>
+          </CardContent>
+        </Card>
       </div>
       <div className="secondary-grid">
-        <section className="panel" aria-labelledby="latency-title">
-          <div className="panel-heading">
-            <h2 id="latency-title">Time to first token</h2>
+        <Card
+          role="region"
+          className="min-w-0 gap-4"
+          aria-labelledby="latency-title"
+        >
+          <CardHeader className="flex flex-row items-center justify-between gap-2">
+            <CardTitle>
+              <h2 id="latency-title">Time to first token</h2>
+            </CardTitle>
             <span className="muted">Engine</span>
-          </div>
-          <div className="latency-values">
-            <div>
-              <strong className="numeric">
-                {percentile(quantile(ttft, 0.5))}
-              </strong>
-              <span>p50</span>
+          </CardHeader>
+          <CardContent>
+            <div className="latency-values">
+              <div>
+                <strong className="numeric">
+                  {percentile(quantile(ttft, 0.5))}
+                </strong>
+                <span>p50</span>
+              </div>
+              <div>
+                <strong className="numeric">
+                  {percentile(quantile(ttft, 0.95))}
+                </strong>
+                <span>p95</span>
+              </div>
             </div>
-            <div>
-              <strong className="numeric">
-                {percentile(quantile(ttft, 0.95))}
-              </strong>
-              <span>p95</span>
+            <Chart
+              points={latencyPoints(history)}
+              label="Estimated p95 engine time to first token, trailing 30 seconds"
+              unit="milliseconds"
+              compact
+            />
+            <div className="detail-row">
+              <span>Queue p95</span>
+              <span>{percentile(quantile(queue, 0.95))}</span>
             </div>
-          </div>
-          <Chart
-            points={latencyPoints(history)}
-            label="Estimated p95 engine time to first token, trailing 30 seconds"
-            unit="milliseconds"
-            compact
-          />
-          <div className="detail-row">
-            <span>Queue p95</span>
-            <span>{percentile(quantile(queue, 0.95))}</span>
-          </div>
-          <div className="detail-row">
-            <span>
-              {pacing && pacing.count > 0
-                ? "Time / output token"
-                : isDecisionWorkload
-                  ? "Mean decision E2E"
-                  : "Time / output token"}
-            </span>
-            <span>
-              {duration(
-                pacing && pacing.count > 0
-                  ? pacing.sum / pacing.count
-                  : isDecisionWorkload && e2eRaw && e2eRaw.count > 0
-                    ? e2eRaw.sum / e2eRaw.count
-                    : null,
-              )}
-            </span>
-          </div>
-          <p className="footnote">
-            Bucket estimates · excludes HTTP preprocessing.
-            <br />
-            Token pacing is a completed-request average, not SSE timing.
-          </p>
-        </section>
-        <section className="panel" aria-labelledby="cache-title">
-          <div className="panel-heading">
-            <h2 id="cache-title">Prefix reuse</h2>
+            <div className="detail-row">
+              <span>
+                {pacing && pacing.count > 0
+                  ? "Time / output token"
+                  : isDecisionWorkload
+                    ? "Mean decision E2E"
+                    : "Time / output token"}
+              </span>
+              <span>
+                {duration(
+                  pacing && pacing.count > 0
+                    ? pacing.sum / pacing.count
+                    : isDecisionWorkload && e2eRaw && e2eRaw.count > 0
+                      ? e2eRaw.sum / e2eRaw.count
+                      : null,
+                )}
+              </span>
+            </div>
+            <p className="footnote">
+              Bucket estimates · excludes HTTP preprocessing.
+              <br />
+              Token pacing is a completed-request average, not SSE timing.
+            </p>
+          </CardContent>
+        </Card>
+        <Card
+          role="region"
+          className="min-w-0 gap-4"
+          aria-labelledby="cache-title"
+        >
+          <CardHeader className="flex flex-row items-center justify-between gap-2">
+            <CardTitle>
+              <h2 id="cache-title">Prefix reuse</h2>
+            </CardTitle>
             <span className="muted">Observed window</span>
-          </div>
-          <div className="secondary-number numeric">{percent(cached)}</div>
-          <p className="metric-caption">Prompt tokens restored from cache</p>
-          <div
-            className="cache-track"
-            role="img"
-            aria-label={
-              cached === null
-                ? "No prompt observations in this window"
-                : `${percent(cached)} of prompt tokens reused`
-            }
-          >
-            <span style={{ width: `${(cached ?? 0) * 100}%` }} />
-          </div>
-          <div className="detail-row">
-            <span>Cached tokens</span>
-            <span>{number(latest?.tokens.cached)}</span>
-          </div>
-          <div className="detail-row">
-            <span>Computed prompt tokens</span>
-            <span>{number(latest?.tokens.computed)}</span>
-          </div>
-          {specEnabled && speculation && (
-            <div className="speculation">
-              <span className="eyebrow">SPECULATIVE DECODING</span>
-              <div className="detail-row">
-                <span>
-                  {speculation.draft_tokens === null
-                    ? "Verify rounds"
-                    : "Draft acceptance"}
-                </span>
-                <span>
-                  {speculation.draft_tokens === null
-                    ? number(speculation.rounds)
-                    : percent(
-                        ratio(
-                          speculation.accepted_tokens,
-                          speculation.draft_tokens,
-                        ),
-                      )}
-                </span>
-              </div>
-              <div className="detail-row">
-                <span>Tokens / verify round</span>
-                <span>
-                  {speculation.rounds
-                    ? (
-                        1 +
-                        speculation.accepted_tokens / speculation.rounds
-                      ).toFixed(2)
-                    : "—"}
-                </span>
-              </div>
+          </CardHeader>
+          <CardContent>
+            <div className="secondary-number numeric">{percent(cached)}</div>
+            <p className="metric-caption">Prompt tokens restored from cache</p>
+            <div
+              className="cache-track"
+              role="img"
+              aria-label={
+                cached === null
+                  ? "No prompt observations in this window"
+                  : `${percent(cached)} of prompt tokens reused`
+              }
+            >
+              <span style={{ width: `${(cached ?? 0) * 100}%` }} />
             </div>
-          )}
-          <p className="footnote">
-            Token totals and speculation since startup.
-            <br />
-            Draft proposals are not counted as output.
-          </p>
-        </section>
-        <section className="panel" aria-labelledby="capacity-title">
-          <div className="panel-heading">
-            <h2 id="capacity-title">Cache capacity</h2>
+            <div className="detail-row">
+              <span>Cached tokens</span>
+              <span>{number(latest?.tokens.cached)}</span>
+            </div>
+            <div className="detail-row">
+              <span>Computed prompt tokens</span>
+              <span>{number(latest?.tokens.computed)}</span>
+            </div>
+            {specEnabled && speculation && (
+              <div className="speculation">
+                <span className="eyebrow">SPECULATIVE DECODING</span>
+                <div className="detail-row">
+                  <span>
+                    {speculation.draft_tokens === null
+                      ? "Verify rounds"
+                      : "Draft acceptance"}
+                  </span>
+                  <span>
+                    {speculation.draft_tokens === null
+                      ? number(speculation.rounds)
+                      : percent(
+                          ratio(
+                            speculation.accepted_tokens,
+                            speculation.draft_tokens,
+                          ),
+                        )}
+                  </span>
+                </div>
+                <div className="detail-row">
+                  <span>Tokens / verify round</span>
+                  <span>
+                    {speculation.rounds
+                      ? (
+                          1 +
+                          speculation.accepted_tokens / speculation.rounds
+                        ).toFixed(2)
+                      : "—"}
+                  </span>
+                </div>
+              </div>
+            )}
+            <p className="footnote">
+              Token totals and speculation since startup.
+              <br />
+              Draft proposals are not counted as output.
+            </p>
+          </CardContent>
+        </Card>
+        <Card
+          role="region"
+          className="min-w-0 gap-4"
+          aria-labelledby="capacity-title"
+        >
+          <CardHeader className="flex flex-row items-center justify-between gap-2">
+            <CardTitle>
+              <h2 id="capacity-title">Cache capacity</h2>
+            </CardTitle>
             <span className="muted">Target pools</span>
-          </div>
-          <PoolBar name="KV cache" pool={latest?.pools.kv} unit="pages" />
-          <PoolBar name="GDN state" pool={latest?.pools.gdn} unit="slots" />
-          <div className="capacity-legend">
-            <span>
-              <i className="violet-dot" />
-              Active / reserved
-            </span>
-            <span>
-              <i className="indigo-dot" />
-              Evictable
-            </span>
-            <span>
-              <i className="free-dot" />
-              Free
-            </span>
-          </div>
-          <p className="footnote">
-            Cached resources can be reclaimed for new requests. High cache
-            occupancy alone is not pressure.
-          </p>
-        </section>
+          </CardHeader>
+          <CardContent>
+            <PoolBar name="KV cache" pool={latest?.pools.kv} unit="pages" />
+            <PoolBar name="GDN state" pool={latest?.pools.gdn} unit="slots" />
+            {latest?.pools.gdn_checkpoints && (
+              <div className="detail-row">
+                <span>WHT128-Q8 checkpoints</span>
+                <span className="numeric">
+                  L1 {number(latest.pools.gdn_checkpoints.vram_used)}/
+                  {number(latest.pools.gdn_checkpoints.vram_capacity)} VRAM · L2{" "}
+                  {number(latest.pools.gdn_checkpoints.host_used)}/
+                  {number(latest.pools.gdn_checkpoints.host_capacity)} RAM
+                </span>
+              </div>
+            )}
+            <div className="capacity-legend">
+              <span>
+                <i className="violet-dot" />
+                Active / reserved
+              </span>
+              <span>
+                <i className="indigo-dot" />
+                Evictable
+              </span>
+              <span>
+                <i className="free-dot" />
+                Free
+              </span>
+            </div>
+            <p className="footnote">
+              Cached resources can be reclaimed for new requests. High cache
+              occupancy alone is not pressure.
+            </p>
+          </CardContent>
+        </Card>
       </div>
       <div className="bottom-line">
         <span>
@@ -483,7 +579,7 @@ function Overview({ state }: { state: MetricsState }) {
           <b>{number(latest?.http_responses.server_error)}</b> server errors{" "}
           <span className="muted">· since startup</span>
         </span>
-        <a href="/metrics" target="_blank" rel="noreferrer">
+        <a href={apiUrl("/metrics")} target="_blank" rel="noreferrer">
           Prometheus metrics <span aria-hidden="true">↗</span>
         </a>
       </div>
@@ -516,6 +612,7 @@ function sanitizeModelForSnippet(model: string | null): string {
 
 function CopyCodeBlock({ label, code }: { label: string; code: string }) {
   const [copied, setCopied] = useState(false);
+  const [copyError, setCopyError] = useState(false);
   const timerRef = useRef<number | null>(null);
   useEffect(() => {
     return () => {
@@ -525,7 +622,11 @@ function CopyCodeBlock({ label, code }: { label: string; code: string }) {
     };
   }, []);
   const onCopy = () => {
-    if (!navigator.clipboard?.writeText) return;
+    setCopyError(false);
+    if (!navigator.clipboard?.writeText) {
+      setCopyError(true);
+      return;
+    }
     navigator.clipboard
       .writeText(code)
       .then(() => {
@@ -540,21 +641,39 @@ function CopyCodeBlock({ label, code }: { label: string; code: string }) {
       })
       .catch(() => {
         setCopied(false);
+        setCopyError(true);
       });
   };
   return (
     <div className="connect-snippet">
       <div className="connect-snippet-header">
         <span className="connect-snippet-label">{label}</span>
-        <button
+        <Button
           type="button"
-          className="pg-btn pg-btn-ghost connect-copy-btn"
+          variant="ghost"
+          size="sm"
+          aria-label={`${copied ? "Copied" : "Copy"} ${label}`}
           onClick={onCopy}
         >
-          {copied ? "Copied" : "Copy"}
-        </button>
+          {copied ? <Check aria-hidden="true" /> : <Copy aria-hidden="true" />}
+          <span aria-live="polite">{copied ? "Copied" : "Copy"}</span>
+        </Button>
       </div>
-      <pre>{code}</pre>
+      {copyError && (
+        <Alert variant="destructive">
+          <AlertTitle>Could not copy.</AlertTitle>
+          <AlertDescription>
+            Select and copy the snippet manually.
+          </AlertDescription>
+        </Alert>
+      )}
+      <pre
+        tabIndex={0}
+        aria-label={label}
+        className="overflow-x-auto rounded-md border bg-background p-4 text-[13px] leading-relaxed text-foreground"
+      >
+        {code}
+      </pre>
     </div>
   );
 }
@@ -568,8 +687,8 @@ function ConnectionGuide({
   kvPages: number | null;
   maxModelLen: number | null;
 }) {
-  const [activeTab, setActiveTab] = useState<AgentTabId>("claude-code");
-  const base = window.location.origin;
+  const basePath = detectBasePath();
+  const base = baseOriginUrl(window.location.origin, basePath);
   const activeModel = sanitizeModelForSnippet(model);
   const ctxTokens =
     maxModelLen && maxModelLen > 0
@@ -577,7 +696,10 @@ function ConnectionGuide({
       : kvPages && kvPages > 0
         ? kvPages * 16
         : 32768;
-  const maxOutTokens = Math.min(4096, Math.max(512, Math.floor(ctxTokens / 4)));
+  const maxOutTokens = Math.min(
+    32768,
+    Math.max(512, Math.floor(ctxTokens / 4)),
+  );
   const compactLimit = Math.floor(ctxTokens * 0.75);
 
   const guides: AgentGuideSpec[] = [
@@ -586,7 +708,7 @@ function ConnectionGuide({
       title: "Claude Code",
       protocol: "Anthropic Messages API · /v1/messages",
       summary:
-        "Claude Code appends /v1/messages to ANTHROPIC_BASE_URL automatically — pass the server root without /v1. Set CLAUDE_CODE_MAX_OUTPUT_TOKENS within warp34's 4,096-token per-turn output cap; warp34 natively serves /v1/messages/count_tokens and strips cch= billing headers so MambaRadixCache prefixes stay warm.",
+        "Claude Code appends /v1/messages to ANTHROPIC_BASE_URL automatically — pass the server root without /v1. Set CLAUDE_CODE_MAX_OUTPUT_TOKENS to size each turn's output budget within the active context window; warp34 natively serves /v1/messages/count_tokens and strips cch= billing headers so MambaRadixCache prefixes stay warm.",
       snippets: [
         {
           label: "Quick launch (terminal)",
@@ -677,8 +799,6 @@ function ConnectionGuide({
     },
   ];
 
-  const currentGuide = guides.find((g) => g.id === activeTab) ?? guides[0];
-
   return (
     <>
       <div className="section-heading">
@@ -688,105 +808,151 @@ function ConnectionGuide({
         </div>
       </div>
 
-      <section className="panel guide connect-hero">
-        <div className="connect-hero-top">
-          <div>
-            <span className="eyebrow">CODING AGENTS &amp; SDKS</span>
-            <h2>Bring your coding agent.</h2>
-            <p>
-              Point an OpenAI-compatible, Responses API, or Anthropic Messages
-              client at this server. Snippets below are pre-filled with your
-              loaded model and{" "}
-              <span className="numeric">{ctxTokens.toLocaleString()}</span>
-              -token KV capacity.
-            </p>
+      <Card
+        role="region"
+        aria-labelledby="connect-title"
+        className="mb-5 min-w-0"
+      >
+        <CardHeader>
+          <span className="eyebrow">CODING AGENTS &amp; SDKS</span>
+          <CardTitle>
+            <h2 id="connect-title" className="text-xl font-semibold">
+              Bring your coding agent.
+            </h2>
+          </CardTitle>
+          <CardDescription className="max-w-3xl leading-relaxed">
+            Point an OpenAI-compatible, Responses API, or Anthropic Messages
+            client at this server. Snippets below are pre-filled with your
+            loaded model and{" "}
+            <span className="numeric">{ctxTokens.toLocaleString()}</span>
+            -token KV capacity.
+          </CardDescription>
+        </CardHeader>
+        <CardContent>
+          <div className="connect-endpoints-bar">
+            <div className="connect-endpoint-item">
+              <span>OpenAI Base URL (/v1/chat/completions, /v1/responses)</span>
+              <code>{base}/v1</code>
+            </div>
+            <div className="connect-endpoint-item">
+              <span>Anthropic Base URL (/v1/messages — no /v1 suffix)</span>
+              <code>{base}</code>
+            </div>
+            <div className="connect-endpoint-item">
+              <span>Loaded Model ID</span>
+              <code>{activeModel}</code>
+            </div>
           </div>
-        </div>
 
-        <div className="connect-endpoints-bar">
-          <div className="connect-endpoint-item">
-            <span>OpenAI Base URL (/v1/chat/completions, /v1/responses)</span>
-            <code>{base}/v1</code>
-          </div>
-          <div className="connect-endpoint-item">
-            <span>Anthropic Base URL (/v1/messages — no /v1 suffix)</span>
-            <code>{base}</code>
-          </div>
-          <div className="connect-endpoint-item">
-            <span>Loaded Model ID</span>
-            <code>{activeModel}</code>
-          </div>
-        </div>
-
-        <div
-          className="connect-tabs"
-          role="tablist"
-          aria-label="Coding agent integrations"
-        >
-          {guides.map((g) => (
-            <button
-              key={g.id}
-              id={`connect-tab-${g.id}`}
-              type="button"
-              role="tab"
-              aria-selected={currentGuide.id === g.id}
-              aria-controls="connect-tabpanel"
-              className={`connect-tab ${currentGuide.id === g.id ? "active" : ""}`}
-              onClick={() => setActiveTab(g.id)}
+          <Tabs defaultValue="claude-code" className="mt-6 gap-5">
+            <TabsList
+              aria-label="Coding agent integrations"
+              className="h-auto! max-w-full flex-wrap justify-start gap-1"
             >
-              {g.title}
-            </button>
-          ))}
-        </div>
-
-        <div
-          id="connect-tabpanel"
-          className="connect-tab-body"
-          role="tabpanel"
-          aria-labelledby={`connect-tab-${currentGuide.id}`}
-        >
-          <div className="connect-tab-meta">
-            <span className="connect-protocol-badge">
-              {currentGuide.protocol}
-            </span>
-            <p>{currentGuide.summary}</p>
-          </div>
-          <div className="connect-snippets-grid">
-            {currentGuide.snippets.map((s) => (
-              <CopyCodeBlock key={s.label} label={s.label} code={s.code} />
+              {guides.map((guide) => (
+                <TabsTrigger
+                  key={guide.id}
+                  value={guide.id}
+                  className="min-h-9 flex-none px-3"
+                >
+                  {guide.title}
+                </TabsTrigger>
+              ))}
+            </TabsList>
+            {guides.map((guide) => (
+              <TabsContent key={guide.id} value={guide.id} className="min-w-0">
+                <div className="connect-tab-meta">
+                  <Badge variant="secondary" className="whitespace-normal">
+                    {guide.protocol}
+                  </Badge>
+                  <p className="text-sm leading-relaxed text-muted-foreground">
+                    {guide.summary}
+                  </p>
+                </div>
+                <div className="connect-snippets-grid">
+                  {guide.snippets.map((s) => (
+                    <CopyCodeBlock
+                      key={s.label}
+                      label={s.label}
+                      code={s.code}
+                    />
+                  ))}
+                </div>
+              </TabsContent>
             ))}
-          </div>
-        </div>
-      </section>
+          </Tabs>
+        </CardContent>
+      </Card>
 
       <div className="connect-grid">
-        <section className="panel guide">
-          <span className="eyebrow">OBSERVABILITY</span>
-          <h2>Use your own monitoring.</h2>
-          <p>
-            Scrape <a href="/metrics">/metrics</a> with Prometheus, or consume
-            the same counters and histogram buckets as JSON at{" "}
-            <a href="/api/metrics">/api/metrics</a>. This dashboard keeps up to
-            five minutes of history in this tab; use an external collector for
-            persistence.
-          </p>
-          <label>Prometheus scrape config</label>
-          <pre>{`scrape_configs:\n  - job_name: warp34\n    scrape_interval: 10s\n    static_configs:\n      - targets: ['${window.location.host}']`}</pre>
-        </section>
-        <section className="panel guide-security">
-          <span className="eyebrow">EXPOSURE &amp; AUTHENTICATION</span>
-          <h2>Keep your endpoint private.</h2>
-          <p>
-            API-key authentication is optional. When enabled, configure your
-            client with the deployment’s key (Bearer authorization or
-            x-api-key). The dashboard, metrics, and health endpoints remain
-            public. Bind locally or use an authenticated TLS reverse proxy to
-            protect the whole service. The dashboard is read-only and contains
-            no prompt or response content.
-          </p>
-          <label>Start server with API key authentication</label>
-          <pre>{`export WARP34_API_KEY="your-secret-key"\nwarp34 serve "${activeModel}" -c 64k --api-key-env WARP34_API_KEY`}</pre>
-        </section>
+        <Card
+          role="region"
+          aria-labelledby="monitoring-title"
+          className="min-w-0"
+        >
+          <CardHeader>
+            <span className="eyebrow">OBSERVABILITY</span>
+            <CardTitle>
+              <h2 id="monitoring-title" className="text-xl font-semibold">
+                Use your own monitoring.
+              </h2>
+            </CardTitle>
+          </CardHeader>
+          <CardContent className="space-y-4 text-sm leading-relaxed text-muted-foreground [&_pre]:overflow-x-auto [&_a]:underline [&_a]:underline-offset-4">
+            <p>
+              Scrape <a href={apiUrl("/metrics", basePath)}>/metrics</a> with
+              Prometheus, or consume the same counters and histogram buckets as
+              JSON at{" "}
+              <a href={apiUrl("/api/metrics", basePath)}>/api/metrics</a>. This
+              dashboard keeps up to five minutes of history in this tab; use an
+              external collector for persistence.
+            </p>
+            <p id="prometheus-caption" className="text-xs">
+              Prometheus scrape config
+            </p>
+            <pre
+              tabIndex={0}
+              aria-labelledby="prometheus-caption"
+              className="rounded-md border bg-background p-4 text-xs leading-relaxed text-foreground"
+            >{`scrape_configs:\n  - job_name: warp34\n    scrape_interval: 10s${basePath ? `\n    metrics_path: ${basePath}/metrics` : ""}\n    static_configs:\n      - targets: ['${window.location.host}']`}</pre>
+          </CardContent>
+        </Card>
+        <Card
+          role="region"
+          aria-labelledby="security-title"
+          className="min-w-0"
+        >
+          <CardHeader>
+            <span className="eyebrow">EXPOSURE &amp; AUTHENTICATION</span>
+            <CardTitle>
+              <h2 id="security-title" className="text-xl font-semibold">
+                Keep your endpoint private.
+              </h2>
+            </CardTitle>
+          </CardHeader>
+          <CardContent className="space-y-4 text-sm leading-relaxed text-muted-foreground [&_pre]:overflow-x-auto [&_a]:underline [&_a]:underline-offset-4">
+            <p>
+              API-key authentication is optional. When enabled, configure your
+              client with the deployment’s key (Bearer authorization or
+              x-api-key). The dashboard, metrics, and health endpoints remain
+              public. The server binds to 127.0.0.1 by default. Restrict network
+              access or use an authenticated TLS reverse proxy to protect the
+              whole service. Overview and Connect are read-only; Playground
+              requests require the same configured API key as other clients.
+              Playground displays prompts and responses in this browser tab. Use
+              --no-webui to disable these pages and assets; metrics and health
+              remain available.
+            </p>
+            <p id="auth-caption" className="text-xs">
+              Start server with API key authentication
+            </p>
+            <pre
+              tabIndex={0}
+              aria-labelledby="auth-caption"
+              className="rounded-md border bg-background p-4 text-xs leading-relaxed text-foreground"
+            >{`export WARP34_API_KEY="your-secret-key"\nwarp34 serve "${activeModel}" -c 64k --api-key-env WARP34_API_KEY`}</pre>
+          </CardContent>
+        </Card>
       </div>
     </>
   );
@@ -817,14 +983,13 @@ function DashboardShell({ state }: { state: MetricsState }) {
       </a>
       <header className="topbar">
         <Link className="brand" to="/" aria-label="warp34 home">
-          <svg viewBox="0 0 32 32" aria-hidden="true">
-            <path className="warp-bar-1" d="M4.5 23 9.5 9h4l-5 14z" />
-            <path className="warp-bar-2" d="M11.5 23 16.5 9h4l-5 14z" />
-            <path className="warp-bar-3" d="M18.5 23 23.5 9h4l-5 14z" />
-          </svg>
-          <span>
-            warp<span className="brand-suffix">34</span>
-          </span>
+          <img
+            src={warp34Logo}
+            alt="warp34"
+            className="brand-logo"
+            width={110}
+            height={48}
+          />
         </Link>
         <div className="topbar-right">
           <span className="uptime">
@@ -833,15 +998,21 @@ function DashboardShell({ state }: { state: MetricsState }) {
           <Status state={state} />
         </div>
       </header>
-      <nav aria-label="Main navigation">
+      <nav className="app-nav" aria-label="Main navigation">
         <NavLink to="/" end>
+          <LayoutDashboard className="mr-2 size-4" aria-hidden="true" />{" "}
           Overview
         </NavLink>
-        <NavLink to="/playground">Playground</NavLink>
-        <NavLink to="/connect">Connect</NavLink>
+        <NavLink to="/playground">
+          <SquareTerminal className="mr-2 size-4" aria-hidden="true" />{" "}
+          Playground
+        </NavLink>
+        <NavLink to="/connect">
+          <Plug className="mr-2 size-4" aria-hidden="true" /> Connect
+        </NavLink>
         <span className="nav-label">INFERENCE CONSOLE</span>
       </nav>
-      <main id="main">
+      <main id="main" tabIndex={-1}>
         <Routes>
           <Route path="/" element={<Overview state={state} />} />
           <Route
@@ -850,6 +1021,13 @@ function DashboardShell({ state }: { state: MetricsState }) {
               <Playground
                 model={latest?.model ?? null}
                 imageMode={isImageModel}
+                loraAdapters={latest?.config.lora_adapters}
+                maxContextTokens={
+                  latest?.config.max_model_len ??
+                  (latest?.pools.kv.capacity
+                    ? latest.pools.kv.capacity * 16
+                    : null)
+                }
               />
             }
           />
@@ -859,6 +1037,13 @@ function DashboardShell({ state }: { state: MetricsState }) {
               <Playground
                 model={latest?.model ?? null}
                 imageMode={isImageModel}
+                loraAdapters={latest?.config.lora_adapters}
+                maxContextTokens={
+                  latest?.config.max_model_len ??
+                  (latest?.pools.kv.capacity
+                    ? latest.pools.kv.capacity * 16
+                    : null)
+                }
               />
             }
           />
@@ -882,9 +1067,11 @@ function DashboardShell({ state }: { state: MetricsState }) {
         <span>
           {state.connection === "live"
             ? "Updates every 2s"
-            : state.connection === "offline"
-              ? "Waiting to reconnect"
-              : "Connecting to engine"}
+            : state.connection === "paused"
+              ? "Paused"
+              : state.connection === "offline"
+                ? "Waiting to reconnect"
+                : "Connecting to engine"}
           <span className="separator">·</span>
           {isPlayground ? "Interactive console" : "Read-only"}
         </span>
@@ -907,8 +1094,9 @@ export function Dashboard({
       </MemoryRouter>
     );
   }
+  const basename = detectBasePath();
   return (
-    <BrowserRouter>
+    <BrowserRouter basename={basename || undefined}>
       <DashboardShell state={state} />
     </BrowserRouter>
   );

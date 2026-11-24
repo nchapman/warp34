@@ -237,12 +237,23 @@ impl Qwen3_5Engine {
             r.device.make_current()?;
             r.kv_pool.reset_all_pages();
             r.state_pool.reset_all_slots();
+            if let Some(ckpt) = &mut r.checkpoint_pool {
+                ckpt.reset_all_slots();
+            }
             for st in &r.state_pool.layers {
                 st.conv_state.zero_async(&r.stream)?;
                 st.ssm_state.zero_async(&r.stream)?;
             }
             if let Some(ple_st) = &r.state_pool.ple_conv_state {
                 ple_st.zero_async(&r.stream)?;
+            }
+            if let Some(tmoe) = &mut r.tiered_moe {
+                tmoe.sync_all_dirty_from_device(&r.stream)?;
+                for (store, cache) in tmoe.stores.iter().zip(&mut tmoe.caches) {
+                    if cache.adapted_slots_dirty {
+                        cache.restore_initial_if_adapted(store, &mut tmoe.ws, &r.stream)?;
+                    }
+                }
             }
             r.stream.synchronize()?;
         }

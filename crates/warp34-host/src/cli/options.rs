@@ -67,8 +67,10 @@ pub(crate) fn parse_tp_arg(raw: &str) -> Result<usize, String> {
 }
 
 pub fn print_usage() {
-    eprintln!(
-        r#"Usage: warp34 <subcommand> [model] [options]
+    eprintln!("{USAGE}");
+}
+
+pub(crate) const USAGE: &str = r#"Usage: warp34 <subcommand> [model] [options]
 
 Subcommands:
   serve        [model] Start OpenAI/Anthropic/Images HTTP server & embedded dashboard (default :8000)
@@ -77,9 +79,11 @@ Subcommands:
   image        [model] Qwen-Image-2.1 text-to-image, single/multi-image editing, & RGBA generation
   bench        [model] Throughput & latency benchmark (--stage decode|radix|scheduler|vision|all)
   bench-image  [model] Qwen-Image-2.1 end-to-end diffusion latency & throughput benchmark
+  update               Update a release-bundle installation to the latest GitHub Release (--check)
   greedy-diff  [model] Token-level parity check against oracle golden JSON (--golden <dir|json>)
   dump-diff    [model] Layer-by-layer tensor or image parity check (--compare-tp2 | --golden <path>)
   profile-diff         Nsight Systems SQLite kernel category comparison vs vLLM/SGLang
+  -V, --version        Print warp34 version and exit
 
 Model & Hub Options:
   <model>, -m, --model <id|path>      Hugging Face repo ID or local Safetensors directory
@@ -88,38 +92,48 @@ Model & Hub Options:
   --revision <rev>                    Hub branch, tag, or full 40-char commit SHA
   --draft-revision <rev>              Hub revision for --draft-model (requires --draft-model)
   --offline                           Use local Hugging Face cache only (also respects HF_HUB_OFFLINE=1)
-  --lora-modules <name=path|path>...  Preload up to 8 hot-swappable LoRA adapters (supports @rev)
+  --lora-modules <name=path|path>...  Preload up to 62 hot-swappable LoRA adapters (supports @rev)
   --lora, --active-lora <name|spec>   Activate a LoRA adapter for single-sequence CLI commands
 
 Context & KV Cache Options:
-  -c, --ctx-size <tokens>             Target KV pool capacity in tokens (supports k/M suffixes:
-                                      4k, 16k, 32k, 64k, 128k, 256k; aliases: --context-length, --kv-tokens)
-  --kv-format <policy>                tq4 (default, 3.07x), tq4_all (3.88x), fp8, q8_0, fp16, bf16, auto
+  -c, --ctx-size <auto|tokens>        Target KV pool capacity in tokens (default: auto up to 256k in serve,
+                                      16k chat, 4k generate; supports k/M suffixes: 4k, 16k, 32k, 64k, 128k, 256k;
+                                      aliases: --context-length, --kv-tokens)
+  --kv-format <policy>                auto (default: tq4 3.07x, auto-fits tq4_all in serve when needed for full context),
+                                      tq4, tq4_all (3.88x), fp8, q8_0, fp16, bf16
                                       (aliases: --kv-cache-dtype, --cache-type-k)
   --kv-pages <n>                      Target KV pool in 16-token pages (low-level alternative to --ctx-size)
 
 Parallelism & Speculative Decoding:
-  --tp, --tp-size <1|2|4|auto>        Tensor parallelism degree (alias: --tensor-parallel-size)
-  --speculative mtp|dflash2|none      Speculative decoding mode (native MTP or DFlash2 block drafter)
-  --draft-model <id|path>             DFlash2 draft checkpoint (required for --speculative dflash2)
+  --tp, --tp-size <1|2|4|auto>        Tensor parallelism degree (default: 1; alias: --tensor-parallel-size)
+  --speculative auto|mtp|dflash2|off  Speculative decoding (default: auto in serve/chat/generate — uses native MTP
+                                      when present or DFlash2 when --draft-model is set; off in bench/oracle)
+  --draft-model <id|path>             DFlash2 draft checkpoint (implies --speculative dflash2 when --speculative is auto)
   --mtp-k <1..3>                      Draft tokens per MTP round (default: 3; alias: --num-speculative-tokens)
   --no-cuda-graph, --enforce-eager    Disable CUDA Graph capture and run eager launches
 
 Serving Options (warp34 serve):
-  --host <addr>                       Bind address (default: 127.0.0.1; use 0.0.0.0 for LAN/Tailscale)
+  --host <addr>                       Bind address (default: 127.0.0.1, or WARP34_HOST; select an interface for remote access)
   --port <n>                          Listen port (default: 8000)
   --max-num-seqs <1..16>              Max concurrent active sequences (default: 16; alias: --max-running-requests)
   --max-model-len <tokens>            Max total prompt + output tokens per request (supports 16k, 64k, etc.;
                                       auto-expands KV pool when --ctx-size/--kv-pages is omitted)
   --served-model-name, --alias <name> Public model ID advertised on /v1/models (default: model ID)
-  --api-key <val> | --api-key-env <v> Bearer token auth for /v1/* routes (dashboard/metrics/health stay public)
+  --api-key <val> | --api-key-env <v> Optional bearer token auth for all API operations, including aliases (not only /v1)
+                                      Metrics (/metrics and /api/metrics), minimal health, and enabled webui remain unauthenticated
+  --no-webui                         Disable the web UI only; metrics and API remain available
+  --reasoning-effort <level>          Default reasoning_effort (off|none|minimal|low|medium|high|xhigh|max)
+  --reasoning-budget <auto|off|n>     Default thinking token budget (default: auto; off/-1 = unlimited, disables effort cap)
+  --reasoning-budget-message <text>   Transition text injected before </think> on budget exhaustion ("" for none)
+  --no-reasoning-effort-budget        Disable automatic OpenRouter % thinking caps (minimal=10%, low=20%,
+                                      medium=50%, high=80%, xhigh/max=95% of min(max_tokens, 32k))
 
 Generation & Chat Options (warp34 chat / generate):
   -p, --prompt <text>                 Prompt text (omit in terminal with `warp34 chat` for interactive REPL)
   -f, --prompt-file <path>            Read prompt text from a UTF-8 file
   --system, --system-prompt <text>    System prompt prepended to the conversation
   -i, --interactive                   Force interactive multi-turn REPL mode in `warp34 chat`
-  -n, --max-tokens <tokens>           Max generated tokens (default: 512 chat, 256 generate, 64 greedy-diff)
+  -n, --max-tokens <tokens>           Max generated tokens (default: 2048 chat, 512 generate, 64 greedy-diff)
   --temp, --temperature <0..2>        Sampling temperature (0 = greedy default)
   --top-p <0..1> / --top-k <n>        Nucleus (top-p) and top-k sampling filters
   --min-p <0..1> / --seed <u64>       Min-p filter threshold and deterministic RNG seed
@@ -139,14 +153,22 @@ Image Generation & Editing Options (warp34 image / bench-image):
   --rgba, --transparent               Preserve 4-channel RGBA alpha in output PNG
   -o, --out, --output <path>          Output PNG path (default: qwen_image_out.png) or JSON report path
 
+Benchmark Options (warp34 bench):
+  --stage <decode|radix|scheduler|vision|all>  Benchmark stage (default: decode)
+  --prompt-len <tokens>               Prompt length in tokens (default: 128; supports k/M suffixes)
+  --gen-len <tokens>                  Generated output length in tokens (default: 128; supports k/M suffixes)
+  --realistic-prompt, --realistic     Use realistic coding/systems prompt instead of synthetic repetition
+  --batch-size <1..1024>              Concurrent batch size for scheduler stage (default: 8)
+  --out <path>                        Write benchmark JSON summary to file
+
 Examples:
-  warp34 serve Qwen/Qwen3.5-4B -c 64k --speculative mtp
+  warp34 serve nchapman/Qwen3.8-27B-W4A16-HGPTQ
+  warp34 serve nchapman/Qwen3.8-27B-W4A16-HGPTQ --draft-model nchapman/Qwen3.8-27B-DFlash2-W4A16-HGPTQ
+  warp34 serve nchapman/Qwen3.8-Flash-Next-W2.6A16-HGPTQ-RCO --tp 2
   warp34 serve Qwen/Qwen-Image-2.1-Turbo --tp 2
   warp34 image Qwen/Qwen-Image-2.1-Turbo -p "A macro photo of a mechanical watch" --size 1024x1024 -o watch.png
-  warp34 chat Qwen/Qwen3.5-4B --speculative mtp
-  warp34 generate Qwen/Qwen3.5-4B -p "Write a lock-free ring buffer in Rust" -n 512 --temp 0.6"#
-    );
-}
+  warp34 chat nchapman/Qwen3.8-27B-W4A16-HGPTQ
+  warp34 generate nchapman/Qwen3.5-9B-W4A16-HGPTQ -p "Write a lock-free ring buffer in Rust" -n 512 --temp 0.6"#;
 
 #[cfg(feature = "cuda")]
 #[derive(Clone, Debug, Default)]
@@ -214,7 +236,7 @@ impl CliSamplingOptions {
 
     pub(crate) fn validate(&self) -> Result<(), String> {
         let params = self.to_sampling_params(1, &[]);
-        params.validate().map_err(|e| e.to_string())
+        params.validate()
     }
 }
 
@@ -231,33 +253,87 @@ pub(crate) struct ServeCliConfig {
 
 #[cfg(feature = "cuda")]
 impl ServeCliConfig {
-    /// Derives the target KV page request for `warp34 serve`:
+    /// Derives the explicit KV page request for `warp34 serve`:
     /// - When `--ctx-size` or `--kv-pages` was explicitly set, honors `kv_pages`.
-    /// - Otherwise, if `--max-model-len` was set and requires more pages than the default
-    ///   (or when `--speculative` is enabled, which otherwise defaults to 256 pages / 4096 tokens),
-    ///   auto-expands the target KV page request to accommodate `max_model_len`.
+    /// - When `--max-model-len` was explicitly set, sizes the KV pool to at least
+    ///   `max_model_len.div_ceil(16)` pages.
+    /// - Otherwise returns `None` so [`Qwen3_5Engine::load_for_serving_with_auto_fit`]
+    ///   automatically fits the maximum context window up to the model's `max_position_embeddings`.
     pub(crate) fn effective_kv_pages(
         kv_pages: Option<usize>,
         max_model_len: Option<usize>,
-        spec_config: Option<&crate::proposer::SpeculativeConfig>,
+        _spec_config: Option<&crate::proposer::SpeculativeConfig>,
     ) -> Option<usize> {
         if let Some(explicit) = kv_pages {
             return Some(explicit);
         }
-        let needed_for_max_len = max_model_len.map(|tokens| tokens.div_ceil(16));
-        if spec_config.is_some() {
-            Some(needed_for_max_len.unwrap_or(256).max(256))
-        } else if let Some(needed) = needed_for_max_len
-            && needed > crate::model::DEFAULT_SERVING_TARGET_KV_PAGES
-        {
-            Some(needed)
-        } else {
-            None
-        }
+        max_model_len.map(|tokens| {
+            tokens
+                .div_ceil(16)
+                .max(crate::model::DEFAULT_TARGET_KV_PAGES)
+        })
     }
 
-    fn parse(&mut self, args: &[String], i: &mut usize) -> Result<bool, String> {
+    pub(super) fn parse(&mut self, args: &[String], i: &mut usize) -> Result<bool, String> {
         let flag = args[*i].as_str();
+        if flag == "--no-webui" {
+            self.used = true;
+            self.options.webui = false;
+            return Ok(true);
+        }
+        if flag == "--no-reasoning-effort-budget" {
+            self.used = true;
+            self.options.reasoning_effort_budget = false;
+            return Ok(true);
+        }
+        if flag == "--reasoning-effort-budget" {
+            self.used = true;
+            self.options.reasoning_effort_budget = true;
+            return Ok(true);
+        }
+        if flag == "--reasoning-budget" {
+            self.used = true;
+            *i += 1;
+            let value = args
+                .get(*i)
+                .ok_or_else(|| "missing --reasoning-budget value".to_string())?;
+            let trimmed = value.trim();
+            if trimmed.eq_ignore_ascii_case("auto") {
+                self.options.reasoning_budget = None;
+                self.options.reasoning_effort_budget = true;
+            } else if trimmed.eq_ignore_ascii_case("off")
+                || trimmed.eq_ignore_ascii_case("none")
+                || trimmed.eq_ignore_ascii_case("unlimited")
+            {
+                self.options.reasoning_budget = None;
+                self.options.reasoning_effort_budget = false;
+            } else if let Ok(parsed) = trimmed.parse::<i64>() {
+                if parsed < -1 {
+                    return Err("--reasoning-budget must be >= -1 (-1/off for unlimited)".into());
+                }
+                if parsed == -1 {
+                    self.options.reasoning_budget = None;
+                    self.options.reasoning_effort_budget = false;
+                } else {
+                    self.options.reasoning_budget =
+                        Some(usize::try_from(parsed).map_err(|_| "invalid --reasoning-budget")?);
+                }
+            } else {
+                self.options.reasoning_budget =
+                    Some(parse_token_count(trimmed, "--reasoning-budget")?);
+            }
+            return Ok(true);
+        }
+        if flag == "--reasoning-budget-message" {
+            self.used = true;
+            *i += 1;
+            let value = args
+                .get(*i)
+                .cloned()
+                .ok_or_else(|| "missing --reasoning-budget-message value".to_string())?;
+            self.options.reasoning_budget_message = Some(value);
+            return Ok(true);
+        }
         if !matches!(
             flag,
             "--api-key"
@@ -270,6 +346,7 @@ impl ServeCliConfig {
                 | "--parallel"
                 | "-np"
                 | "--max-model-len"
+                | "--reasoning-effort"
         ) {
             if matches!(
                 flag,
@@ -303,6 +380,7 @@ impl ServeCliConfig {
                     | "--frequency-penalty"
                     | "--prompt-len"
                     | "--gen-len"
+                    | "--realistic-prompt"
                     | "--stage"
                     | "--golden"
                     | "--out"
@@ -343,19 +421,30 @@ impl ServeCliConfig {
             "--api-key-env" => self.api_key_env = Some(value),
             "--served-model-name" | "--alias" | "-a" => self.model_name = Some(value),
             "--max-num-seqs" | "--max-running-requests" | "--parallel" | "-np" => {
-                self.options.max_num_seqs = value.parse().map_err(|_| "invalid --max-num-seqs")?
+                self.options.max_num_seqs = value.parse().map_err(|_| "invalid --max-num-seqs")?;
             }
             "--max-model-len" => {
-                self.options.max_model_len = Some(parse_token_count(&value, "--max-model-len")?)
+                self.options.max_model_len = Some(parse_token_count(&value, "--max-model-len")?);
+            }
+            "--reasoning-effort" => {
+                let normalized = if value.trim().eq_ignore_ascii_case("off") {
+                    "none".to_string()
+                } else {
+                    value
+                };
+                crate::server::validate_reasoning_effort(&normalized)?;
+                self.options.reasoning_effort = Some(normalized);
             }
             _ => unreachable!(),
         }
         Ok(true)
     }
 
-    fn validate(&self, sub: &str) -> Result<(), String> {
+    pub(super) fn validate(&self, sub: &str) -> Result<(), String> {
         if sub != "serve" && self.used {
-            return Err("API key, served model name and admission options require serve".into());
+            return Err(
+                "API key, webui, served model name and admission options require serve".into(),
+            );
         }
         if sub == "serve"
             && let Some(flag) = &self.rejected
@@ -396,11 +485,44 @@ impl ServeCliConfig {
                 .transpose()?,
         };
         self.options.api_key = value
+            .as_deref()
             .map(crate::api_auth::ApiKey::new)
             .transpose()
             .map_err(|_| "invalid API key".to_string())?;
         Ok(())
     }
+}
+
+#[cfg(feature = "cuda")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SpeculativeChoice {
+    Auto,
+    Off,
+    Explicit(crate::proposer::SpeculativeKind),
+}
+
+#[cfg(feature = "cuda")]
+pub(crate) fn checkpoint_supports_auto_mtp(dir: &std::path::Path) -> bool {
+    if !dir.is_dir() {
+        return false;
+    }
+    // Decision-only CodeReadout checkpoints (GLiDE/d3) do not decode tokens with MTP.
+    if dir.join("readout.safetensors").is_file() || dir.join("decision_config.json").is_file() {
+        return false;
+    }
+    let has_mtp = |path: &std::path::Path| -> bool {
+        crate::loader::SafetensorsArchive::open(path).is_ok_and(|archive| {
+            archive.resolve_name("mtp.norm.weight").is_some()
+                || archive
+                    .resolve_name("mtp.hyper_connection_mixer.hc_norm.weight")
+                    .is_some()
+        })
+    };
+    if has_mtp(dir) {
+        return true;
+    }
+    let compact_dir = dir.join("runtime/mtp-int4-g32");
+    compact_dir.is_dir() && has_mtp(&compact_dir)
 }
 
 #[cfg(feature = "cuda")]
@@ -424,7 +546,9 @@ pub(crate) struct CudaCliOptions {
     pub(crate) max_tokens: usize,
     pub(crate) prompt_len: usize,
     pub(crate) gen_len: usize,
+    pub(crate) realistic_prompt: bool,
     pub(crate) kv_format: String,
+    pub(crate) explicit_kv_format: bool,
     pub(crate) golden_path: Option<String>,
     pub(crate) out_json: Option<String>,
     pub(crate) max_prompts: usize,
@@ -435,8 +559,10 @@ pub(crate) struct CudaCliOptions {
     pub(crate) warp34_prof_path: Option<String>,
     pub(crate) prof_rounds: usize,
     pub(crate) host: String,
+    pub(crate) explicit_host: bool,
     pub(crate) port: u16,
     pub(crate) enable_thinking: bool,
+    pub(crate) speculative_choice: SpeculativeChoice,
     pub(crate) speculative_kind: Option<crate::proposer::SpeculativeKind>,
     pub(crate) draft_model: Option<String>,
     pub(crate) mtp_k: usize,
@@ -475,7 +601,7 @@ pub(crate) fn revision_value(args: &[String], index: &mut usize) -> Result<Strin
 // None means help was requested; stop parsing immediately, before validation.
 #[cfg(feature = "cuda")]
 pub(crate) fn parse_cuda_options(args: &[String]) -> Result<Option<CudaCliOptions>, String> {
-    let sub = args.first().map(String::as_str).unwrap_or("");
+    let sub = args.first().map_or("", String::as_str);
     let is_image_sub = matches!(sub, "image" | "bench-image");
     let mut serve = ServeCliConfig::default();
     let mut model = if is_image_sub {
@@ -502,13 +628,15 @@ pub(crate) fn parse_cuda_options(args: &[String]) -> Result<Option<CudaCliOption
     let mut interactive = false;
     let mut sampling = CliSamplingOptions::default();
     let mut max_tokens = match sub {
-        "chat" => 512usize,
-        "generate" => 256usize,
+        "chat" => 2048usize,
+        "generate" => 512usize,
         _ => 64usize,
     };
     let mut prompt_len = 128usize;
     let mut gen_len = 128usize;
+    let mut realistic_prompt = false;
     let mut kv_format = "tq4".to_string();
+    let mut explicit_kv_format = false;
     let mut golden_path: Option<String> = None;
     let mut out_json: Option<String> = None;
     let mut max_prompts = 12usize;
@@ -523,8 +651,13 @@ pub(crate) fn parse_cuda_options(args: &[String]) -> Result<Option<CudaCliOption
         128usize
     };
     let mut host = "127.0.0.1".to_string();
+    let mut explicit_host = false;
     let mut port = 8000u16;
     let mut enable_thinking = true;
+    let mut speculative_choice = match sub {
+        "serve" | "chat" | "generate" => SpeculativeChoice::Auto,
+        _ => SpeculativeChoice::Off,
+    };
     let mut speculative_kind = None;
     let mut draft_model = None;
     let mut mtp_k = 3usize;
@@ -561,11 +694,20 @@ pub(crate) fn parse_cuda_options(args: &[String]) -> Result<Option<CudaCliOption
             "--offline" => offline = true,
             "--speculative" | "--speculative-algorithm" => {
                 i += 1;
-                speculative_kind = match args.get(i).map(|s| s.to_ascii_lowercase()).as_deref() {
-                    Some("mtp" | "nextn") => Some(crate::proposer::SpeculativeKind::Mtp),
-                    Some("dflash2" | "dflash") => Some(crate::proposer::SpeculativeKind::DFlash2),
-                    Some("none" | "off" | "disabled") => None,
-                    _ => return Err("--speculative expects mtp or dflash2".into()),
+                speculative_choice = match args.get(i).map(|s| s.to_ascii_lowercase()).as_deref() {
+                    Some("auto") => SpeculativeChoice::Auto,
+                    Some("mtp" | "nextn") => {
+                        SpeculativeChoice::Explicit(crate::proposer::SpeculativeKind::Mtp)
+                    }
+                    Some("dflash2" | "dflash") => {
+                        SpeculativeChoice::Explicit(crate::proposer::SpeculativeKind::DFlash2)
+                    }
+                    Some("none" | "off" | "disabled") => SpeculativeChoice::Off,
+                    _ => return Err("--speculative expects auto, mtp, dflash2, or off".into()),
+                };
+                speculative_kind = match speculative_choice {
+                    SpeculativeChoice::Explicit(kind) => Some(kind),
+                    SpeculativeChoice::Auto | SpeculativeChoice::Off => None,
                 };
             }
             "--draft-model" | "--speculative-draft-model-path" | "--model-draft" | "-md" => {
@@ -586,7 +728,11 @@ pub(crate) fn parse_cuda_options(args: &[String]) -> Result<Option<CudaCliOption
             "--ctx-size" | "-c" | "--context-length" | "--kv-tokens" => {
                 i += 1;
                 let raw = args.get(i).ok_or("missing --ctx-size")?;
-                ctx_tokens = Some(parse_token_count(raw, "--ctx-size")?);
+                if raw.trim().eq_ignore_ascii_case("auto") {
+                    ctx_tokens = None;
+                } else {
+                    ctx_tokens = Some(parse_token_count(raw, "--ctx-size")?);
+                }
             }
             "--kv-pages" | "--num-gpu-blocks-override" => {
                 i += 1;
@@ -711,15 +857,19 @@ pub(crate) fn parse_cuda_options(args: &[String]) -> Result<Option<CudaCliOption
                 let raw = args.get(i).ok_or("missing --gen-len")?;
                 gen_len = parse_token_count(raw, "--gen-len")?;
             }
+            "--realistic-prompt" | "--realistic" => {
+                realistic_prompt = true;
+            }
             "--kv-format" | "--kv-cache-dtype" | "--cache-type-k" => {
                 i += 1;
                 kv_format = args.get(i).cloned().ok_or("missing --kv-format")?;
+                explicit_kv_format = !kv_format.trim().eq_ignore_ascii_case("auto");
             }
             "--golden" => {
                 i += 1;
                 golden_path = Some(args.get(i).cloned().ok_or("missing --golden")?);
             }
-            "--out" | "--output" | "-o" => {
+            "--out" | "--out-json" | "--output" | "-o" => {
                 i += 1;
                 out_json = Some(args.get(i).cloned().ok_or("missing --out")?);
             }
@@ -763,6 +913,7 @@ pub(crate) fn parse_cuda_options(args: &[String]) -> Result<Option<CudaCliOption
             "--host" => {
                 i += 1;
                 host = args.get(i).cloned().ok_or("missing --host")?;
+                explicit_host = true;
             }
             "--port" | "-P" => {
                 i += 1;
@@ -943,6 +1094,10 @@ pub(crate) fn parse_cuda_options(args: &[String]) -> Result<Option<CudaCliOption
         kv_pages = Some(tokens.div_ceil(16));
     }
 
+    if speculative_choice == SpeculativeChoice::Auto && draft_model.is_some() {
+        speculative_kind = Some(crate::proposer::SpeculativeKind::DFlash2);
+    }
+
     Ok(Some(CudaCliOptions {
         serve,
         model,
@@ -962,7 +1117,9 @@ pub(crate) fn parse_cuda_options(args: &[String]) -> Result<Option<CudaCliOption
         max_tokens,
         prompt_len,
         gen_len,
+        realistic_prompt,
         kv_format,
+        explicit_kv_format,
         golden_path,
         out_json,
         max_prompts,
@@ -973,8 +1130,10 @@ pub(crate) fn parse_cuda_options(args: &[String]) -> Result<Option<CudaCliOption
         warp34_prof_path,
         prof_rounds,
         host,
+        explicit_host,
         port,
         enable_thinking,
+        speculative_choice,
         speculative_kind,
         draft_model,
         mtp_k,
@@ -1044,9 +1203,39 @@ pub(crate) fn validate_cuda_command(options: &CudaCliOptions, sub: &str) -> Resu
 }
 
 #[cfg(feature = "cuda")]
+pub(crate) fn resolve_serve_host(
+    host: &str,
+    explicit_host: bool,
+    env_host: Option<&str>,
+) -> String {
+    if explicit_host {
+        return host.to_string();
+    }
+    if let Some(env_val) = env_host.map(str::trim).filter(|s| !s.is_empty()) {
+        return env_val.to_string();
+    }
+    host.to_string()
+}
+
+#[cfg(feature = "cuda")]
 pub(crate) const MAX_CLI_KV_PAGES: usize = 65_536;
 #[cfg(feature = "cuda")]
 pub(crate) const MAX_CLI_KV_TOKENS: usize = MAX_CLI_KV_PAGES * 16;
+
+#[cfg(feature = "cuda")]
+pub(crate) fn bench_required_stage_tokens(stage: &str, prompt_len: usize, gen_len: usize) -> usize {
+    let decode_tokens = prompt_len.saturating_add(gen_len.max(1));
+    let radix_prompt_len = (prompt_len.max(128) / 64)
+        .saturating_mul(64)
+        .saturating_add(8);
+    let radix_tokens = radix_prompt_len.saturating_add(gen_len.clamp(4, 32));
+    match stage {
+        "decode" => decode_tokens,
+        "radix" => radix_tokens,
+        "all" => decode_tokens.max(radix_tokens),
+        _ => 0,
+    }
+}
 
 #[cfg(feature = "cuda")]
 pub(crate) fn validate_cuda_options(
@@ -1116,13 +1305,76 @@ pub(crate) fn validate_cuda_options(
     }
     if draft_model.is_some() && *speculative_kind != Some(crate::proposer::SpeculativeKind::DFlash2)
     {
-        return Err(
-            "--draft-model requires --speculative dflash2; native MTP uses target weights".into(),
-        );
+        return Err(if options.speculative_choice == SpeculativeChoice::Off {
+            "--draft-model cannot be combined with --speculative off".into()
+        } else {
+            "--draft-model requires --speculative dflash2; native MTP uses target weights".into()
+        });
     }
     if *speculative_kind == Some(crate::proposer::SpeculativeKind::DFlash2) && draft_model.is_none()
     {
         return Err("--speculative dflash2 requires --draft-model".into());
+    }
+    if *speculative_kind == Some(crate::proposer::SpeculativeKind::DFlash2) {
+        let max_dflash_tokens = crate::dflash::DFLASH2_MAX_KV_CAPACITY;
+        let max_dflash_pages = max_dflash_tokens / 16;
+        if let Some(pages) = *kv_pages
+            && pages > max_dflash_pages
+        {
+            return Err(format!(
+                "--speculative dflash2 supports at most {max_dflash_tokens} tokens ({max_dflash_pages} KV pages); got {} tokens ({pages} pages)",
+                pages.saturating_mul(16)
+            ));
+        }
+        if sub == "serve"
+            && let Some(max_len) = options.serve.options.max_model_len
+            && max_len > max_dflash_tokens
+        {
+            return Err(format!(
+                "--max-model-len ({max_len} tokens) exceeds --speculative dflash2 maximum capacity ({max_dflash_tokens} tokens / {max_dflash_pages} pages)"
+            ));
+        }
+        if sub == "bench" {
+            let bench_tokens = bench_required_stage_tokens(
+                &options.bench_stage,
+                options.prompt_len,
+                options.gen_len,
+            );
+            if bench_tokens > max_dflash_tokens {
+                return Err(format!(
+                    "bench stage '{}' requires {bench_tokens} tokens (--prompt-len {} + --gen-len {}), which exceeds --speculative dflash2 maximum capacity ({max_dflash_tokens} tokens / {max_dflash_pages} pages)",
+                    options.bench_stage, options.prompt_len, options.gen_len
+                ));
+            }
+        }
+    }
+    if sub == "bench" {
+        if options.prompt_len == 0 {
+            return Err("--prompt-len must be >= 1".into());
+        }
+        if options.gen_len == 0 {
+            return Err("--gen-len must be >= 1".into());
+        }
+        let total_bench_tokens =
+            bench_required_stage_tokens(&options.bench_stage, options.prompt_len, options.gen_len);
+        if total_bench_tokens > MAX_CLI_KV_TOKENS {
+            return Err(format!(
+                "bench stage '{}' requires {total_bench_tokens} tokens (--prompt-len {} + --gen-len {}), which exceeds maximum supported context ({MAX_CLI_KV_TOKENS} tokens / 1M)",
+                options.bench_stage, options.prompt_len, options.gen_len
+            ));
+        }
+        if let Some(pages) = *kv_pages {
+            let cap_tokens = pages.saturating_mul(16);
+            if total_bench_tokens > cap_tokens {
+                return Err(format!(
+                    "bench stage '{}' requires {total_bench_tokens} tokens (--prompt-len {} + --gen-len {}), which exceeds allocated KV capacity ({cap_tokens} tokens from {pages} pages; need at least --ctx-size {total_bench_tokens} or --kv-pages {})",
+                    options.bench_stage,
+                    options.prompt_len,
+                    options.gen_len,
+                    total_bench_tokens.div_ceil(16)
+                ));
+            }
+        }
     }
     if *verify_lossless && speculative_kind.is_none() {
         return Err("--verify-lossless requires --speculative".into());
@@ -1302,6 +1554,13 @@ pub(crate) fn prepare_cuda_cli_with_env(
         )
         .map_err(|e| e.to_string())?,
     )?;
+    if options.speculative_choice == SpeculativeChoice::Auto
+        && options.speculative_kind.is_none()
+        && options.image_urls.is_empty()
+        && checkpoint_supports_auto_mtp(std::path::Path::new(&options.resolved_model))
+    {
+        options.speculative_kind = Some(crate::proposer::SpeculativeKind::Mtp);
+    }
     let draft_model = options
         .draft_model
         .as_ref()

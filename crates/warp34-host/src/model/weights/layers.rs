@@ -29,23 +29,44 @@ impl FullAttentionLayerWeights {
         rows: usize,
         h_dim: usize,
     ) -> [u64; 2] {
-        if h_dim > PRODUCER_FUSED_H64_MAX_HIDDEN_SIZE
-            || !h_dim.is_multiple_of(HADAMARD_BLOCK_64)
-            || !self.qkv_proj.can_fuse_h64_from_producer()
+        self.pre_attn_norm_targets_with_block(normed_buf, ex, rows, h_dim, false)
+            .0
+    }
+
+    #[inline]
+    pub fn pre_attn_norm_targets_with_block(
+        &self,
+        normed_buf: u64,
+        ex: &Warp34Exec,
+        rows: usize,
+        h_dim: usize,
+        allow_h512: bool,
+    ) -> ([u64; 2], usize) {
+        let had_block = if h_dim <= PRODUCER_FUSED_H64_MAX_HIDDEN_SIZE
+            && h_dim.is_multiple_of(HADAMARD_BLOCK_64)
+            && self.qkv_proj.can_fuse_h64_from_producer()
         {
-            return [normed_buf, 0];
-        }
+            HADAMARD_BLOCK_64
+        } else if allow_h512
+            && h_dim <= PRODUCER_FUSED_H64_MAX_HIDDEN_SIZE
+            && h_dim.is_multiple_of(512)
+            && self.qkv_proj.can_fuse_h512_from_producer()
+        {
+            512
+        } else {
+            return ([normed_buf, 0], 0);
+        };
         if self.qsa_indexer.is_none() {
-            [0, normed_buf]
+            ([0, normed_buf], had_block)
         } else if ex.scratch_ptr != 0
             && ex
                 .scratch_ptr
                 .is_multiple_of(HADAMARD_WORKSPACE_ALIGN_BYTES as u64)
             && ex.scratch_size >= rows.saturating_mul(h_dim).saturating_mul(FP16_ELEM_BYTES)
         {
-            [normed_buf, ex.scratch_ptr]
+            ([normed_buf, ex.scratch_ptr], had_block)
         } else {
-            [normed_buf, 0]
+            ([normed_buf, 0], 0)
         }
     }
 
@@ -233,6 +254,15 @@ impl HcBlockWeights {
         ctx: &HcStepContext<'_>,
         [out_mixed_buf, out_had64_buf]: [u64; 2],
     ) -> Result<()> {
+        self.forward_mix_with_targets_ex(ctx, [out_mixed_buf, out_had64_buf], false)
+    }
+
+    pub fn forward_mix_with_targets_ex(
+        &self,
+        ctx: &HcStepContext<'_>,
+        [out_mixed_buf, out_had64_buf]: [u64; 2],
+        skip_rmsnorm: bool,
+    ) -> Result<()> {
         let ex = ctx.ex;
         let cublas = ctx.cublas;
         let marlin_ws_ptr = ctx.marlin_ws_ptr;
@@ -247,17 +277,19 @@ impl HcBlockWeights {
         let eps = ctx.eps;
         let hc_down_buf = ple_val_buf;
         let hc_inj_raw_buf = ple_val_buf + (num_tokens * low_dim * 2) as u64;
-        crate::ple::gpu_ops::hc_rmsnorm_f16(
-            ex,
-            hc_residual_buf,
-            self.hc_norm_ptr,
-            ple_buf_a,
-            0,
-            num_tokens,
-            hc_count,
-            h_dim,
-            eps,
-        )?;
+        if !skip_rmsnorm {
+            crate::ple::gpu_ops::hc_rmsnorm_f16(
+                ex,
+                hc_residual_buf,
+                self.hc_norm_ptr,
+                ple_buf_a,
+                0,
+                num_tokens,
+                hc_count,
+                h_dim,
+                eps,
+            )?;
+        }
         // Fuse HC down (`N0 <= 512`, e.g. `hc_lowrank = 320`) + inject (`N1 <= 256`, e.g. `4`)
         // for decode and speculative verification (`num_tokens <= 16`), preserving 0-ULP parity
         // between `M = 1` decode and `M <= 16` speculative verify while keeping `m > 16` prefill
@@ -377,7 +409,18 @@ impl HcBlockWeights {
         block_out_buf: u64,
         tap: TapExport,
     ) -> Result<()> {
-        crate::ple::gpu_ops::hc_combine_tap_f16(
+        self.forward_combine_tap_rmsnorm(ctx, block_out_buf, 0, 0, tap)
+    }
+
+    pub fn forward_combine_tap_rmsnorm(
+        &self,
+        ctx: &HcStepContext<'_>,
+        block_out_buf: u64,
+        next_norm_weight: u64,
+        next_normed_out: u64,
+        tap: TapExport,
+    ) -> Result<()> {
+        crate::ple::gpu_ops::hc_combine_tap_rmsnorm_f16(
             ctx.ex,
             ctx.hc_residual_buf,
             block_out_buf,
@@ -385,10 +428,13 @@ impl HcBlockWeights {
             0,
             ctx.hc_residual_buf,
             tap.dst,
+            next_norm_weight,
+            next_normed_out,
             0,
             ctx.num_tokens,
             ctx.hc_count,
             ctx.h_dim,
+            ctx.eps,
             tap.stride,
             tap.offset,
         )
@@ -424,6 +470,13 @@ impl LayerResidual {
         }
     }
 
+    pub fn hc_input_norm_ptr(&self) -> Option<u64> {
+        match self {
+            Self::SingleStream { .. } => None,
+            Self::HyperConnection { attn_hc, .. } => Some(attn_hc.hc_norm_ptr),
+        }
+    }
+
     pub fn single_stream_post_attn_norm_ptr(&self) -> Option<u64> {
         match self {
             Self::SingleStream {
@@ -456,22 +509,48 @@ impl LayerResidual {
         ctx: &HcStepContext<'_>,
         [norm_out, norm_had64]: [u64; 2],
     ) -> Result<()> {
+        self.pre_attn_with_targets_ex(layer_idx, false, ctx, [norm_out, norm_had64])
+    }
+
+    pub fn pre_attn_with_targets_ex(
+        &self,
+        layer_idx: usize,
+        hc_pre_normed: bool,
+        ctx: &HcStepContext<'_>,
+        [norm_out, norm_had]: [u64; 2],
+    ) -> Result<()> {
+        self.pre_attn_with_targets_block(layer_idx, hc_pre_normed, ctx, [norm_out, norm_had], 64)
+    }
+
+    pub fn pre_attn_with_targets_block(
+        &self,
+        layer_idx: usize,
+        hc_pre_normed: bool,
+        ctx: &HcStepContext<'_>,
+        [norm_out, norm_had]: [u64; 2],
+        had_block: usize,
+    ) -> Result<()> {
         match self {
             Self::SingleStream {
                 input_layernorm_ptr,
                 ..
             } => {
                 if layer_idx == 0 {
+                    let norm_fn = if had_block == 512 && norm_had != 0 {
+                        ffi::warp34_gemma_rms_norm_hadamard512_f16
+                    } else {
+                        ffi::warp34_gemma_rms_norm_hadamard_f16
+                    };
                     check_rc(
-                        // SAFETY: `residual_buf`, `norm_out`, and `norm_had64` are disjoint
+                        // SAFETY: `residual_buf`, `norm_out`, and `norm_had` are disjoint
                         // `num_tokens * h_dim` FP16 buffers; `input_layernorm_ptr` holds `h_dim` FP16 elements.
                         unsafe {
-                            ffi::warp34_gemma_rms_norm_hadamard_f16(
+                            norm_fn(
                                 ctx.ex,
                                 ctx.residual_buf as *const c_void,
                                 *input_layernorm_ptr as *const c_void,
                                 norm_out as *mut c_void,
-                                norm_had64 as *mut c_void,
+                                norm_had as *mut c_void,
                                 core::ptr::null(),
                                 ctx.num_tokens as i32,
                                 ctx.h_dim as i32,
@@ -484,7 +563,7 @@ impl LayerResidual {
                 Ok(())
             }
             Self::HyperConnection { attn_hc, .. } => {
-                attn_hc.forward_mix_with_targets(ctx, [norm_out, norm_had64])
+                attn_hc.forward_mix_with_targets_ex(ctx, [norm_out, norm_had], hc_pre_normed)
             }
         }
     }
@@ -515,7 +594,29 @@ impl LayerResidual {
         tp2: Option<&Tp2Collectives>,
         rank: usize,
         block_out_buf: u64,
+        [norm_out, norm_had]: [u64; 2],
+        preserve_block_out_on_tp2: bool,
+    ) -> Result<()> {
+        self.post_attn_pre_mlp_with_targets_block(
+            ctx,
+            tp2,
+            rank,
+            block_out_buf,
+            [norm_out, norm_had],
+            64,
+            preserve_block_out_on_tp2,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn post_attn_pre_mlp_with_targets_block(
+        &self,
+        ctx: &HcStepContext<'_>,
+        tp2: Option<&Tp2Collectives>,
+        rank: usize,
+        block_out_buf: u64,
         [norm_out, norm_had64]: [u64; 2],
+        had_block: usize,
         preserve_block_out_on_tp2: bool,
     ) -> Result<()> {
         match self {
@@ -546,11 +647,16 @@ impl LayerResidual {
                         0,
                     )
                 } else {
+                    let norm_fn = if had_block == 512 && norm_had64 != 0 {
+                        ffi::warp34_fused_add_gemma_rms_norm_tap_hadamard512_f16
+                    } else {
+                        ffi::warp34_fused_add_gemma_rms_norm_tap_hadamard_f16
+                    };
                     check_rc(
                         // SAFETY: `block_out_buf`, `residual_buf`, `norm_out`, and `norm_had64` each hold
                         // `num_tokens * h_dim` FP16 elements.
                         unsafe {
-                            ffi::warp34_fused_add_gemma_rms_norm_tap_hadamard_f16(
+                            norm_fn(
                                 ctx.ex,
                                 block_out_buf as *const c_void,
                                 ctx.residual_buf as *mut c_void,
@@ -595,9 +701,15 @@ impl LayerResidual {
                         0,
                     )?;
                 } else {
-                    attn_hc.forward_combine(ctx, block_out_buf)?;
+                    attn_hc.forward_combine_tap_rmsnorm(
+                        ctx,
+                        block_out_buf,
+                        mlp_hc.hc_norm_ptr,
+                        ctx.ple_bufs[0],
+                        TapExport::default(),
+                    )?;
                 }
-                mlp_hc.forward_mix_with_targets(ctx, [norm_out, norm_had64])
+                mlp_hc.forward_mix_with_targets_ex(ctx, [norm_out, norm_had64], tp2.is_none())
             }
         }
     }
@@ -631,6 +743,28 @@ impl LayerResidual {
         [next_norm_weight, next_norm_out, next_norm_had64]: [u64; 3],
         tap: TapExport,
     ) -> Result<()> {
+        self.post_mlp_with_targets_block(
+            ctx,
+            tp2,
+            rank,
+            mlp_out_buf,
+            [next_norm_weight, next_norm_out, next_norm_had64],
+            64,
+            tap,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn post_mlp_with_targets_block(
+        &self,
+        ctx: &HcStepContext<'_>,
+        tp2: Option<&Tp2Collectives>,
+        rank: usize,
+        mlp_out_buf: u64,
+        [next_norm_weight, next_norm_out, next_norm_had64]: [u64; 3],
+        next_had_block: usize,
+        tap: TapExport,
+    ) -> Result<()> {
         match self {
             Self::SingleStream { .. } => {
                 if let Some(comm) = tp2 {
@@ -651,11 +785,16 @@ impl LayerResidual {
                         tap.offset,
                     )
                 } else {
+                    let norm_fn = if next_had_block == 512 && next_norm_had64 != 0 {
+                        ffi::warp34_fused_add_gemma_rms_norm_tap_hadamard512_f16
+                    } else {
+                        ffi::warp34_fused_add_gemma_rms_norm_tap_hadamard_f16
+                    };
                     check_rc(
                         // SAFETY: `mlp_out_buf`, `residual_buf`, `next_norm_out`, and `next_norm_had64` hold
                         // `num_tokens * h_dim` FP16 elements; `tap.dst` is 0 or a validated BF16 tap buffer.
                         unsafe {
-                            ffi::warp34_fused_add_gemma_rms_norm_tap_hadamard_f16(
+                            norm_fn(
                                 ctx.ex,
                                 mlp_out_buf as *const c_void,
                                 ctx.residual_buf as *mut c_void,
@@ -695,7 +834,13 @@ impl LayerResidual {
                         tap.offset,
                     )
                 } else {
-                    mlp_hc.forward_combine_with_tap(ctx, mlp_out_buf, tap)
+                    mlp_hc.forward_combine_tap_rmsnorm(
+                        ctx,
+                        mlp_out_buf,
+                        next_norm_weight,
+                        next_norm_out,
+                        tap,
+                    )
                 }
             }
         }
@@ -718,6 +863,13 @@ impl FinalResidual {
         match self {
             Self::SingleStream { norm_ptr } => Some(*norm_ptr),
             Self::HyperConnection { .. } => None,
+        }
+    }
+
+    pub fn hc_norm_ptr(&self) -> Option<u64> {
+        match self {
+            Self::SingleStream { .. } => None,
+            Self::HyperConnection { mixer } => Some(mixer.hc_norm_ptr),
         }
     }
 
@@ -761,6 +913,23 @@ impl FinalResidual {
         final_norm_out_buf: u64,
         last_final_hidden_f16: Option<&DeviceBuffer>,
     ) -> Result<()> {
+        self.finish_stack_ex(
+            ctx,
+            stream,
+            final_norm_out_buf,
+            last_final_hidden_f16,
+            false,
+        )
+    }
+
+    pub fn finish_stack_ex(
+        &self,
+        ctx: &HcStepContext<'_>,
+        stream: &CudaStream,
+        final_norm_out_buf: u64,
+        last_final_hidden_f16: Option<&DeviceBuffer>,
+        hc_pre_normed: bool,
+    ) -> Result<()> {
         match self {
             Self::SingleStream { .. } => Ok(()),
             Self::HyperConnection { mixer } => {
@@ -783,7 +952,7 @@ impl FinalResidual {
                 }
                 let mut mix_ctx = *ctx;
                 mix_ctx.hc_inj_weights_buf = 0;
-                mixer.forward_mix(&mix_ctx, final_norm_out_buf)
+                mixer.forward_mix_with_targets_ex(&mix_ctx, [final_norm_out_buf, 0], hc_pre_normed)
             }
         }
     }
@@ -977,7 +1146,6 @@ pub enum LayerBlockWeights {
 #[cfg(feature = "cuda")]
 impl LayerBlockWeights {
     /// Returns `[unrotated_out, had64_out]` targets for the pre-attention norm / stream mixer.
-    #[inline]
     pub fn pre_attn_norm_targets(
         &self,
         normed_buf: u64,
@@ -985,21 +1153,48 @@ impl LayerBlockWeights {
         rows: usize,
         h_dim: usize,
     ) -> [u64; 2] {
+        self.pre_attn_norm_targets_with_block(normed_buf, ex, rows, h_dim, false)
+            .0
+    }
+
+    #[inline]
+    pub fn pre_attn_norm_targets_with_block(
+        &self,
+        normed_buf: u64,
+        ex: &Warp34Exec,
+        rows: usize,
+        h_dim: usize,
+        allow_h512: bool,
+    ) -> ([u64; 2], usize) {
         match self {
-            Self::FullAttention(fa) => fa.pre_attn_norm_targets(normed_buf, ex, rows, h_dim),
+            Self::FullAttention(fa) => {
+                fa.pre_attn_norm_targets_with_block(normed_buf, ex, rows, h_dim, allow_h512)
+            }
             Self::LinearAttention(gdn) => {
-                if h_dim <= PRODUCER_FUSED_H64_MAX_HIDDEN_SIZE
+                let had_block = if h_dim <= PRODUCER_FUSED_H64_MAX_HIDDEN_SIZE
                     && h_dim.is_multiple_of(HADAMARD_BLOCK_64)
                     && gdn.in_proj_qkvz.can_fuse_h64_from_producer()
+                {
+                    HADAMARD_BLOCK_64
+                } else if allow_h512
+                    && h_dim <= PRODUCER_FUSED_H64_MAX_HIDDEN_SIZE
+                    && h_dim.is_multiple_of(512)
+                    && gdn.in_proj_qkvz.can_fuse_h512_from_producer()
+                {
+                    512
+                } else {
+                    0
+                };
+                if had_block > 0
                     && ex.scratch_ptr != 0
                     && ex
                         .scratch_ptr
                         .is_multiple_of(HADAMARD_WORKSPACE_ALIGN_BYTES as u64)
                     && ex.scratch_size >= rows.saturating_mul(h_dim).saturating_mul(FP16_ELEM_BYTES)
                 {
-                    [normed_buf, ex.scratch_ptr]
+                    ([normed_buf, ex.scratch_ptr], had_block)
                 } else {
-                    [normed_buf, 0]
+                    ([normed_buf, 0], 0)
                 }
             }
         }

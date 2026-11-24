@@ -86,7 +86,7 @@ __global__ void copy_masked_rows_f16_kernel(
     }
 }
 
-template <int VEC_ITERS>
+template <int VEC_ITERS, int HAD512_WARPS = 0>
 __global__ void gemma_rms_norm_vec8_f16_kernel(
     const __half* __restrict__ x,
     const __half* __restrict__ weight,
@@ -115,6 +115,7 @@ __global__ void gemma_rms_norm_vec8_f16_kernel(
     const uint4* w_v = reinterpret_cast<const uint4*>(weight);
 
     __shared__ float s_warp[32];
+    __shared__ float s_had512[HAD512_WARPS > 0 ? HAD512_WARPS : 1][32][8];
     float reg_v8[VEC_ITERS][8];
     float sum_sq = 0.0f;
 #pragma unroll
@@ -137,9 +138,10 @@ __global__ void gemma_rms_norm_vec8_f16_kernel(
 #pragma unroll
     for (int k = 0; k < VEC_ITERS; ++k) {
         const int vi = (int)threadIdx.x + k * (int)blockDim.x;
-        if (vi < vec_cols) {
+        const bool active = vi < vec_cols;
+        uint4 ov = make_uint4(0u, 0u, 0u, 0u);
+        if (active) {
             const uint4 wv = __ldg(&w_v[vi]);
-            uint4 ov;
             const __half* wh = reinterpret_cast<const __half*>(&wv);
             __half* oh = reinterpret_cast<__half*>(&ov);
 #pragma unroll
@@ -150,9 +152,14 @@ __global__ void gemma_rms_norm_vec8_f16_kernel(
             if (out_v != nullptr) {
                 out_v[vi] = ov;
             }
-            if (out_had64_v != nullptr) {
-                out_had64_v[vi] = hadamard64_vec8_f16(ov, (int)threadIdx.x);
+        }
+        if constexpr (HAD512_WARPS > 0) {
+            const uint4 rot = hadamard512_vec8_f16(ov, active, s_had512);
+            if (active && out_had64_v != nullptr) {
+                out_had64_v[vi] = rot;
             }
+        } else if (active && out_had64_v != nullptr) {
+            out_had64_v[vi] = hadamard64_vec8_f16(ov, (int)threadIdx.x);
         }
     }
 }
@@ -262,7 +269,7 @@ __global__ void gemma_rms_norm_strided_f16_kernel(
     }
 }
 
-template <int VEC_ITERS>
+template <int VEC_ITERS, int HAD512_WARPS = 0>
 __global__ void fused_add_gemma_rms_norm_vec8_f16_kernel(
     const __half* __restrict__ x,
     __half* __restrict__ residual,
@@ -299,6 +306,7 @@ __global__ void fused_add_gemma_rms_norm_vec8_f16_kernel(
     const uint4* w_v = reinterpret_cast<const uint4*>(weight);
 
     __shared__ float s_warp[32];
+    __shared__ float s_had512[HAD512_WARPS > 0 ? HAD512_WARPS : 1][32][8];
     float reg_v8[VEC_ITERS][8];
     float sum_sq = 0.0f;
 #pragma unroll
@@ -335,9 +343,10 @@ __global__ void fused_add_gemma_rms_norm_vec8_f16_kernel(
 #pragma unroll
     for (int k = 0; k < VEC_ITERS; ++k) {
         const int vi = (int)threadIdx.x + k * (int)blockDim.x;
-        if (vi < vec_cols) {
+        const bool active = vi < vec_cols;
+        uint4 ov = make_uint4(0u, 0u, 0u, 0u);
+        if (active) {
             const uint4 wv = __ldg(&w_v[vi]);
-            uint4 ov;
             const __half* wh = reinterpret_cast<const __half*>(&wv);
             __half* oh = reinterpret_cast<__half*>(&ov);
 #pragma unroll
@@ -348,9 +357,14 @@ __global__ void fused_add_gemma_rms_norm_vec8_f16_kernel(
             if (out_v != nullptr) {
                 out_v[vi] = ov;
             }
-            if (out_had64_v != nullptr) {
-                out_had64_v[vi] = hadamard64_vec8_f16(ov, (int)threadIdx.x);
+        }
+        if constexpr (HAD512_WARPS > 0) {
+            const uint4 rot = hadamard512_vec8_f16(ov, active, s_had512);
+            if (active && out_had64_v != nullptr) {
+                out_had64_v[vi] = rot;
             }
+        } else if (active && out_had64_v != nullptr) {
+            out_had64_v[vi] = hadamard64_vec8_f16(ov, (int)threadIdx.x);
         }
     }
 }
@@ -859,6 +873,111 @@ __global__ void apply_attn_output_gate_hadamard_f16_kernel(
     }
 }
 
+__global__ void silu_and_mul_hadamard512_f16_kernel(
+    const __half* __restrict__ gate_up,
+    __half* __restrict__ out,
+    const uint8_t* __restrict__ valid_token_mask,
+    int intermediate_size) {
+    __shared__ float s_had512[4][32][8];
+    const int tok = blockIdx.x;
+    if (valid_token_mask != nullptr && valid_token_mask[tok] == 0) return;
+    const int vcol = (int)blockIdx.y * (int)blockDim.x + (int)threadIdx.x;
+    const int vec_cols = intermediate_size >> 3;
+    const bool active = vcol < vec_cols;
+    const int col = vcol << 3;
+    const __half* row_in = gate_up + (size_t)tok * (2 * intermediate_size);
+    __half* row_out = out + (size_t)tok * intermediate_size;
+    const bool aligned = ((((uintptr_t)gate_up | (uintptr_t)out) & 15u) == 0u);
+    uint4 ov = make_uint4(0u, 0u, 0u, 0u);
+    if (active) {
+        __half* oh = reinterpret_cast<__half*>(&ov);
+        if (aligned) {
+            const uint4* row_in_v = reinterpret_cast<const uint4*>(row_in);
+            const uint4 gv = __ldg(&row_in_v[vcol]);
+            const uint4 uv = __ldg(&row_in_v[vcol + vec_cols]);
+            const __half* gh = reinterpret_cast<const __half*>(&gv);
+            const __half* uh = reinterpret_cast<const __half*>(&uv);
+#pragma unroll
+            for (int j = 0; j < 8; ++j) {
+                const float g = __half2float(gh[j]);
+                const float u = __half2float(uh[j]);
+                oh[j] = __float2half((g / (1.0f + expf(-g))) * u);
+            }
+        } else {
+#pragma unroll
+            for (int j = 0; j < 8; ++j) {
+                const float g = __half2float(row_in[col + j]);
+                const float u = __half2float(row_in[col + intermediate_size + j]);
+                oh[j] = __float2half((g / (1.0f + expf(-g))) * u);
+            }
+        }
+    }
+    const uint4 rot = hadamard512_vec8_f16(ov, active, s_had512);
+    if (active) {
+        if (aligned) {
+            reinterpret_cast<uint4*>(row_out)[vcol] = rot;
+        } else {
+            const __half* rh = reinterpret_cast<const __half*>(&rot);
+#pragma unroll
+            for (int j = 0; j < 8; ++j) {
+                row_out[col + j] = rh[j];
+            }
+        }
+    }
+}
+
+__global__ void apply_attn_output_gate_hadamard512_f16_kernel(
+    const __half* __restrict__ attn_out,
+    const __half* __restrict__ gate,
+    __half* __restrict__ out,
+    const uint8_t* __restrict__ valid_token_mask,
+    int total_dim) {
+    __shared__ float s_had512[4][32][8];
+    const int tok = blockIdx.x;
+    if (valid_token_mask != nullptr && valid_token_mask[tok] == 0) return;
+    const int vcol = (int)blockIdx.y * (int)blockDim.x + (int)threadIdx.x;
+    const int vec_cols = total_dim >> 3;
+    const bool active = vcol < vec_cols;
+    const int col = vcol << 3;
+    const size_t row_off = (size_t)tok * total_dim;
+    const bool aligned = ((((uintptr_t)attn_out | (uintptr_t)gate | (uintptr_t)out) & 15u) == 0u);
+    uint4 ov = make_uint4(0u, 0u, 0u, 0u);
+    if (active) {
+        __half* oh = reinterpret_cast<__half*>(&ov);
+        if (aligned) {
+            const uint4 av = __ldg(&reinterpret_cast<const uint4*>(attn_out + row_off)[vcol]);
+            const uint4 gv = __ldg(&reinterpret_cast<const uint4*>(gate + row_off)[vcol]);
+            const __half* ah = reinterpret_cast<const __half*>(&av);
+            const __half* gh = reinterpret_cast<const __half*>(&gv);
+#pragma unroll
+            for (int j = 0; j < 8; ++j) {
+                const float a = __half2float(ah[j]);
+                const float g = __half2float(gh[j]);
+                oh[j] = __float2half(a * (1.0f / (1.0f + expf(-g))));
+            }
+        } else {
+#pragma unroll
+            for (int j = 0; j < 8; ++j) {
+                const float a = __half2float(attn_out[row_off + col + j]);
+                const float g = __half2float(gate[row_off + col + j]);
+                oh[j] = __float2half(a * (1.0f / (1.0f + expf(-g))));
+            }
+        }
+    }
+    const uint4 rot = hadamard512_vec8_f16(ov, active, s_had512);
+    if (active) {
+        if (aligned) {
+            reinterpret_cast<uint4*>(out + row_off)[vcol] = rot;
+        } else {
+            const __half* rh = reinterpret_cast<const __half*>(&rot);
+#pragma unroll
+            for (int j = 0; j < 8; ++j) {
+                out[row_off + col + j] = rh[j];
+            }
+        }
+    }
+}
+
 }  // namespace warp34
 
 extern "C" int warp34_embed_lookup_f16(const warp34_exec* ex, const int32_t* token_ids,
@@ -971,6 +1090,85 @@ extern "C" int warp34_gemma_rms_norm_hadamard_f16(
     float eps) {
     return launch_rms_norm_hadamard_f16(
         ex, x, weight, out, out_had64, valid_token_mask, num_tokens, hidden_size, eps, 1.0f);
+}
+
+extern "C" int warp34_gemma_rms_norm_hadamard512_f16(
+    const warp34_exec* ex,
+    const void* x,
+    const void* weight,
+    void* out,
+    void* out_had512,
+    const uint8_t* valid_token_mask,
+    int num_tokens,
+    int hidden_size,
+    float eps) {
+    if (ex == nullptr || x == nullptr || weight == nullptr || out_had512 == nullptr ||
+        (hidden_size & 511) != 0 || hidden_size > 12288 ||
+        ((((uintptr_t)x | (uintptr_t)weight | (uintptr_t)out | (uintptr_t)out_had512) & 15u) != 0u)) {
+        return (int)cudaErrorInvalidValue;
+    }
+    if (num_tokens <= 0 || hidden_size <= 0) return 0;
+    if (hidden_size <= 2048) {
+        warp34::gemma_rms_norm_vec8_f16_kernel<1, 8><<<num_tokens, 256, 0, (cudaStream_t)ex->stream>>>(
+            (const __half*)x, (const __half*)weight, (__half*)out, (__half*)out_had512,
+            valid_token_mask, hidden_size, eps, 1.0f);
+    } else if (hidden_size <= 4096) {
+        warp34::gemma_rms_norm_vec8_f16_kernel<1, 16><<<num_tokens, 512, 0, (cudaStream_t)ex->stream>>>(
+            (const __half*)x, (const __half*)weight, (__half*)out, (__half*)out_had512,
+            valid_token_mask, hidden_size, eps, 1.0f);
+    } else if (hidden_size <= 8192) {
+        warp34::gemma_rms_norm_vec8_f16_kernel<2, 16><<<num_tokens, 512, 0, (cudaStream_t)ex->stream>>>(
+            (const __half*)x, (const __half*)weight, (__half*)out, (__half*)out_had512,
+            valid_token_mask, hidden_size, eps, 1.0f);
+    } else {
+        warp34::gemma_rms_norm_vec8_f16_kernel<3, 16><<<num_tokens, 512, 0, (cudaStream_t)ex->stream>>>(
+            (const __half*)x, (const __half*)weight, (__half*)out, (__half*)out_had512,
+            valid_token_mask, hidden_size, eps, 1.0f);
+    }
+    return (int)cudaGetLastError();
+}
+
+extern "C" int warp34_fused_add_gemma_rms_norm_tap_hadamard512_f16(
+    const warp34_exec* ex,
+    const void* x,
+    void* residual,
+    const void* weight,
+    void* out,
+    void* out_had512,
+    void* tap_dst_bf16,
+    const uint8_t* valid_token_mask,
+    int num_tokens,
+    int hidden_size,
+    float eps,
+    int tap_row_stride,
+    int tap_col_offset) {
+    if (ex == nullptr || x == nullptr || residual == nullptr || weight == nullptr ||
+        out_had512 == nullptr || (hidden_size & 511) != 0 || hidden_size > 6144 ||
+        ((tap_dst_bf16 != nullptr) &&
+         (tap_col_offset < 0 || tap_row_stride < tap_col_offset + hidden_size ||
+          (((tap_row_stride | tap_col_offset) & 7) != 0))) ||
+        ((((uintptr_t)x | (uintptr_t)residual | (uintptr_t)tap_dst_bf16 |
+           (uintptr_t)weight | (uintptr_t)out | (uintptr_t)out_had512) & 15u) != 0u)) {
+        return (int)cudaErrorInvalidValue;
+    }
+    if (num_tokens <= 0 || hidden_size <= 0) return 0;
+    if (hidden_size <= 2048) {
+        warp34::fused_add_gemma_rms_norm_vec8_f16_kernel<1, 8><<<num_tokens, 256, 0, (cudaStream_t)ex->stream>>>(
+            (const __half*)x, (__half*)residual, (const __half*)weight, (__half*)out, (__half*)out_had512,
+            (__nv_bfloat16*)tap_dst_bf16, valid_token_mask, hidden_size, eps,
+            tap_row_stride, tap_col_offset, 1.0f);
+    } else if (hidden_size <= 4096) {
+        warp34::fused_add_gemma_rms_norm_vec8_f16_kernel<1, 16><<<num_tokens, 512, 0, (cudaStream_t)ex->stream>>>(
+            (const __half*)x, (__half*)residual, (const __half*)weight, (__half*)out, (__half*)out_had512,
+            (__nv_bfloat16*)tap_dst_bf16, valid_token_mask, hidden_size, eps,
+            tap_row_stride, tap_col_offset, 1.0f);
+    } else {
+        warp34::fused_add_gemma_rms_norm_vec8_f16_kernel<2, 16><<<num_tokens, 512, 0, (cudaStream_t)ex->stream>>>(
+            (const __half*)x, (__half*)residual, (const __half*)weight, (__half*)out, (__half*)out_had512,
+            (__nv_bfloat16*)tap_dst_bf16, valid_token_mask, hidden_size, eps,
+            tap_row_stride, tap_col_offset, 1.0f);
+    }
+    return (int)cudaGetLastError();
 }
 
 extern "C" int warp34_gemma_rms_norm_f16(const warp34_exec* ex, const void* x, const void* weight,
@@ -1418,6 +1616,24 @@ extern "C" int warp34_silu_and_mul_hadamard_f16(const warp34_exec* ex, const voi
     if (col_blocks > 65535u) return (int)cudaErrorInvalidValue;
     dim3 grid((unsigned)num_tokens, col_blocks);
     warp34::silu_and_mul_hadamard_f16_kernel<<<grid, blk, 0, (cudaStream_t)ex->stream>>>(
+        (const __half*)gate_up, (__half*)out, valid_token_mask, intermediate_size);
+    return (int)cudaGetLastError();
+}
+
+extern "C" int warp34_silu_and_mul_hadamard512_f16(const warp34_exec* ex, const void* gate_up, void* out,
+                                                const uint8_t* valid_token_mask,
+                                                int num_tokens, int intermediate_size) {
+    if (ex == nullptr || gate_up == nullptr || out == nullptr || (intermediate_size & 511) != 0 ||
+        ((((uintptr_t)gate_up | (uintptr_t)out) & 1u) != 0u)) {
+        return (int)cudaErrorInvalidValue;
+    }
+    if (num_tokens <= 0 || intermediate_size <= 0) return 0;
+    const unsigned blk = 128u;
+    const unsigned cols = (unsigned)(intermediate_size >> 3);
+    const unsigned col_blocks = (cols + blk - 1u) / blk;
+    if (col_blocks > 65535u) return (int)cudaErrorInvalidValue;
+    dim3 grid((unsigned)num_tokens, col_blocks);
+    warp34::silu_and_mul_hadamard512_f16_kernel<<<grid, blk, 0, (cudaStream_t)ex->stream>>>(
         (const __half*)gate_up, (__half*)out, valid_token_mask, intermediate_size);
     return (int)cudaGetLastError();
 }
@@ -2053,6 +2269,143 @@ __global__ void small_n_gemm_dual_4x4_f16_kernel(
     reduce_store_tile_4x4_f16(acc, s_warp, out, m_base, n_base, rows, cols, size_n);
 }
 
+// 8-row x 4-col tile variant for speculative verify (`m = 5..8` in a single CTA along Y),
+// halving HBM weight reads vs `small_n_gemm_dual_4x4_f16_kernel` (`gridY = 1` instead of `2`).
+__global__ void small_n_gemm_dual_8x4_f16_kernel(
+    const __half* __restrict__ x,
+    const __half* __restrict__ w0,
+    __half* __restrict__ out0,
+    int size_n0,
+    int tiles_n0,
+    const __half* __restrict__ w1,
+    __half* __restrict__ out1,
+    int size_n1,
+    int m,
+    int size_k) {
+    const int m_base = (int)blockIdx.y * 8;
+    if (m_base >= m) return;
+
+    const bool second = ((int)blockIdx.x >= tiles_n0);
+    const int tile_x = second ? ((int)blockIdx.x - tiles_n0) : (int)blockIdx.x;
+    const int n_base = tile_x * 4;
+    const int size_n = second ? size_n1 : size_n0;
+    if (n_base >= size_n) return;
+
+    const __half* w = second ? w1 : w0;
+    __half* out = second ? out1 : out0;
+    const int rows = (m - m_base < 8) ? (m - m_base) : 8;
+    const int cols = (size_n - n_base < 4) ? (size_n - n_base) : 4;
+
+    float acc_lo[4][4];
+    float acc_hi[4][4];
+#pragma unroll
+    for (int r = 0; r < 4; r++) {
+#pragma unroll
+        for (int c = 0; c < 4; c++) {
+            acc_lo[r][c] = 0.0f;
+            acc_hi[r][c] = 0.0f;
+        }
+    }
+
+    if (rows == 8 && cols == 4) {
+#pragma unroll 1
+        for (int k = (int)threadIdx.x * 8; k < size_k; k += 2048) {
+            uint4 wv[4];
+#pragma unroll
+            for (int c = 0; c < 4; c++) {
+                wv[c] = *reinterpret_cast<const uint4*>(
+                    w + (size_t)(n_base + c) * size_k + k);
+            }
+#pragma unroll
+            for (int r = 0; r < 4; r++) {
+                const uint4 xv = *reinterpret_cast<const uint4*>(
+                    x + (size_t)(m_base + r) * size_k + k);
+                const __half* xh = reinterpret_cast<const __half*>(&xv);
+#pragma unroll
+                for (int c = 0; c < 4; c++) {
+                    const __half* wh = reinterpret_cast<const __half*>(&wv[c]);
+#pragma unroll
+                    for (int j = 0; j < 8; j++) {
+                        acc_lo[r][c] = fmaf(__half2float(xh[j]), __half2float(wh[j]), acc_lo[r][c]);
+                    }
+                }
+            }
+#pragma unroll
+            for (int r = 0; r < 4; r++) {
+                const uint4 xv = *reinterpret_cast<const uint4*>(
+                    x + (size_t)(m_base + 4 + r) * size_k + k);
+                const __half* xh = reinterpret_cast<const __half*>(&xv);
+#pragma unroll
+                for (int c = 0; c < 4; c++) {
+                    const __half* wh = reinterpret_cast<const __half*>(&wv[c]);
+#pragma unroll
+                    for (int j = 0; j < 8; j++) {
+                        acc_hi[r][c] = fmaf(__half2float(xh[j]), __half2float(wh[j]), acc_hi[r][c]);
+                    }
+                }
+            }
+        }
+    } else {
+#pragma unroll 1
+        for (int k = (int)threadIdx.x * 8; k < size_k; k += 2048) {
+            uint4 wv[4];
+#pragma unroll
+            for (int c = 0; c < 4; c++) {
+                if (c < cols) {
+                    wv[c] = *reinterpret_cast<const uint4*>(
+                        w + (size_t)(n_base + c) * size_k + k);
+                }
+            }
+#pragma unroll
+            for (int r = 0; r < 4; r++) {
+                if (r < rows) {
+                    const uint4 xv = *reinterpret_cast<const uint4*>(
+                        x + (size_t)(m_base + r) * size_k + k);
+                    const __half* xh = reinterpret_cast<const __half*>(&xv);
+#pragma unroll
+                    for (int c = 0; c < 4; c++) {
+                        if (c < cols) {
+                            const __half* wh = reinterpret_cast<const __half*>(&wv[c]);
+#pragma unroll
+                            for (int j = 0; j < 8; j++) {
+                                acc_lo[r][c] =
+                                    fmaf(__half2float(xh[j]), __half2float(wh[j]), acc_lo[r][c]);
+                            }
+                        }
+                    }
+                }
+            }
+#pragma unroll
+            for (int r = 0; r < 4; r++) {
+                if (4 + r < rows) {
+                    const uint4 xv = *reinterpret_cast<const uint4*>(
+                        x + (size_t)(m_base + 4 + r) * size_k + k);
+                    const __half* xh = reinterpret_cast<const __half*>(&xv);
+#pragma unroll
+                    for (int c = 0; c < 4; c++) {
+                        if (c < cols) {
+                            const __half* wh = reinterpret_cast<const __half*>(&wv[c]);
+#pragma unroll
+                            for (int j = 0; j < 8; j++) {
+                                acc_hi[r][c] =
+                                    fmaf(__half2float(xh[j]), __half2float(wh[j]), acc_hi[r][c]);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    __shared__ float s_warp[16][8];
+    const int lo_rows = (rows < 4) ? rows : 4;
+    reduce_store_tile_4x4_f16(acc_lo, s_warp, out, m_base, n_base, lo_rows, cols, size_n);
+    if (rows > 4) {
+        __syncthreads();
+        reduce_store_tile_4x4_f16(acc_hi, s_warp, out, m_base + 4, n_base, rows - 4, cols, size_n);
+    }
+}
+
 }  // namespace warp34
 
 extern "C" int warp34_small_n_gemm_f16(
@@ -2132,6 +2485,12 @@ extern "C" int warp34_small_n_gemm_dual_f16(
         warp34::small_n_gemm_dual_f16_kernel<4, 4><<<grid, 256, 0, stream>>>(
             (const __half*)x, (const __half*)w0, (__half*)out0, size_n0,
             (const __half*)w1, (__half*)out1, size_n1, m, size_k);
+    } else if (m >= 5 && m <= 16 && (t0 + t1) >= 64) {
+        const int tiles_m8 = (m + 7) / 8;
+        dim3 grid((unsigned)(t0 + t1), (unsigned)tiles_m8);
+        warp34::small_n_gemm_dual_8x4_f16_kernel<<<grid, 256, 0, stream>>>(
+            (const __half*)x, (const __half*)w0, (__half*)out0, size_n0, t0,
+            (const __half*)w1, (__half*)out1, size_n1, m, size_k);
     } else {
         dim3 grid((unsigned)(t0 + t1), (unsigned)tiles_m);
         warp34::small_n_gemm_dual_4x4_f16_kernel<<<grid, 256, 0, stream>>>(
@@ -2161,6 +2520,31 @@ extern "C" int warp34_apply_attn_output_gate_hadamard_f16(
     if (col_blocks > 65535u) return (int)cudaErrorInvalidValue;
     dim3 grid((unsigned)num_tokens, col_blocks);
     warp34::apply_attn_output_gate_hadamard_f16_kernel<<<grid, blk, 0, (cudaStream_t)ex->stream>>>(
+        (const __half*)attn_out, (const __half*)gate, (__half*)out,
+        valid_token_mask, total_dim);
+    return (int)cudaGetLastError();
+}
+
+extern "C" int warp34_apply_attn_output_gate_hadamard512_f16(
+    const warp34_exec* ex,
+    const void* attn_out,
+    const void* gate,
+    void* out,
+    const uint8_t* valid_token_mask,
+    int num_tokens,
+    int total_dim) {
+    if (ex == nullptr || attn_out == nullptr || gate == nullptr || out == nullptr ||
+        (total_dim & 511) != 0 ||
+        ((((uintptr_t)attn_out | (uintptr_t)gate | (uintptr_t)out) & 1u) != 0u)) {
+        return (int)cudaErrorInvalidValue;
+    }
+    if (num_tokens <= 0 || total_dim <= 0) return 0;
+    const unsigned blk = 128u;
+    const unsigned cols = (unsigned)(total_dim >> 3);
+    const unsigned col_blocks = (cols + blk - 1u) / blk;
+    if (col_blocks > 65535u) return (int)cudaErrorInvalidValue;
+    dim3 grid((unsigned)num_tokens, col_blocks);
+    warp34::apply_attn_output_gate_hadamard512_f16_kernel<<<grid, blk, 0, (cudaStream_t)ex->stream>>>(
         (const __half*)attn_out, (const __half*)gate, (__half*)out,
         valid_token_mask, total_dim);
     return (int)cudaGetLastError();

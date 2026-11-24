@@ -40,6 +40,9 @@ pub struct Tp2Collectives {
 /// Byte threshold (`64 KiB`) at and above which `TP=2` collectives use Copy-Engine
 /// `cudaMemcpyAsync` TX into `[0, max_stage_bytes_per_epoch)` followed by 2-barrier SM RX.
 pub const TP2_DMA_THRESHOLD_BYTES: usize = 65_536;
+/// Byte threshold (`512 KiB`) at and above which `TP=2` PCIe collectives overlap
+/// multi-chunk Copy-Engine DMA TX (`dma_pipes[rank].stream`) with SM RX (`ex.stream`).
+pub const TP2_DMA_PIPELINE_MIN_BYTES: usize = 512 * 1024;
 /// Number of `max_stage_bytes_per_epoch` slots allocated per rank (`[0, cap)` for 2-barrier
 /// DMA TX, `[cap, 2 * cap)` for even 1-barrier epochs, and `[2 * cap, 3 * cap)` for odd 1-barrier epochs).
 const TP2_STAGE_EPOCH_SLOTS: usize = 3;
@@ -126,7 +129,16 @@ impl Tp2Collectives {
                 )?));
             }
         } else {
-            for _ in 0..tp_size {
+            let num_gpus = super::CudaDevice::count()?.max(1) as usize;
+            for r in 0..tp_size {
+                let dev_id = (r % num_gpus) as i32;
+                check_rc(
+                    // SAFETY: binds calling thread to a valid visible device before allocating
+                    // portable mapped host memory for rank `r` (wraps modulo `num_gpus` so
+                    // TP=4 mapped-host simulation tests work on 1- or 2-GPU hosts).
+                    unsafe { ffi::warp34_set_device(dev_id) },
+                    "warp34_set_device",
+                )?;
                 let sig = MappedHostBuffer::alloc(sig_bytes)?;
                 if SIG_EPOCH_CAP_U32_IDX * 4 + 4 <= sig.len_bytes {
                     // SAFETY: `sig.host_ptr` is 128B-aligned mapped host memory of size `sig.len_bytes`,
@@ -145,18 +157,18 @@ impl Tp2Collectives {
             }
         }
         let mut dma_pipes = Vec::new();
-        if tp_size == 2 && !all_p2p && CudaDevice::count().unwrap_or(0) >= 2 {
+        if tp_size == 2 && !all_p2p && super::CudaDevice::count().unwrap_or(0) >= 2 {
             for dev in 0..2i32 {
-                let stream = CudaStream::new(dev)?;
-                let ev_ready = CudaEvent::new(dev, false)?;
-                let ev0 = CudaEvent::new(dev, false)?;
-                let ev1 = CudaEvent::new(dev, false)?;
-                let ev2 = CudaEvent::new(dev, false)?;
-                let ev3 = CudaEvent::new(dev, false)?;
-                let ev4 = CudaEvent::new(dev, false)?;
-                let ev5 = CudaEvent::new(dev, false)?;
-                let ev6 = CudaEvent::new(dev, false)?;
-                let ev7 = CudaEvent::new(dev, false)?;
+                let stream = super::CudaStream::new(dev)?;
+                let ev_ready = super::CudaEvent::new(dev, false)?;
+                let ev0 = super::CudaEvent::new(dev, false)?;
+                let ev1 = super::CudaEvent::new(dev, false)?;
+                let ev2 = super::CudaEvent::new(dev, false)?;
+                let ev3 = super::CudaEvent::new(dev, false)?;
+                let ev4 = super::CudaEvent::new(dev, false)?;
+                let ev5 = super::CudaEvent::new(dev, false)?;
+                let ev6 = super::CudaEvent::new(dev, false)?;
+                let ev7 = super::CudaEvent::new(dev, false)?;
                 let ev_tx_handles = [
                     ev0.handle, ev1.handle, ev2.handle, ev3.handle, ev4.handle, ev5.handle,
                     ev6.handle, ev7.handle,
@@ -188,7 +200,8 @@ impl Tp2Collectives {
         num_elems: i32,
     ) -> Result<()> {
         assert!(
-            (num_elems as usize) * 2 <= self.max_stage_bytes_per_epoch,
+            num_elems >= 0
+                && (num_elems as usize).saturating_mul(2) <= self.max_stage_bytes_per_epoch,
             "all_reduce_f16 exceeds max_stage_bytes_per_epoch"
         );
         if self.tp_size == 4 {
@@ -214,6 +227,14 @@ impl Tp2Collectives {
                 },
                 "warp34_tp4_all_reduce_f16",
             );
+        }
+        if self.tp_size == 2
+            && !self.p2p_vram
+            && self.dma_pipes.len() == 2
+            && (rank == 0 || rank == 1)
+            && (num_elems as usize).saturating_mul(2) >= TP2_DMA_PIPELINE_MIN_BYTES
+        {
+            return self.all_reduce_pipelined_f16(ex, local_in_ptr, out_ptr, rank, num_elems);
         }
         check_rc(
             // SAFETY: staging capacity is asserted above; `stages[0..2]` and `sigs[0..2]` are live
@@ -260,7 +281,41 @@ impl Tp2Collectives {
             ));
         }
         if self.tp_size != 2 || self.dma_pipes.len() < 2 {
-            return self.all_reduce_f16(ex, local_in_ptr, out_ptr, rank, num_elems);
+            return check_rc(
+                // SAFETY: `stages` and `sigs` are live buffers owned by `self` with sufficient capacity.
+                unsafe {
+                    if self.tp_size == 4 {
+                        ffi::warp34_tp4_all_reduce_f16(
+                            ex,
+                            local_in_ptr as *const c_void,
+                            out_ptr as *mut c_void,
+                            self.stages[0].dev_ptr(),
+                            self.stages[1].dev_ptr(),
+                            self.stages[2].dev_ptr(),
+                            self.stages[3].dev_ptr(),
+                            self.sigs[0].dev_ptr(),
+                            self.sigs[1].dev_ptr(),
+                            self.sigs[2].dev_ptr(),
+                            self.sigs[3].dev_ptr(),
+                            rank,
+                            num_elems,
+                        )
+                    } else {
+                        ffi::warp34_tp2_all_reduce_f16(
+                            ex,
+                            local_in_ptr as *const c_void,
+                            out_ptr as *mut c_void,
+                            self.stages[0].dev_ptr(),
+                            self.stages[1].dev_ptr(),
+                            self.sigs[0].dev_ptr(),
+                            self.sigs[1].dev_ptr(),
+                            rank,
+                            num_elems,
+                        )
+                    }
+                },
+                "warp34_tp2_all_reduce_f16",
+            );
         }
         let pipe = &self.dma_pipes[rank as usize];
         check_rc(
@@ -340,9 +395,13 @@ impl Tp2Collectives {
         tap_row_stride: i32,
         tap_col_offset: i32,
     ) -> Result<()> {
-        let num_elems = (num_tokens as usize) * (hidden_size as usize);
         assert!(
-            num_elems * 2 <= self.max_stage_bytes_per_epoch,
+            num_tokens >= 0 && hidden_size > 0,
+            "all_reduce_residual_gemma_rms_norm_f16 invalid dimensions"
+        );
+        let num_elems = (num_tokens as usize).saturating_mul(hidden_size as usize);
+        assert!(
+            num_elems.saturating_mul(2) <= self.max_stage_bytes_per_epoch,
             "all_reduce_residual_gemma_rms_norm_f16 exceeds max_stage_bytes_per_epoch"
         );
         if self.tp_size == 4 {
@@ -376,6 +435,45 @@ impl Tp2Collectives {
                     )
                 },
                 "warp34_tp4_all_reduce_residual_gemma_rms_norm_hadamard_f16",
+            );
+        }
+        if self.tp_size == 2
+            && !self.p2p_vram
+            && self.dma_pipes.len() == 2
+            && (rank == 0 || rank == 1)
+            && num_elems.saturating_mul(2) >= TP2_DMA_PIPELINE_MIN_BYTES
+        {
+            let pipe = &self.dma_pipes[rank as usize];
+            return check_rc(
+                // SAFETY: staging capacity is asserted above; `stages[0..2]`, `sigs[0..2]`, and `pipe`
+                // belong to `self` on device `rank`, and caller guarantees valid device pointers.
+                unsafe {
+                    ffi::warp34_tp2_all_reduce_residual_gemma_rms_norm_hadamard_pipelined_f16(
+                        ex,
+                        local_in_ptr as *const c_void,
+                        ar_out_ptr as *mut c_void,
+                        residual_ptr as *mut c_void,
+                        weight_ptr as *const c_void,
+                        out_ptr as *mut c_void,
+                        out_had64_ptr as *mut c_void,
+                        tap_dst_bf16_ptr as *mut c_void,
+                        self.stages[0].dev_ptr(),
+                        self.stages[1].dev_ptr(),
+                        self.sigs[0].dev_ptr(),
+                        self.sigs[1].dev_ptr(),
+                        rank,
+                        num_tokens,
+                        hidden_size,
+                        eps,
+                        tap_row_stride,
+                        tap_col_offset,
+                        pipe.stream.handle,
+                        pipe.ev_ready.handle,
+                        pipe.ev_tx_handles.as_ptr(),
+                        8,
+                    )
+                },
+                "warp34_tp2_all_reduce_residual_gemma_rms_norm_hadamard_pipelined_f16",
             );
         }
         check_rc(

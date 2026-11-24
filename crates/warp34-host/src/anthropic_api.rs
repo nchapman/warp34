@@ -224,6 +224,7 @@ fn convert_messages(
         out.push(json!({"role": "system", "content": sys}));
     }
 
+    let mut has_conversation_msg = false;
     for msg in arr {
         let obj = msg
             .as_object()
@@ -237,238 +238,390 @@ fn convert_messages(
             .ok_or_else(|| AnthropicApiError::bad_request("message missing 'content'"))?;
 
         match role {
-            "user" => match content_val {
-                Value::String(s) => {
-                    out.push(json!({"role": "user", "content": s}));
+            "system" | "developer" => {
+                if let Some(sys_text) = extract_system_prompt(Some(content_val))? {
+                    out.push(json!({"role": "system", "content": sys_text}));
                 }
-                Value::Array(blocks) => {
-                    if blocks.is_empty() {
-                        return Err(AnthropicApiError::bad_request(
-                            "user message content array must not be empty",
-                        ));
+            }
+            "user" => {
+                has_conversation_msg = true;
+                match content_val {
+                    Value::String(s) => {
+                        out.push(json!({"role": "user", "content": s}));
                     }
-                    let mut tool_messages = Vec::new();
-                    let mut user_parts = Vec::new();
-                    let mut has_image = false;
-                    let mut user_text = String::new();
+                    Value::Array(blocks) => {
+                        if blocks.is_empty() {
+                            return Err(AnthropicApiError::bad_request(
+                                "user message content array must not be empty",
+                            ));
+                        }
+                        let mut tool_messages = Vec::new();
+                        let mut user_parts = Vec::new();
+                        let mut has_image = false;
+                        let mut user_text = String::new();
 
-                    for b in blocks {
-                        let bobj = b.as_object().ok_or_else(|| {
-                            AnthropicApiError::bad_request("content block must be an object")
-                        })?;
-                        let btype = bobj.get("type").and_then(Value::as_str).ok_or_else(|| {
-                            AnthropicApiError::bad_request("content block missing string 'type'")
-                        })?;
-                        match btype {
-                            "text" => {
-                                let t =
-                                    bobj.get("text").and_then(Value::as_str).ok_or_else(|| {
-                                        AnthropicApiError::bad_request(
-                                            "text block missing string 'text'",
-                                        )
-                                    })?;
-                                user_text.push_str(t);
-                                user_parts.push(json!({"type": "text", "text": t}));
-                            }
-                            "image" => {
-                                has_image = true;
-                                user_parts.push(convert_image_block(bobj)?);
-                            }
-                            "tool_result" => {
-                                let tool_use_id = bobj
-                                    .get("tool_use_id")
-                                    .and_then(Value::as_str)
-                                    .filter(|s| !s.is_empty())
-                                    .ok_or_else(|| {
-                                        AnthropicApiError::bad_request(
-                                            "tool_result block missing non-empty 'tool_use_id'",
-                                        )
-                                    })?;
-                                let is_error = bobj
-                                    .get("is_error")
-                                    .and_then(Value::as_bool)
-                                    .unwrap_or(false);
-                                let mut tr_text = String::new();
-                                match bobj.get("content") {
-                                    None | Some(Value::Null) => {}
-                                    Some(Value::String(s)) => tr_text.push_str(s),
-                                    Some(Value::Array(inner)) => {
-                                        for ib in inner {
-                                            let iobj = ib.as_object().ok_or_else(|| {
+                        for b in blocks {
+                            let bobj = b.as_object().ok_or_else(|| {
+                                AnthropicApiError::bad_request("content block must be an object")
+                            })?;
+                            let btype =
+                                bobj.get("type").and_then(Value::as_str).ok_or_else(|| {
+                                    AnthropicApiError::bad_request(
+                                        "content block missing string 'type'",
+                                    )
+                                })?;
+                            match btype {
+                                "text" => {
+                                    let t = bobj.get("text").and_then(Value::as_str).ok_or_else(
+                                        || {
+                                            AnthropicApiError::bad_request(
+                                                "text block missing string 'text'",
+                                            )
+                                        },
+                                    )?;
+                                    user_text.push_str(t);
+                                    user_parts.push(json!({"type": "text", "text": t}));
+                                }
+                                "image" => {
+                                    has_image = true;
+                                    user_parts.push(convert_image_block(bobj)?);
+                                }
+                                "tool_result" => {
+                                    let tool_use_id = bobj
+                                        .get("tool_use_id")
+                                        .and_then(Value::as_str)
+                                        .filter(|s| !s.is_empty())
+                                        .ok_or_else(|| {
+                                            AnthropicApiError::bad_request(
+                                                "tool_result block missing non-empty 'tool_use_id'",
+                                            )
+                                        })?;
+                                    let is_error = bobj
+                                        .get("is_error")
+                                        .and_then(Value::as_bool)
+                                        .unwrap_or(false);
+                                    let mut tr_text = String::new();
+                                    match bobj.get("content") {
+                                        None | Some(Value::Null) => {}
+                                        Some(Value::String(s)) => tr_text.push_str(s),
+                                        Some(Value::Array(inner)) => {
+                                            for ib in inner {
+                                                let iobj = ib.as_object().ok_or_else(|| {
                                                 AnthropicApiError::bad_request(
                                                     "tool_result content block must be an object",
                                                 )
                                             })?;
-                                            match iobj.get("type").and_then(Value::as_str) {
-                                                Some("text") => {
-                                                    if let Some(t) =
-                                                        iobj.get("text").and_then(Value::as_str)
-                                                    {
-                                                        if !tr_text.is_empty() {
-                                                            tr_text.push('\n');
+                                                match iobj.get("type").and_then(Value::as_str) {
+                                                    Some("text") => {
+                                                        if let Some(t) =
+                                                            iobj.get("text").and_then(Value::as_str)
+                                                        {
+                                                            if !tr_text.is_empty() {
+                                                                tr_text.push('\n');
+                                                            }
+                                                            tr_text.push_str(t);
                                                         }
-                                                        tr_text.push_str(t);
                                                     }
-                                                }
-                                                Some("image") => {
-                                                    has_image = true;
-                                                    user_parts.push(convert_image_block(iobj)?);
-                                                }
-                                                Some(other) => {
-                                                    return Err(AnthropicApiError::bad_request(
-                                                        format!(
-                                                            "unsupported tool_result inner block type '{other}'"
-                                                        ),
-                                                    ));
-                                                }
-                                                None => {
-                                                    return Err(AnthropicApiError::bad_request(
-                                                        "tool_result inner block missing 'type'",
-                                                    ));
+                                                    Some("image") => {
+                                                        has_image = true;
+                                                        user_parts.push(convert_image_block(iobj)?);
+                                                    }
+                                                    Some(other) => {
+                                                        return Err(
+                                                            AnthropicApiError::bad_request(
+                                                                format!(
+                                                                    "unsupported tool_result inner block type '{other}'"
+                                                                ),
+                                                            ),
+                                                        );
+                                                    }
+                                                    None => {
+                                                        return Err(
+                                                            AnthropicApiError::bad_request(
+                                                                "tool_result inner block missing 'type'",
+                                                            ),
+                                                        );
+                                                    }
                                                 }
                                             }
                                         }
+                                        Some(_) => {
+                                            return Err(AnthropicApiError::bad_request(
+                                                "tool_result 'content' must be a string or array",
+                                            ));
+                                        }
                                     }
-                                    Some(_) => {
+                                    if is_error && !tr_text.starts_with("Error:") {
+                                        tr_text = format!("Error: {tr_text}");
+                                    }
+                                    tool_messages.push(json!({
+                                        "role": "tool",
+                                        "tool_call_id": tool_use_id,
+                                        "content": tr_text,
+                                    }));
+                                }
+                                other => {
+                                    return Err(AnthropicApiError::bad_request(format!(
+                                        "unsupported user content block type '{other}'"
+                                    )));
+                                }
+                            }
+                        }
+
+                        out.extend(tool_messages);
+                        if has_image {
+                            out.push(json!({"role": "user", "content": user_parts}));
+                        } else if !user_parts.is_empty() {
+                            out.push(json!({"role": "user", "content": user_text}));
+                        }
+                    }
+                    _ => {
+                        return Err(AnthropicApiError::bad_request(
+                            "user 'content' must be a string or array of blocks",
+                        ));
+                    }
+                }
+            }
+            "assistant" => {
+                has_conversation_msg = true;
+                match content_val {
+                    Value::String(s) => {
+                        out.push(json!({"role": "assistant", "content": s}));
+                    }
+                    Value::Array(blocks) => {
+                        let mut thinking_text = String::new();
+                        let mut assistant_text = String::new();
+                        let mut tool_calls = Vec::new();
+
+                        for b in blocks {
+                            let bobj = b.as_object().ok_or_else(|| {
+                                AnthropicApiError::bad_request("assistant block must be an object")
+                            })?;
+                            let btype =
+                                bobj.get("type").and_then(Value::as_str).ok_or_else(|| {
+                                    AnthropicApiError::bad_request(
+                                        "assistant block missing string 'type'",
+                                    )
+                                })?;
+                            match btype {
+                                "thinking" => {
+                                    if let Some(t) = bobj.get("thinking").and_then(Value::as_str) {
+                                        thinking_text.push_str(t);
+                                    }
+                                }
+                                "redacted_thinking" => {}
+                                "text" => {
+                                    let t = bobj.get("text").and_then(Value::as_str).ok_or_else(
+                                        || {
+                                            AnthropicApiError::bad_request(
+                                                "assistant text block missing string 'text'",
+                                            )
+                                        },
+                                    )?;
+                                    assistant_text.push_str(t);
+                                }
+                                "tool_use" => {
+                                    let id = bobj
+                                        .get("id")
+                                        .and_then(Value::as_str)
+                                        .filter(|s| !s.is_empty())
+                                        .ok_or_else(|| {
+                                            AnthropicApiError::bad_request(
+                                                "tool_use block missing non-empty 'id'",
+                                            )
+                                        })?;
+                                    let name = bobj
+                                        .get("name")
+                                        .and_then(Value::as_str)
+                                        .filter(|s| !s.is_empty())
+                                        .ok_or_else(|| {
+                                            AnthropicApiError::bad_request(
+                                                "tool_use block missing non-empty 'name'",
+                                            )
+                                        })?;
+                                    let input =
+                                        bobj.get("input").cloned().unwrap_or_else(|| json!({}));
+                                    if !input.is_object() {
                                         return Err(AnthropicApiError::bad_request(
-                                            "tool_result 'content' must be a string or array",
+                                            "tool_use 'input' must be a JSON object",
                                         ));
                                     }
+                                    tool_calls.push(json!({
+                                        "id": id,
+                                        "type": "function",
+                                        "function": {
+                                            "name": name,
+                                            "arguments": input,
+                                        }
+                                    }));
                                 }
-                                if is_error && !tr_text.starts_with("Error:") {
-                                    tr_text = format!("Error: {tr_text}");
+                                other => {
+                                    return Err(AnthropicApiError::bad_request(format!(
+                                        "unsupported assistant content block type '{other}'"
+                                    )));
                                 }
-                                tool_messages.push(json!({
-                                    "role": "tool",
-                                    "tool_call_id": tool_use_id,
-                                    "content": tr_text,
-                                }));
-                            }
-                            other => {
-                                return Err(AnthropicApiError::bad_request(format!(
-                                    "unsupported user content block type '{other}'"
-                                )));
                             }
                         }
-                    }
 
-                    out.extend(tool_messages);
-                    if has_image {
-                        out.push(json!({"role": "user", "content": user_parts}));
-                    } else if !user_parts.is_empty() {
-                        out.push(json!({"role": "user", "content": user_text}));
-                    }
-                }
-                _ => {
-                    return Err(AnthropicApiError::bad_request(
-                        "user 'content' must be a string or array of blocks",
-                    ));
-                }
-            },
-            "assistant" => match content_val {
-                Value::String(s) => {
-                    out.push(json!({"role": "assistant", "content": s}));
-                }
-                Value::Array(blocks) => {
-                    let mut thinking_text = String::new();
-                    let mut assistant_text = String::new();
-                    let mut tool_calls = Vec::new();
-
-                    for b in blocks {
-                        let bobj = b.as_object().ok_or_else(|| {
-                            AnthropicApiError::bad_request("assistant block must be an object")
-                        })?;
-                        let btype = bobj.get("type").and_then(Value::as_str).ok_or_else(|| {
-                            AnthropicApiError::bad_request("assistant block missing string 'type'")
-                        })?;
-                        match btype {
-                            "thinking" => {
-                                if let Some(t) = bobj.get("thinking").and_then(Value::as_str) {
-                                    thinking_text.push_str(t);
-                                }
-                            }
-                            "redacted_thinking" => {}
-                            "text" => {
-                                let t =
-                                    bobj.get("text").and_then(Value::as_str).ok_or_else(|| {
-                                        AnthropicApiError::bad_request(
-                                            "assistant text block missing string 'text'",
-                                        )
-                                    })?;
-                                assistant_text.push_str(t);
-                            }
-                            "tool_use" => {
-                                let id = bobj
-                                    .get("id")
-                                    .and_then(Value::as_str)
-                                    .filter(|s| !s.is_empty())
-                                    .ok_or_else(|| {
-                                        AnthropicApiError::bad_request(
-                                            "tool_use block missing non-empty 'id'",
-                                        )
-                                    })?;
-                                let name = bobj
-                                    .get("name")
-                                    .and_then(Value::as_str)
-                                    .filter(|s| !s.is_empty())
-                                    .ok_or_else(|| {
-                                        AnthropicApiError::bad_request(
-                                            "tool_use block missing non-empty 'name'",
-                                        )
-                                    })?;
-                                let input = bobj.get("input").cloned().unwrap_or_else(|| json!({}));
-                                if !input.is_object() {
-                                    return Err(AnthropicApiError::bad_request(
-                                        "tool_use 'input' must be a JSON object",
-                                    ));
-                                }
-                                tool_calls.push(json!({
-                                    "id": id,
-                                    "type": "function",
-                                    "function": {
-                                        "name": name,
-                                        "arguments": input,
-                                    }
-                                }));
-                            }
-                            other => {
-                                return Err(AnthropicApiError::bad_request(format!(
-                                    "unsupported assistant content block type '{other}'"
-                                )));
-                            }
+                        let mut amsg = json!({
+                            "role": "assistant",
+                            "content": if assistant_text.is_empty() && !tool_calls.is_empty() {
+                                Value::Null
+                            } else {
+                                Value::String(assistant_text)
+                            },
+                        });
+                        if !thinking_text.is_empty() {
+                            amsg["reasoning_content"] = json!(thinking_text);
                         }
+                        if !tool_calls.is_empty() {
+                            amsg["tool_calls"] = Value::Array(tool_calls);
+                        }
+                        out.push(amsg);
                     }
-
-                    let mut amsg = json!({
-                        "role": "assistant",
-                        "content": if assistant_text.is_empty() && !tool_calls.is_empty() {
-                            Value::Null
-                        } else {
-                            Value::String(assistant_text)
-                        },
-                    });
-                    if !thinking_text.is_empty() {
-                        amsg["reasoning_content"] = json!(thinking_text);
+                    _ => {
+                        return Err(AnthropicApiError::bad_request(
+                            "assistant 'content' must be a string or array of blocks",
+                        ));
                     }
-                    if !tool_calls.is_empty() {
-                        amsg["tool_calls"] = Value::Array(tool_calls);
-                    }
-                    out.push(amsg);
                 }
-                _ => {
-                    return Err(AnthropicApiError::bad_request(
-                        "assistant 'content' must be a string or array of blocks",
-                    ));
-                }
-            },
+            }
             other => {
                 return Err(AnthropicApiError::bad_request(format!(
-                    "unsupported Anthropic message role '{other}': expected 'user' or 'assistant'"
+                    "unsupported Anthropic message role '{other}': expected 'user', 'assistant', or 'system'"
                 )));
             }
         }
     }
+    if !has_conversation_msg {
+        return Err(AnthropicApiError::bad_request(
+            "'messages' must contain at least one 'user' or 'assistant' message",
+        ));
+    }
     Ok(out)
+}
+
+#[allow(clippy::type_complexity)]
+fn parse_anthropic_thinking_config(
+    obj: &Map<String, Value>,
+    is_forced_tool_choice: bool,
+    require_max_tokens: bool,
+    max_tokens: usize,
+) -> Result<(Option<bool>, Option<usize>, Option<String>, Option<Value>), AnthropicApiError> {
+    let mut enable_thinking: Option<bool> = None;
+    let mut thinking_budget: Option<usize> = None;
+    let mut reasoning_effort: Option<String> = None;
+    if let Some(th_val) = obj.get("thinking").filter(|v| !v.is_null()) {
+        let th_obj = th_val
+            .as_object()
+            .ok_or_else(|| AnthropicApiError::bad_request("'thinking' must be an object"))?;
+        let th_type = th_obj
+            .get("type")
+            .and_then(Value::as_str)
+            .ok_or_else(|| AnthropicApiError::bad_request("thinking missing string 'type'"))?;
+        match th_type {
+            "enabled" => {
+                if is_forced_tool_choice {
+                    return Err(AnthropicApiError::bad_request(
+                        "thinking cannot be enabled when tool_choice forces tool use ('any' or 'tool')",
+                    ));
+                }
+                let budget = th_obj
+                    .get("budget_tokens")
+                    .and_then(Value::as_u64)
+                    .and_then(|n| usize::try_from(n).ok())
+                    .ok_or_else(|| {
+                        AnthropicApiError::bad_request(
+                            "thinking.type 'enabled' requires integer 'budget_tokens'",
+                        )
+                    })?;
+                if budget < 1024 {
+                    return Err(AnthropicApiError::bad_request(
+                        "'thinking.budget_tokens' must be >= 1024",
+                    ));
+                }
+                if require_max_tokens && budget >= max_tokens {
+                    return Err(AnthropicApiError::bad_request(
+                        "'thinking.budget_tokens' must be strictly less than 'max_tokens'",
+                    ));
+                }
+                enable_thinking = Some(true);
+                thinking_budget = Some(budget);
+            }
+            "disabled" => {
+                enable_thinking = Some(false);
+                reasoning_effort = Some("none".to_string());
+            }
+            "adaptive" => {
+                enable_thinking = Some(!is_forced_tool_choice);
+            }
+            other => {
+                return Err(AnthropicApiError::bad_request(format!(
+                    "unsupported thinking.type '{other}'"
+                )));
+            }
+        }
+    } else if is_forced_tool_choice {
+        enable_thinking = Some(false);
+    }
+    let mut response_format: Option<Value> = None;
+    if let Some(oc_val) = obj.get("output_config").filter(|v| !v.is_null()) {
+        let oc_obj = oc_val
+            .as_object()
+            .ok_or_else(|| AnthropicApiError::bad_request("'output_config' must be an object"))?;
+        if let Some(effort_val) = oc_obj.get("effort").filter(|v| !v.is_null()) {
+            let eff = effort_val.as_str().ok_or_else(|| {
+                AnthropicApiError::bad_request("'output_config.effort' must be a string")
+            })?;
+            match eff {
+                "low" | "medium" | "high" | "xhigh" | "max" => {
+                    if enable_thinking != Some(false) {
+                        reasoning_effort = Some(eff.to_string());
+                    }
+                    if enable_thinking.is_none() && !is_forced_tool_choice {
+                        enable_thinking = Some(true);
+                    }
+                }
+                _ => {
+                    return Err(AnthropicApiError::bad_request(format!(
+                        "unsupported output_config.effort '{eff}'"
+                    )));
+                }
+            }
+        }
+        if let Some(fmt_val) = oc_obj.get("format").filter(|v| !v.is_null()) {
+            let fmt_obj = fmt_val.as_object().ok_or_else(|| {
+                AnthropicApiError::bad_request("'output_config.format' must be an object")
+            })?;
+            match fmt_obj.get("type").and_then(Value::as_str) {
+                Some("json_schema") => {
+                    let schema = fmt_obj.get("schema").ok_or_else(|| {
+                        AnthropicApiError::bad_request("output_config.format missing 'schema'")
+                    })?;
+                    response_format = Some(json!({
+                        "type": "json_schema",
+                        "json_schema": {
+                            "name": "anthropic_output_schema",
+                            "strict": true,
+                            "schema": schema,
+                        }
+                    }));
+                }
+                Some("text") | None => {}
+                Some(other) => {
+                    return Err(AnthropicApiError::bad_request(format!(
+                        "unsupported output_config.format.type '{other}'"
+                    )));
+                }
+            }
+        }
+    }
+    Ok((
+        enable_thinking,
+        thinking_budget,
+        reasoning_effort,
+        response_format,
+    ))
 }
 
 /// Translates an Anthropic Messages API request body into `(canonical_chat_request, meta)`.
@@ -501,10 +654,11 @@ pub fn translate_anthropic_to_chat(
                 .as_u64()
                 .and_then(|n| usize::try_from(n).ok())
                 .ok_or_else(|| AnthropicApiError::bad_request("invalid 'max_tokens'"))?;
-            if n == 0 || n > 4096 {
-                return Err(AnthropicApiError::bad_request(
-                    "'max_tokens' must be in 1..=4096",
-                ));
+            if n == 0 || n > crate::server::MAX_OUTPUT_TOKENS {
+                return Err(AnthropicApiError::bad_request(format!(
+                    "'max_tokens' must be in 1..={}",
+                    crate::server::MAX_OUTPUT_TOKENS
+                )));
             }
             n
         }
@@ -539,6 +693,11 @@ pub fn translate_anthropic_to_chat(
                 .and_then(Value::as_str)
                 .filter(|s| !s.is_empty())
                 .ok_or_else(|| AnthropicApiError::bad_request("tool missing non-empty 'name'"))?;
+            if name == "DeferredToolPlaceholder"
+                && tobj.get("defer_loading").and_then(Value::as_bool) == Some(true)
+            {
+                continue;
+            }
             let schema = tobj
                 .get("input_schema")
                 .cloned()
@@ -596,110 +755,14 @@ pub fn translate_anthropic_to_chat(
         None
     };
 
-    // Thinking config
-    let mut enable_thinking: Option<bool> = None;
-    if let Some(th_val) = obj.get("thinking").filter(|v| !v.is_null()) {
-        let th_obj = th_val
-            .as_object()
-            .ok_or_else(|| AnthropicApiError::bad_request("'thinking' must be an object"))?;
-        let th_type = th_obj
-            .get("type")
-            .and_then(Value::as_str)
-            .ok_or_else(|| AnthropicApiError::bad_request("thinking missing string 'type'"))?;
-        match th_type {
-            "enabled" => {
-                if is_forced_tool_choice {
-                    return Err(AnthropicApiError::bad_request(
-                        "thinking cannot be enabled when tool_choice forces tool use ('any' or 'tool')",
-                    ));
-                }
-                let budget = th_obj
-                    .get("budget_tokens")
-                    .and_then(Value::as_u64)
-                    .and_then(|n| usize::try_from(n).ok())
-                    .ok_or_else(|| {
-                        AnthropicApiError::bad_request(
-                            "thinking.type 'enabled' requires integer 'budget_tokens'",
-                        )
-                    })?;
-                if budget < 1024 {
-                    return Err(AnthropicApiError::bad_request(
-                        "'thinking.budget_tokens' must be >= 1024",
-                    ));
-                }
-                if require_max_tokens && budget >= max_tokens {
-                    return Err(AnthropicApiError::bad_request(
-                        "'thinking.budget_tokens' must be strictly less than 'max_tokens'",
-                    ));
-                }
-                enable_thinking = Some(true);
-            }
-            "disabled" => {
-                enable_thinking = Some(false);
-            }
-            "adaptive" => {
-                enable_thinking = Some(!is_forced_tool_choice);
-            }
-            other => {
-                return Err(AnthropicApiError::bad_request(format!(
-                    "unsupported thinking.type '{other}'"
-                )));
-            }
-        }
-    } else if is_forced_tool_choice {
-        enable_thinking = Some(false);
-    }
-
-    // output_config.effort & output_config.format -> response_format
-    let mut response_format: Option<Value> = None;
-    if let Some(oc_val) = obj.get("output_config").filter(|v| !v.is_null()) {
-        let oc_obj = oc_val
-            .as_object()
-            .ok_or_else(|| AnthropicApiError::bad_request("'output_config' must be an object"))?;
-        if let Some(effort_val) = oc_obj.get("effort").filter(|v| !v.is_null()) {
-            let eff = effort_val.as_str().ok_or_else(|| {
-                AnthropicApiError::bad_request("'output_config.effort' must be a string")
-            })?;
-            match eff {
-                "low" | "medium" | "high" | "xhigh" | "max" => {
-                    if enable_thinking.is_none() && !is_forced_tool_choice {
-                        enable_thinking = Some(true);
-                    }
-                }
-                _ => {
-                    return Err(AnthropicApiError::bad_request(format!(
-                        "unsupported output_config.effort '{eff}'"
-                    )));
-                }
-            }
-        }
-        if let Some(fmt_val) = oc_obj.get("format").filter(|v| !v.is_null()) {
-            let fmt_obj = fmt_val.as_object().ok_or_else(|| {
-                AnthropicApiError::bad_request("'output_config.format' must be an object")
-            })?;
-            match fmt_obj.get("type").and_then(Value::as_str) {
-                Some("json_schema") => {
-                    let schema = fmt_obj.get("schema").ok_or_else(|| {
-                        AnthropicApiError::bad_request("output_config.format missing 'schema'")
-                    })?;
-                    response_format = Some(json!({
-                        "type": "json_schema",
-                        "json_schema": {
-                            "name": "anthropic_output_schema",
-                            "strict": true,
-                            "schema": schema,
-                        }
-                    }));
-                }
-                Some("text") | None => {}
-                Some(other) => {
-                    return Err(AnthropicApiError::bad_request(format!(
-                        "unsupported output_config.format.type '{other}'"
-                    )));
-                }
-            }
-        }
-    }
+    // Thinking & output_config
+    let (enable_thinking, thinking_budget, reasoning_effort, response_format) =
+        parse_anthropic_thinking_config(
+            obj,
+            is_forced_tool_choice,
+            require_max_tokens,
+            max_tokens,
+        )?;
 
     let stream = obj
         .get("stream")
@@ -737,6 +800,8 @@ pub fn translate_anthropic_to_chat(
         "stop_token_ids",
         "min_tokens",
         "ignore_eos",
+        "reasoning_budget_message",
+        "thinking_budget_message",
     ] {
         if let Some(val) = obj.get(key).filter(|v| !v.is_null()) {
             chat_req.insert(key.into(), val.clone());
@@ -751,6 +816,12 @@ pub fn translate_anthropic_to_chat(
     if let Some(rf) = response_format {
         chat_req.insert("response_format".into(), rf);
     }
+    if let Some(eff) = reasoning_effort {
+        chat_req.insert("reasoning_effort".into(), json!(eff));
+    }
+    if let Some(budget) = thinking_budget {
+        chat_req.insert("thinking_token_budget".into(), json!(budget));
+    }
     let mut template_kwargs = match obj.get("chat_template_kwargs").filter(|v| !v.is_null()) {
         None => Map::new(),
         Some(v) => v.as_object().cloned().ok_or_else(|| {
@@ -759,6 +830,13 @@ pub fn translate_anthropic_to_chat(
     };
     if let Some(thinking) = enable_thinking {
         template_kwargs.insert("enable_thinking".into(), json!(thinking));
+    } else if !template_kwargs.contains_key("enable_thinking") {
+        // In Anthropic's Messages API, omitting both `thinking` and `output_config.effort`
+        // disables extended thinking (e.g., Claude Code's background classifier / `</block>` calls).
+        template_kwargs.insert("enable_thinking".into(), json!(false));
+        chat_req
+            .entry("reasoning_effort")
+            .or_insert_with(|| json!("none"));
     }
     if !template_kwargs.is_empty() {
         chat_req.insert(
@@ -768,20 +846,23 @@ pub fn translate_anthropic_to_chat(
     }
 
     let meta = AnthropicPreparedMeta {
-        message_id: crate::responses_api::generate_unguessable_response_id(request_seq_id)
-            .replacen("resp_", "msg_", 1),
+        message_id: crate::responses_api::generate_unguessable_prefixed_id("msg_", request_seq_id),
         model,
         stream,
     };
     Ok((Value::Object(chat_req), meta))
 }
 
-fn tool_id_for(message_id: &str, tc: &ParsedToolCall, idx: usize) -> String {
-    if let Some(rest) = tc.id.strip_prefix("toolu_") {
+fn tool_id_for_raw(message_id: &str, raw_id: &str, idx: usize) -> String {
+    if let Some(rest) = raw_id.strip_prefix("toolu_") {
         return format!("toolu_{rest}");
     }
     let suffix = message_id.strip_prefix("msg_").unwrap_or(message_id);
     format!("toolu_{suffix}_{idx}")
+}
+
+fn tool_id_for(message_id: &str, tc: &ParsedToolCall, idx: usize) -> String {
+    tool_id_for_raw(message_id, &tc.id, idx)
 }
 
 fn parse_tool_input_object(arguments: &str) -> Value {
@@ -873,6 +954,7 @@ enum ActiveBlock {
     None,
     Thinking { index: usize },
     Text { index: usize },
+    ToolUse { index: usize, tool_index: usize },
 }
 
 /// Deterministic SSE state machine for `POST /v1/messages` (`stream: true`).
@@ -882,6 +964,7 @@ pub struct AnthropicSseFormatter {
     started: bool,
     next_block_index: usize,
     next_tool_index: usize,
+    completed_tools_count: usize,
     active: ActiveBlock,
 }
 
@@ -893,6 +976,7 @@ impl AnthropicSseFormatter {
             started: false,
             next_block_index: 0,
             next_tool_index: 0,
+            completed_tools_count: 0,
             active: ActiveBlock::None,
         }
     }
@@ -954,6 +1038,73 @@ impl AnthropicSseFormatter {
                 ));
                 self.active = ActiveBlock::None;
             }
+            ActiveBlock::ToolUse { index, .. } => {
+                out.push((
+                    "content_block_stop".into(),
+                    json!({
+                        "type": "content_block_stop",
+                        "index": index,
+                    }),
+                ));
+                self.active = ActiveBlock::None;
+            }
+        }
+    }
+
+    fn emit_tool_call_delta(
+        &mut self,
+        tc_delta: &crate::parser::StreamToolCallDelta,
+        out: &mut Vec<(String, Value)>,
+    ) {
+        let index = match self.active {
+            ActiveBlock::ToolUse { index, tool_index } if tool_index == tc_delta.index => index,
+            _ => {
+                self.close_active(out);
+                let index = self.next_block_index;
+                self.next_block_index += 1;
+                let tool_idx = self.next_tool_index;
+                self.next_tool_index += 1;
+                let id = tool_id_for_raw(
+                    &self.meta.message_id,
+                    tc_delta.id.as_deref().unwrap_or(""),
+                    tool_idx,
+                );
+                out.push((
+                    "content_block_start".into(),
+                    json!({
+                        "type": "content_block_start",
+                        "index": index,
+                        "content_block": {
+                            "type": "tool_use",
+                            "id": id,
+                            "name": tc_delta.name.clone().unwrap_or_default(),
+                            "input": {},
+                        }
+                    }),
+                ));
+                self.active = ActiveBlock::ToolUse {
+                    index,
+                    tool_index: tc_delta.index,
+                };
+                index
+            }
+        };
+        if let Some(arg_chunk) = tc_delta
+            .arguments_delta
+            .as_deref()
+            .filter(|s| !s.is_empty())
+        {
+            out.push((
+                "content_block_delta".into(),
+                json!({
+                    "type": "content_block_delta",
+                    "index": index,
+                    "delta": {
+                        "type": "input_json_delta",
+                        "partial_json": arg_chunk,
+                    }
+                }),
+            ));
         }
     }
 
@@ -1010,28 +1161,43 @@ impl AnthropicSseFormatter {
         cached_tokens: usize,
     ) -> Vec<(String, Value)> {
         let mut out = self.ensure_started(cached_tokens);
+        self.completed_tools_count += delta.completed_tool_calls.len();
+        let mut tc_slice = delta.tool_call_deltas.as_slice();
+
+        if let ActiveBlock::ToolUse {
+            tool_index: active_idx,
+            ..
+        } = self.active
+        {
+            while let Some(first) = tc_slice.first().filter(|d| d.index == active_idx) {
+                self.emit_tool_call_delta(first, &mut out);
+                tc_slice = &tc_slice[1..];
+            }
+            if active_idx < self.completed_tools_count {
+                self.close_active(&mut out);
+            }
+        }
 
         if let Some(r_chunk) = delta.reasoning_delta.filter(|s| !s.is_empty()) {
-            let index = match self.active {
-                ActiveBlock::Thinking { index } => index,
-                _ => {
-                    self.close_active(&mut out);
-                    let idx = self.next_block_index;
-                    self.next_block_index += 1;
-                    out.push((
-                        "content_block_start".into(),
-                        json!({
-                            "type": "content_block_start",
-                            "index": idx,
-                            "content_block": {
-                                "type": "thinking",
-                                "thinking": "",
-                            }
-                        }),
-                    ));
-                    self.active = ActiveBlock::Thinking { index: idx };
-                    idx
-                }
+            let index = if let ActiveBlock::Thinking { index } = self.active {
+                index
+            } else {
+                self.close_active(&mut out);
+                let idx = self.next_block_index;
+                self.next_block_index += 1;
+                out.push((
+                    "content_block_start".into(),
+                    json!({
+                        "type": "content_block_start",
+                        "index": idx,
+                        "content_block": {
+                            "type": "thinking",
+                            "thinking": "",
+                        }
+                    }),
+                ));
+                self.active = ActiveBlock::Thinking { index: idx };
+                idx
             };
             out.push((
                 "content_block_delta".into(),
@@ -1047,26 +1213,25 @@ impl AnthropicSseFormatter {
         }
 
         if let Some(c_chunk) = delta.content_delta.filter(|s| !s.is_empty()) {
-            let index = match self.active {
-                ActiveBlock::Text { index } => index,
-                _ => {
-                    self.close_active(&mut out);
-                    let idx = self.next_block_index;
-                    self.next_block_index += 1;
-                    out.push((
-                        "content_block_start".into(),
-                        json!({
-                            "type": "content_block_start",
-                            "index": idx,
-                            "content_block": {
-                                "type": "text",
-                                "text": "",
-                            }
-                        }),
-                    ));
-                    self.active = ActiveBlock::Text { index: idx };
-                    idx
-                }
+            let index = if let ActiveBlock::Text { index } = self.active {
+                index
+            } else {
+                self.close_active(&mut out);
+                let idx = self.next_block_index;
+                self.next_block_index += 1;
+                out.push((
+                    "content_block_start".into(),
+                    json!({
+                        "type": "content_block_start",
+                        "index": idx,
+                        "content_block": {
+                            "type": "text",
+                            "text": "",
+                        }
+                    }),
+                ));
+                self.active = ActiveBlock::Text { index: idx };
+                idx
             };
             out.push((
                 "content_block_delta".into(),
@@ -1081,8 +1246,19 @@ impl AnthropicSseFormatter {
             ));
         }
 
-        for tc in &delta.completed_tool_calls {
-            self.emit_tool_block(tc, &mut out);
+        if !delta.tool_call_deltas.is_empty() {
+            for tc_delta in tc_slice {
+                self.emit_tool_call_delta(tc_delta, &mut out);
+                if let ActiveBlock::ToolUse { tool_index, .. } = self.active
+                    && tool_index < self.completed_tools_count
+                {
+                    self.close_active(&mut out);
+                }
+            }
+        } else {
+            for tc in &delta.completed_tool_calls {
+                self.emit_tool_block(tc, &mut out);
+            }
         }
 
         out
@@ -1239,6 +1415,68 @@ mod tests {
         assert_eq!(msgs[2]["reasoning_content"], "Reading file");
         assert_eq!(msgs[3]["role"], "tool");
         assert_eq!(msgs[3]["content"], "pub mod server;");
+
+        let claude_code_req = json!({
+            "model": "qwen3.8-27b-warp34",
+            "max_tokens": 32768,
+            "stream": true,
+            "system": [
+                {"type": "text", "text": "x-anthropic-billing-header: cc_version=2.1.327.502; cch=abcd1234;"},
+                {"type": "text", "text": "You are Claude Code.", "cache_control": {"type": "ephemeral"}}
+            ],
+            "thinking": {"type": "adaptive", "display": "updates"},
+            "output_config": {"effort": "medium"},
+            "tools": [
+                {
+                    "name": "Bash",
+                    "description": "Executes bash",
+                    "input_schema": {"type": "object", "properties": {"command": {"type": "string"}}}
+                },
+                {
+                    "name": "DeferredToolPlaceholder",
+                    "description": "Reserved placeholder",
+                    "input_schema": {"type": "object", "properties": {}},
+                    "defer_loading": true
+                }
+            ],
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "<system-reminder>Instructions</system-reminder>\n"},
+                        {"type": "text", "text": "hi"}
+                    ]
+                },
+                {
+                    "role": "system",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": "# Environment\nPrimary working directory: /tmp",
+                            "cache_control": {"type": "ephemeral"}
+                        }
+                    ]
+                }
+            ]
+        });
+        let (cc_chat, _) = translate_anthropic_to_chat(&claude_code_req, "qwen", 5, true).unwrap();
+        let cc_msgs = cc_chat["messages"].as_array().unwrap();
+        assert_eq!(cc_msgs.len(), 3);
+        assert_eq!(cc_msgs[0]["role"], "system");
+        assert_eq!(cc_msgs[1]["role"], "user");
+        assert_eq!(cc_msgs[2]["role"], "system");
+        assert_eq!(
+            cc_msgs[2]["content"],
+            "# Environment\nPrimary working directory: /tmp"
+        );
+        let cc_tools = cc_chat["tools"].as_array().unwrap();
+        assert_eq!(cc_tools.len(), 1);
+        assert_eq!(cc_tools[0]["function"]["name"], "Bash");
+        let (parsed_msgs, _) =
+            crate::server::parse_openai_messages_multimodal(&cc_chat["messages"]).unwrap();
+        let formatted =
+            crate::chatml::format_chatml_prompt(&parsed_msgs, Some(&cc_chat["tools"]), true);
+        assert!(formatted.contains("<|im_start|>user\n<system-reminder>Instructions</system-reminder>\nhi<|im_end|>\n<|im_start|>system\n# Environment\nPrimary working directory: /tmp<|im_end|>\n<|im_start|>assistant\n<think>\n"));
     }
 
     #[test]
@@ -1284,6 +1522,137 @@ mod tests {
         assert_eq!(sync_msg["content"][1]["type"], "text");
         assert_eq!(sync_msg["content"][2]["type"], "tool_use");
         assert_eq!(sync_msg["content"][2]["input"]["host"], "127.0.0.1");
+    }
+
+    #[test]
+    fn anthropic_sse_streams_incremental_tool_use_deltas_without_duplication() {
+        let tools = vec![json!({"function":{"name":"write","parameters":{
+            "type":"object",
+            "properties":{
+                "path":{"type":"string"},
+                "content":{"type":"string"}
+            }
+        }}})];
+        let req = json!({
+            "model": "qwen",
+            "max_tokens": 512,
+            "messages": [{"role": "user", "content": "Write file"}]
+        });
+        let (_, meta) = translate_anthropic_to_chat(&req, "qwen", 10, true).unwrap();
+        let mut parser = Qwen3Parser::with_tools(false, &tools).unwrap();
+        let mut sse = AnthropicSseFormatter::new(meta, 50);
+
+        // Chunk 1 opens tool_call and streams start of `path` before `</parameter>`
+        let ev1 = sse.push_delta(
+            parser.push_str("<tool_call>\n<function=write>\n<parameter=path>\nsrc/"),
+            10,
+        );
+        assert!(
+            ev1.iter().any(|(n, v)| n == "content_block_start"
+                && v["content_block"]["type"] == "tool_use"
+                && v["content_block"]["name"] == "write"),
+            "expected tool_use content_block_start before tool_call completes: {ev1:?}"
+        );
+        assert!(
+            ev1.iter().any(
+                |(n, v)| n == "content_block_delta" && v["delta"]["type"] == "input_json_delta"
+            ),
+            "expected input_json_delta on first chunk: {ev1:?}"
+        );
+        assert!(
+            !ev1.iter().any(|(n, _)| n == "content_block_stop"),
+            "tool_use block must stay open while streaming arguments"
+        );
+
+        let mut all_events = ev1;
+        for chunk in [
+            "scene.js\n</parameter>\n<parameter=content>\nconst x = 1;",
+            "\nexport default x;\n</parameter>\n</function>\n</tool_call>",
+        ] {
+            all_events.extend(sse.push_delta(parser.push_str(chunk), 10));
+        }
+        let (tail, turn) = parser.finish();
+        all_events.extend(sse.push_delta(tail, 10));
+        let finish_events = sse.finish(&turn, "tool_calls", None, 10, 30);
+        // finish() must not emit a duplicate tool_use block.
+        assert!(
+            !finish_events
+                .iter()
+                .any(|(n, _)| n == "content_block_start"),
+            "finish() emitted duplicate content_block_start: {finish_events:?}"
+        );
+        all_events.extend(finish_events);
+
+        let tool_starts = all_events
+            .iter()
+            .filter(|(n, v)| n == "content_block_start" && v["content_block"]["type"] == "tool_use")
+            .count();
+        assert_eq!(tool_starts, 1);
+
+        let joined_json: String = all_events
+            .iter()
+            .filter(|(n, v)| n == "content_block_delta" && v["delta"]["type"] == "input_json_delta")
+            .filter_map(|(_, v)| v["delta"]["partial_json"].as_str())
+            .collect();
+        assert_eq!(
+            joined_json,
+            r#"{"path":"src/scene.js","content":"const x = 1;\nexport default x;"}"#
+        );
+
+        // Multi-tool chunk handoff (tool 0 finishes + tool 1 starts in one chunk, then tool 1
+        // finishes + trailing text in the next chunk).
+        let (_, meta2) = translate_anthropic_to_chat(&req, "qwen", 11, true).unwrap();
+        let mut parser2 = Qwen3Parser::with_tools(false, &tools).unwrap();
+        let mut sse2 = AnthropicSseFormatter::new(meta2, 50);
+        let mut ev2 = Vec::new();
+        ev2.extend(sse2.push_delta(
+            parser2.push_str(concat!(
+                "<tool_call>\n<function=write>\n<parameter=path>a.js</parameter>\n</function>\n</tool_call>\n",
+                "<tool_call>\n<function=write>\n<parameter=path>b."
+            )),
+            10,
+        ));
+        ev2.extend(sse2.push_delta(
+            parser2.push_str("js</parameter>\n</function>\n</tool_call>\nDone."),
+            10,
+        ));
+        let (tail2, turn2) = parser2.finish();
+        ev2.extend(sse2.push_delta(tail2, 10));
+        ev2.extend(sse2.finish(&turn2, "tool_calls", None, 10, 30));
+
+        let tool_starts2 = ev2
+            .iter()
+            .filter(|(n, v)| n == "content_block_start" && v["content_block"]["type"] == "tool_use")
+            .count();
+        assert_eq!(tool_starts2, 2);
+        let block0_json: String = ev2
+            .iter()
+            .filter(|(n, v)| {
+                n == "content_block_delta"
+                    && v["index"] == 0
+                    && v["delta"]["type"] == "input_json_delta"
+            })
+            .filter_map(|(_, v)| v["delta"]["partial_json"].as_str())
+            .collect();
+        let block1_json: String = ev2
+            .iter()
+            .filter(|(n, v)| {
+                n == "content_block_delta"
+                    && v["index"] == 1
+                    && v["delta"]["type"] == "input_json_delta"
+            })
+            .filter_map(|(_, v)| v["delta"]["partial_json"].as_str())
+            .collect();
+        let block2_text: String = ev2
+            .iter()
+            .filter(|(n, v)| {
+                n == "content_block_delta" && v["index"] == 2 && v["delta"]["type"] == "text_delta"
+            })
+            .filter_map(|(_, v)| v["delta"]["text"].as_str())
+            .collect();
+        assert_eq!(block0_json, r#"{"path":"a.js"}"#);
+        assert_eq!(block1_json, r#"{"path":"b.js"}"#);
+        assert_eq!(block2_text, "Done.");
     }
 
     #[test]
@@ -1459,5 +1828,59 @@ mod tests {
         assert_eq!(chat["presence_penalty"], 0.25);
         assert_eq!(chat["chat_template_kwargs"]["enable_thinking"], true);
         assert_eq!(chat["chat_template_kwargs"]["preserve_thinking"], true);
+
+        // Large max_tokens (> 4096) and thinking.budget_tokens >= 4096 are accepted
+        let (large_chat, _) = translate_anthropic_to_chat(
+            &json!({
+                "model": "q",
+                "max_tokens": 16_384,
+                "thinking": {"type": "enabled", "budget_tokens": 8_192},
+                "messages": [{"role": "user", "content": "solve"}]
+            }),
+            "q",
+            2,
+            true,
+        )
+        .unwrap();
+        assert_eq!(large_chat["max_tokens"], 16_384);
+        assert_eq!(large_chat["chat_template_kwargs"]["enable_thinking"], true);
+
+        // Omitting both `thinking` and `output_config.effort` disables thinking (Anthropic spec),
+        // preventing background classifier calls from burning reasoning tokens.
+        let (no_think_chat, _) = translate_anthropic_to_chat(
+            &json!({
+                "model": "q",
+                "max_tokens": 2112,
+                "stop_sequences": ["</block>"],
+                "messages": [{"role": "user", "content": "classify"}]
+            }),
+            "q",
+            3,
+            true,
+        )
+        .unwrap();
+        assert_eq!(
+            no_think_chat["chat_template_kwargs"]["enable_thinking"],
+            false
+        );
+        assert_eq!(no_think_chat["reasoning_effort"], "none");
+
+        // Explicit chat_template_kwargs.enable_thinking is still honored when thinking is omitted.
+        let (explicit_kw_chat, _) = translate_anthropic_to_chat(
+            &json!({
+                "model": "q",
+                "max_tokens": 256,
+                "chat_template_kwargs": {"enable_thinking": true},
+                "messages": [{"role": "user", "content": "hi"}]
+            }),
+            "q",
+            4,
+            true,
+        )
+        .unwrap();
+        assert_eq!(
+            explicit_kw_chat["chat_template_kwargs"]["enable_thinking"],
+            true
+        );
     }
 }

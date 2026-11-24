@@ -334,7 +334,7 @@ __global__ void grouped_conv_bf16(
 // q_out [rows, q_heads * dim]; otherwise writes in-place into qkv.
 // When write_slot_mapping != nullptr and head >= q_heads, writes rotated K and
 // copies V directly into the BF16 paged KV cache described by kv_layout.
-template <typename TableT>
+template <typename TableT, bool UseInvFreq = false>
 __global__ void qk_norm_rope_bf16_warp(
     __nv_bfloat16* __restrict__ qkv,
     __nv_bfloat16* __restrict__ q_out,
@@ -353,7 +353,7 @@ __global__ void qk_norm_rope_bf16_warp(
     const int head = blockIdx.y;
     const int half = dim >> 1;
     const int pos = positions[row];
-    if (pos < 0 || pos >= table_rows) return;
+    if (pos < 0 || (!UseInvFreq && pos >= table_rows)) return;
 
     const int64_t offset = (int64_t)row * (q_heads + 2 * kv_heads) * dim + (int64_t)head * dim;
     const __nv_bfloat16* w = (head < q_heads) ? qw : kw;
@@ -401,13 +401,19 @@ __global__ void qk_norm_rope_bf16_warp(
             v_src = qkv + offset + (int64_t)kv_heads * dim;
         }
     }
-    const TableT* row_table = table + (int64_t)pos * dim;
+    const TableT* row_table = UseInvFreq ? table : (table + (int64_t)pos * dim);
 
     for (int c = lane; c < half; c += 32) {
         const float a = (float)__float2bfloat16((float)qkv[offset + c] * inv * (float)w[c]);
         const float b = (float)__float2bfloat16((float)qkv[offset + half + c] * inv * (float)w[half + c]);
-        const float cosine = (float)row_table[c];
-        const float sine = (float)row_table[half + c];
+        float cosine;
+        float sine;
+        if constexpr (UseInvFreq) {
+            sincosf((float)pos * (float)row_table[c], &sine, &cosine);
+        } else {
+            cosine = (float)row_table[c];
+            sine = (float)row_table[half + c];
+        }
         dst[c] = __float2bfloat16(a * cosine - b * sine);
         dst[half + c] = __float2bfloat16(b * cosine + a * sine);
         if (v_dst != nullptr) {
@@ -522,6 +528,7 @@ __global__ void dflash_select_greedy_bf16_kernel(
     const __nv_bfloat16* __restrict__ pred,
     const __nv_bfloat16* __restrict__ succ,
     int32_t* __restrict__ out_path,
+    float* __restrict__ out_confs,
     const int32_t* __restrict__ anchor_dev,
     int anchor,
     int k,
@@ -598,6 +605,14 @@ __global__ void dflash_select_greedy_bf16_kernel(
             }
             const int32_t win_id = ids[slot * topk + winner];
             out_path[slot] = win_id;
+            if (out_confs != nullptr) {
+                const float max_s = s_scores[winner];
+                float denom = 0.0f;
+                for (int j = 0; j < topk; ++j) {
+                    denom += __expf(s_scores[j] - max_s);
+                }
+                out_confs[slot] = (denom > 0.0f) ? (1.0f / denom) : 0.0f;
+            }
             s_pred_id = win_id;
         }
         __syncthreads();
@@ -1343,7 +1358,42 @@ int warp34_dflash_qk_norm_rope_kv_write_bf16_f32_table(
     return (int)cudaGetLastError();
 }
 
-int warp34_dflash_select_greedy_bf16(
+int warp34_dflash_qk_norm_rope_kv_write_bf16_inv_freq(
+    const warp34_exec* ex,
+    void* qkv,
+    void* q_out,
+    const int32_t* positions,
+    const void* qw,
+    const void* kw,
+    const float* inv_freq,
+    const warp34_kv_layer_layout* kv_layout,
+    const int32_t* write_slot_mapping,
+    int rows,
+    int q_heads,
+    int kv_heads,
+    int dim,
+    float eps) {
+    if (!ex || !qkv || !positions || !qw || !kw || !inv_freq || !kv_layout || !write_slot_mapping ||
+        rows < 0 || q_heads < 0 || kv_heads <= 0 || q_heads % kv_heads ||
+        dim <= 0 || dim > 256 || dim % 2 ||
+        !(eps > 0.0f) || !isfinite(eps) || q_out == qkv ||
+        kv_layout->k_base == 0 || kv_layout->v_base == 0 ||
+        kv_layout->block_size <= 0 || kv_layout->local_kv_heads != kv_heads ||
+        kv_layout->head_dim != dim ||
+        kv_layout->k_format != WARP34_KV_FORMAT_BF16 ||
+        kv_layout->v_format != WARP34_KV_FORMAT_BF16) {
+        return (int)cudaErrorInvalidValue;
+    }
+    if (rows == 0) return 0;
+    qk_norm_rope_bf16_warp<float, true><<<dim3((unsigned)rows, (unsigned)(q_heads + kv_heads)), 32, 0, (cudaStream_t)ex->stream>>>(
+        (__nv_bfloat16*)qkv, (__nv_bfloat16*)q_out, positions,
+        (const __nv_bfloat16*)qw, (const __nv_bfloat16*)kw,
+        inv_freq, q_heads, kv_heads, dim, 0, eps,
+        *kv_layout, write_slot_mapping);
+    return (int)cudaGetLastError();
+}
+
+int warp34_dflash_select_greedy_with_conf_bf16(
     const warp34_exec* ex,
     const int32_t* ids,
     const float* unary,
@@ -1351,6 +1401,7 @@ int warp34_dflash_select_greedy_bf16(
     const void* pred,
     const void* succ,
     int32_t* out_path,
+    float* out_confs,
     int anchor,
     int k,
     int topk,
@@ -1364,7 +1415,49 @@ int warp34_dflash_select_greedy_bf16(
     dflash_select_greedy_bf16_kernel<<<1, (unsigned)(32 * topk), 0, (cudaStream_t)ex->stream>>>(
         ids, unary, (const __nv_bfloat16*)hidden,
         (const __nv_bfloat16*)pred, (const __nv_bfloat16*)succ,
-        out_path, nullptr, anchor, k, topk, rank, vocab);
+        out_path, out_confs, nullptr, anchor, k, topk, rank, vocab);
+    return (int)cudaGetLastError();
+}
+
+int warp34_dflash_select_greedy_bf16(
+    const warp34_exec* ex,
+    const int32_t* ids,
+    const float* unary,
+    const void* hidden,
+    const void* pred,
+    const void* succ,
+    int32_t* out_path,
+    int anchor,
+    int k,
+    int topk,
+    int rank,
+    int vocab) {
+    return warp34_dflash_select_greedy_with_conf_bf16(
+        ex, ids, unary, hidden, pred, succ, out_path, nullptr, anchor, k, topk, rank, vocab);
+}
+
+int warp34_dflash_select_greedy_dev_anchor_with_conf_bf16(
+    const warp34_exec* ex,
+    const int32_t* ids,
+    const float* unary,
+    const void* hidden,
+    const void* pred,
+    const void* succ,
+    int32_t* out_path,
+    float* out_confs,
+    const int32_t* anchor_dev,
+    int k,
+    int topk,
+    int rank,
+    int vocab) {
+    if (!ex || !ids || !unary || !hidden || !pred || !succ || !out_path || !anchor_dev ||
+        k <= 0 || k > 16 || topk <= 0 || topk > 32 || rank <= 0 || rank > 256 || vocab <= 0) {
+        return (int)cudaErrorInvalidValue;
+    }
+    dflash_select_greedy_bf16_kernel<<<1, (unsigned)(32 * topk), 0, (cudaStream_t)ex->stream>>>(
+        ids, unary, (const __nv_bfloat16*)hidden,
+        (const __nv_bfloat16*)pred, (const __nv_bfloat16*)succ,
+        out_path, out_confs, anchor_dev, 0, k, topk, rank, vocab);
     return (int)cudaGetLastError();
 }
 
@@ -1381,15 +1474,8 @@ int warp34_dflash_select_greedy_dev_anchor_bf16(
     int topk,
     int rank,
     int vocab) {
-    if (!ex || !ids || !unary || !hidden || !pred || !succ || !out_path || !anchor_dev ||
-        k <= 0 || k > 16 || topk <= 0 || topk > 32 || rank <= 0 || rank > 256 || vocab <= 0) {
-        return (int)cudaErrorInvalidValue;
-    }
-    dflash_select_greedy_bf16_kernel<<<1, (unsigned)(32 * topk), 0, (cudaStream_t)ex->stream>>>(
-        ids, unary, (const __nv_bfloat16*)hidden,
-        (const __nv_bfloat16*)pred, (const __nv_bfloat16*)succ,
-        out_path, anchor_dev, 0, k, topk, rank, vocab);
-    return (int)cudaGetLastError();
+    return warp34_dflash_select_greedy_dev_anchor_with_conf_bf16(
+        ex, ids, unary, hidden, pred, succ, out_path, nullptr, anchor_dev, k, topk, rank, vocab);
 }
 
 int warp34_dflash_qk_norm_rope_bf16_f32_table(

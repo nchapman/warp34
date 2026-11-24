@@ -1,16 +1,38 @@
 # Metrics and built-in dashboard
 
-`warp34 serve` includes a read-only, ultraviolet-dark React dashboard at **`GET /`**.
+`warp34 serve` includes a built-in shadcn dark React dashboard at **`GET /`**,
+an interactive API Playground at **`GET /playground`**, and a coding-agent setup
+guide at **`GET /connect`** (disable UI routes with `--no-webui`).
 No external collector, CDN, Node runtime, or frontend files are needed at runtime:
 Vite's production assets are embedded in the Rust executable. Prometheus remains
 optional; use it for durable history, alerting, and fleet-wide aggregation.
+
+## Per-turn Docker logs
+
+`warp34 serve` writes one JSON object to stderr when a prepared generation ends (Chat Completions, Completions, Responses, and Messages, including streaming). To diagnose a truncated turn without recording its content:
+
+```sh
+docker logs --since 1h qwen3.8-27b-warp34 2>&1 | jq -Rc 'fromjson? | select(.event == "inference.turn_end" and .length_limit != null) | {request_id, length_limit, prompt_tokens, cached_prompt_tokens, output_tokens, requested_max_output_tokens, effective_max_output_tokens, context_window}'
+```
+
+`length_limit` distinguishes a requested output budget, the server default, the remaining context window (including a tie with the requested budget), and runtime KV capacity. Output counts include reasoning (`reasoning_tokens`), emitted tool calls (`tool_calls`), and hidden stop tokens, alongside protocol/outcome metadata (`api`, `stream`, `status`, `finish_reason`), chat request shape (`messages`, `tools`, `enable_thinking`, `reasoning_effort`, `reasoning_budget_tokens`, `thinking_budget_exhausted`), and effective sampling parameters (`sampling`: `temperature`, `top_p`, `top_k`, `min_p`, `seed`). Request IDs (`chatcmpl-<32 hex>`, `cmpl-<32 hex>`, `resp_<32 hex>`, `msg_<32 hex>`) are 128-bit CSPRNG identifiers that remain globally unique across container restarts. `ttft_ms` and `duration_ms` start after request preparation, before worker submission; `output_tokens_per_s` measures tokens observed by the handler *after* the first token, not prompt throughput or network delivery. Missing observations are `null`. A dropped unfinished response is `cancelled`; a stream error is `error` even if SSE headers already returned HTTP 200. Non-success HTTP responses to inference POSTs, including pre-generation rejections, also emit `inference.http_error` with the route and status.
+
+For slow follow-ups, compare three counts at admission alongside `messages` and `tools` counts instead of relying on a lifetime cache-hit percentage:
+
+```sh
+docker logs --since 1h qwen3.8-27b-warp34 2>&1 | jq -Rc 'fromjson? | select(.event == "inference.turn_end") | {request_id, messages, tools, prompt_tokens, cache_lookup, cached_prompt_tokens, output_tokens, reasoning_tokens, tool_calls, ttft_ms}'
+```
+
+`cache_lookup` distinguishes the page-aligned KV prefix the radix tree matched, the prefix with a usable recurrent checkpoint, and the prefix actually restored after scheduling. A large KV match but short checkpoint points to recurrent-state reuse rather than tokenization; a short KV match means the matching prefix was not in the tree at lookup. That alone does **not** distinguish eviction from a client changing the serialized history or tool schema. Missing admission evidence is `null`, not a zero-token miss.
+
+Filter on `event`: startup diagnostics still share stderr. No prompts, completions, reasoning text, tool arguments, headers or raw error strings are included in these events. Model names and server-generated response IDs are operational metadata. Configure retention in the container's logging driver if you need history after `docker run --rm` containers exit.
 
 ## Interfaces
 
 | Route | Contract |
 |---|---|
-| `/` | Embedded dashboard; HTML revalidates on navigation |
-| `/assets/*` | Content-hashed, immutable production assets |
+| `/`, `/playground`, `/connect` | Embedded dashboard, interactive API Playground, and Connect guide; HTML revalidates on navigation (`404` when `--no-webui` is passed) |
+| `/assets/*` | Content-hashed, immutable production assets (`404` when `--no-webui` is passed) |
 | `/metrics` | Prometheus text exposition 0.0.4, with HELP/TYPE metadata |
 | `/api/metrics` | Versioned JSON snapshot (`schema_version: 1`), `Cache-Control: no-store` |
 | `/health` | Existing worker-health endpoint, independent of dashboard polling |
@@ -23,12 +45,14 @@ are included. The configured model name is operational metadata; if you use a lo
 path as the served model name, that name is visible too.
 
 **Exposure:** [optional API-key authentication](SERVING.md) protects inference,
-model-list, tokenization, and stored-Responses APIs. The dashboard, `/health`,
+model-list, tokenization, and stored-Responses APIs (including requests sent from
+`/playground`). The dashboard pages, `/health`,
 `/metrics`, and `/api/metrics` remain **unauthenticated**, even when a key is enabled.
 Bind to loopback, use a trusted private network, or protect the entire service with
 an authenticated TLS reverse proxy. Without `--api-key` or `--api-key-env`,
 credentials used to scope stored Responses do not enforce access control.
-The dashboard adds no generation, benchmarking, or administrative actions.
+Overview and Connect are read-only, while Playground issues ordinary client API requests
+to the same origin.
 Its production CSP restricts scripts and connections to the same origin, and assets
 are served from an embedded allowlist, never the filesystem.
 
@@ -37,6 +61,9 @@ are served from an embedded allowlist, never the filesystem.
 All counters reset with a process restart. Time measurements are monotonic seconds.
 Model configuration labels appear only on `warp34_model_info`; labels on other families
 have fixed, bounded values. Use Prometheus target labels to distinguish servers.
+`warp34_lora_adapters_loaded` reports the number of static LoRA adapters loaded on the
+engine (individual adapter names are listed in `/api/metrics` under
+`config.lora_adapters` and in `/v1/models`).
 
 ### Work and outcomes
 
@@ -88,9 +115,13 @@ explicitly named instead. It is not pure GPU kernel time either.
 
 ### Resource capacity
 
-`warp34_pool_units{pool="kv|gdn",state="capacity|active|cached|free"}`:
+`warp34_pool_units{pool="kv|gdn|gdn_ckpt_vram|gdn_ckpt_host",state="capacity|active|cached|free|used"}`:
 
 - KV units are logical **pages** (16 tokens/page); GDN units are **state slots**.
+- When the tiered `WHT128-Q8_0` GDN checkpoint pool is enabled, `gdn_ckpt_vram`
+  (L1 VRAM) and `gdn_ckpt_host` (L2 pinned host RAM) expose `capacity` and `used`
+  slot counts in Prometheus, and `/api/metrics` includes `pools.gdn_checkpoints`
+  (`vram_capacity`, `vram_used`, `host_capacity`, `host_used`).
 - Counted once across tensor-parallel ranks, not summed as if each rank served
   independent requests. These are target pools, not total device VRAM usage.
 - `active` includes protected and reserved allocations.
@@ -194,8 +225,8 @@ Docker builds the same locked frontend in a separate Node stage and copies only
 
 ## Donor requirements
 
-The first version follows vLLM 0.31.0's counter/histogram approach
-(`v1/metrics/{stats,loggers,buckets}.py`) and SGLang v0.5.19's separation of active,
+The telemetry design follows `vLLM 0.34.0`'s counter/histogram approach
+(`v1/metrics/{stats,loggers,buckets}.py`) and `SGLang v0.5.23`'s separation of active,
 evictable, and free hybrid pools (`srt/observability/metrics_collector.py` and
 `scheduler_components/pool_stats_observer.py`). We adopt their operational semantics,
 not their entire metric inventory or Python implementation. High-cardinality request

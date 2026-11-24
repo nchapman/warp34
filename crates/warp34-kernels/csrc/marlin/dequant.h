@@ -146,6 +146,33 @@ __device__ inline void dequant<half2, vllm::kU2B2.id(), false>(int q,
 }
 
 template <>
+__device__ inline void dequant<half2, vllm::kU2B2Sym.id(), true>(int q,
+                                                                 half2* frag_b) {
+  dequant<half2, vllm::kU2B2.id(), true>(q, frag_b);
+}
+
+template <>
+__device__ inline void dequant<half2, vllm::kU2B2Sym.id(), false>(
+    int q, half2* frag_b) {
+  const int HI = 0x000c000c;
+  const int EX = 0x64006400;
+  // clang-format off
+  int lo = lop3<(0xf0 & 0xcc) | 0xaa>(q << 2, HI, EX);
+  int hi = lop3<(0xf0 & 0xcc) | 0xaa>(q, HI, EX);
+  // clang-format on
+  // Fuse the `-1.5` half-integer symmetric zero point (`{0, 1, 2, 3} -> {-1.5, -0.5, +0.5, +1.5}`)
+  // via `(1024 + 4*q) * 0.25 + (-257.5) = q - 1.5` (exact in IEEE-754 binary16).
+  const int MUL = 0x34003400;
+  const int ADD = 0xdc06dc06;
+  frag_b[0] = __hfma2(*reinterpret_cast<half2*>(&lo),
+                      *reinterpret_cast<const half2*>(&MUL),
+                      *reinterpret_cast<const half2*>(&ADD));
+  frag_b[1] = __hfma2(*reinterpret_cast<half2*>(&hi),
+                      *reinterpret_cast<const half2*>(&MUL),
+                      *reinterpret_cast<const half2*>(&ADD));
+}
+
+template <>
 __device__ inline void dequant<nv_bfloat162, vllm::kU2B2.id(), true>(
     int q, nv_bfloat162* frag_b) {
   static constexpr uint32_t MASK = 0x00030003;
@@ -170,6 +197,32 @@ __device__ inline void dequant<nv_bfloat162, vllm::kU2B2.id(), false>(
 
   frag_b[0] = __hsub2(frag_b[0], *reinterpret_cast<const nv_bfloat162*>(&SUB));
   frag_b[1] = __hsub2(frag_b[1], *reinterpret_cast<const nv_bfloat162*>(&SUB));
+}
+
+template <>
+__device__ inline void dequant<nv_bfloat162, vllm::kU2B2Sym.id(), true>(
+    int q, nv_bfloat162* frag_b) {
+  dequant<nv_bfloat162, vllm::kU2B2.id(), true>(q, frag_b);
+}
+
+template <>
+__device__ inline void dequant<nv_bfloat162, vllm::kU2B2Sym.id(), false>(
+    int q, nv_bfloat162* frag_b) {
+  static constexpr uint32_t HI = 0x000c000c;
+  static constexpr uint32_t EX = 0x43004300;
+  // clang-format off
+  int lo = lop3<(0xf0 & 0xcc) | 0xaa>(q << 2, HI, EX);
+  int hi = lop3<(0xf0 & 0xcc) | 0xaa>(q, HI, EX);
+  // clang-format on
+  // `(128 + 4*q) * 0.25 + (-33.5) = q - 1.5` (exact in IEEE-754 bfloat16).
+  static constexpr uint32_t MUL = 0x3e803e80;
+  static constexpr uint32_t ADD = 0xc206c206;
+  frag_b[0] = __hfma2(*reinterpret_cast<nv_bfloat162*>(&lo),
+                      *reinterpret_cast<const nv_bfloat162*>(&MUL),
+                      *reinterpret_cast<const nv_bfloat162*>(&ADD));
+  frag_b[1] = __hfma2(*reinterpret_cast<nv_bfloat162*>(&hi),
+                      *reinterpret_cast<const nv_bfloat162*>(&MUL),
+                      *reinterpret_cast<const nv_bfloat162*>(&ADD));
 }
 
 template <>

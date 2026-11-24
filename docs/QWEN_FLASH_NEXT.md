@@ -1,6 +1,6 @@
 # Qwen3.8-Flash-Next (`qwen4_exp`) — Architecture & Verification Reference
 
-> **Posture:** Native, production-grade support for **`Qwen3.8-Flash-Next` (`Qwen4ExpForConditionalGeneration`, `model_type: "qwen4_exp"`)** across **1–4× RTX 30-series (`sm_86`) and 40-series (`sm_89`) GPUs** in `warp34`, built on the `CudaDeviceProps` / `warp34_device_props` multi-arch (`sm_86,sm_89`) foundation.
+> **Posture:** Native, production-grade support for **`Qwen3.8-Flash-Next` (`Qwen4ExpForConditionalGeneration`, `model_type: "qwen4_exp"`)** across **1–4× NVIDIA A100 (`sm_80`), RTX 30-series (`sm_86`), and RTX 40-series (`sm_89`) GPUs** in `warp34`, built on the `CudaDeviceProps` / `warp34_device_props` multi-arch (`sm_80,sm_86,sm_89`) foundation.
 >
 > **Strategic Scope:** `Qwen3.8-Flash-Next` is the first open-weight release of the **Qwen4 architecture family** (`qwen4_exp` / `qwen4_exp_text`). Every primitive introduced here — **HyperConnection (`GatedResidual`)**, **Qwen Sparse Attention (`QSA`)**, **N-Gram Per-Layer Embeddings (`PLE`)**, **Tiered 512-Expert MoE Offloading**, and **Multi-Stream `Qwen4` `MTP`** — is a first-class, reusable `warp34` subsystem that composes cleanly with `CudaDeviceProps`, `KvPool`, `StateBundlePool`, `MambaRadixCache`, `CUDAGraphRunner`, and `warp34` oracle verification contracts.
 >
@@ -10,32 +10,32 @@
 
 ## 1. Model Architecture & Delta vs. `Qwen3.5` / `Qwen3.6`
 
-`Qwen/Qwen3.8-Flash-Next` (`180B` total parameters: `125B` backbone with `6B` activated per token + `51.2B` PLE n-gram table + `4B` MTP drafter) shares the 3:1 hybrid recurrence schedule and multimodal stem proven across `warp34`, while introducing five Qwen4-generation architectural primitives.
+`Qwen/Qwen3.8-Flash-Next` (`180B` total parameters: `125B` backbone with `6B` activated per token + `51.2B` PLE n-gram table + `4B` MTP drafter) shares the hybrid GDN + paged attention recurrence and multimodal stem proven across `warp34` (`5:1` GDN:QSA schedule on real 48-layer checkpoints: `40 GDN + 8 QSA`), while introducing five Qwen4-generation architectural primitives.
 
 ### 1.1 Structural Overview (`config.json`)
 
 | Parameter | Value | `warp34` Subsystem |
 |---|---|---|
-| `architectures` / `model_type` | `Qwen4ExpForConditionalGeneration` / `qwen4_exp` (`qwen4_exp_text`) | `crates/warp34-host/src/loader/config.rs` & `src/model/` |
-| `num_hidden_layers` | `48` (`12 × [3 × GDN → MoE, 1 × QSA → MoE]`) | Hybrid 3:1 layer schedule |
+| `architectures` / `model_type` | `Qwen4ExpForConditionalGeneration` / `qwen4_exp` (`qwen4_exp_text`) | `crates/warp34-host/src/loader/config.rs` & `crates/warp34-host/src/model/` |
+| `num_hidden_layers` | `48` (`8 × [5 × GDN → MoE, 1 × QSA → MoE]`: `40` GDN + `8` QSA) | Hybrid 5:1 layer schedule (`layer_types` in `config.json`) |
 | `hidden_size` / `vocab_size` | `2560` / `248,320` (`bos` / `eos` = `248044`) | Same vocab size & tokenizer family as Qwen 3.5 / 3.8 |
 | `max_position_embeddings` | `262,144` (extensible to `1,000,000` via YaRN) | Supported by existing capacity & RoPE infrastructure |
-| **Gated DeltaNet (`linear_attention`, 36 layers)** | `H_v = 48`, `H_qk = 16`, `head_dim = 128`, `conv_kernel = 4`, `FP32` `ssm_state` | `csrc/ops/{op_gdn,op_gdn_wy}.cu`, `StateBundlePool` |
-| **Vision (`Qwen3_VisionTransformer`) & 3D `mRoPE`** | `mrope_section = [11, 11, 10]`, `partial_rotary_factor = 0.25`, `theta = 1e7` | `csrc/ops/{op_vision,op_vision_fa2}.cu`, `src/vision.rs` |
-| **HyperConnection (`GatedResidual`)** | `hc_count = 4` streams (`[T, 4, 2560]`), `hc_lowrank = 320`, per-branch `GemmaRMSNorm` | `csrc/ops/op_hc.cu`, `src/model/weights/layers.rs` |
-| **Qwen Sparse Attention (`QSA`, 12 layers)** | Main GQA `24 Q / 2 KV` (`d = 256`, output sigmoid gate) + MQA Indexer (`4 Q / 1 KV`, `d = 128`, `compress_ratio = 4`, `budget = 2048` tokens = `512` blocks) | `csrc/ops/op_qsa.cu`, `src/cache.rs` |
-| **N-Gram Per-Layer Embedding (`PLE`)** | `ple_layer_ids = [2]` (0-based layer `1`), `ngram_size = 3`, `heads_per_ngram = 8` (`16` heads × `160` dim = `2560`), `~20M` rows/head (`51.2B` params across `128` shards), dilated short-conv (`kernel = 4`, `dilation = 3`, `state_len = 9`) | `csrc/ops/op_ple.cu`, `src/ple.rs`, `StateBundlePool` |
-| **512-Expert Sparse MoE (`48` layers)** | `num_experts = 512`, `top_k = 10` routed + `1` shared expert, `moe_intermediate_size = 640`, `shared_expert_intermediate_size = 640` (`~62.8 GB` at `W4A16 g128`) | `csrc/ops/{op_moe,op_moe_router,op_moe_cpu_bridge}.cu`, `src/{moe_offload,moe_cpu_bridge}.rs` |
-| **Qwen4 Multi-Token Predictor (`MTP`)** | `1` layer (`full_attention` QSA + `512`-expert `INT4 g32` MoE), `residual_linear_shared` (`fc_embedding` + `fc_hidden`), dual-stream output (`[T, 2560]` + `[T, 10240]`), `K = 3` (`M_verify = 4`) | `src/mtp.rs`, `src/mtp/propose.rs` |
+| **Gated DeltaNet (`linear_attention`, 40 layers)** | `H_v = 48`, `H_qk = 16`, `head_dim = 128`, `conv_kernel = 4`, `FP32` `ssm_state` | `crates/warp34-kernels/csrc/ops/{op_gdn,op_gdn_wy}.cu`, `StateBundlePool` |
+| **Vision (`Qwen3_VisionTransformer`) & 3D `mRoPE`** | `mrope_section = [11, 11, 10]`, `partial_rotary_factor = 0.25`, `theta = 1e7` | `crates/warp34-kernels/csrc/ops/{op_vision,op_vision_fa2}.cu`, `crates/warp34-host/src/vision.rs` |
+| **HyperConnection (`GatedResidual`)** | `hc_count = 4` streams (`[T, 4, 2560]`), `hc_lowrank = 320`, per-branch `GemmaRMSNorm` | `crates/warp34-kernels/csrc/ops/op_hc.cu`, `crates/warp34-host/src/model/weights/layers.rs` |
+| **Qwen Sparse Attention (`QSA`, 8 layers)** | Main GQA `24 Q / 2 KV` (`d = 256`, output sigmoid gate) + MQA Indexer (`4 Q / 1 KV`, `d = 128`, `compress_ratio = 4`, `budget = 2048` tokens = `512` blocks) | `crates/warp34-kernels/csrc/ops/op_qsa.cu`, `crates/warp34-host/src/cache.rs` |
+| **N-Gram Per-Layer Embedding (`PLE`, 8 layers)** | `ple_layer_ids = [5, 11, 17, 23, 29, 35, 41, 47]` (on every QSA layer; synthetic micro-fixtures may test `ple_layer_ids = [2]`), `ngram_size = 3`, `heads_per_ngram = 8` (`16` heads × `160` dim = `2560`), `~20M` rows/head (`51.2B` params across `8` PLE layers / `128` shards), dilated short-conv (`kernel = 4`, `dilation = 3`, `state_len = 9`) | `crates/warp34-kernels/csrc/ops/op_ple.cu`, `crates/warp34-host/src/ple.rs`, `StateBundlePool` |
+| **512-Expert Sparse MoE (`48` layers)** | `num_experts = 512`, `top_k = 10` routed + `1` shared expert, `moe_intermediate_size = 640`, `shared_expert_intermediate_size = 640` (`~62.8 GB` at `W4A16`, `~35.6 GB` at `W2.6A16-HGPTQ-RCO`) | `crates/warp34-kernels/csrc/ops/{op_moe,op_moe_router,op_moe_cpu_bridge}.cu`, `crates/warp34-host/src/{moe_offload,moe_cpu_bridge}.rs` |
+| **Qwen4 Speculative Decoders (`MTP-3` & `DFlash2`)** | Native `1`-layer `Qwen4` `MTP` (`QSA` + `512`-expert MoE, `residual_linear_shared`, dual-stream `[T, 2560]` + `[T, 10240]`, `K = 3`, `M_verify = 4`) and 5-layer parallel block-diffusion **`DFlash2`** (`M_verify = 8`, `nchapman/Qwen3.8-Flash-Next-DFlash2-W4A16-HGPTQ`) | `crates/warp34-host/src/{mtp.rs,mtp/propose.rs,dflash.rs}` |
 
-### 1.2 Canonical Checkpoint Target
+### 1.2 Canonical Checkpoint Targets
 
-Our primary reference checkpoint is [`albucino/Qwen3.8-Flash-Next-W4A16-FP8PLE`](https://huggingface.co/albucino/Qwen3.8-Flash-Next-W4A16-FP8PLE) (pinned revision `ef554143369a706525336f6b42a09094835dc077`), alongside compatibility with upstream `Qwen/Qwen3.8-Flash-Next` and standard AutoRound / GPTQ / Compressed-Tensors `W4A16` checkpoints:
-- **Target Backbone (`~72.6 GiB`):**
-  - Routed MoE experts (`48 × 512` experts, `gate_proj`/`up_proj`/`down_proj`): Intel AutoRound symmetric `W4A16` (`bits = 4`, `group_size = 128`, `~62.8 GiB` total = `~2.56 MiB` per expert, `~1.31 GiB` per layer).
-  - Dense weights (GDN projections, QSA projections & indexer, shared experts, `GatedResidual` norms & projections, token embeddings, `lm_head`): `~9.8 GiB` total (`BF16` / `W4A16` per checkpoint `extra_config`).
-- **PLE N-Gram Table (`~51.3 GiB`):** `128` shards (`ple.ple_embedding.ngram_embedding.shard_{0..127}.weight`) in serialized `F8_E4M3` with per-tensor `BF16` `weight_scale`.
-- **MTP Draft Module (`~3.85 GiB`):** 1-layer QSA + 512-expert MoE in symmetric `INT4` (`group_size = 32`), sharing `embed_tokens` and `lm_head` with the target model.
+Our primary reference checkpoints are **`nchapman/Qwen3.8-Flash-Next-W4A16-HGPTQ`** (`6ee06d2936b111f19eb5eb331044cb8b8b28562b`, `94 GiB` with `H_64` routed/shared/MTP experts + 4-bit `lut4-gptq` `PLE`), **`nchapman/Qwen3.8-Flash-Next-W2.6A16-HGPTQ-RCO`** (`2-bit U2B2` + `4-bit U4B8` + online `U8B128` `lm_head` + `lut4-gptq` `PLE`), **`nchapman/Qwen3.8-Flash-Next-DFlash2-W4A16-HGPTQ`** (`27cb8fb1695586fd8265c960708e079215be2404`), and [`albucino/Qwen3.8-Flash-Next-W4A16-FP8PLE`](https://huggingface.co/albucino/Qwen3.8-Flash-Next-W4A16-FP8PLE) (pinned revision `ef554143369a706525336f6b42a09094835dc077`), alongside compatibility with upstream `Qwen/Qwen3.8-Flash-Next` and standard AutoRound / GPTQ / Compressed-Tensors `W4A16` checkpoints:
+- **Target Backbone (`~72.6 GiB` at `W4A16`, `~43 GiB` at `W2.6A16-HGPTQ-RCO`):**
+  - Routed MoE experts (`48 × 512` experts, `gate_proj`/`up_proj`/`down_proj`): `W4A16-HGPTQ` (`bits = 4`, `group_size = 64`, `H_64`), mixed `W2.6A16-HGPTQ-RCO` (`bits = 2/4`, `group_size = 64`, `H_64`), or AutoRound symmetric `W4A16` (`bits = 4`, `group_size = 128`, `~62.8 GiB` total = `~2.56 MiB` per expert at `W4A16`, `~1.30 MiB` per expert at `W2A16`).
+  - Dense weights (GDN projections, QSA projections & indexer, shared experts, `GatedResidual` norms & projections, token embeddings, `lm_head`): `~9.8 GiB` total (`FP16` / `BF16` / `W4A16` / online `U8B128` `lm_head`).
+- **PLE N-Gram Table (`~14.1 GiB` at `lut4-gptq`, `~51.3 GiB` at `F8_E4M3`):** Either 8 consolidated 4-bit `lut4-gptq` shards (`model-ple-000..007.safetensors`, `PleTableFormat::Lut4Gptq`, `3.63×` smaller disk/mmap footprint) or `128` `F8_E4M3` shards (`ple.ple_embedding.ngram_embedding.shard_{0..127}.weight`, `PleTableFormat::F8E4m3`) with `BF16` `weight_scale`.
+- **Speculative Draft Modules:** Native 1-layer `MTP` (`~3.85 GiB`, QSA + 512-expert MoE in symmetric `INT4`, sharing `embed_tokens` and `lm_head` with the target model) or 5-layer `DFlash2` (`nchapman/Qwen3.8-Flash-Next-DFlash2-W4A16-HGPTQ`, `M = 8` parallel verification).
 
 ---
 
@@ -151,18 +151,19 @@ Each of the 48 decoder layers wraps its token mixer (`GDN` or `QSA`) and its `Mo
 
 ---
 
-### 3.3 N-Gram Per-Layer Embedding (`PLE`, `csrc/ops/op_ple.cu` & `src/ple.rs`)
+### 3.3 N-Gram Per-Layer Embedding (`PLE`, `crates/warp34-kernels/csrc/ops/op_ple.cu` & `crates/warp34-host/src/ple.rs`)
 
-At layer index `1` (`ple_layer_ids = [2]` in 1-based config indexing), before `attn_hyper_connection.mix`:
-1. **Materialize Pending HC Combine:** Any pending `(prev_block_output, prev_injection)` from Layer 0's MoE is combined into `hidden_states: [T, 10240]` first.
+At each configured PLE layer (`ple_layer_ids = [5, 11, 17, 23, 29, 35, 41, 47]` on real 48-layer checkpoints, or `ple_layer_ids = [2]` in synthetic unit-test fixtures), before `attn_hyper_connection.mix`:
+1. **Materialize Pending HC Combine:** Any pending `(prev_block_output, prev_injection)` from the preceding layer's MoE is combined into `hidden_states: [T, 10240]` first.
 2. **Deterministic N-Gram Hashing (`ngram_size = 3`, `heads_per_ngram = 8` → `16` heads):**
    - Uses exact 64-bit `splitmix64` multipliers seeded from `seed + 10007 * ple_dense_layer_id` and per-head prime moduli `ngram_heads_vocab_sizes[0..16]` (`_nth_prime_after(19_999_999, head + 1)`).
    - Prepends each request's 2-token `ple_ngram_context` to its scheduled `input_ids`, resets shifts across `eos_token_id` (`248044`) boundaries, and computes `[T, 16]` global row IDs into the `~320M`-row table (`head_dim = 160`).
-3. **Zero-Copy `PleMmapTable` Gather + Async H2D:**
-   - Groups the `16 * T` row IDs by shard (`0..128`), issues coalesced `madvise(MADV_WILLNEED)` across unique 4 KiB OS pages, gathers `16 × 160 B` (`2,560 B/tok`) of `F8_E4M3` bytes into a pinned host staging buffer using the CPU thread pool, and copies to GPU (`2.56 KB` for `M=1` decode, `10.24 KB` for `M=4` verify, `20 MiB` for an `8192`-token prefill chunk).
-   - For CUDA Graph capture/replay (`M=1` decode and `M=4` verify), the host prepares the n-gram IDs from the known input token IDs (or runs a lightweight host-launch callback / pre-step gather for known anchor tokens, and in-graph pinned gather for draft tokens) into fixed-address device buffers.
-4. **GPU PLE Gating & Dilated Short-Conv (`csrc/ops/op_ple.cu`):**
-   - Dequantizes `F8_E4M3` embeddings via `weight_scale` into `[T, 2560]`.
+3. **Zero-Copy `PleMmapTable` Gather + Async H2D (`PleTableFormat::Lut4Gptq` & `PleTableFormat::F8E4m3`):**
+   - Supports both 4-bit `lut4-gptq` (`weight_packed [248320, 1280] I32` + `weight_scale [248320, 160] BF16` + `weight_codebook [16] F32` across `model-ple-000..007.safetensors`) and 8-bit `F8_E4M3` (`shard_{0..127}.weight`).
+   - Groups the `16 * T` row IDs by shard, issues coalesced `madvise(MADV_WILLNEED)` across unique 4 KiB OS pages, gathers and dequantizes the `16 × 160` embedding rows into a pinned host staging buffer using the CPU thread pool on a dedicated `ple_stream`, and copies to GPU.
+   - For CUDA Graph capture/replay (`M=1` decode and `M=4`/`M=8` verify), the host prepares the n-gram IDs from the known input token IDs into fixed-address device buffers.
+4. **GPU PLE Gating & Dilated Short-Conv (`crates/warp34-kernels/csrc/ops/op_ple.cu`):**
+   - Consumes the `[T, 2560]` embeddings on device.
    - Computes `key = key_proj(embeddings)` (`[T, 4, 2560]`) and `value = value_proj(embeddings)` (`[T, 2560]`).
    - Applies grouped `GemmaRMSNorm(group_size = 2560)` to `key` and `query = hidden_states.view(T, 4, 2560)`.
    - Computes branch-wise scalar gate:
@@ -172,9 +173,9 @@ At layer index `1` (`ple_layer_ids = [2]` in 1-based config indexing), before `a
 
 ---
 
-### 3.4 Qwen Sparse Attention (`QSA`, `csrc/ops/op_qsa.cu`)
+### 3.4 Qwen Sparse Attention (`QSA`, `crates/warp34-kernels/csrc/ops/op_qsa.cu`)
 
-On the 12 full-attention layers (`layer_idx ∈ {3, 7, 11, ..., 47}`):
+On the 8 full-attention layers (`layer_idx ∈ {5, 11, 17, 23, 29, 35, 41, 47}` on real 48-layer checkpoints):
 1. **Fused Pre-Indexer (`warp34_qsa_pre_indexer`):**
    - Projects `index_qk_proj(block_input)` (`[T, 2560] → [T, (4 + 1) × 128]`).
    - Applies `q_layernorm` (`GemmaRMSNorm(128)`) and `k_layernorm` (`GemmaRMSNorm(128)`), followed by partial interleaved 3D `mRoPE` (`rotary_dim = 64`, `mrope_section = [11, 11, 10]`, `theta = 1e7`).
@@ -304,16 +305,24 @@ Every subsystem is verified by `warp34 dump-diff` (tensor parity), `warp34 greed
 
 ### 5.3 Standalone HTTP Serving Campaign Sweep (`benchmarks/perf/campaigns/flash-next-serving.toml`)
 
-With the optimizations in §5.2, `warp34` sweeps **5/5** serving workloads on **both** 1× RTX 3090 Ti (`warp34-flash-tp1-mtp3` vs `qfn-3090-mtp3`) and 2× RTX 3090 Ti (`warp34-flash-tp2-mtp3` vs `qfn-2x3090-mtp3`), plus `cold-read-60k` (`57,611` prompt tokens):
+With the optimizations in §5.2 plus Dynamic TinyLFU + Clock-Pro (`warp34_moe_hybrid_plan_and_submit_dynamic` with `TIERED_MOE_DYNAMIC_LRU_MIN_HOT_EXPERTS = 64`), zero-sync 8-token sliced device-bridge launches up to `40` tokens + `dynamic_short_adapt` (`32..1024` tokens) + slice-0 shared-expert GPU overlap (`bc80012`), parallel block-diffusion **`DFlash2`** (`M=8`, `nchapman/Qwen3.8-Flash-Next-DFlash2-W4A16-HGPTQ`), and **`W2.6A16-HGPTQ-RCO`** (`nchapman/Qwen3.8-Flash-Next-W2.6A16-HGPTQ-RCO`), `warp34` sweeps **5/5** serving workloads against both `DominikBucko/qwen38-flash-next-*` and `Niko1221/Strata v0.2.17` across **1× and 2× RTX 3090 Ti (`sm_86`)** and **1× and 2× RTX 4090 (`sm_89`)**:
 
-| Workload | `warp34-flash-tp1-mtp3` (1× 3090 Ti) | `qfn-3090-mtp3` (1× 3090 Ti) | `warp34-flash-tp2-mtp3` (2× 3090 Ti) | `qfn-2x3090-mtp3` (2× 3090 Ti) |
-|---|---:|---:|---:|---:|
-| `short-chat` | **32.41–33.56 tok/s** (`+5.2%–8.9%`) | 30.82 tok/s | **69.25 tok/s** (`+23.2%`) | 56.20 tok/s |
-| `prefill-context-r16` | **18.37–18.54 tok/s** (`+79.6%`) | 10.23 tok/s | **27.09 tok/s** (`+27.4%`) | 21.27 tok/s |
-| `code-context-r64` (~6K prompt) | **21.51–21.90 tok/s** (`+1.3%–3.2%`) | 21.23 tok/s | **28.81 tok/s** (`+2.2%`) | 28.20 tok/s |
-| `prefix-primed-r16` (warm prefix) | **28.67 tok/s** (`+181.9%`, `2.82×`) | 10.17 tok/s | **45.90 tok/s** (`+123.7%`, `2.24×`) | 20.52 tok/s |
-| `coding-agent-replay` (strict replay) | **27.25–29.78 tok/s** (`8/8` passed) | Failed (`0/8` HTTP 400) | **55.49 tok/s** (`8/8` passed) | Failed (`0/8` HTTP 400) |
-| `cold-read-60k` (`57,611` prompt) | **6/6** retrieval through ~252K | Not supported | **68.2 s** (`0.938 tok/s`, `1.471` steady) | 72.3 s (`0.885 tok/s`) |
+| Deployment (`131K` auto-fit on `warp34`) | `short-chat` (`tok/s`) | `prefill-context-r16` (`tok/s`) | `code-context-r64` (`tok/s`) | `prefix-primed-r16` (`tok/s`) | `coding-agent-replay` (`tok/s`) |
+|---|---:|---:|---:|---:|---:|
+| **`warp34` (`1× 3090 Ti`, `W4A16-HGPTQ + MTP-3`)** | **53.7** (`6/6` quality) | **19.2** | **22.6** | **31.7** | **34.7** (`8/8` passed) |
+| **`warp34` (`1× 3090 Ti`, `W4A16-HGPTQ + DFlash2`)** | **83.9** (`97.9` dec) | **32.1** | **34.7** | **74.0** | **58.4** (`8/8` passed) |
+| **`warp34` (`1× 3090 Ti`, `W2.6-RCO + DFlash2`)** | **100.2** (`118.2` dec) | **33.4** | **37.1** | **93.2** | **62.4** (`8/8` passed) |
+| `Strata v0.2.17` (`1× 3090 Ti`, `Q4_K_M + MTP-3`, `32K`) | 80.9 (`5/6` quality) | 23.6 | 33.4 | 31.1 | 57.6 |
+| `qfn-3090-mtp3` (`1× 3090 Ti`, `vLLM + MTP-3`, `65K`) | 30.8 | 10.2 | 21.2 | 10.2 | Failed (`0/8` HTTP 400) |
+| **`warp34` (`2× 3090 Ti`, `W4A16-HGPTQ + MTP-3`)** | **99.4** (`6/6` quality) | **42.6** | **43.9** | **71.9** | **79.3** (`8/8` passed) |
+| **`warp34` (`2× 3090 Ti`, `W4A16-HGPTQ + DFlash2`)** | **140.1** (`170.3` dec) | **51.5** | **50.0** | **123.5** | **123.6** (`8/8` passed) |
+| **`warp34` (`2× 3090 Ti`, `W2.6-RCO + DFlash2`)** | **167.0** (`211.7` dec) | **51.1** | **51.1** | **167.1** | **135.4** (`8/8` passed) |
+| `Strata v0.2.17` (`2× 3090 Ti`, `Q4_K_M + MTP-3`, `32K`) | 126.9 (`5/6` quality) | 40.9 | 45.6 | 75.5 | 95.6 |
+| `qfn-2x3090-mtp3` (`2× 3090 Ti`, `vLLM + MTP-3`, `65K`) | 56.2 | 21.3 | 28.2 | 20.5 | Failed (`0/8` HTTP 400) |
+| **`warp34` (`1× 4090`, `W4A16-HGPTQ + DFlash2`)** | **120.0** (`143.9` dec) | **55.9** | **56.3** | **97.3** | **75.9** (`8/8` passed) |
+| **`warp34` (`1× 4090`, `W2.6-RCO + DFlash2`)** | **148.2** (`187.8` dec) | **54.1** | **59.4** | **145.6** | **87.2** (`8/8` passed) |
+| **`warp34` (`2× 4090`, `W4A16-HGPTQ + DFlash2`)** | **179.6** (`234.4` dec) | **75.2** | **79.3** | **178.7** | **184.7** (`8/8` passed) |
+| **`warp34` (`2× 4090`, `W2.6-RCO + DFlash2`)** | **201.3** (`269.6` dec) | **71.6** | **78.8** | **207.8** | **185.7** (`8/8` passed) |
 
 ---
 

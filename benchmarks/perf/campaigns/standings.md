@@ -2,7 +2,7 @@
 
 ## Bottom line
 
-**27B leads on both one GPU and two GPUs (`310.49 tok/s` weighted / `312.47 tok/s` median at 1-GPU FP16-KV C8 vs vLLM `309.89` / `277.67`), and Qwen3.5-4B sweeps all 7/7 serving cases against both vLLM 0.19.0 and SGLang 0.5.10 (`188.62 tok/s` TP1 / `200.28 tok/s` TP2 on `burst-chat-c4` with batched multi-slot MTP). Native Flash Next MTP-3 (`warp34-flash-tp1-mtp3` and `warp34-flash-tp2-mtp3`) and TP2 4096-page / 16384-page capacity admission pass all quality checks (`6/6` serving and `6/6` capacity retrieval through `~252K`), with TP2 MTP-3 leading `qfn-2x3090-mtp3` on short chat (`66.68` vs `56.20 tok/s`), `prefill-context-r16` (`23.69` vs `21.27 tok/s`), `prefix-primed-r16` (`41.45` vs `20.52 tok/s`, `+102%` at `94.8%` warm-prefix hit rate), and strict coding-agent replay (`50.30` vs `44.96 tok/s`).**
+**27B leads on both one GPU and two GPUs (`310.49 tok/s` weighted / `312.47 tok/s` median at 1-GPU FP16-KV C8 vs vLLM `309.89` / `277.67`; `204.3 / 316.0 tok/s` with `DFlash2` on `1× / 2× 3090 Ti`, and `288.2 / 435.5 tok/s` on `1× / 2× 4090`), and Qwen3.5-4B sweeps all 7/7 serving cases against both vLLM 0.19.0 and SGLang 0.5.10 (`188.62 tok/s` TP1 / `200.28 tok/s` TP2 on `burst-chat-c4` with batched multi-slot MTP). On `Qwen3.8-Flash-Next` (`180B` total / `512` experts), `warp34` (`W4A16-HGPTQ` + `DFlash2` @ `131K` auto-fit) sweeps all 5/5 serving workloads against both `DominikBucko/qwen38-flash-next-*` (`65K`) and `Niko1221/Strata v0.2.17` (`32K`) on 1× and 2× RTX 3090 Ti (`83.9 / 140.1 tok/s` `short-chat`, `32.1 / 51.5 tok/s` `prefill-context-r16`, `34.7 / 50.0 tok/s` `code-context-r64`, `74.0 / 123.5 tok/s` `prefix-primed-r16`, `58.4 / 123.6 tok/s` strict `coding-agent-replay`, and `100.2 / 167.0 tok/s` with `W2.6A16-HGPTQ-RCO + DFlash2`; `120.0 / 179.6 tok/s` `W4A16-HGPTQ` and `148.2 / 201.3 tok/s` `W2.6-RCO` on 1× / 2× RTX 4090).**
 
 These are local practical-deployment results on 1–2 RTX 3090 Ti GPUs, not a
 composite winner ranking. Rates below are total output tokens divided by total
@@ -48,24 +48,31 @@ Native MTP2 reaches **136.25** single-request / **108.39** agent tok/s; DFlash2
 reaches **169.70 / 141.41**. C8 remains about **462–466 tok/s**: the observed
 benefit is predominantly latency-oriented, not higher saturated throughput.
 vLLM's packed-MTP recipe failed startup; that cell has no performance score.
-SGLang MTP/DFlash2 and NInfer KV/MTP/multi-device outcomes are retained in the
-[advanced report](../qualification/27b-advanced-measurements.md).
+SGLang MTP/DFlash2 and NInfer KV/MTP/multi-device outcomes are retained in
+`qualification/27b-advanced-measurements.json`.
 
 TQ4 and TQ4_all each pass six early/late retrieval checks through **251,641
 server-reported prompt tokens**, plus the long HTTP workload campaign.
 The separate two-TP1-replica evidence remains historical, not a fresh DP2 result.
 
-## Flash Next: native MTP-3 & TP2 admission fixed; 5/5 serving sweep on TP1 & TP2
+## Flash Next: 5/5 serving sweep on 1× and 2× RTX 3090 Ti (and 1× / 2× RTX 4090)
 
-| Deployment | Short chat tok/s | ~6K-context code proxy tok/s | Strict agent replay |
-|---|---:|---:|---|
-| warp34 TP1, target-only (post-fix) | 16.52 | 3.54 | 11.77 tok/s; complete (6/6 quality) |
-| warp34 TP1, MTP3 (post-fix) | 33.56 | 21.90 | 29.78 tok/s; complete (6/6 quality) |
-| [one-GPU specialized vLLM](https://github.com/DominikBucko/qwen38-flash-next-3090), MTP3 | 30.82 | 21.23 | Failed: live tool call |
-| warp34 TP2, target-only, 4096 pages (post-fix) | 48.26 | 4.63 | 34.38 tok/s; complete (6/6 quality) |
-| warp34 TP2, MTP3, 4096 pages (post-fix) | 69.25 | 28.81 | 55.49 tok/s; complete (6/6 quality) |
-| [two-GPU specialized vLLM](https://github.com/DominikBucko/qwen38-flash-next-2x3090), MTP3 | 56.20 | 28.20 | Failed: live tool call |
-| Strata TP1, lookup4 | 52.95 | 15.27 | 49.67 tok/s; quality caveat |
+| Deployment (`131K` auto-fit on `warp34`) | `short-chat` tok/s | `prefill-r16` tok/s | `code-r64` (~6K) tok/s | `prefix-primed-r16` tok/s | Strict `coding-agent-replay` |
+|---|---:|---:|---:|---:|---|
+| **`warp34` TP1, `W4A16-HGPTQ + DFlash2`** | **83.9** (`97.9` dec) | **32.1** | **34.7** | **74.0** | **58.4 tok/s**; complete (`6/6` quality, `8/8` replay) |
+| **`warp34` TP1, `W2.6-RCO + DFlash2`** | **100.2** (`118.2` dec) | **33.4** | **37.1** | **93.2** | **62.4 tok/s**; complete (`6/6` quality, `8/8` replay) |
+| `warp34` TP1, `W4A16-HGPTQ + MTP-3` | 53.7 (`60.3` dec) | 19.2 | 22.6 | 31.7 | 34.7 tok/s; complete (`6/6` quality, `8/8` replay) |
+| `Strata v0.2.17` TP1 (`Q4_K_M + MTP-3`, `32K`) | 80.9 (`90.1` dec) | 23.6 | 33.4 | 31.1 | 57.6 tok/s (`5/6` quality; refusal caveat) |
+| [one-GPU specialized vLLM](https://github.com/DominikBucko/qwen38-flash-next-3090), `MTP-3` (`65K`) | 30.8 | 10.2 | 21.2 | 10.2 | Failed: live tool call (`0/8` HTTP 400) |
+| **`warp34` TP2, `W4A16-HGPTQ + DFlash2`** | **140.1** (`170.3` dec) | **51.5** | **50.0** | **123.5** | **123.6 tok/s**; complete (`6/6` quality, `8/8` replay) |
+| **`warp34` TP2, `W2.6-RCO + DFlash2`** | **167.0** (`211.7` dec) | **51.1** | **51.1** | **167.1** | **135.4 tok/s**; complete (`6/6` quality, `8/8` replay) |
+| `warp34` TP2, `W4A16-HGPTQ + MTP-3` | 99.4 (`115.6` dec) | 42.6 | 43.9 | 71.9 | 79.3 tok/s; complete (`6/6` quality, `8/8` replay) |
+| `Strata v0.2.17` TP2 (`Q4_K_M + MTP-3`, `32K`) | 126.9 (`146.3` dec) | 40.9 | 45.6 | 75.5 | 95.6 tok/s (`5/6` quality; refusal caveat) |
+| [two-GPU specialized vLLM](https://github.com/DominikBucko/qwen38-flash-next-2x3090), `MTP-3` (`65K`) | 56.2 | 21.3 | 28.2 | 20.5 | Failed: live tool call (`0/8` HTTP 400) |
+| **`warp34` TP1 (`1× 4090`), `W4A16-HGPTQ + DFlash2`** | **120.0** (`143.9` dec) | **55.9** | **56.3** | **97.3** | **75.9 tok/s**; complete (`8/8` replay) |
+| **`warp34` TP1 (`1× 4090`), `W2.6-RCO + DFlash2`** | **148.2** (`187.8` dec) | **54.1** | **59.4** | **145.6** | **87.2 tok/s**; complete (`8/8` replay) |
+| **`warp34` TP2 (`2× 4090`), `W4A16-HGPTQ + DFlash2`** | **179.6** (`234.4` dec) | **75.2** | **79.3** | **178.7** | **184.7 tok/s**; complete (`8/8` replay) |
+| **`warp34` TP2 (`2× 4090`), `W2.6-RCO + DFlash2`** | **201.3** (`269.6` dec) | **71.6** | **78.8** | **207.8** | **185.7 tok/s**; complete (`8/8` replay) |
 
 - **Flash Next MTP HTTP serving (`warp34-flash-tp1-mtp3` and `warp34-flash-tp2-mtp3`) now passes all `6/6` quality checks (`arithmetic`, `json`, `code`, `needle-short-front`, `needle-medium-middle`, `needle-medium-end`) and completes 100% of HTTP benchmark trials with zero SSE errors.** Three interacting bugs were fixed:
   1. `serving_state_slots(max_num_seqs)` returned `4` for `--max-num-seqs 1`, leaving only `1` free `StateBundlePool` slot after allocating `3` request private slots (`running_slot`, `extra_slot_a`, `extra_slot_b`), whereas `step_scheduled_verify_round` with `MTP-3` (`k=3`) requires `3` verification state slots (`alloc_state_slot_from` failed with `no speculative verification state slots` on the first verify step of `json`). Enforcing `.map(|slots| slots.max(8))` guarantees at least 8 state slots for single-sequence serving.
@@ -91,13 +98,26 @@ The separate two-TP1-replica evidence remains historical, not a fresh DP2 result
 | Deployment | Retrieval checks | ~60K cold read | 120K/252K strict agent replay |
 |---|---|---|---|
 | Native TP1 target | 6/6 through ~252K | 0.240 output tok/s | Complete; 60/60 total workload requests |
-| Native TP2, 16384 pages (post-fix) | 6/6 through ~252K | 0.410 output tok/s | Startup admission & 252K retrieval qualified (`72` hot experts/layer) |
+| Native TP2, 16384 pages (`W4A16-HGPTQ + MTP-3 [auto]`) | 6/6 through ~252K | **1.699 output tok/s** (3-rep weighted; `37.7s` mean, `31.7s` steady) | Startup admission & 252K retrieval qualified |
 | Two-GPU specialized vLLM, MTP3 | 6/6 through ~252K | 1.466 output tok/s | Six trials fail on live tool calls |
 
-The reference's cold-read rate is about **3.6×** native TP2 target (`1.466` vs `0.410 output tok/s`) and **6.1×** native TP1, and uses two GPUs
-and MTP. These output rates include processing 57,611 prompt tokens to generate
-at most 64 output tokens; they are **not steady-state decode rates**. Native
-TP1's complete agent workload reached **251,982 prompt tokens**.
+With the post-campaign QSA + AVX-512 hybrid MoE prefill optimizations, native
+TP2 (`16384` pages = `262K` TQ4 KV, default `MTP-3 [auto]`) now leads the
+two-GPU specialized vLLM reference on the exact same 3-rep `cold-read-60k`
+benchmark (**`1.699` vs `1.466 output tok/s`**, `+15.9%`, `192` output tokens
+across `112.99s`, `57,611` uncached prompt tokens per rep). These output rates
+include processing 57,611 prompt tokens to generate at most 64 output tokens;
+they are **not steady-state decode rates**. Native TP1's complete agent
+workload reached **251,982 prompt tokens**.
+
+## Flash Next multi-client Open-SWE-Traces (`2× RTX 3090 Ti`, `TP=2`, `65K` TQ4 KV)
+
+Replaying intact 7–15 turn trajectories from `nvidia/Open-SWE-Traces` (`519 → 12,354` prompt tokens, `flash-next-swe-multiclient.toml`, `--max-num-seqs 4`, `--max-model-len 16384`):
+
+| Deployment (`W4A16-HGPTQ`, `TP=2`) | `smoke-warmup` (4/4) | `swe-c4-shared` (73/73) | `swe-c4-unique` (73/73) | `swe-c8-burst` (92/92) |
+|---|---:|---:|---:|---:|
+| **`warp34` + `DFlash2`** | **74.0 tok/s** | **94.2 tok/s** | **89.6 tok/s** | **88.2 tok/s** |
+| `warp34` + `MTP-3` | 73.5 tok/s | 69.2 tok/s | — | — |
 
 ## Resolved post-campaign gaps (commits `3ebda3f`, `25b2ebf`, and follow-up)
 
@@ -108,12 +128,9 @@ TP1's complete agent workload reached **251,982 prompt tokens**.
 
 ## Evidence and refresh
 
-- [Campaign outcomes and resource interpretation](completion-results.md)
-- [27B baseline report](../qualification/27b-baselines-measurements.md)
-- [Flash serving report](../qualification/flash-serving-measurements.md)
-- [Flash capacity report](../qualification/flash-capacity-measurements.md)
-- [Detailed latency/prefix/agent reports](../qualification/reports/)
-- Guarded comparison receipts: `qualification/{27b,flash}-comparison-receipt.json`.
+- [Long-context coding-agent campaign](longctx-coding-agent.md)
+- Guarded comparison receipts: `qualification/{27b,flash}-comparison-receipt.json`
+  and `qualification/*-measurements.json`.
   Full comparison JSON and raw evidence remain under `results/` (gitignored).
 - Frozen configs provide `--preset quick`, `full`, `release` (1/3/5 within-process
   repetitions). Full was measured here; quick/release are refreshable presets,

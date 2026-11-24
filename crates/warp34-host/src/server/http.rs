@@ -1,4 +1,5 @@
 //! Axum owns transport; only EngineWorker's OS thread owns CUDA objects.
+use super::request_log::TurnLog;
 use crate::{
     engine_worker::{EngineWorker, GenerationEvent, GenerationStream, WorkerError},
     model::Qwen3_5Engine,
@@ -34,6 +35,11 @@ const BODY_TIMEOUT: Duration = Duration::from_secs(10);
 pub struct OpenAiServerState {
     pub model_name: String,
     api_key: Option<crate::api_auth::ApiKey>,
+    webui: bool,
+    pub default_reasoning_effort: Option<String>,
+    pub default_reasoning_budget: Option<usize>,
+    pub default_reasoning_budget_message: Option<String>,
+    pub reasoning_effort_budget: bool,
     pub worker: EngineWorker,
     pub metrics: Arc<crate::telemetry::Telemetry>,
     next_request_id: AtomicU64,
@@ -86,9 +92,13 @@ impl OpenAiServerState {
         worker.set_max_model_len(options.max_model_len)?;
         let mut state = Self::with_worker(model_name, worker, allow_remote_images);
         // This newly created state has not been shared with any request handler.
-        Arc::get_mut(&mut state)
-            .expect("unshared server state")
-            .api_key = options.api_key;
+        let unshared = Arc::get_mut(&mut state).expect("unshared server state");
+        unshared.api_key = options.api_key;
+        unshared.webui = options.webui;
+        unshared.default_reasoning_effort = options.reasoning_effort;
+        unshared.default_reasoning_budget = options.reasoning_budget;
+        unshared.default_reasoning_budget_message = options.reasoning_budget_message;
+        unshared.reasoning_effort_budget = options.reasoning_effort_budget;
         Ok(state)
     }
     fn with_worker(
@@ -96,9 +106,20 @@ impl OpenAiServerState {
         worker: EngineWorker,
         allow_remote_images: bool,
     ) -> Arc<Self> {
-        let eos: Vec<_> = worker.eos_token_ids.iter().map(|&id| id as u32).collect();
         let constraint_factory = worker.tokenizer.as_ref().and_then(|t| {
-            crate::constraints::ConstraintFactory::new(t.clone(), worker.vocab_size, &eos).ok()
+            let eos: Vec<u32> = worker
+                .eos_token_ids
+                .iter()
+                .filter_map(|&id| u32::try_from(id).ok())
+                .filter(|&id| t.id_to_token(id).is_some())
+                .collect();
+            match crate::constraints::ConstraintFactory::new(t, worker.vocab_size, &eos) {
+                Ok(factory) => Some(factory),
+                Err(err) => {
+                    eprintln!("warning: structured output constraints disabled: {err}");
+                    None
+                }
+            }
         });
         let decoded_vocab = if worker.tokenizer.is_some() {
             (0..worker.vocab_size)
@@ -112,6 +133,11 @@ impl OpenAiServerState {
         Arc::new(Self {
             model_name,
             api_key: None,
+            webui: true,
+            default_reasoning_effort: None,
+            default_reasoning_budget: None,
+            default_reasoning_budget_message: None,
+            reasoning_effort_budget: true,
             worker,
             allow_remote_images,
             response_store: crate::responses_api::ResponseStore::default(),
@@ -161,10 +187,15 @@ pub(super) fn error(status: StatusCode, message: impl ToString) -> ApiError {
     )
 }
 pub(super) fn worker_api_err(err: WorkerError) -> ApiError {
-    (
-        err.http_status(),
-        Json(json!({"error":{"message":err.to_string(),"type":err.openai_error_type()}})),
-    )
+    let mut obj = serde_json::Map::from_iter([
+        ("message".to_owned(), json!(err.to_string())),
+        ("type".to_owned(), json!(err.openai_error_type())),
+    ]);
+    if let Some(code) = err.openai_error_code() {
+        obj.insert("code".to_owned(), json!(code));
+        obj.insert("param".to_owned(), Value::Null);
+    }
+    (err.http_status(), Json(json!({"error": obj})))
 }
 pub(super) fn bad(message: impl ToString) -> ApiError {
     error(StatusCode::BAD_REQUEST, message)
@@ -188,19 +219,18 @@ pub(super) fn admission_error(err: tokio::sync::TryAcquireError) -> ApiError {
 }
 
 async fn health(State(s): State<Arc<OpenAiServerState>>) -> Response {
-    let panic = s.worker.is_panicked().then(|| {
-        s.worker
-            .panic_reason()
-            .unwrap_or_else(|| "engine worker panicked".into())
-    });
-    health_response(panic, s.admission.is_closed() || s.worker.is_stopping())
+    health_response(
+        s.worker.is_panicked(),
+        s.admission.is_closed() || s.worker.is_stopping(),
+    )
 }
 
-fn health_response(panic: Option<String>, stopping: bool) -> Response {
-    if let Some(detail) = panic {
+fn health_response(panicked: bool, stopping: bool) -> Response {
+    // Readiness is public. The worker logs diagnostics; never publish them here.
+    if panicked {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
-            Json(json!({"status":"error","error":format!("engine worker terminated after panic: {detail}")})),
+            Json(json!({"status":"error"})),
         )
             .into_response();
     }
@@ -215,7 +245,7 @@ fn health_response(panic: Option<String>, stopping: bool) -> Response {
 }
 
 pub fn router(state: Arc<OpenAiServerState>) -> Router {
-    Router::new()
+    let app = Router::new()
         .route("/v1/models", get(models))
         .route("/tokenize", post(tokenize))
         .route("/detokenize", post(detokenize))
@@ -245,24 +275,36 @@ pub fn router(state: Arc<OpenAiServerState>) -> Router {
         ))
         .route("/health", get(health))
         .route("/metrics", get(metrics))
-        .route("/api/metrics", get(metrics_json))
-        .merge(crate::dashboard::router())
-        .layer(axum::middleware::from_fn_with_state(
-            state.clone(),
-            count_inference_responses,
-        ))
-        .fallback(|| async { error(StatusCode::NOT_FOUND, "not found") })
-        .with_state(state)
+        .route("/api/metrics", get(metrics_json));
+    // UI visibility is independent of API authentication and telemetry exposure.
+    let app = if state.webui {
+        app.merge(crate::dashboard::router())
+    } else {
+        app
+    };
+    app.layer(axum::middleware::from_fn_with_state(
+        state.clone(),
+        count_inference_responses,
+    ))
+    .fallback(|| async { error(StatusCode::NOT_FOUND, "not found") })
+    .with_state(state)
 }
 async fn models(State(s): State<Arc<OpenAiServerState>>) -> Json<Value> {
+    let max_model_len = s.worker.max_model_len();
     let mut data = Vec::with_capacity(1 + s.worker.lora_registry.len());
-    data.push(json!({"id":s.model_name,"object":"model","owned_by":"warp34"}));
+    data.push(json!({
+        "id": s.model_name,
+        "object": "model",
+        "owned_by": "warp34",
+        "max_model_len": max_model_len,
+    }));
     for entry in s.worker.lora_registry.entries() {
         data.push(json!({
             "id": entry.name,
             "object": "model",
             "owned_by": "warp34",
             "parent": s.model_name,
+            "max_model_len": max_model_len,
         }));
     }
     Json(json!({"object":"list","data":data}))
@@ -301,10 +343,15 @@ async fn count_inference_responses(
     request: Request,
     next: axum::middleware::Next,
 ) -> Response {
-    let count = is_inference_endpoint(request.method(), request.uri().path());
+    let endpoint = is_inference_endpoint(request.method(), request.uri().path())
+        .then(|| request.uri().path().to_owned());
     let response = next.run(request).await;
-    if count {
-        s.metrics.http_response(response.status().as_u16());
+    if let Some(endpoint) = endpoint {
+        let status = response.status();
+        s.metrics.http_response(status.as_u16());
+        if status.is_client_error() || status.is_server_error() {
+            super::request_log::http_error(&endpoint, status.as_u16());
+        }
     }
     response
 }
@@ -341,6 +388,13 @@ pub(super) async fn cpu<T: Send + 'static>(
     state: &OpenAiServerState,
     f: impl FnOnce() -> Result<T, String> + Send + 'static,
 ) -> Result<T, ApiError> {
+    cpu_with(state, f, bad).await
+}
+async fn cpu_with<T: Send + 'static, E: Send + 'static>(
+    state: &OpenAiServerState,
+    f: impl FnOnce() -> Result<T, E> + Send + 'static,
+    map_err: impl FnOnce(E) -> ApiError,
+) -> Result<T, ApiError> {
     let permit = state
         .preprocessing
         .clone()
@@ -353,7 +407,7 @@ pub(super) async fn cpu<T: Send + 'static>(
     })
     .await
     .map_err(|e| error(StatusCode::INTERNAL_SERVER_ERROR, e))?
-    .map_err(bad)
+    .map_err(map_err)
 }
 async fn tokenize(
     State(s): State<Arc<OpenAiServerState>>,
@@ -428,18 +482,247 @@ async fn completion(
     generate(s, req, false).await
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PrepareMode {
+    Generate,
+    CountTokens,
+}
+
+enum PrepareError {
+    BadRequest(String),
+    ContextLengthExceeded {
+        prompt_tokens: usize,
+        max_model_len: usize,
+        param: &'static str,
+    },
+}
+
+impl From<String> for PrepareError {
+    fn from(msg: String) -> Self {
+        Self::BadRequest(msg)
+    }
+}
+
+impl From<&str> for PrepareError {
+    fn from(msg: &str) -> Self {
+        Self::BadRequest(msg.to_owned())
+    }
+}
+
+fn prepare_openai_err(err: PrepareError) -> ApiError {
+    match err {
+        PrepareError::BadRequest(msg) => bad(msg),
+        PrepareError::ContextLengthExceeded {
+            prompt_tokens,
+            max_model_len,
+            param,
+        } => (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": {
+                    "message": format!(
+                        "This model's maximum context length is {max_model_len} tokens (serving context limit). However, your prompt contains {prompt_tokens} input tokens, leaving no room for generation. Please reduce the length of the {param}."
+                    ),
+                    "type": "invalid_request_error",
+                    "param": param,
+                    "code": "context_length_exceeded",
+                }
+            })),
+        ),
+    }
+}
+
+fn prepare_responses_err(err: PrepareError) -> ApiError {
+    match err {
+        PrepareError::BadRequest(msg) => {
+            responses_api_err(crate::responses_api::ResponsesApiError::bad_request(msg))
+        }
+        PrepareError::ContextLengthExceeded {
+            prompt_tokens,
+            max_model_len,
+            ..
+        } => responses_api_err(
+            crate::responses_api::ResponsesApiError::context_length_exceeded(
+                prompt_tokens,
+                max_model_len,
+            ),
+        ),
+    }
+}
+
+fn prepare_anthropic_err(err: PrepareError) -> ApiError {
+    match err {
+        PrepareError::BadRequest(msg) => anthropic_api_err(
+            StatusCode::BAD_REQUEST,
+            crate::anthropic_api::AnthropicApiError::bad_request(msg),
+        ),
+        PrepareError::ContextLengthExceeded {
+            prompt_tokens,
+            max_model_len,
+            ..
+        } => anthropic_api_err(
+            StatusCode::BAD_REQUEST,
+            crate::anthropic_api::AnthropicApiError::bad_request(format!(
+                "prompt is too long: {prompt_tokens} tokens > {} maximum",
+                max_model_len.saturating_sub(1)
+            )),
+        ),
+    }
+}
+
 struct Prepared {
+    explicit_max_tokens: Option<usize>,
     parser: Qwen3Parser,
     prompt: Vec<i32>,
     images: Vec<crate::vision::PreprocessedImage>,
     params: SamplingParams,
+    soft_output_budget: bool,
     constraint: Option<crate::parser::TokenBitmaskConstraint>,
     lora_id: i32,
     served_model: String,
     stream: bool,
     include_usage: bool,
+    messages_count: Option<usize>,
+    tools_count: Option<usize>,
+    enable_thinking: Option<bool>,
+    reasoning_effort: Option<String>,
 }
-fn prepare(s: &OpenAiServerState, request: Value, chat: bool) -> Result<Prepared, String> {
+impl Prepared {
+    fn turn_log(&self, id: String, api: &'static str, context: usize) -> TurnLog {
+        TurnLog::new(
+            id,
+            api,
+            self.served_model.clone(),
+            self.stream,
+            self.prompt.len(),
+            self.explicit_max_tokens,
+            self.params.max_tokens,
+            context,
+        )
+        .with_turn_metadata(
+            self.messages_count,
+            self.tools_count,
+            self.enable_thinking,
+            self.reasoning_effort.clone(),
+            self.params.thinking_budget.as_ref().map(|b| b.budget),
+            &self.params,
+        )
+    }
+}
+
+fn build_thinking_budget_config(
+    s: &OpenAiServerState,
+    request: &Value,
+    tokenizer: &tokenizers::Tokenizer,
+    per_request_effort: Option<&str>,
+    resolved_effort: Option<&str>,
+    max_tokens: usize,
+    has_tools: bool,
+) -> Result<Option<crate::parser::ThinkingBudgetConfig>, PrepareError> {
+    let (budget_kind, budget_msg) = super::resolve_chat_reasoning_budget(
+        request,
+        s.default_reasoning_budget,
+        s.default_reasoning_budget_message.as_deref(),
+    )?;
+    let (effective_budget, is_effort_derived) = match budget_kind {
+        super::ResolvedReasoningBudget::PerRequestExplicit(n) => (Some(n), false),
+        super::ResolvedReasoningBudget::Unlimited => (None, false),
+        super::ResolvedReasoningBudget::ServerDefault(_)
+            if per_request_effort.is_some() && s.reasoning_effort_budget =>
+        {
+            (
+                super::compute_effort_reasoning_budget(resolved_effort, max_tokens),
+                true,
+            )
+        }
+        super::ResolvedReasoningBudget::ServerDefault(n) => (Some(n), false),
+        super::ResolvedReasoningBudget::Default if s.reasoning_effort_budget => (
+            super::compute_effort_reasoning_budget(resolved_effort, max_tokens),
+            true,
+        ),
+        super::ResolvedReasoningBudget::Default => (None, false),
+    };
+    let Some(mut budget) = effective_budget else {
+        return Ok(None);
+    };
+    let enc = |text: &str| -> Result<Vec<i32>, String> {
+        Ok(tokenizer
+            .encode(text, false)
+            .map_err(|e| e.to_string())?
+            .get_ids()
+            .iter()
+            .map(|&id| id as i32)
+            .collect())
+    };
+    let tag_ids = |tag: &str| -> Result<Vec<i32>, String> {
+        if let Some(id) = tokenizer.token_to_id(tag) {
+            Ok(vec![id as i32])
+        } else {
+            enc(tag)
+        }
+    };
+    let start_token_ids = tag_ids("<think>")?;
+    let end_token_ids = tag_ids("</think>")?;
+    let explicit_custom_msg = budget_msg.is_some();
+    let mut forced_token_ids = Vec::new();
+    // Skip the default transition line when budget == 0 (immediate close) unless
+    // the caller explicitly configured a custom message.
+    let effective_msg = match budget_msg.as_deref() {
+        Some(m) => m,
+        None if budget == 0 => "",
+        None => super::DEFAULT_REASONING_BUDGET_MESSAGE,
+    };
+    if !effective_msg.is_empty() {
+        forced_token_ids.extend(enc(effective_msg)?);
+    }
+    // Stop forcing at `</think>` (do not append `\n`) so XGrammar structured
+    // outputs and tool grammars control byte 0 of the answer cleanly.
+    forced_token_ids.extend_from_slice(&end_token_ids);
+    if start_token_ids.is_empty() || end_token_ids.is_empty() || forced_token_ids.is_empty() {
+        return Err(
+            "tokenizer cannot encode <think>/</think> tags required for thinking budget".into(),
+        );
+    }
+    // Reserve headroom for forced closing tokens + at least 1 answer token so
+    // small `max_tokens` requests never truncate mid-transition before `</think>`.
+    if budget
+        .saturating_add(forced_token_ids.len())
+        .saturating_add(1)
+        > max_tokens
+    {
+        if is_effort_derived {
+            if max_tokens > forced_token_ids.len() + 1 {
+                budget = max_tokens - forced_token_ids.len() - 1;
+            } else {
+                forced_token_ids.clone_from(&end_token_ids);
+                budget = max_tokens.saturating_sub(forced_token_ids.len() + 1);
+            }
+        } else if !explicit_custom_msg {
+            forced_token_ids.clone_from(&end_token_ids);
+        }
+    }
+    let mut extra_end_token_ids = Vec::new();
+    if has_tools
+        && let Ok(tool_ids) = tag_ids("<tool_call>")
+        && !tool_ids.is_empty()
+    {
+        extra_end_token_ids.push(tool_ids);
+    }
+    Ok(Some(crate::parser::ThinkingBudgetConfig {
+        budget,
+        start_token_ids,
+        end_token_ids,
+        forced_token_ids,
+        extra_end_token_ids,
+    }))
+}
+
+fn prepare(
+    s: &OpenAiServerState,
+    request: Value,
+    chat: bool,
+    mode: PrepareMode,
+) -> Result<Prepared, PrepareError> {
     if !request.is_object() {
         return Err("request must be an object".into());
     }
@@ -452,21 +735,36 @@ fn prepare(s: &OpenAiServerState, request: Value, chat: bool) -> Result<Prepared
         .or_else(|| request.get("adapter"))
         .and_then(Value::as_str);
     let (lora_id, served_model) = s.resolve_request_lora(req_model, explicit_lora)?;
-    let max_tokens = request
+    let explicit_max_tokens = match request
         .get("max_completion_tokens")
         .or_else(|| request.get("max_tokens"))
-        .map_or(Ok(256), |n| {
-            n.as_u64()
+        .filter(|v| !v.is_null())
+    {
+        None => None,
+        Some(n) => {
+            let n = n
+                .as_u64()
                 .and_then(|n| usize::try_from(n).ok())
-                .ok_or("invalid max_tokens")
-        })?;
-    if max_tokens == 0 {
-        return Err("max_tokens must be positive".into());
-    }
+                .ok_or("invalid max_tokens")?;
+            if n == 0 {
+                return Err("max_tokens must be positive".into());
+            }
+            Some(n)
+        }
+    };
+    let initial_max_tokens = explicit_max_tokens.unwrap_or(super::MAX_OUTPUT_TOKENS);
     let mut params = if chat {
-        super::native_sampling_params(&request, max_tokens)?
+        super::native_sampling_params_with_defaults(
+            &request,
+            initial_max_tokens,
+            &s.worker.default_sampling_params,
+        )?
     } else {
-        super::completion_sampling_params(&request, max_tokens)?
+        super::completion_sampling_params_with_defaults(
+            &request,
+            initial_max_tokens,
+            &s.worker.default_sampling_params,
+        )?
     };
     params.eos_token_ids.clone_from(&s.worker.eos_token_ids);
     if params
@@ -477,36 +775,52 @@ fn prepare(s: &OpenAiServerState, request: Value, chat: bool) -> Result<Prepared
     {
         return Err("stop_token_ids/logit_bias token outside model vocabulary".into());
     }
-    let thinking = if chat {
-        super::resolve_chat_enable_thinking(&request)?
+    let per_request_effort = if chat {
+        super::request_explicit_reasoning_effort(&request)?
     } else {
-        false
+        None
     };
-    params.enable_thinking = thinking;
-    let (prompt, images) = if chat {
-        let (messages, images) = super::parse_openai_messages_with_image_policy(
+    let (thinking, resolved_effort) = if chat {
+        super::resolve_chat_reasoning_config(&request, s.default_reasoning_effort.as_deref())?
+    } else {
+        (false, None)
+    };
+    let (prompt, images, messages_count, tools_count, enable_thinking) = if chat {
+        let (messages, images) = super::parse_openai_messages_with_vision_config(
             request.get("messages").ok_or("missing messages")?,
             s.allow_remote_images,
+            &s.worker.vision_preprocessor,
         )?;
-        let preserve = request
-            .pointer("/chat_template_kwargs/preserve_reasoning")
-            .and_then(Value::as_bool)
-            .or_else(|| {
-                request
-                    .pointer("/chat_template_kwargs/preserve_thinking")
-                    .and_then(Value::as_bool)
-            })
-            .unwrap_or(s.worker.default_preserve_thinking);
+        let mut template_kwargs = match request.get("chat_template_kwargs").filter(|v| !v.is_null())
+        {
+            None => serde_json::Map::new(),
+            Some(v) => v
+                .as_object()
+                .cloned()
+                .ok_or("chat_template_kwargs must be an object")?,
+        };
+        template_kwargs.insert("enable_thinking".into(), Value::Bool(thinking));
+        if let Some(ref effort) = resolved_effort {
+            template_kwargs.insert("reasoning_effort".into(), Value::String(effort.clone()));
+        } else {
+            template_kwargs.remove("reasoning_effort");
+        }
+        let active_tools = request
+            .get("tools")
+            .filter(|v| !v.is_null() && request["tool_choice"] != "none");
+        let msg_cnt = messages.len();
+        let tool_cnt = active_tools.and_then(Value::as_array).map_or(0, Vec::len);
+        let rendered =
+            s.worker
+                .chat_template
+                .render(&messages, active_tools, true, &template_kwargs)?;
+        let effective_thinking = thinking && !rendered.trim_end().ends_with("</think>");
         (
-            super::format_chatml_prompt_with_options(
-                &messages,
-                request
-                    .get("tools")
-                    .filter(|v| !v.is_null() && request["tool_choice"] != "none"),
-                thinking,
-                preserve,
-            ),
+            rendered,
             images,
+            Some(msg_cnt),
+            Some(tool_cnt),
+            Some(effective_thinking),
         )
     } else {
         (
@@ -516,8 +830,13 @@ fn prepare(s: &OpenAiServerState, request: Value, chat: bool) -> Result<Prepared
                 .ok_or("missing string prompt")?
                 .to_owned(),
             Vec::new(),
+            None,
+            None,
+            None,
         )
     };
+    let thinking = enable_thinking.unwrap_or(false);
+    params.enable_thinking = thinking;
     let tokenizer = s.worker.tokenizer.as_ref().ok_or("tokenizer unavailable")?;
     let prompt: Vec<i32> = tokenizer
         .encode(prompt, false)
@@ -529,16 +848,57 @@ fn prepare(s: &OpenAiServerState, request: Value, chat: bool) -> Result<Prepared
     if prompt.is_empty() {
         return Err("prompt must be nonempty".into());
     }
-    let constraint = match crate::request_constraints::RequestConstraint::parse(&request)? {
-        Some(spec) => {
-            let factory = s
-                .constraint_factory
-                .as_ref()
-                .ok_or("constraint tokenizer unavailable")?;
-            let request_factory = factory.with_stop_tokens(&params.stop_token_ids)?;
-            Some(spec.compile(&request_factory, thinking)?)
+    let mut soft_output_budget = false;
+    if mode == PrepareMode::Generate {
+        let max_len = s.worker.max_model_len();
+        if prompt.len() >= max_len {
+            return Err(PrepareError::ContextLengthExceeded {
+                prompt_tokens: prompt.len(),
+                max_model_len: max_len,
+                param: if chat { "messages" } else { "prompt" },
+            });
         }
-        None => None,
+        let remaining = max_len - prompt.len();
+        const SOFT_CEILING_THRESHOLD_TOKENS: usize = 2048;
+        let (resolved_max, soft) = match explicit_max_tokens {
+            Some(n) => (
+                n.min(remaining),
+                n > remaining || (chat && !params.ignore_eos && n > SOFT_CEILING_THRESHOLD_TOKENS),
+            ),
+            None if chat => (remaining, true),
+            None => (remaining.min(super::DEFAULT_COMPLETION_MAX_TOKENS), false),
+        };
+        params.max_tokens = resolved_max;
+        soft_output_budget = soft;
+        if params.min_tokens > params.max_tokens {
+            return Err("min_tokens exceeds max_tokens".into());
+        }
+        if chat && thinking {
+            params.thinking_budget = build_thinking_budget_config(
+                s,
+                &request,
+                tokenizer,
+                per_request_effort.as_deref(),
+                resolved_effort.as_deref(),
+                params.max_tokens,
+                tools_count.unwrap_or(0) > 0,
+            )?;
+        }
+    }
+    let constraint = if mode == PrepareMode::Generate {
+        match crate::request_constraints::RequestConstraint::parse(&request)? {
+            Some(spec) => {
+                let factory = s
+                    .constraint_factory
+                    .as_ref()
+                    .ok_or("constraint tokenizer unavailable")?;
+                let request_factory = factory.with_stop_tokens(&params.stop_token_ids)?;
+                Some(spec.compile(&request_factory, thinking)?)
+            }
+            None => None,
+        }
+    } else {
+        None
     };
     let stream = request
         .get("stream")
@@ -547,6 +907,7 @@ fn prepare(s: &OpenAiServerState, request: Value, chat: bool) -> Result<Prepared
         .pointer("/stream_options/include_usage")
         .map_or(Ok(false), |v| v.as_bool().ok_or("invalid include_usage"))?;
     Ok(Prepared {
+        explicit_max_tokens,
         parser: Qwen3Parser::with_tools(
             thinking,
             &crate::request_constraints::parser_tools(&request)?,
@@ -554,11 +915,16 @@ fn prepare(s: &OpenAiServerState, request: Value, chat: bool) -> Result<Prepared
         prompt,
         images,
         params,
+        soft_output_budget,
         constraint,
         lora_id,
         served_model,
         stream,
         include_usage,
+        messages_count,
+        tools_count,
+        enable_thinking,
+        reasoning_effort: resolved_effort,
     })
 }
 async fn generate(
@@ -586,24 +952,44 @@ async fn generate(
             Ok(None)
         );
     let prepared = if inline_fast {
-        prepare(&prep_state, json, chat).map_err(bad)?
+        prepare(&prep_state, json, chat, PrepareMode::Generate).map_err(prepare_openai_err)?
     } else {
-        cpu(&s, move || prepare(&prep_state, json, chat)).await?
+        cpu_with(
+            &s,
+            move || prepare(&prep_state, json, chat, PrepareMode::Generate),
+            prepare_openai_err,
+        )
+        .await?
     };
+    let request_id = s.next_request_id.fetch_add(1, Ordering::Relaxed) + 1;
+    let id = crate::responses_api::generate_unguessable_prefixed_id(
+        if chat { "chatcmpl-" } else { "cmpl-" },
+        request_id,
+    );
+    let mut log = prepared.turn_log(
+        id.clone(),
+        if chat { "chat" } else { "completions" },
+        s.worker.max_model_len(),
+    );
     let prompt_len = prepared.prompt.len();
     let generation = s
         .worker
-        .submit_with_images_and_lora(
+        .submit_with_images_lora_and_budget_mode(
             prepared.prompt,
             prepared.images,
             prepared.params.clone(),
             prepared.constraint,
             prepared.lora_id,
+            prepared.soft_output_budget,
         )
+        .inspect_err(|_| log.finish("error", false))
         .map_err(worker_api_err)?;
+    log.track_cache(
+        generation.cached_tokens.clone(),
+        generation.cache_lookup.clone(),
+    );
     let stream = prepared.stream;
     let include_usage = prepared.include_usage;
-    let request_id = s.next_request_id.fetch_add(1, Ordering::Relaxed) + 1;
     let output = output_stream(
         s,
         generation,
@@ -612,7 +998,8 @@ async fn generate(
         prepared.served_model,
         chat,
         prompt_len,
-        request_id,
+        id,
+        log,
         admission,
     );
     if stream {
@@ -715,7 +1102,33 @@ fn delta_value(d: StreamParseDelta, tool_index: &mut usize) -> Value {
     if let Some(text) = d.content_delta {
         value["content"] = json!(text);
     }
-    if !d.completed_tool_calls.is_empty() {
+    if !d.tool_call_deltas.is_empty() {
+        value["tool_calls"] = json!(
+            d.tool_call_deltas
+                .into_iter()
+                .map(|tc| {
+                    *tool_index = (*tool_index).max(tc.index + 1);
+                    let mut fn_obj = serde_json::Map::new();
+                    if let Some(name) = tc.name {
+                        fn_obj.insert("name".into(), json!(name));
+                    }
+                    if let Some(args) = tc.arguments_delta {
+                        fn_obj.insert("arguments".into(), json!(args));
+                    } else if fn_obj.contains_key("name") {
+                        fn_obj.insert("arguments".into(), json!(""));
+                    }
+                    let mut item = serde_json::Map::new();
+                    item.insert("index".into(), json!(tc.index));
+                    if let Some(id) = tc.id {
+                        item.insert("id".into(), json!(id));
+                        item.insert("type".into(), json!("function"));
+                    }
+                    item.insert("function".into(), Value::Object(fn_obj));
+                    Value::Object(item)
+                })
+                .collect::<Vec<_>>()
+        );
+    } else if !d.completed_tool_calls.is_empty() {
         value["tool_calls"] = json!(
             d.completed_tool_calls
                 .into_iter()
@@ -762,7 +1175,8 @@ fn output_stream(
     served_model: String,
     chat: bool,
     prompt_len: usize,
-    request_id: u64,
+    id: String,
+    mut log: TurnLog,
     admission: OwnedSemaphorePermit,
 ) -> impl Stream<Item = Output> + Send {
     async_stream::stream! {
@@ -780,7 +1194,6 @@ fn output_stream(
         let mut legacy_offset = 0;
         let mut decoded_offset = 0;
         let mut tool_index = 0;
-        let id = format!("{}-{request_id}",if chat { "chatcmpl" } else { "cmpl" });
         let created = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
         let chunk = |delta: Value, lp: Value| {
             let choice = if chat { json!({"index":0,"delta":delta,"finish_reason":null,"logprobs":lp}) }
@@ -791,6 +1204,7 @@ fn output_stream(
         while let Some(event) = generation.events.recv().await {
             match event {
                 GenerationEvent::Token { id, logprobs } => {
+                    log.token();
                     count += 1;
                     let mut lp = logprobs.as_ref().map(|lp| logprob_value(lp, tokenizer, &s.decoded_vocab));
                     if chat && let Some(lp) = &lp { logs.push(lp.clone()); }
@@ -807,8 +1221,15 @@ fn output_stream(
                         continue;
                     }
                     let decoded = match decoder.step(id as u32) {
-                        Ok(Some(text)) => text, Ok(None) if chat => continue, Ok(None) => String::new(),
-                        Err(e) => { yield Output::Error(WorkerError::internal(e.to_string())); return; }
+                        Ok(Some(text)) => text,
+                        Ok(None) if chat => {
+                            if parser.in_reasoning() {
+                                log.reasoning_token();
+                            }
+                            continue;
+                        }
+                        Ok(None) => String::new(),
+                        Err(e) => { log.finish("error", false); yield Output::Error(WorkerError::internal(e.to_string())); return; }
                     };
                     if !chat {
                         if let Some(lp) = &mut lp {
@@ -822,19 +1243,33 @@ fn output_stream(
                     let active_stops = if count >= params.min_tokens { params.stop_strings.as_slice() } else { &[] };
                     let (visible, matched) = stops.push(&decoded, active_stops);
                     text.push_str(&visible);
-                    let delta = if chat { delta_value(parser.push_str(&visible),&mut tool_index) } else { json!({"content":visible}) };
+                    let was_reasoning = chat && parser.in_reasoning();
+                    let delta = if chat {
+                        let raw_delta = parser.push_str(&visible);
+                        if was_reasoning && (parser.in_reasoning() || raw_delta.reasoning_delta.is_some()) {
+                            log.reasoning_token();
+                        }
+                        log.set_tool_calls(parser.emitted_tool_calls_count());
+                        delta_value(raw_delta, &mut tool_index)
+                    } else {
+                        json!({"content":visible})
+                    };
                     if delta.as_object().is_some_and(|o| !o.is_empty()) || lp.is_some() {
                         yield Output::Delta(chunk(delta,lp.map_or(Value::Null,|v| if chat { json!({"content":[v]}) } else { super::completion_logprobs(&[v], &mut legacy_offset) })));
                     }
                     if matched { stopped = true; done = true; break; }
                 }
-                GenerationEvent::Finished { cached_tokens, .. } => { cached = cached_tokens; done = true; break; }
-                GenerationEvent::Error(err) => { yield Output::Error(err); return; }
+                GenerationEvent::Finished { cached_tokens, thinking_budget_exhausted, .. } => {
+                    if thinking_budget_exhausted { log.mark_thinking_budget_exhausted(); }
+                    cached = cached_tokens; done = true; break;
+                }
+                GenerationEvent::Error(err) => { log.finish("error", false); yield Output::Error(err); return; }
             }
         }
         cached = cached.max(generation.cached_tokens.load(Ordering::Acquire) as usize);
+        let hit_limit = generation.hit_limit.load(Ordering::Acquire);
         drop(generation); // cancellation also covers stop strings and a dropped HTTP response body
-        if !done { yield Output::Error(WorkerError::internal("engine stream closed before completion (overload, shutdown, or worker failure)")); return; }
+        if !done { log.finish("error", false); yield Output::Error(WorkerError::internal("engine stream closed before completion (client backpressure, overload, shutdown, or worker failure)")); return; }
         let tail = std::mem::take(&mut stops.pending);
         text.push_str(&tail);
         if !tail.is_empty() {
@@ -844,10 +1279,19 @@ fn output_stream(
         let (tail,turn) = parser.finish();
         let delta = delta_value(tail,&mut tool_index);
         if chat && delta.as_object().is_some_and(|o| !o.is_empty()) { yield Output::Delta(chunk(delta,Value::Null)); }
-        let finish = if chat && !turn.tool_calls.is_empty() { "tool_calls" } else if !stopped && count >= params.max_tokens { "length" } else { "stop" };
+        if chat {
+            let reasoning_override = turn
+                .reasoning_content
+                .as_deref()
+                .is_none_or(str::is_empty)
+                .then_some(0);
+            log.set_turn_outcome(reasoning_override, turn.tool_calls.len());
+        }
+        let finish = if chat && !turn.tool_calls.is_empty() { "tool_calls" } else if !stopped && (count >= params.max_tokens || hit_limit) { "length" } else { "stop" };
         let lp = if !params.logprobs { Value::Null } else if chat { json!({"content":logs}) } else { super::completion_logprobs(&logs, &mut 0) };
         let choice = if chat { json!({"index":0,"message":{"role":"assistant","content":turn.content,"reasoning_content":turn.reasoning_content,"tool_calls":turn.tool_calls},"finish_reason":finish,"logprobs":lp}) }
             else { json!({"index":0,"text":text,"finish_reason":finish,"logprobs":lp}) };
+        log.finish(finish, hit_limit);
         yield Output::Complete(json!({"id":id,"object":if chat {"chat.completion"} else {"text_completion"},"created":created,"model":served_model,"choices":[choice],"usage":{"prompt_tokens":prompt_len,"completion_tokens":count,"total_tokens":prompt_len+count,"prompt_tokens_details":{"cached_tokens":cached}}}));
     }
 }
@@ -862,6 +1306,28 @@ fn responses_api_err(err: crate::responses_api::ResponsesApiError) -> ApiError {
 
 fn anthropic_api_err(status: StatusCode, err: crate::anthropic_api::AnthropicApiError) -> ApiError {
     (status, Json(err.to_json()))
+}
+
+fn worker_anthropic_err(err: WorkerError) -> ApiError {
+    if let WorkerError::ContextLengthExceeded {
+        prompt_tokens,
+        output_tokens,
+        limit,
+    } = err
+    {
+        let max_input = if output_tokens == 0 {
+            limit
+        } else {
+            limit.saturating_sub(1)
+        };
+        return anthropic_api_err(
+            StatusCode::BAD_REQUEST,
+            crate::anthropic_api::AnthropicApiError::bad_request(format!(
+                "prompt is too long: {prompt_tokens} tokens > {max_input} maximum"
+            )),
+        );
+    }
+    to_anthropic_err(worker_api_err(err))
 }
 
 fn to_anthropic_err((status, Json(body)): ApiError) -> ApiError {
@@ -919,9 +1385,11 @@ async fn chat_input_tokens(
         obj.remove("min_tokens");
     }
     let prep_state = s.clone();
-    let count = cpu(&s, move || {
-        prepare(&prep_state, body, true).map(|p| p.prompt.len())
-    })
+    let count = cpu_with(
+        &s,
+        move || prepare(&prep_state, body, true, PrepareMode::CountTokens).map(|p| p.prompt.len()),
+        prepare_openai_err,
+    )
     .await?;
     Ok(Json(json!({
         "object": "response.input_tokens",
@@ -965,9 +1433,13 @@ async fn responses_input_tokens(
     )
     .map_err(responses_api_err)?;
     let prep_state = s.clone();
-    let count = cpu(&s, move || {
-        prepare(&prep_state, chat_req, true).map(|p| p.prompt.len())
-    })
+    let count = cpu_with(
+        &s,
+        move || {
+            prepare(&prep_state, chat_req, true, PrepareMode::CountTokens).map(|p| p.prompt.len())
+        },
+        prepare_responses_err,
+    )
     .await?;
     Ok(Json(json!({
         "object": "response.input_tokens",
@@ -993,11 +1465,14 @@ async fn anthropic_count_tokens(
         obj.remove("min_tokens");
     }
     let prep_state = s.clone();
-    let count = cpu(&s, move || {
-        prepare(&prep_state, chat_req, true).map(|p| p.prompt.len())
-    })
-    .await
-    .map_err(to_anthropic_err)?;
+    let count = cpu_with(
+        &s,
+        move || {
+            prepare(&prep_state, chat_req, true, PrepareMode::CountTokens).map(|p| p.prompt.len())
+        },
+        prepare_anthropic_err,
+    )
+    .await?;
     Ok(Json(json!({
         "input_tokens": count,
     })))
@@ -1068,8 +1543,7 @@ fn count_reasoning_tokens(
         None => 0,
         Some(text) => tokenizer
             .encode(text, false)
-            .map(|e| e.len().min(output_tokens))
-            .unwrap_or(0),
+            .map_or(0, |e| e.len().min(output_tokens)),
     }
 }
 
@@ -1144,19 +1618,38 @@ async fn responses_create(
     )
     .map_err(responses_api_err)?;
     let prep_state = s.clone();
-    let prepared = cpu(&s, move || prepare(&prep_state, chat_req, true)).await?;
+    let prepared = cpu_with(
+        &s,
+        move || prepare(&prep_state, chat_req, true, PrepareMode::Generate),
+        prepare_responses_err,
+    )
+    .await?;
     meta.model.clone_from(&prepared.served_model);
+    meta.max_output_tokens = prepared.params.max_tokens;
+    meta.temperature = f64::from(prepared.params.temperature);
+    meta.top_p = f64::from(prepared.params.top_p);
+    let mut log = prepared.turn_log(
+        meta.response_id.clone(),
+        "responses",
+        s.worker.max_model_len(),
+    );
     let prompt_len = prepared.prompt.len();
     let generation = s
         .worker
-        .submit_with_images_and_lora(
+        .submit_with_images_lora_and_budget_mode(
             prepared.prompt,
             prepared.images,
             prepared.params.clone(),
             prepared.constraint,
             prepared.lora_id,
+            prepared.soft_output_budget,
         )
+        .inspect_err(|_| log.finish("error", false))
         .map_err(worker_api_err)?;
+    log.track_cache(
+        generation.cached_tokens.clone(),
+        generation.cache_lookup.clone(),
+    );
     if let Some(ref scope) = caller_scope {
         s.response_store.register_active(
             meta.response_id.clone(),
@@ -1193,6 +1686,7 @@ async fn responses_create(
             while let Some(event) = generation.events.recv().await {
                 match event {
                     GenerationEvent::Token { id, .. } => {
+                        log.token();
                         count += 1;
                         if count >= params.min_tokens && params.is_stop_or_eos(id, &s.worker.eos_token_ids) {
                             stopped = true;
@@ -1200,8 +1694,14 @@ async fn responses_create(
                         }
                         let decoded = match decoder.step(id as u32) {
                             Ok(Some(t)) => t,
-                            Ok(None) => continue,
+                            Ok(None) => {
+                                if parser.in_reasoning() {
+                                    log.reasoning_token();
+                                }
+                                continue;
+                            }
                             Err(e) => {
+                                log.finish("error", false);
                                 let (ev_name, payload) = responses_stream_failure(&s.response_store, &meta, caller_scope.as_deref(), &mut sse, &e.to_string());
                                 yield Ok(Event::default().event(ev_name).data(payload.to_string()));
                                 return;
@@ -1209,21 +1709,36 @@ async fn responses_create(
                         };
                         let active_stops = if count >= params.min_tokens { params.stop_strings.as_slice() } else { &[] };
                         let (visible, matched) = stops.push(&decoded, active_stops);
-                        for (ev_name, payload) in sse.push_delta(parser.push_str(&visible)) {
+                        let was_reasoning = parser.in_reasoning();
+                        let raw_delta = parser.push_str(&visible);
+                        let emitted_reasoning = raw_delta.reasoning_delta.is_some();
+                        for (ev_name, payload) in sse.push_delta(raw_delta) {
                             yield Ok(Event::default().event(ev_name).data(payload.to_string()));
                         }
+                        if was_reasoning && (parser.in_reasoning() || emitted_reasoning) {
+                            log.reasoning_token();
+                        }
+                        log.set_tool_calls(parser.emitted_tool_calls_count());
                         if matched {
                             stopped = true;
                             done = true;
                             break;
                         }
                     }
-                    GenerationEvent::Finished { cached_tokens, .. } => {
+                    GenerationEvent::Finished {
+                        cached_tokens,
+                        thinking_budget_exhausted,
+                        ..
+                    } => {
+                        if thinking_budget_exhausted {
+                            log.mark_thinking_budget_exhausted();
+                        }
                         cached = cached_tokens;
                         done = true;
                         break;
                     }
                     GenerationEvent::Error(err) => {
+                        log.finish("error", false);
                         let msg = err.to_string();
                         let (ev_name, payload) = responses_stream_failure(&s.response_store, &meta, caller_scope.as_deref(), &mut sse, &msg);
                         yield Ok(Event::default().event(ev_name).data(payload.to_string()));
@@ -1232,8 +1747,10 @@ async fn responses_create(
                 }
             }
             cached = cached.max(generation.cached_tokens.load(Ordering::Acquire) as usize);
+            let hit_limit = generation.hit_limit.load(Ordering::Acquire);
             drop(generation);
             if !done {
+                log.finish("error", false);
                 let (ev_name, payload) = responses_stream_failure(&s.response_store, &meta, caller_scope.as_deref(), &mut sse, "engine stream closed before completion");
                 yield Ok(Event::default().event(ev_name).data(payload.to_string()));
                 return;
@@ -1250,19 +1767,22 @@ async fn responses_create(
             }
             let finish = if !turn.tool_calls.is_empty() {
                 "tool_calls"
-            } else if !stopped && count >= params.max_tokens {
+            } else if !stopped && (count >= params.max_tokens || hit_limit) {
                 "length"
             } else {
                 "stop"
             };
             let reasoning_tokens = count_reasoning_tokens(tokenizer, &turn, count);
-            let (mut end_frames, final_resp, history) =
+            log.set_turn_outcome(Some(reasoning_tokens as u64), turn.tool_calls.len());
+            let (end_frames, final_resp, history) =
                 sse.finish_output(&turn, finish, prompt_len, cached, count, reasoning_tokens);
             let final_resp = finalize_response(&s.response_store, &meta, caller_scope.as_deref(), final_resp, history);
-            end_frames.push(sse.terminal_response(final_resp));
             for (ev_name, payload) in end_frames {
                 yield Ok(Event::default().event(ev_name).data(payload.to_string()));
             }
+            let (ev_name, payload) = sse.terminal_response(final_resp);
+            log.finish(finish, hit_limit);
+            yield Ok(Event::default().event(ev_name).data(payload.to_string()));
         };
         Ok(Sse::new(events)
             .keep_alive(KeepAlive::new().interval(Duration::from_secs(15)))
@@ -1283,6 +1803,7 @@ async fn responses_create(
         while let Some(event) = generation.events.recv().await {
             match event {
                 GenerationEvent::Token { id, .. } => {
+                    log.token();
                     count += 1;
                     if count >= prepared.params.min_tokens
                         && prepared.params.is_stop_or_eos(id, &s.worker.eos_token_ids)
@@ -1294,6 +1815,7 @@ async fn responses_create(
                         Ok(Some(t)) => t,
                         Ok(None) => continue,
                         Err(e) => {
+                            log.finish("error", false);
                             return responses_sync_failure(
                                 &s.response_store,
                                 &meta,
@@ -1308,19 +1830,32 @@ async fn responses_create(
                         &[]
                     };
                     let (visible, matched) = stops.push(&decoded, active_stops);
+                    let was_reasoning = parser.in_reasoning();
                     let _ = parser.push_str(&visible);
+                    if was_reasoning && parser.in_reasoning() {
+                        log.reasoning_token();
+                    }
+                    log.set_tool_calls(parser.emitted_tool_calls_count());
                     if matched {
                         stopped = true;
                         done = true;
                         break;
                     }
                 }
-                GenerationEvent::Finished { cached_tokens, .. } => {
+                GenerationEvent::Finished {
+                    cached_tokens,
+                    thinking_budget_exhausted,
+                    ..
+                } => {
+                    if thinking_budget_exhausted {
+                        log.mark_thinking_budget_exhausted();
+                    }
                     cached = cached_tokens;
                     done = true;
                     break;
                 }
                 GenerationEvent::Error(err) => {
+                    log.finish("error", false);
                     return responses_sync_failure(
                         &s.response_store,
                         &meta,
@@ -1331,8 +1866,10 @@ async fn responses_create(
             }
         }
         cached = cached.max(generation.cached_tokens.load(Ordering::Acquire) as usize);
+        let hit_limit = generation.hit_limit.load(Ordering::Acquire);
         drop(generation);
         if !done {
+            log.finish("error", false);
             return responses_sync_failure(
                 &s.response_store,
                 &meta,
@@ -1350,12 +1887,13 @@ async fn responses_create(
         let (_, turn) = parser.finish();
         let finish = if !turn.tool_calls.is_empty() {
             "tool_calls"
-        } else if !stopped && count >= prepared.params.max_tokens {
+        } else if !stopped && (count >= prepared.params.max_tokens || hit_limit) {
             "length"
         } else {
             "stop"
         };
         let reasoning_tokens = count_reasoning_tokens(tokenizer, &turn, count);
+        log.set_turn_outcome(Some(reasoning_tokens as u64), turn.tool_calls.len());
         let (resp, history) = crate::responses_api::build_response_object(
             &meta,
             &turn,
@@ -1372,6 +1910,7 @@ async fn responses_create(
             resp,
             history,
         );
+        log.finish(finish, hit_limit);
         Ok(Json(resp).into_response())
     }
 }
@@ -1391,21 +1930,35 @@ async fn anthropic_messages(
         crate::anthropic_api::translate_anthropic_to_chat(&body, &s.model_name, request_id, true)
             .map_err(|e| anthropic_api_err(StatusCode::BAD_REQUEST, e))?;
     let prep_state = s.clone();
-    let prepared = cpu(&s, move || prepare(&prep_state, chat_req, true))
-        .await
-        .map_err(to_anthropic_err)?;
+    let prepared = cpu_with(
+        &s,
+        move || prepare(&prep_state, chat_req, true, PrepareMode::Generate),
+        prepare_anthropic_err,
+    )
+    .await?;
     meta.model.clone_from(&prepared.served_model);
+    let mut log = prepared.turn_log(
+        meta.message_id.clone(),
+        "anthropic",
+        s.worker.max_model_len(),
+    );
     let prompt_len = prepared.prompt.len();
     let generation = s
         .worker
-        .submit_with_images_and_lora(
+        .submit_with_images_lora_and_budget_mode(
             prepared.prompt,
             prepared.images,
             prepared.params.clone(),
             prepared.constraint,
             prepared.lora_id,
+            prepared.soft_output_budget,
         )
-        .map_err(|e| to_anthropic_err(worker_api_err(e)))?;
+        .inspect_err(|_| log.finish("error", false))
+        .map_err(worker_anthropic_err)?;
+    log.track_cache(
+        generation.cached_tokens.clone(),
+        generation.cache_lookup.clone(),
+    );
 
     if meta.stream {
         let params = prepared.params;
@@ -1427,6 +1980,7 @@ async fn anthropic_messages(
             while let Some(event) = generation.events.recv().await {
                 match event {
                     GenerationEvent::Token { id, .. } => {
+                        log.token();
                         count += 1;
                         cached = cached.max(generation.cached_tokens.load(Ordering::Acquire) as usize);
                         for (ev_name, payload) in sse.ensure_started(cached) {
@@ -1438,8 +1992,14 @@ async fn anthropic_messages(
                         }
                         let decoded = match decoder.step(id as u32) {
                             Ok(Some(t)) => t,
-                            Ok(None) => continue,
+                            Ok(None) => {
+                                if parser.in_reasoning() {
+                                    log.reasoning_token();
+                                }
+                                continue;
+                            }
                             Err(e) => {
+                                log.finish("error", false);
                                 let (ev_name, payload) = crate::anthropic_api::AnthropicSseFormatter::error_event(&e.to_string());
                                 yield Ok(Event::default().event(ev_name).data(payload.to_string()));
                                 return;
@@ -1447,9 +2007,16 @@ async fn anthropic_messages(
                         };
                         let active_stops = if count >= params.min_tokens { params.stop_strings.as_slice() } else { &[] };
                         let (visible, m_stop) = stops.push_matched(&decoded, active_stops);
-                        for (ev_name, payload) in sse.push_delta(parser.push_str(&visible), cached) {
+                        let was_reasoning = parser.in_reasoning();
+                        let raw_delta = parser.push_str(&visible);
+                        let emitted_reasoning = raw_delta.reasoning_delta.is_some();
+                        for (ev_name, payload) in sse.push_delta(raw_delta, cached) {
                             yield Ok(Event::default().event(ev_name).data(payload.to_string()));
                         }
+                        if was_reasoning && (parser.in_reasoning() || emitted_reasoning) {
+                            log.reasoning_token();
+                        }
+                        log.set_tool_calls(parser.emitted_tool_calls_count());
                         if let Some(seq) = m_stop {
                             matched_stop = Some(seq);
                             stopped = true;
@@ -1457,12 +2024,20 @@ async fn anthropic_messages(
                             break;
                         }
                     }
-                    GenerationEvent::Finished { cached_tokens, .. } => {
+                    GenerationEvent::Finished {
+                        cached_tokens,
+                        thinking_budget_exhausted,
+                        ..
+                    } => {
+                        if thinking_budget_exhausted {
+                            log.mark_thinking_budget_exhausted();
+                        }
                         cached = cached.max(cached_tokens);
                         done = true;
                         break;
                     }
                     GenerationEvent::Error(err) => {
+                        log.finish("error", false);
                         let msg = err.to_string();
                         let (ev_name, payload) = crate::anthropic_api::AnthropicSseFormatter::error_event(&msg);
                         yield Ok(Event::default().event(ev_name).data(payload.to_string()));
@@ -1471,8 +2046,10 @@ async fn anthropic_messages(
                 }
             }
             cached = cached.max(generation.cached_tokens.load(Ordering::Acquire) as usize);
+            let hit_limit = generation.hit_limit.load(Ordering::Acquire);
             drop(generation);
             if !done {
+                log.finish("error", false);
                 let (ev_name, payload) = crate::anthropic_api::AnthropicSseFormatter::error_event(
                     "engine stream closed before completion",
                 );
@@ -1489,14 +2066,24 @@ async fn anthropic_messages(
             for (ev_name, payload) in sse.push_delta(tail_delta, cached) {
                 yield Ok(Event::default().event(ev_name).data(payload.to_string()));
             }
+            let reasoning_override = turn
+                .reasoning_content
+                .as_deref()
+                .is_none_or(str::is_empty)
+                .then_some(0);
+            log.set_turn_outcome(reasoning_override, turn.tool_calls.len());
             let finish = if !turn.tool_calls.is_empty() {
                 "tool_calls"
-            } else if !stopped && count >= params.max_tokens {
+            } else if !stopped && (count >= params.max_tokens || hit_limit) {
                 "length"
             } else {
                 "stop"
             };
             for (ev_name, payload) in sse.finish(&turn, finish, matched_stop.as_deref(), cached, count) {
+                if ev_name == "message_delta" {
+                    let (reason, _) = crate::anthropic_api::resolve_stop_reason(&turn, finish, matched_stop.as_deref());
+                    log.finish(reason, hit_limit);
+                }
                 yield Ok(Event::default().event(ev_name).data(payload.to_string()));
             }
         };
@@ -1519,6 +2106,7 @@ async fn anthropic_messages(
         while let Some(event) = generation.events.recv().await {
             match event {
                 GenerationEvent::Token { id, .. } => {
+                    log.token();
                     count += 1;
                     if count >= prepared.params.min_tokens
                         && prepared.params.is_stop_or_eos(id, &s.worker.eos_token_ids)
@@ -1528,8 +2116,14 @@ async fn anthropic_messages(
                     }
                     let decoded = match decoder.step(id as u32) {
                         Ok(Some(t)) => t,
-                        Ok(None) => continue,
+                        Ok(None) => {
+                            if parser.in_reasoning() {
+                                log.reasoning_token();
+                            }
+                            continue;
+                        }
                         Err(e) => {
+                            log.finish("error", false);
                             return Err(anthropic_api_err(
                                 StatusCode::INTERNAL_SERVER_ERROR,
                                 crate::anthropic_api::AnthropicApiError::api_error(e.to_string()),
@@ -1542,7 +2136,14 @@ async fn anthropic_messages(
                         &[]
                     };
                     let (visible, m_stop) = stops.push_matched(&decoded, active_stops);
-                    let _ = parser.push_str(&visible);
+                    let was_reasoning = parser.in_reasoning();
+                    let raw_delta = parser.push_str(&visible);
+                    if was_reasoning
+                        && (parser.in_reasoning() || raw_delta.reasoning_delta.is_some())
+                    {
+                        log.reasoning_token();
+                    }
+                    log.set_tool_calls(parser.emitted_tool_calls_count());
                     if let Some(seq) = m_stop {
                         matched_stop = Some(seq);
                         stopped = true;
@@ -1550,19 +2151,29 @@ async fn anthropic_messages(
                         break;
                     }
                 }
-                GenerationEvent::Finished { cached_tokens, .. } => {
+                GenerationEvent::Finished {
+                    cached_tokens,
+                    thinking_budget_exhausted,
+                    ..
+                } => {
+                    if thinking_budget_exhausted {
+                        log.mark_thinking_budget_exhausted();
+                    }
                     cached = cached_tokens;
                     done = true;
                     break;
                 }
                 GenerationEvent::Error(err) => {
-                    return Err(to_anthropic_err(worker_api_err(err)));
+                    log.finish("error", false);
+                    return Err(worker_anthropic_err(err));
                 }
             }
         }
         cached = cached.max(generation.cached_tokens.load(Ordering::Acquire) as usize);
+        let hit_limit = generation.hit_limit.load(Ordering::Acquire);
         drop(generation);
         if !done {
+            log.finish("error", false);
             return Err(anthropic_api_err(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 crate::anthropic_api::AnthropicApiError::api_error(
@@ -1575,9 +2186,15 @@ async fn anthropic_messages(
             let _ = parser.push_str(&tail);
         }
         let (_, turn) = parser.finish();
+        let reasoning_override = turn
+            .reasoning_content
+            .as_deref()
+            .is_none_or(str::is_empty)
+            .then_some(0);
+        log.set_turn_outcome(reasoning_override, turn.tool_calls.len());
         let finish = if !turn.tool_calls.is_empty() {
             "tool_calls"
-        } else if !stopped && count >= prepared.params.max_tokens {
+        } else if !stopped && (count >= prepared.params.max_tokens || hit_limit) {
             "length"
         } else {
             "stop"
@@ -1591,6 +2208,9 @@ async fn anthropic_messages(
             cached,
             count,
         );
+        let (reason, _) =
+            crate::anthropic_api::resolve_stop_reason(&turn, finish, matched_stop.as_deref());
+        log.finish(reason, hit_limit);
         Ok(Json(msg).into_response())
     }
 }
@@ -1636,6 +2256,28 @@ pub async fn serve(
         .map_err(std::io::Error::other)?;
     result
 }
+/// Format only deployment state, never credentials or user-supplied hostnames.
+pub(crate) fn serve_exposure_notice(
+    addr: std::net::SocketAddr,
+    auth_enabled: bool,
+    webui: bool,
+) -> String {
+    let auth = if auth_enabled { "enabled" } else { "disabled" };
+    let ui = if webui {
+        "webui enabled and unauthenticated"
+    } else {
+        "webui disabled (API and metrics remain available)"
+    };
+    let warning = if addr.ip().is_loopback() {
+        ""
+    } else {
+        "WARNING: non-loopback listener exposes public endpoints; "
+    };
+    format!(
+        "[warp34 serve] {warning}ready on http://{addr}; API auth {auth} (all API operations including aliases); metrics (/metrics and /api/metrics) and minimal health are unauthenticated; {ui}"
+    )
+}
+
 pub fn run_blocking_server(addr: &str, state: Arc<OpenAiServerState>) -> std::io::Result<()> {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -1652,7 +2294,10 @@ pub fn run_blocking_server(addr: &str, state: Arc<OpenAiServerState>) -> std::io
                 return Err(error);
             }
         };
-        eprintln!("[warp34 serve] ready on http://{}", listener.local_addr()?);
+        eprintln!(
+            "{}",
+            serve_exposure_notice(listener.local_addr()?, state.api_key.is_some(), state.webui)
+        );
         serve(listener, state, async {
             #[cfg(unix)]
             {
@@ -1672,7 +2317,7 @@ pub fn run_blocking_server(addr: &str, state: Arc<OpenAiServerState>) -> std::io
 
 #[cfg(test)]
 mod tests {
-    use super::{StopBuffer, admission_error, to_anthropic_err, worker_api_err};
+    use super::{Qwen3Parser, StopBuffer, admission_error, json, to_anthropic_err, worker_api_err};
     use crate::engine_worker::WorkerError;
     use axum::http::StatusCode;
 
@@ -1791,19 +2436,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn readiness_is_unavailable_while_stopping_and_preserves_panic_diagnostics() {
+    async fn readiness_is_unavailable_without_exposing_panic_diagnostics() {
         use axum::body::to_bytes;
-        assert_eq!(super::health_response(None, false).status(), StatusCode::OK);
-        let stopping = super::health_response(None, true);
+        assert_eq!(
+            super::health_response(false, false).status(),
+            StatusCode::OK
+        );
+        let stopping = super::health_response(false, true);
         assert_eq!(stopping.status(), StatusCode::SERVICE_UNAVAILABLE);
         let body: serde_json::Value =
             serde_json::from_slice(&to_bytes(stopping.into_body(), 4096).await.unwrap()).unwrap();
         assert_eq!(body["status"], "stopping");
-        let failed = super::health_response(Some("test panic".into()), true);
+        let failed = super::health_response(true, true);
         assert_eq!(failed.status(), StatusCode::SERVICE_UNAVAILABLE);
         let body: serde_json::Value =
             serde_json::from_slice(&to_bytes(failed.into_body(), 4096).await.unwrap()).unwrap();
-        assert!(body["error"].as_str().unwrap().contains("test panic"));
+        assert_eq!(body, serde_json::json!({"status": "error"}));
     }
 
     #[test]
@@ -1844,5 +2492,55 @@ mod tests {
         let (ast, abody) = to_anthropic_err((st, body));
         assert_eq!(ast, StatusCode::INTERNAL_SERVER_ERROR);
         assert_eq!(abody.0["error"]["type"], "api_error");
+    }
+
+    #[test]
+    fn chat_completions_delta_value_streams_incremental_tool_call_chunks() {
+        let tools = vec![json!({"function":{"name":"write","parameters":{
+            "type":"object",
+            "properties":{
+                "path":{"type":"string"},
+                "content":{"type":"string"}
+            }
+        }}})];
+        let mut parser = Qwen3Parser::with_tools(false, &tools).unwrap();
+        let mut tool_index = 0usize;
+        let mut chunks = Vec::new();
+        for piece in [
+            "<tool_call>\n<function=write>\n<parameter=path>\nsrc/",
+            "scene.js\n</parameter>\n<parameter=content>\nhello",
+            " world\n</parameter>\n</function>\n</tool_call>",
+        ] {
+            let v = super::delta_value(parser.push_str(piece), &mut tool_index);
+            if v != json!({}) {
+                chunks.push(v);
+            }
+        }
+        let (final_d, turn) = parser.finish();
+        let vf = super::delta_value(final_d, &mut tool_index);
+        if vf != json!({}) {
+            chunks.push(vf);
+        }
+        assert_eq!(tool_index, 1);
+        assert_eq!(chunks.len(), 3);
+        assert_eq!(chunks[0]["tool_calls"][0]["index"], 0);
+        assert_eq!(chunks[0]["tool_calls"][0]["id"], "call_warp34_0");
+        assert_eq!(chunks[0]["tool_calls"][0]["type"], "function");
+        assert_eq!(chunks[0]["tool_calls"][0]["function"]["name"], "write");
+        for later in &chunks[1..] {
+            assert_eq!(later["tool_calls"][0]["index"], 0);
+            assert!(later["tool_calls"][0].get("id").is_none());
+            assert!(later["tool_calls"][0].get("type").is_none());
+            assert!(later["tool_calls"][0]["function"].get("name").is_none());
+        }
+        let joined_args: String = chunks
+            .iter()
+            .filter_map(|c| c["tool_calls"][0]["function"]["arguments"].as_str())
+            .collect();
+        assert_eq!(joined_args, turn.tool_calls[0].function.arguments);
+        assert_eq!(
+            joined_args,
+            r#"{"path":"src/scene.js","content":"hello world"}"#
+        );
     }
 }

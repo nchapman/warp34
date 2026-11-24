@@ -774,7 +774,7 @@ impl QwenImage21TransformerEngine {
                 &mut arena,
                 &mut repack_staging,
                 &if tp_size > 1 {
-                    out_raw.slice_cols(qkv_start, qkv_end)?
+                    out_raw.into_slice_cols(qkv_start, qkv_end)?
                 } else {
                     out_raw
                 },
@@ -800,7 +800,7 @@ impl QwenImage21TransformerEngine {
                 &mut arena,
                 &mut repack_staging,
                 &if tp_size > 1 {
-                    mlp_out_raw.slice_cols(mlp_start, mlp_end)?
+                    mlp_out_raw.into_slice_cols(mlp_start, mlp_end)?
                 } else {
                     mlp_out_raw
                 },
@@ -1666,10 +1666,9 @@ impl QwenImage21TransformerEngine {
                 }
             }
 
-            let cache_k_ptr = kv_cache
-                .as_ref()
-                .map(|c| c.layer_k[layer_idx].addr() as *mut c_void)
-                .unwrap_or(core::ptr::null_mut());
+            let cache_k_ptr = kv_cache.as_ref().map_or(core::ptr::null_mut(), |c| {
+                c.layer_k[layer_idx].addr() as *mut c_void
+            });
 
             check_rc(
                 // SAFETY: `d_q` and `d_k` span `total_seq_len * qkv_dim_local * 2` bytes; `d_cos_full`/`d_sin_full` span `total_seq_len * 64 * 4` bytes.
@@ -2722,10 +2721,8 @@ impl QwenImage21TransformerEngine {
                 .is_some_and(|&(gp, gt, ge, _)| (gp, gt, ge) == geom)
             {
                 2
-            } else if kv_cache.graph_warmed_geom == Some(geom) {
-                1
             } else {
-                0
+                u8::from(kv_cache.graph_warmed_geom == Some(geom))
             };
             let mode = if let Some(gate) = capture_gate {
                 gate.agree_min_u8(local_mode)?
