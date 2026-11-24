@@ -98,16 +98,17 @@ The separate two-TP1-replica evidence remains historical, not a fresh DP2 result
 | Deployment | Retrieval checks | ~60K cold read | 120K/252K strict agent replay |
 |---|---|---|---|
 | Native TP1 target | 6/6 through ~252K | 0.240 output tok/s | Complete; 60/60 total workload requests |
-| Native TP2, 16384 pages (`W4A16-HGPTQ + MTP-3 [auto]`) | 6/6 through ~252K | **1.690 output tok/s** (`37.8s`, `78.3 tok/s` dec) | Startup admission & 252K retrieval qualified |
+| Native TP2, 16384 pages (`W4A16-HGPTQ + MTP-3 [auto]`) | 6/6 through ~252K | **1.699 output tok/s** (3-rep weighted; `37.7s` mean, `31.7s` steady) | Startup admission & 252K retrieval qualified |
 | Two-GPU specialized vLLM, MTP3 | 6/6 through ~252K | 1.466 output tok/s | Six trials fail on live tool calls |
 
 With the post-campaign QSA + AVX-512 hybrid MoE prefill optimizations, native
 TP2 (`16384` pages = `262K` TQ4 KV, default `MTP-3 [auto]`) now leads the
-two-GPU specialized vLLM reference on `cold-read-60k` (**`1.690` vs `1.466 output
-tok/s`**, `+15.3%`, processing `57,611` prompt tokens in `37.0s` TTFT and
-decoding at `78.3 tok/s`). These output rates include processing 57,611 prompt
-tokens to generate at most 64 output tokens; they are **not steady-state decode
-rates**. Native TP1's complete agent workload reached **251,982 prompt tokens**.
+two-GPU specialized vLLM reference on the exact same 3-rep `cold-read-60k`
+benchmark (**`1.699` vs `1.466 output tok/s`**, `+15.9%`, `192` output tokens
+across `112.99s`, `57,611` uncached prompt tokens per rep). These output rates
+include processing 57,611 prompt tokens to generate at most 64 output tokens;
+they are **not steady-state decode rates**. Native TP1's complete agent
+workload reached **251,982 prompt tokens**.
 
 ## Flash Next multi-client Open-SWE-Traces (`2× RTX 3090 Ti`, `TP=2`, `65K` TQ4 KV)
 
