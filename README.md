@@ -1,16 +1,16 @@
 # warp34
 
-A [fast](#performance) single-binary inference engine for **Qwen 3.5, 3.6, 3.8, and Flash-Next** on NVIDIA GPUs—outperforming `vLLM`, `SGLang`, and `llama.cpp` across prefill, decode, continuous batching, and long-context coding agents.
+A [fast](#performance) single-binary inference engine for **Qwen 3.5–3.8 & Flash-Next** on **RTX 30- and 40-series NVIDIA GPUs**—outperforming `vLLM`, `SGLang`, and `llama.cpp` across prefill, decode, continuous batching, and long-context coding agents.
 
-[![Release](https://img.shields.io/github/v/release/nchapman/warp34)](https://github.com/nchapman/warp34/releases/latest)
+[![Release](https://img.shields.io/github/v/release/nchapman/warp34.svg)](https://github.com/nchapman/warp34/releases/latest)
 [![Docker](https://github.com/nchapman/warp34/actions/workflows/docker.yml/badge.svg)](https://github.com/nchapman/warp34/actions/workflows/docker.yml)
 [![License: Apache-2.0](https://img.shields.io/badge/License-Apache--2.0-blue.svg)](LICENSE)
-[![CUDA](https://img.shields.io/badge/CUDA-sm__80%20%7C%20sm__86%20%7C%20sm__89-76b900.svg)](docs/HARDWARE.md)
+[![CUDA](https://img.shields.io/badge/CUDA-sm__86%20%7C%20sm__89-76b900.svg)](docs/HARDWARE.md)
 [![Models on HF](https://img.shields.io/badge/Hugging%20Face-nchapman%2Fmodels-ffd21e.svg)](https://huggingface.co/nchapman/models)
 
 [Quickstart](#quickstart) · [Models](#pick-a-model-for-your-gpu) · [Performance](#performance) · [APIs & Agents](#apis--coding-agents) · [Docs](#documentation)
 
-Written in Rust and CUDA with zero Python and zero NCCL. Built specifically for Qwen's hybrid Gated DeltaNet + full-attention architecture on RTX 30-series (`sm_86`), RTX 40-series (`sm_89`), and A100 (`sm_80`) GPUs.
+Written in Rust and CUDA with zero Python and zero NCCL. Built specifically for Qwen's hybrid Gated DeltaNet + full-attention architecture on RTX 30-series (`sm_86`) and RTX 40-series (`sm_89`) NVIDIA GPUs.
 
 ![warp34 embedded web dashboard](docs/assets/dashboard.png)
 
@@ -18,7 +18,7 @@ Written in Rust and CUDA with zero Python and zero NCCL. Built specifically for 
 
 ## Quickstart
 
-**Requirements:** Linux `x86_64` (AVX2/FMA), an NVIDIA RTX 30/40-series or A100 GPU, and a CUDA 13-capable driver (R580+).
+**Requirements:** Linux `x86_64` (AVX2/FMA), an NVIDIA RTX 30- or 40-series GPU, and a CUDA 13-capable driver (R580+).
 
 > The examples below use `Qwen3.8-27B-W4A16-HGPTQ` (24 GB GPU). On **8–16 GB GPUs**, swap in a smaller checkpoint from [Pick a Model for Your GPU](#pick-a-model-for-your-gpu).
 
@@ -54,7 +54,7 @@ mise install && mise run build
 ./target/release/warp34 serve nchapman/Qwen3.8-27B-W4A16-HGPTQ
 ```
 
-*(Tip: set `WARP34_ARCH=sm_89` / `sm_86` / `sm_80` before `mise run build` to compile only your GPU arch.)*
+*(Tip: set `WARP34_ARCH=sm_89` or `sm_86` before `mise run build` to compile only your GPU arch.)*
 
 ### Verify
 
@@ -178,8 +178,8 @@ Common flags (`--tp 2`, `--draft-model`, `--lora-modules`, `--api-key-env`, `--o
 
 ## Scope & Limitations
 
-- **Qwen hybrid family only:** Qwen 3.5 / 3.6 / 3.8, `Qwen3.8-Flash-Next`, and `GLiDE`/`d3` decision models. For Llama, Mistral, Gemma, or DeepSeek, use `vLLM`, `SGLang`, or `llama.cpp`.
-- **Hardware & OS:** Linux `x86_64` with NVIDIA RTX 30-series (`sm_86`), RTX 40-series (`sm_89`), or A100 (`sm_80`). No macOS, Windows, ROCm, or pre-Ampere support.
+- **Qwen hybrid family only:** Qwen 3.5–3.8, `Qwen3.8-Flash-Next`, and `GLiDE`/`d3` decision models. For Llama, Mistral, Gemma, or DeepSeek, use `vLLM`, `SGLang`, or `llama.cpp`.
+- **Hardware & OS:** Linux `x86_64` with NVIDIA RTX 30-series (`sm_86`) or RTX 40-series (`sm_89`) GPUs. No macOS, Windows, ROCm, or pre-Ampere support.
 - **Single-node only:** Supports `TP=1`, `TP=2`, and `TP=4` on one machine; multi-node distributed serving is out of scope.
 
 ---

@@ -36,7 +36,7 @@ check_platform() {
   os="$(uname -s)"
   arch="$(uname -m)"
   if [ "$os" != "Linux" ]; then
-    err "warp34 only supports Linux x86_64 with NVIDIA GPUs (detected OS: $os)"
+    err "warp34 only supports Linux x86_64 with NVIDIA RTX 30/40-series GPUs (detected OS: $os)"
   fi
   if [ "$arch" != "x86_64" ]; then
     err "warp34 only supports Linux x86_64 (detected arch: $arch)"
@@ -45,7 +45,7 @@ check_platform() {
 
 check_driver() {
   if ! command -v nvidia-smi >/dev/null 2>&1; then
-    say "Note: nvidia-smi not found. warp34 requires an NVIDIA RTX 30/40-series or A100 GPU with an R580+ driver."
+    say "Note: nvidia-smi not found. warp34 requires an NVIDIA RTX 30- or 40-series GPU with an R580+ driver."
     return
   fi
   drv="$(nvidia-smi --query-gpu=driver_version --format=csv,noheader 2>/dev/null | head -n 1 | tr -d '[:space:]')"
