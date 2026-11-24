@@ -22,7 +22,7 @@ use serde_json::{Value, json};
 use std::{
     sync::{
         Arc, OnceLock,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         mpsc,
     },
     thread::JoinHandle,
@@ -224,6 +224,7 @@ pub struct QwenImage21ServerState {
     pub allow_remote_images: bool,
     pub use_cuda_graph: bool,
     admission: Arc<Semaphore>,
+    next_request_id: AtomicU64,
 }
 
 impl QwenImage21ServerState {
@@ -247,6 +248,7 @@ impl QwenImage21ServerState {
             allow_remote_images,
             use_cuda_graph,
             admission: Arc::new(Semaphore::new(options.max_num_seqs.max(1))),
+            next_request_id: AtomicU64::new(0),
         }))
     }
 }
@@ -1108,6 +1110,23 @@ async fn handle_image_request(
     let steps = parsed
         .num_inference_steps
         .unwrap_or(state.worker.default_steps);
+    let request_id = state.next_request_id.fetch_add(1, Ordering::Relaxed) + 1;
+    let mut turn_log = super::request_log::ImageTurnLog::new(
+        crate::responses_api::generate_unguessable_prefixed_id("img-", request_id),
+        if require_images {
+            "images_edits"
+        } else {
+            "images_generations"
+        },
+        state.model_name.clone(),
+        parsed.n,
+        parsed.condition_images.len(),
+        parsed.width,
+        parsed.height,
+        steps,
+        parsed.guidance_scale,
+        parsed.rgba_output,
+    );
 
     let effective_prompt = if parsed.rgba_output && parsed.condition_images.is_empty() {
         crate::qwen_image::ensure_rgba_transparency_prompt(&parsed.prompt)
@@ -1137,11 +1156,14 @@ async fn handle_image_request(
             rgba_output: parsed.rgba_output,
             use_cuda_graph: state.use_cuda_graph,
         };
-        let res = state
-            .worker
-            .generate(gen_req)
-            .await
-            .map_err(super::http::worker_api_err)?;
+        let res = match state.worker.generate(gen_req).await {
+            Ok(res) => res,
+            Err(err) => {
+                turn_log.finish("error");
+                return Err(super::http::worker_api_err(err));
+            }
+        };
+        turn_log.image_completed(res.width, res.height);
         let b64 = encode_base64(&res.png_bytes);
         data.push(json!({
             "b64_json": b64,
@@ -1162,6 +1184,7 @@ async fn handle_image_request(
         }));
     }
 
+    turn_log.finish("ok");
     let created = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -1242,14 +1265,19 @@ async fn count_image_responses(
     request: Request,
     next: axum::middleware::Next,
 ) -> Response {
-    let count = *request.method() == axum::http::Method::POST
+    let endpoint = (*request.method() == axum::http::Method::POST
         && matches!(
             request.uri().path(),
             "/v1/images/generations" | "/images/generations" | "/v1/images/edits" | "/images/edits"
-        );
+        ))
+    .then(|| request.uri().path().to_owned());
     let response = next.run(request).await;
-    if count {
-        s.metrics.http_response(response.status().as_u16());
+    if let Some(endpoint) = endpoint {
+        let status = response.status();
+        s.metrics.http_response(status.as_u16());
+        if status.is_client_error() || status.is_server_error() {
+            super::request_log::http_error(&endpoint, status.as_u16());
+        }
     }
     response
 }
