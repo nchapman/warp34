@@ -1,0 +1,189 @@
+name: release
+
+# Builds a portable Linux x86_64 binary bundle (Ubuntu 22.04 / glibc 2.35 +
+# bundled CUDA 13.4 runtime libraries resolved via $ORIGIN/lib RPATH) and
+# publishes it with SHA256SUMS to GitHub Releases on `v*` tags.
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Version label for dry-run artifact (e.g. v0.1.0-test)'
+        required: false
+        default: ''
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/v') }}
+
+env:
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  release-linux-x86_64:
+    runs-on: sprinters:aws:ubuntu-24.04-minimal:m7a.4xlarge:temp=gp3/48/max/max:spot=rerun
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+
+      - id: meta
+        name: Resolve release version
+        shell: bash
+        run: |
+          if [[ "${{ github.ref }}" == refs/tags/v* ]]; then
+            TAG="${GITHUB_REF_NAME}"
+            PUBLISH=true
+          else
+            TAG="${{ inputs.tag }}"
+            if [ -z "$TAG" ]; then
+              TAG="dev-${GITHUB_SHA:0:7}"
+            fi
+            PUBLISH=false
+          fi
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "publish=${PUBLISH}" >> "$GITHUB_OUTPUT"
+          echo "bundle=warp34-${TAG}-linux-x86_64" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24.21.0
+
+      - uses: actions/cache@v6
+        with:
+          path: ~/.pnpm-store
+          key: pnpm-${{ runner.os }}-${{ hashFiles('dashboard/pnpm-lock.yaml') }}
+          restore-keys: |
+            pnpm-${{ runner.os }}-
+
+      - name: Build embedded dashboard
+        run: |
+          corepack enable
+          corepack prepare pnpm@12.10.1 --activate
+          pnpm --dir dashboard config set store-dir ~/.pnpm-store
+          pnpm --dir dashboard install --frozen-lockfile
+          pnpm --dir dashboard build
+
+      - uses: actions/cache@v6
+        with:
+          path: |
+            .cargo-cache/registry/index
+            .cargo-cache/registry/cache
+            .cargo-cache/git/db
+          key: release-cargo-linux-x86_64-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            release-cargo-linux-x86_64-
+
+      - name: Build portable CUDA binary (Ubuntu 22.04 / glibc 2.35)
+        run: |
+          mkdir -p .cargo-cache dist-release
+          docker run --rm \
+            -v "${PWD}:/src" \
+            -v "${PWD}/.cargo-cache:/cargo" \
+            -w /src \
+            -e CARGO_HOME=/cargo \
+            -e CUDA_HOME=/usr/local/cuda \
+            -e LIBRARY_PATH=/usr/local/cuda/lib64/stubs \
+            -e WARP34_ARCH=sm_80,sm_86,sm_89 \
+            -e WARP34_NVCC_JOBS=16 \
+            -e WARP34_NVCC_EXTRA=--compress-mode=size \
+            -e CARGO_INCREMENTAL=0 \
+            -e RUSTFLAGS="-C link-arg=-Wl,-rpath,\$ORIGIN/lib" \
+            nvidia/cuda:13.4.1-devel-ubuntu22.04 \
+            bash -euo pipefail -c '
+              apt-get update
+              apt-get install -y --no-install-recommends build-essential cmake nasm curl ca-certificates
+              curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain 1.99.0
+              export PATH="/usr/local/cuda/bin:/root/.cargo/bin:$PATH"
+              cargo build --locked --release --features cuda --bin warp34
+
+              BUNDLE_DIR="/src/dist-release/${{ steps.meta.outputs.bundle }}"
+              rm -rf "$BUNDLE_DIR"
+              mkdir -p "$BUNDLE_DIR/lib"
+              cp target/release/warp34 "$BUNDLE_DIR/warp34"
+              cp -L \
+                /usr/local/cuda/targets/x86_64-linux/lib/libcudart.so.13 \
+                /usr/local/cuda/targets/x86_64-linux/lib/libcublas.so.13 \
+                /usr/local/cuda/targets/x86_64-linux/lib/libcublasLt.so.13 \
+                "$BUNDLE_DIR/lib/"
+              cp LICENSE NOTICE "$BUNDLE_DIR/"
+              chmod 0755 "$BUNDLE_DIR/warp34"
+              chmod 0644 "$BUNDLE_DIR/lib/"*.so.13 "$BUNDLE_DIR/LICENSE" "$BUNDLE_DIR/NOTICE"
+            '
+
+      - name: Verify RPATH, glibc ceiling, and clean Ubuntu 22.04 runtime
+        run: |
+          BUNDLE_DIR="${PWD}/dist-release/${{ steps.meta.outputs.bundle }}"
+          docker run --rm \
+            -v "${BUNDLE_DIR}:/bundle:ro" \
+            ubuntu:22.04 \
+            bash -euo pipefail -c '
+              apt-get update >/dev/null
+              apt-get install -y --no-install-recommends binutils libstdc++6 >/dev/null
+
+              echo "=== RPATH / RUNPATH ==="
+              readelf -d /bundle/warp34 | grep -E "RPATH|RUNPATH" | tee /tmp/rpath.txt
+              grep -q "\$ORIGIN/lib" /tmp/rpath.txt
+
+              echo "=== Max GLIBC symbol version ==="
+              MAX_GLIBC=$(objdump -T /bundle/warp34 | grep -oE "GLIBC_[0-9]+\.[0-9]+" | sort -V | tail -n 1 || true)
+              echo "Max GLIBC: ${MAX_GLIBC}"
+              if [ -n "$MAX_GLIBC" ]; then
+                TOP=$(printf "%s\nGLIBC_2.35\n" "$MAX_GLIBC" | sort -V | tail -n 1)
+                if [ "$TOP" != "GLIBC_2.35" ]; then
+                  echo "ERROR: binary requires $MAX_GLIBC (> GLIBC_2.35)" >&2
+                  exit 1
+                fi
+              fi
+
+              echo "=== ldd (no host CUDA installed) ==="
+              ldd /bundle/warp34 | tee /tmp/ldd.txt
+              if grep -q "not found" /tmp/ldd.txt; then
+                echo "ERROR: unresolved shared library" >&2
+                exit 1
+              fi
+              grep -q "/bundle/lib/libcudart.so.13" /tmp/ldd.txt
+              grep -q "/bundle/lib/libcublas.so.13" /tmp/ldd.txt
+              grep -q "/bundle/lib/libcublasLt.so.13" /tmp/ldd.txt
+
+              echo "=== smoke test: warp34 --help ==="
+              /bundle/warp34 --help | head -n 5
+            '
+
+      - name: Package tarball and SHA256SUMS
+        run: |
+          cd dist-release
+          ARCHIVE="${{ steps.meta.outputs.bundle }}.tar.gz"
+          tar -czf "$ARCHIVE" "${{ steps.meta.outputs.bundle }}"
+          sha256sum "$ARCHIVE" > SHA256SUMS
+          ls -lh "$ARCHIVE" SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Upload dry-run artifact
+        if: steps.meta.outputs.publish != 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.meta.outputs.bundle }}
+          path: |
+            dist-release/${{ steps.meta.outputs.bundle }}.tar.gz
+            dist-release/SHA256SUMS
+          retention-days: 7
+
+      - name: Publish GitHub Release
+        if: steps.meta.outputs.publish == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${{ steps.meta.outputs.tag }}"
+          ARCHIVE="dist-release/${{ steps.meta.outputs.bundle }}.tar.gz"
+          SUMS="dist-release/SHA256SUMS"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" "$ARCHIVE" "$SUMS" --clobber
+          else
+            gh release create "$TAG" "$ARCHIVE" "$SUMS" \
+              --verify-tag \
+              --title "warp34 ${TAG}" \
+              --generate-notes
+          fi
