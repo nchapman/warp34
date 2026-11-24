@@ -28,8 +28,8 @@ describe("dashboard states", () => {
     expect(
       screen
         .getByRole("link", { name: "warp34 home" })
-        .querySelectorAll("path"),
-    ).toHaveLength(3);
+        .querySelector("img.brand-logo"),
+    ).toHaveAttribute("alt", "warp34");
     expect(screen.getByText("test/model")).toBeVisible();
     expect(
       screen.getByRole("img", {
@@ -81,7 +81,7 @@ describe("dashboard states", () => {
       />,
     );
     expect(screen.getByText('<img src=x onerror="alert(1)">')).toBeVisible();
-    expect(document.querySelector("img")).toBeNull();
+    expect(document.querySelectorAll("img:not(.brand-logo)")).toHaveLength(0);
   });
   it("provides a read-only connection guide and security warning", async () => {
     const user = userEvent.setup();

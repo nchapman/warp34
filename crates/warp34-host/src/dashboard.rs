@@ -18,12 +18,17 @@ pub fn router<S: Clone + Send + Sync + 'static>() -> Router<S> {
         .route("/playground", get(index))
         .route("/playground/{*path}", get(index))
         .route("/connect", get(index))
+        .route("/favicon.png", get(favicon_png))
         .route("/favicon.svg", get(favicon))
         .route("/assets/{*path}", get(asset))
 }
 
 async fn index() -> Response {
     embedded_file("index.html", false)
+}
+
+async fn favicon_png() -> Response {
+    embedded_file("favicon.png", false)
 }
 
 async fn favicon() -> Response {
@@ -47,6 +52,8 @@ fn embedded_file(path: &str, immutable: bool) -> Response {
         Some("js") => "text/javascript; charset=utf-8",
         Some("css") => "text/css; charset=utf-8",
         Some("svg") => "image/svg+xml",
+        Some("png") => "image/png",
+        Some("webp") => "image/webp",
         Some("woff2") => "font/woff2",
         _ => return StatusCode::NOT_FOUND.into_response(),
     };
@@ -154,6 +161,15 @@ mod tests {
                 StatusCode::NOT_FOUND
             );
         }
+        assert_eq!(
+            client
+                .get(format!("{base}/favicon.png"))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
         assert_eq!(
             client
                 .get(format!("{base}/favicon.svg"))

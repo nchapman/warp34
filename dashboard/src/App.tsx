@@ -45,6 +45,7 @@ import {
   type Snapshot,
 } from "./metrics";
 import { useMetrics, type MetricsState } from "./useMetrics";
+import warp34Logo from "./assets/warp34-logo.png";
 
 const number = (value: number | null | undefined) =>
   value === undefined || value === null
@@ -161,7 +162,7 @@ function Status({ state }: { state: MetricsState }) {
       variant="outline"
       className={
         style === "healthy"
-          ? "text-cyan-300"
+          ? "text-[var(--aqua)]"
           : style === "danger"
             ? "text-red-400"
             : "text-muted-foreground"
@@ -976,14 +977,13 @@ function DashboardShell({ state }: { state: MetricsState }) {
       </a>
       <header className="topbar">
         <Link className="brand" to="/" aria-label="warp34 home">
-          <svg viewBox="0 0 32 32" aria-hidden="true">
-            <path className="warp-bar-1" d="M4.5 23 9.5 9h4l-5 14z" />
-            <path className="warp-bar-2" d="M11.5 23 16.5 9h4l-5 14z" />
-            <path className="warp-bar-3" d="M18.5 23 23.5 9h4l-5 14z" />
-          </svg>
-          <span>
-            warp<span className="brand-suffix">34</span>
-          </span>
+          <img
+            src={warp34Logo}
+            alt="warp34"
+            className="brand-logo"
+            width={110}
+            height={48}
+          />
         </Link>
         <div className="topbar-right">
           <span className="uptime">

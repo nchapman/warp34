@@ -975,7 +975,7 @@ export function Playground({
                                     msg.tool_calls.length > 0 && (
                                       <Badge
                                         variant="secondary"
-                                        className="text-violet-400"
+                                        className="text-[var(--accent-bright)]"
                                       >
                                         {msg.tool_calls.length} tool_call
                                         {msg.tool_calls.length > 1 ? "s" : ""}
@@ -1205,7 +1205,10 @@ export function Playground({
                   <div className="pg-title-group">
                     <h2 id="resp-pane-title">Wire Response</h2>
                     {inFlight && (
-                      <Badge variant="secondary" className="text-violet-400">
+                      <Badge
+                        variant="secondary"
+                        className="text-[var(--accent-bright)]"
+                      >
                         Streaming…
                       </Badge>
                     )}
@@ -1218,7 +1221,7 @@ export function Playground({
                         }
                         className={
                           callMetrics.status >= 200 && callMetrics.status < 300
-                            ? "text-teal-400"
+                            ? "text-[var(--aqua)]"
                             : undefined
                         }
                       >
@@ -1453,7 +1456,7 @@ function MethodBadge({ method }: { method: string }) {
   return (
     <Badge
       variant="outline"
-      className={`font-mono text-[10px] ${method === "GET" ? "text-teal-400" : "text-violet-400"}`}
+      className={`font-mono text-[10px] ${method === "GET" ? "text-[var(--aqua)]" : "text-[var(--accent-bright)]"}`}
     >
       {method}
     </Badge>
