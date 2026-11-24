@@ -1,6 +1,6 @@
 # warp34
 
-The [fastest](#performance) single-binary inference engine for **Qwen 3.5, 3.6, 3.8, and Flash-Next** on NVIDIA GPUs—outperforming `vLLM`, `SGLang`, and `llama.cpp` across prefill, decode, continuous batching, and long-context coding agents.
+One of the [fastest](#performance) single-binary inference engines for **Qwen 3.5, 3.6, 3.8, and Flash-Next** on NVIDIA GPUs—outperforming `vLLM`, `SGLang`, and `llama.cpp` across prefill, decode, continuous batching, and long-context coding agents.
 
 [![Docker](https://github.com/nchapman/warp34/actions/workflows/docker.yml/badge.svg)](https://github.com/nchapman/warp34/actions/workflows/docker.yml)
 [![License: Apache-2.0](https://img.shields.io/badge/License-Apache--2.0-blue.svg)](LICENSE)
@@ -68,7 +68,7 @@ Open **`http://127.0.0.1:8000/`** in your browser for live telemetry, **`/playgr
 
 ## What Makes `warp34` Great
 
-- **Fastest Qwen hybrid inference on consumer GPUs** — Beats `vLLM`, `SGLang`, and `llama.cpp` via purpose-built CUDA kernels, shared-weight `W4A8` prefill on RTX 30/40-series (zero extra weight VRAM), and lossless `MTP-3` / `DFlash2` speculation that composes cleanly with prefix caching and multi-GPU.
+- **Fastest Qwen hybrid inference on consumer GPUs** — Beats `vLLM`, `SGLang`, and `llama.cpp` via purpose-built CUDA kernels, shared-weight `W4A8`/`W2A8` prefill on RTX 30/40-series (zero extra weight VRAM), and lossless `MTP-3` / `DFlash2` speculation that composes cleanly with prefix caching and multi-GPU.
 - **Fit Vision, `MTP-3`, `128K` context, and LoRA on one card** — Pair our [optimized `HGPTQ` & `W2.6-RCO` checkpoints](https://huggingface.co/nchapman/models) with built-in 4-bit TurboQuant KV (`tq4`, 3.07× compression) so you never have to trade off context length, vision, or model size.
 - **Zero-config VRAM tuning** — Just run `warp34 serve <model>`. The planner automatically maximizes context (up to `256K` / `262,144` tokens), selects the right KV format, and balances hot experts against context on tiered MoE models while preserving safe headroom.
 - **Run 180B `Qwen3.8-Flash-Next` on 1–2 consumer GPUs** — Streams n-gram tables from disk via `mmap` (`51 GB` FP8 / `~14 GB` `lut4-gptq`), caches hot experts in VRAM, prefetches cold experts over PCIe, and evaluates misses on a 0-ULP AVX-512/AVX2 CPU bridge—reaching **`66 tok/s`** on `1× 24 GB` and **`107 tok/s`** on `2× 24 GB` (`W2.6-RCO` + `MTP-3`).
@@ -83,7 +83,7 @@ Our [Hugging Face collection (`nchapman/models`)](https://huggingface.co/nchapma
 
 | GPU VRAM | Recommended Checkpoint (`nchapman/...`) | Footprint @ `128K tq4` | Why pick it |
 |---|---|---:|---|
-| **8 GB** *(RTX 4060)* | `Qwen3.5-9B-W2.6A16-HGPTQ-RCO` *(2.60 bpw)* | `6.0 GiB` | Full **Vision + `MTP-3` + `128K`** on 8 GB (`151.5 tok/s` w/ MTP, ~935 MiB free) |
+| **8 GB** *(RTX 3060 Ti / 4060)* | `Qwen3.5-9B-W2.6A16-HGPTQ-RCO` *(2.60 bpw)* | `6.0 GiB` | Full **Vision + `MTP-3` + `128K`** on 8 GB (`151.5 tok/s` w/ MTP, ~935 MiB free) |
 | **12 GB** *(RTX 3060 / 4070)* | `Qwen3.5-9B-W4A16-HGPTQ` *(4.00 bpw)* | `8.6 GiB` | Best quality on 12 GB (`140.5 tok/s` w/ MTP); alt: `Qwen3.8-27B-W2.2A16-HGPTQ-RCO` (`10.6 GiB` @ `64K tq4_all`) |
 | **16 GB** *(RTX 4060 Ti / 4080)* | `Qwen3.6-35B-A3B-W2.6A16-HGPTQ-RCO` *(2.62 bpw)* | `14.6 GiB` | Fast MoE pick (`190.8 tok/s` w/ MTP); dense alt: `Qwen3.8-27B-W2.6A16-HGPTQ-RCO` (`14.6 GiB`, `48.5 tok/s` w/ MTP) |
 | **1× 24 GB** *(RTX 3090 / 4090)* | `Qwen3.8-27B-W4A16-HGPTQ` or `Qwen3.6-35B-A3B-W4A16-HGPTQ` | `~19–21 GiB` | Full `W4` quality + Vision + `MTP-3`/`DFlash2` (`128K–256K`); or `Qwen3.8-Flash-Next-W2.6A16-HGPTQ-RCO` (`19.0 GiB`, `66 tok/s` w/ `MTP-3`) |
