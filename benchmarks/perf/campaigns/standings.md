@@ -98,13 +98,25 @@ The separate two-TP1-replica evidence remains historical, not a fresh DP2 result
 | Deployment | Retrieval checks | ~60K cold read | 120K/252K strict agent replay |
 |---|---|---|---|
 | Native TP1 target | 6/6 through ~252K | 0.240 output tok/s | Complete; 60/60 total workload requests |
-| Native TP2, 16384 pages (post-fix) | 6/6 through ~252K | 0.410 output tok/s | Startup admission & 252K retrieval qualified (`72` hot experts/layer) |
+| Native TP2, 16384 pages (`W4A16-HGPTQ + MTP-3 [auto]`) | 6/6 through ~252K | **1.690 output tok/s** (`37.8s`, `78.3 tok/s` dec) | Startup admission & 252K retrieval qualified |
 | Two-GPU specialized vLLM, MTP3 | 6/6 through ~252K | 1.466 output tok/s | Six trials fail on live tool calls |
 
-The reference's cold-read rate is about **3.6×** native TP2 target (`1.466` vs `0.410 output tok/s`) and **6.1×** native TP1, and uses two GPUs
-and MTP. These output rates include processing 57,611 prompt tokens to generate
-at most 64 output tokens; they are **not steady-state decode rates**. Native
-TP1's complete agent workload reached **251,982 prompt tokens**.
+With the post-campaign QSA + AVX-512 hybrid MoE prefill optimizations, native
+TP2 (`16384` pages = `262K` TQ4 KV, default `MTP-3 [auto]`) now leads the
+two-GPU specialized vLLM reference on `cold-read-60k` (**`1.690` vs `1.466 output
+tok/s`**, `+15.3%`, processing `57,611` prompt tokens in `37.0s` TTFT and
+decoding at `78.3 tok/s`). These output rates include processing 57,611 prompt
+tokens to generate at most 64 output tokens; they are **not steady-state decode
+rates**. Native TP1's complete agent workload reached **251,982 prompt tokens**.
+
+## Flash Next multi-client Open-SWE-Traces (`2× RTX 3090 Ti`, `TP=2`, `65K` TQ4 KV)
+
+Replaying intact 7–15 turn trajectories from `nvidia/Open-SWE-Traces` (`519 → 12,354` prompt tokens, `flash-next-swe-multiclient.toml`, `--max-num-seqs 4`, `--max-model-len 16384`):
+
+| Deployment (`W4A16-HGPTQ`, `TP=2`) | `smoke-warmup` (4/4) | `swe-c4-shared` (73/73) | `swe-c4-unique` (73/73) | `swe-c8-burst` (92/92) |
+|---|---:|---:|---:|---:|
+| **`warp34` + `DFlash2`** | **74.0 tok/s** | **94.2 tok/s** | **89.6 tok/s** | **88.2 tok/s** |
+| `warp34` + `MTP-3` | 73.5 tok/s | 69.2 tok/s | — | — |
 
 ## Resolved post-campaign gaps (commits `3ebda3f`, `25b2ebf`, and follow-up)
 
