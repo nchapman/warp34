@@ -96,7 +96,7 @@ jobs:
               apt-get update
               apt-get install -y --no-install-recommends build-essential cmake nasm curl ca-certificates
               curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain 1.99.0
-              export PATH="/usr/local/cuda/bin:/root/.cargo/bin:$PATH"
+              export PATH="/usr/local/cuda/bin:/cargo/bin:$PATH"
               cargo build --locked --release --features cuda --bin warp34
 
               BUNDLE_DIR="/src/dist-release/${{ steps.meta.outputs.bundle }}"
