@@ -16,6 +16,9 @@ pub fn router<S: Clone + Send + Sync + 'static>() -> Router<S> {
     Router::new()
         .route("/", get(index))
         .route("/playground", get(index))
+        .route("/playground/favicon.png", get(favicon_png))
+        .route("/playground/favicon.svg", get(favicon))
+        .route("/playground/assets/{*path}", get(asset))
         .route("/playground/{*path}", get(index))
         .route("/connect", get(index))
         .route("/favicon.png", get(favicon_png))
@@ -131,18 +134,27 @@ mod tests {
         );
         let html = response.text().await.unwrap();
         assert!(html.contains("warp34"));
-        // Vite's real output is the contract: follow every generated asset reference.
+        // Vite's real output is the contract: follow every generated relative
+        // asset reference (both at `/` and under `/playground/` for deep-link
+        // reloads and subpath reverse proxies such as llama-swap).
         let mut assets = 0;
-        for url in html.split('"').filter(|part| part.starts_with("/assets/")) {
-            let response = client.get(format!("{base}{url}")).send().await.unwrap();
-            assert_eq!(response.status(), StatusCode::OK, "{url}");
-            assert!(
-                response.headers()[header::CACHE_CONTROL]
-                    .to_str()
-                    .unwrap()
-                    .contains("immutable")
-            );
-            assert!(!response.bytes().await.unwrap().is_empty());
+        for url in html.split('"').filter(|part| part.starts_with("./assets/")) {
+            let trimmed = url.trim_start_matches('.');
+            for prefix in ["", "/playground"] {
+                let response = client
+                    .get(format!("{base}{prefix}{trimmed}"))
+                    .send()
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), StatusCode::OK, "{prefix}{trimmed}");
+                assert!(
+                    response.headers()[header::CACHE_CONTROL]
+                        .to_str()
+                        .unwrap()
+                        .contains("immutable")
+                );
+                assert!(!response.bytes().await.unwrap().is_empty());
+            }
             assets += 1;
         }
         assert!(assets >= 2, "must embed the production JS and CSS");

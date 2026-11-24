@@ -29,6 +29,7 @@ import {
   Routes,
   useLocation,
 } from "react-router";
+import { apiUrl, baseOriginUrl, detectBasePath } from "./basePath";
 import { Chart, type Point } from "./LazyChart";
 import { Playground } from "./Playground";
 import {
@@ -578,7 +579,7 @@ function Overview({ state }: { state: MetricsState }) {
           <b>{number(latest?.http_responses.server_error)}</b> server errors{" "}
           <span className="muted">· since startup</span>
         </span>
-        <a href="/metrics" target="_blank" rel="noreferrer">
+        <a href={apiUrl("/metrics")} target="_blank" rel="noreferrer">
           Prometheus metrics <span aria-hidden="true">↗</span>
         </a>
       </div>
@@ -686,7 +687,8 @@ function ConnectionGuide({
   kvPages: number | null;
   maxModelLen: number | null;
 }) {
-  const base = window.location.origin;
+  const basePath = detectBasePath();
+  const base = baseOriginUrl(window.location.origin, basePath);
   const activeModel = sanitizeModelForSnippet(model);
   const ctxTokens =
     maxModelLen && maxModelLen > 0
@@ -898,11 +900,12 @@ function ConnectionGuide({
           </CardHeader>
           <CardContent className="space-y-4 text-sm leading-relaxed text-muted-foreground [&_pre]:overflow-x-auto [&_a]:underline [&_a]:underline-offset-4">
             <p>
-              Scrape <a href="/metrics">/metrics</a> with Prometheus, or consume
-              the same counters and histogram buckets as JSON at{" "}
-              <a href="/api/metrics">/api/metrics</a>. This dashboard keeps up
-              to five minutes of history in this tab; use an external collector
-              for persistence.
+              Scrape <a href={apiUrl("/metrics", basePath)}>/metrics</a> with
+              Prometheus, or consume the same counters and histogram buckets as
+              JSON at{" "}
+              <a href={apiUrl("/api/metrics", basePath)}>/api/metrics</a>. This
+              dashboard keeps up to five minutes of history in this tab; use an
+              external collector for persistence.
             </p>
             <p id="prometheus-caption" className="text-xs">
               Prometheus scrape config
@@ -911,7 +914,7 @@ function ConnectionGuide({
               tabIndex={0}
               aria-labelledby="prometheus-caption"
               className="rounded-md border bg-background p-4 text-xs leading-relaxed text-foreground"
-            >{`scrape_configs:\n  - job_name: warp34\n    scrape_interval: 10s\n    static_configs:\n      - targets: ['${window.location.host}']`}</pre>
+            >{`scrape_configs:\n  - job_name: warp34\n    scrape_interval: 10s${basePath ? `\n    metrics_path: ${basePath}/metrics` : ""}\n    static_configs:\n      - targets: ['${window.location.host}']`}</pre>
           </CardContent>
         </Card>
         <Card
@@ -1086,8 +1089,9 @@ export function Dashboard({
       </MemoryRouter>
     );
   }
+  const basename = detectBasePath();
   return (
-    <BrowserRouter>
+    <BrowserRouter basename={basename || undefined}>
       <DashboardShell state={state} />
     </BrowserRouter>
   );

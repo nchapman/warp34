@@ -1,3 +1,4 @@
+import { apiUrl, baseOriginUrl } from "./basePath";
 import { Card, CardHeader, CardContent } from "./components/ui/card";
 import { Alert, AlertDescription } from "./components/ui/alert";
 import { Badge } from "./components/ui/badge";
@@ -492,7 +493,7 @@ export function Playground({
 
     try {
       resetIdleTimer(initialTimeoutMs);
-      const response = await fetch(endpoint.path, {
+      const response = await fetch(apiUrl(endpoint.path), {
         method: endpoint.method,
         headers,
         body: endpoint.method === "GET" ? undefined : payloadText,
@@ -631,7 +632,7 @@ export function Playground({
   }
 
   const curlCommand = formatCurlCommand(
-    window.location.origin,
+    baseOriginUrl(),
     endpoint,
     rawJson,
     apiKey,

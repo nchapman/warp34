@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+import { apiUrl } from "./basePath";
 import { appendSnapshot, parseSnapshot, type Snapshot } from "./metrics";
 
 export interface MetricsState {
@@ -24,7 +25,7 @@ export function useMetrics(): MetricsState {
       request = controller;
       const timeout = setTimeout(() => controller.abort(), 5000);
       try {
-        const response = await fetch("/api/metrics", {
+        const response = await fetch(apiUrl("/api/metrics"), {
           signal: controller.signal,
           cache: "no-store",
           credentials: "same-origin",
