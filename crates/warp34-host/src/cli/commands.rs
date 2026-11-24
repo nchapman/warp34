@@ -38,6 +38,9 @@ pub(crate) fn prepare_multimodal_prompt_and_images(
 
 #[cfg(feature = "cuda")]
 pub fn run_cuda_cli(args: &[String]) -> Result<ExitCode, String> {
+    if args.first().map(String::as_str) == Some("update") {
+        return run_update(&args[1..]);
+    }
     let Some(PreparedCudaCli {
         options,
         policy,

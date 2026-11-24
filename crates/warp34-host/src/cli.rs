@@ -19,6 +19,7 @@ mod commands;
 mod options;
 #[cfg(feature = "cuda")]
 mod oracle;
+mod update;
 
 #[cfg(feature = "cuda")]
 pub use commands::run_cuda_cli;
@@ -29,6 +30,7 @@ pub use options::print_usage;
 pub(crate) use options::*;
 #[cfg(feature = "cuda")]
 pub(crate) use oracle::*;
+pub use update::run_update;
 
 #[cfg(all(test, feature = "cuda"))]
 mod tests;

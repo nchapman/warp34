@@ -77,6 +77,7 @@ Subcommands:
   chat         [model] Interactive multi-turn chat REPL or single-turn chat (--prompt)
   generate     [model] Single-prompt text/multimodal generation
   bench        [model] Throughput & latency benchmark (--stage decode|radix|scheduler|vision|all)
+  update               Update a release-bundle installation to the latest GitHub Release (--check)
   greedy-diff  [model] Token-level parity check against oracle golden JSON (--golden <dir|json>)
   dump-diff    [model] Layer-by-layer tensor parity check (--compare-tp2 | --golden <safetensors>)
   profile-diff         Nsight Systems SQLite kernel category comparison vs vLLM/SGLang

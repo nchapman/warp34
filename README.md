@@ -19,7 +19,18 @@ Written in Rust and CUDA with zero Python and zero NCCL. Built specifically for 
 
 **Requirements:** Linux `x86_64` (AVX2/FMA), an NVIDIA RTX 30/40-series or A100 GPU, and a CUDA 13-capable driver (R580+).
 
-### Docker (fastest)
+### Install binary (Linux)
+
+Downloads a self-contained release bundle (no CUDA toolkit or Docker required):
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/nchapman/warp34/main/install.sh | sh
+warp34 serve nchapman/Qwen3.8-27B-W4A16-HGPTQ
+```
+
+Upgrade anytime with `warp34 update` (or `warp34 update --check`).
+
+### Docker
 
 Requires [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html):
 
