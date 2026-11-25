@@ -485,6 +485,11 @@ impl Qwen3_5Engine {
         if pool.contains_and_touch(lora_id, prefix_tokens) {
             return;
         }
+        // Throttle redundant synchronous D2H publishes on every short turn of a long pinned
+        // agent trajectory: once a checkpoint > 4K is in the pool, only refresh every ~4K tokens.
+        if num_tokens > 4096 && pool.has_recent_prefix_within(lora_id, prefix_tokens, 4096) {
+            return;
+        }
         // Guard against allocating oversized host buffers that `pool.insert` would immediately
         // reject (> max_bytes / 2).
         let est_kv_bytes: usize = self

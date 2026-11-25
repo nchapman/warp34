@@ -404,6 +404,27 @@ fn admit_into_mtp_batch_slots(
                 proposer.import_shared_memo_features(&entry.token_ids, feats);
             }
         }
+        // Do not force speculative admission if the proposer lacks a memo for a deep warm
+        // radix hit (>= 2K tokens): throwing away thousands of cached KV+GDN tokens to run
+        // MTP causes multi-second re-prefill cliffs. Defer to plain admission instead.
+        if w.radix_key_tokens.len() > 1 {
+            let prev_lora = sched.radix.active_lora_id;
+            sched.radix.active_lora_id = w.lora_id;
+            let radix_matched = sched
+                .radix
+                .peek_matched_tokens(&w.radix_key_tokens[..w.radix_key_tokens.len() - 1]);
+            sched.radix.active_lora_id = prev_lora;
+            if radix_matched >= 2048
+                && !proposer.can_restore_batch_slot(
+                    slot_idx,
+                    &w.radix_key_tokens[..radix_matched],
+                    w.prompt_tokens.len(),
+                )
+            {
+                requests.get_mut(&id).unwrap().reserved_pages = prev_reserved;
+                break;
+            }
+        }
         let before = sched.active.len();
         sched.cfg.max_num_seqs = before + 1;
         sched.admit_waiting_with_filter(
@@ -890,29 +911,47 @@ fn admit_requests(
                         proposer.import_shared_memo_features(&entry.token_ids, feats);
                     }
                 }
-                let saved_max = sched.cfg.max_num_seqs;
-                sched.cfg.max_num_seqs = 1;
-                sched.admit_waiting_with_filter(
-                    |r| engine.alloc_three_state_slots_from(r),
-                    |_, prompt, matched| {
-                        proposer.can_restore_prefix(&prompt[..matched], prompt.len())
-                    },
-                );
-                sched.cfg.max_num_seqs = saved_max;
-                record_admissions(sched, requests);
-                if let Some(seq) = sched.active.first_mut() {
-                    match proposer
-                        .restore_prefix(engine, &seq.radix_key_tokens[..seq.cached_prefix_tokens])
-                    {
-                        Ok(()) => {
-                            *speculative_id = Some(id);
-                            seq.custom_prefill = true;
-                        }
-                        Err(e) => {
-                            let r = requests.remove(&id).unwrap();
-                            notify_request_error(r, WorkerError::Cuda(e));
-                            release(engine, sched.cancel_request(id));
-                            proposer.abort_scheduled();
+                let prev_lora = sched.radix.active_lora_id;
+                sched.radix.active_lora_id = p.lora_id;
+                let radix_matched = if p.radix_key_tokens.len() > 1 {
+                    sched
+                        .radix
+                        .peek_matched_tokens(&p.radix_key_tokens[..p.radix_key_tokens.len() - 1])
+                } else {
+                    0
+                };
+                sched.radix.active_lora_id = prev_lora;
+                let skip_spec_for_warm_radix = radix_matched >= 2048
+                    && !proposer.can_restore_prefix(
+                        &p.radix_key_tokens[..radix_matched],
+                        p.prompt_tokens.len(),
+                    );
+                if !skip_spec_for_warm_radix {
+                    let saved_max = sched.cfg.max_num_seqs;
+                    sched.cfg.max_num_seqs = 1;
+                    sched.admit_waiting_with_filter(
+                        |r| engine.alloc_three_state_slots_from(r),
+                        |_, prompt, matched| {
+                            proposer.can_restore_prefix(&prompt[..matched], prompt.len())
+                        },
+                    );
+                    sched.cfg.max_num_seqs = saved_max;
+                    record_admissions(sched, requests);
+                    if let Some(seq) = sched.active.first_mut() {
+                        match proposer.restore_prefix(
+                            engine,
+                            &seq.radix_key_tokens[..seq.cached_prefix_tokens],
+                        ) {
+                            Ok(()) => {
+                                *speculative_id = Some(id);
+                                seq.custom_prefill = true;
+                            }
+                            Err(e) => {
+                                let r = requests.remove(&id).unwrap();
+                                notify_request_error(r, WorkerError::Cuda(e));
+                                release(engine, sched.cancel_request(id));
+                                proposer.abort_scheduled();
+                            }
                         }
                     }
                 }

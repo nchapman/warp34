@@ -13,6 +13,10 @@ use std::sync::{Arc, Mutex};
 /// Minimum prefix length (in tokens) eligible for cross-replica L2 publishing and hydration.
 pub const DP_L2_MIN_PREFIX_TOKENS: usize = 256;
 
+/// Shared harness threshold: prefixes up to this length are never superseded by longer
+/// single-agent continuations so newly arriving agents always hit the shared system prompt.
+const SHARED_HARNESS_KEEP_TOKENS: usize = 4096;
+
 /// Default hard cap on host RAM consumed by [`SharedDpPrefixPool`] (`16 GiB`).
 const DEFAULT_MAX_POOL_BYTES: usize = 16 * 1024 * 1024 * 1024;
 
@@ -209,6 +213,44 @@ impl SharedDpPrefixPool {
         found
     }
 
+    /// Returns `true` if the pool already holds a prefix of `tokens` (under `lora_id`) whose
+    /// length is within `max_delta` tokens of `tokens.len()`. Used to throttle redundant
+    /// synchronous D2H publishes on every short turn of a pinned multi-turn agent.
+    pub fn has_recent_prefix_within(&self, lora_id: i32, tokens: &[i32], max_delta: usize) -> bool {
+        if self.max_bytes == 0 || tokens.len() <= max_delta || self.is_empty() {
+            return false;
+        }
+        let min_len = tokens.len() - max_delta;
+        let st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let candidate_lens: Vec<usize> = st
+            .lengths
+            .range(min_len..=tokens.len())
+            .map(|(&len, _)| len)
+            .collect();
+        if candidate_lens.is_empty() {
+            return false;
+        }
+        let mut h = seed_for_lora(lora_id);
+        let mut cursor = 0usize;
+        for len in candidate_lens {
+            for &t in &tokens[cursor..len] {
+                h = fnv_mix_i32(h, t);
+            }
+            cursor = len;
+            let key = PoolKey {
+                lora_id,
+                len,
+                hash: h,
+            };
+            if let Some(entry) = st.entries.get(&key)
+                && entry.token_ids.as_slice() == &tokens[..len]
+            {
+                return true;
+            }
+        }
+        false
+    }
+
     /// Inserts `entry` into the pool, evicting LRU entries if needed to stay within `max_bytes`.
     /// Entries larger than `max_bytes / 2` or shorter than [`DP_L2_MIN_PREFIX_TOKENS`] are
     /// ignored so a single oversized prompt cannot thrash the shared pool.
@@ -235,6 +277,52 @@ impl SharedDpPrefixPool {
             }
             st.lru.push_back(key);
             return false;
+        }
+
+        // Supersede any strictly shorter trajectory-private checkpoint (> 4096 tokens) of the
+        // same agent so multi-turn continuations keep only their latest L2 snapshot instead of
+        // piling up stale intermediate turns, while preserving shared harnesses (<= 4096).
+        if entry.token_ids.len() > SHARED_HARNESS_KEEP_TOKENS {
+            let shorter_lens: Vec<usize> = st
+                .lengths
+                .range((SHARED_HARNESS_KEEP_TOKENS + 1)..entry.token_ids.len())
+                .map(|(&len, _)| len)
+                .collect();
+            if !shorter_lens.is_empty() {
+                let mut h = seed_for_lora(entry.lora_id);
+                let mut cursor = 0usize;
+                let mut stale_keys = Vec::new();
+                for len in shorter_lens {
+                    for &t in &entry.token_ids[cursor..len] {
+                        h = fnv_mix_i32(h, t);
+                    }
+                    cursor = len;
+                    let sk = PoolKey {
+                        lora_id: entry.lora_id,
+                        len,
+                        hash: h,
+                    };
+                    if let Some(old) = st.entries.get(&sk)
+                        && old.token_ids.as_slice() == &entry.token_ids[..len]
+                    {
+                        stale_keys.push(sk);
+                    }
+                }
+                for sk in stale_keys {
+                    if let Some(old) = st.entries.remove(&sk) {
+                        st.used_bytes = st.used_bytes.saturating_sub(old.total_bytes);
+                        if let Some(cnt) = st.lengths.get_mut(&sk.len) {
+                            *cnt = cnt.saturating_sub(1);
+                            if *cnt == 0 {
+                                st.lengths.remove(&sk.len);
+                            }
+                        }
+                        if let Some(pos) = st.lru.iter().position(|k| *k == sk) {
+                            st.lru.remove(pos);
+                        }
+                    }
+                }
+            }
         }
 
         // Evict LRU entries until there is room for `entry.total_bytes`.
@@ -402,5 +490,33 @@ mod tests {
         assert!(st.used_bytes <= 8192);
         assert!(st.evictions >= 1);
         assert!(pool.lookup_longest_match(-1, &seq_b, 0).is_some());
+    }
+
+    #[test]
+    fn supersedes_stale_agent_turns_while_preserving_shared_harness_and_stride_check() {
+        let pool = SharedDpPrefixPool::new(1024 * 1024, 16);
+        let harness_4k: Vec<i32> = (1..=4096).collect();
+        let mut turn1_6k = harness_4k.clone();
+        turn1_6k.extend(10_000..12_048); // 6,144 tokens
+        let mut turn2_8k = turn1_6k.clone();
+        turn2_8k.extend(20_000..22_048); // 8,192 tokens
+        let mut turn3_11k = turn2_8k.clone();
+        turn3_11k.extend(30_000..33_072); // 11,264 tokens
+
+        assert!(pool.insert(make_entry(-1, harness_4k.clone(), 1024)));
+        assert!(pool.insert(make_entry(-1, turn1_6k.clone(), 1024)));
+        assert_eq!(pool.stats().entries, 2);
+
+        // turn2_8k is within 4096 tokens of turn1_6k -> stride throttle returns true.
+        assert!(pool.has_recent_prefix_within(-1, &turn2_8k, 4096));
+        // turn3_11k is > 4096 tokens past turn1_6k -> stride throttle returns false.
+        assert!(!pool.has_recent_prefix_within(-1, &turn3_11k, 4096));
+
+        // Publishing turn3_11k supersedes turn1_6k (> 4096) while keeping harness_4k (<= 4096).
+        assert!(pool.insert(make_entry(-1, turn3_11k.clone(), 1024)));
+        assert_eq!(pool.stats().entries, 2);
+        assert!(pool.contains_and_touch(-1, &harness_4k));
+        assert!(!pool.contains_and_touch(-1, &turn1_6k));
+        assert!(pool.contains_and_touch(-1, &turn3_11k));
     }
 }
