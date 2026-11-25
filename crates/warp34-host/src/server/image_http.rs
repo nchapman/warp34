@@ -1342,23 +1342,17 @@ pub fn run_blocking_image_server(
             )
         );
         let app = image_router(state.clone());
-        let admission_shutdown = state.admission.clone();
-        let res = axum::serve(listener, app)
-            .with_graceful_shutdown(async move {
-                #[cfg(unix)]
-                {
-                    let mut terminate =
-                        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-                            .expect("SIGTERM handler");
-                    tokio::select! { _ = tokio::signal::ctrl_c() => {}, _ = terminate.recv() => {} }
-                }
-                #[cfg(not(unix))]
-                {
-                    let _ = tokio::signal::ctrl_c().await;
-                }
-                admission_shutdown.close();
-            })
-            .await;
+        let drain_state = state.clone();
+        let res = super::http::serve_with_graceful_shutdown(
+            listener,
+            app,
+            super::http::shutdown_signal(),
+            move || {
+                drain_state.metrics.set_status("stopping");
+                drain_state.admission.close();
+            },
+        )
+        .await;
         state
             .worker
             .shutdown()

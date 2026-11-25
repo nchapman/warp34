@@ -207,7 +207,7 @@ impl ModelKind {
     pub fn detect_dir(dir: &Path) -> io::Result<Self> {
         let model_index = dir.join("model_index.json");
         let config_json = dir.join("config.json");
-        if model_index.is_file() && !config_json.is_file() {
+        if crate::qwen_image::QwenImage21PipelineConfig::is_pipeline_dir(dir) {
             let text = fs::read_to_string(&model_index)?;
             let root: Json = serde_json::from_str(&text).map_err(|e| {
                 io::Error::new(

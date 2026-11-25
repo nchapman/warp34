@@ -116,31 +116,6 @@ pub fn format_ti2i_prompt(user_prompt: &str, num_images: usize) -> String {
     tpl.replace("{}", p)
 }
 
-/// Composites an `[H, W, 4]` RGBA `u8` buffer over opaque white `(255, 255, 255)` into `[H, W, 3]` RGB `u8`,
-/// matching `PIL.Image.new("RGB", size, (255, 255, 255)); white.paste(img, mask=A)` in `QwenImage21Pipeline`.
-pub fn composite_rgba_over_white(rgba: &[u8]) -> io::Result<Vec<u8>> {
-    if !rgba.len().is_multiple_of(4) {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "RGBA buffer length must be a multiple of 4",
-        ));
-    }
-    let num_px = rgba.len() / 4;
-    let mut rgb = Vec::with_capacity(num_px * 3);
-    for px in rgba.as_chunks::<4>().0 {
-        let a = px[3] as u32;
-        let inv_a = 255 - a;
-        // PIL's integer paste formula: `(src * a + 255 * (255 - a) + 127) / 255`
-        let r = ((px[0] as u32 * a + 255 * inv_a + 127) / 255) as u8;
-        let g = ((px[1] as u32 * a + 255 * inv_a + 127) / 255) as u8;
-        let b = ((px[2] as u32 * a + 255 * inv_a + 127) / 255) as u8;
-        rgb.push(r);
-        rgb.push(g);
-        rgb.push(b);
-    }
-    Ok(rgb)
-}
-
 /// Computes `(width, height)` rounded to multiples of `32` for a target pixel area and aspect ratio
 /// (`width / height`), matching `calculate_dimensions` in `diffusers`'s `pipeline_qwenimage21.py`.
 pub fn calculate_dimensions(target_area: usize, ratio: f64) -> (usize, usize) {

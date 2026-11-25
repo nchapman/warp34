@@ -35,10 +35,10 @@ use crate::qwen_image::vae::{
 #[cfg(feature = "cuda")]
 use crate::qwen_image::{
     IMAGE_PAD_TOKEN_ID, QwenImage21PipelineConfig, SYS_PROMPT, calculate_dimensions,
-    composite_rgba_over_white, format_t2i_prompt, format_ti2i_prompt,
+    format_t2i_prompt, format_ti2i_prompt,
 };
 #[cfg(feature = "cuda")]
-use crate::vision::{PreprocessedImage, preprocess_rgb_image};
+use crate::vision::{PreprocessedImage, preprocess_rgba_image_for_vision};
 
 /// Generates `n` standard normal `FP16` values bit-identically matching PyTorch CPU
 /// `torch.randn(shape, generator=torch.Generator("cpu").manual_seed(seed), dtype=torch.float16)`.
@@ -1027,12 +1027,9 @@ impl QwenImage21PipelineEngine {
             let in_h = (((in_h as u32) / multiple_of).max(1)) * multiple_of;
             let resized = cond_img.resize_lanczos(in_w, in_h);
 
-            let rgb_white = composite_rgba_over_white(&resized.rgba).map_err(|e| {
-                CudaError::with_detail(-10, "composite RGBA over white", e.to_string())
-            })?;
             let px = (in_w as usize) * (in_h as usize);
-            let vit_pre = preprocess_rgb_image(
-                &rgb_white,
+            let vit_pre = preprocess_rgba_image_for_vision(
+                &resized.rgba,
                 in_h as usize,
                 in_w as usize,
                 patch_size,

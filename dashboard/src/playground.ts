@@ -1,5 +1,15 @@
 export type HttpMethod = "GET" | "POST" | "DELETE";
 
+export function isImageModel(
+  model: string | null | undefined,
+  kvFormat?: string | null,
+): boolean {
+  return (
+    kvFormat === "fp16_dit_vae" ||
+    Boolean(model?.toLowerCase().includes("qwen-image"))
+  );
+}
+
 export type EndpointKind =
   | "openai-chat"
   | "openai-responses"

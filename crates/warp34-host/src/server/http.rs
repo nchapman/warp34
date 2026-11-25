@@ -2217,10 +2217,25 @@ async fn anthropic_messages(
 
 use super::decision_http::{decisions_adapter, systemone_decide};
 
-pub async fn serve(
+pub(super) async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        let mut terminate =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                .expect("SIGTERM handler");
+        tokio::select! { _ = tokio::signal::ctrl_c() => {}, _ = terminate.recv() => {} }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
+}
+
+pub(super) async fn serve_with_graceful_shutdown(
     listener: tokio::net::TcpListener,
-    state: Arc<OpenAiServerState>,
+    app: Router,
     shutdown: impl std::future::Future<Output = ()> + Send + 'static,
+    on_shutdown: impl FnOnce() + Send,
 ) -> std::io::Result<()> {
     use axum::serve::ListenerExt;
     use std::future::IntoFuture;
@@ -2229,26 +2244,40 @@ pub async fn serve(
         let _ = tcp_stream.set_nodelay(true);
     });
     let mut serving = Box::pin(
-        axum::serve(listener, router(state.clone()))
+        axum::serve(listener, app)
             .with_graceful_shutdown(async {
                 let _ = stop_rx.await;
             })
             .into_future(),
     );
-    let result = tokio::select! {
+    tokio::select! {
         result = &mut serving => result,
         _ = shutdown => {
-            state.metrics.set_status("stopping");
-            state.admission.close();
-            state.preprocessing.close();
-            // Existing generations can complete while HTTP drains. shutdown() below
-            // cancels remaining work only once draining finishes or hits its deadline.
+            on_shutdown();
+            // Existing generations can complete while HTTP drains. Callers cancel
+            // remaining worker activity once draining finishes or hits its deadline.
             let _ = stop_tx.send(());
-            tokio::time::timeout(Duration::from_secs(30), &mut serving).await
+            tokio::time::timeout(Duration::from_secs(30), &mut serving)
+                .await
                 .map_err(|_| std::io::Error::other("HTTP graceful shutdown deadline exceeded"))
                 .and_then(|result| result)
         }
-    };
+    }
+}
+
+pub async fn serve(
+    listener: tokio::net::TcpListener,
+    state: Arc<OpenAiServerState>,
+    shutdown: impl std::future::Future<Output = ()> + Send + 'static,
+) -> std::io::Result<()> {
+    let drain_state = state.clone();
+    let result =
+        serve_with_graceful_shutdown(listener, router(state.clone()), shutdown, move || {
+            drain_state.metrics.set_status("stopping");
+            drain_state.admission.close();
+            drain_state.preprocessing.close();
+        })
+        .await;
     state
         .worker
         .shutdown()
@@ -2298,20 +2327,7 @@ pub fn run_blocking_server(addr: &str, state: Arc<OpenAiServerState>) -> std::io
             "{}",
             serve_exposure_notice(listener.local_addr()?, state.api_key.is_some(), state.webui)
         );
-        serve(listener, state, async {
-            #[cfg(unix)]
-            {
-                let mut terminate =
-                    tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-                        .expect("SIGTERM handler");
-                tokio::select! { _ = tokio::signal::ctrl_c() => {}, _ = terminate.recv() => {} }
-            }
-            #[cfg(not(unix))]
-            {
-                let _ = tokio::signal::ctrl_c().await;
-            }
-        })
-        .await
+        serve(listener, state, shutdown_signal()).await
     })
 }
 

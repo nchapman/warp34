@@ -32,6 +32,7 @@ import {
 import { apiUrl, baseOriginUrl, detectBasePath } from "./basePath";
 import { Chart, type Point } from "./LazyChart";
 import { Playground } from "./Playground";
+import { isImageModel as isQwenImageModel } from "./playground";
 import {
   counterRate,
   duration,
@@ -968,9 +969,10 @@ function DashboardShell({ state }: { state: MetricsState }) {
   const location = useLocation();
   const latest = state.history.at(-1);
   const isPlayground = location.pathname.startsWith("/playground");
-  const isImageModel =
-    latest?.config.kv_format === "fp16_dit_vae" ||
-    Boolean(latest?.model.toLowerCase().includes("qwen-image"));
+  const isImageModel = isQwenImageModel(
+    latest?.model,
+    latest?.config.kv_format,
+  );
 
   useEffect(() => {
     document.title = titleFromPathname(location.pathname);

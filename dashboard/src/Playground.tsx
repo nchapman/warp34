@@ -25,6 +25,7 @@ import {
   drainSseBuffer,
   emptyParsedResult,
   extractMessagesFromBody,
+  isImageModel as detectImageModel,
   formatCurlCommand,
   parseJsonResponse,
   type EndpointSpec,
@@ -98,8 +99,7 @@ function resolveRoute(
   presetId: string;
 } {
   const requestedEndpoint = searchParams.get("endpoint") ?? pathEndpointId;
-  const isImageModel =
-    imageMode || Boolean(model?.toLowerCase().includes("qwen-image"));
+  const isImageModel = imageMode || detectImageModel(model);
   const available = endpointsForModel(isImageModel);
   const fallbackId = decisionMode
     ? "decisions"
@@ -171,8 +171,7 @@ export function Playground({
   const navigate = useNavigate();
   const { endpointId: pathEndpointId } = useParams<{ endpointId?: string }>();
   const [searchParams, setSearchParams] = useSearchParams();
-  const isImageModel =
-    imageMode || Boolean(model?.toLowerCase().includes("qwen-image"));
+  const isImageModel = imageMode || detectImageModel(model);
   const availableEndpoints = useMemo(
     () => endpointsForModel(isImageModel),
     [isImageModel],
