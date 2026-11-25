@@ -653,32 +653,37 @@ def run_evaluation_harness(
         instance_ids=changed_ids,
     )
     norm_log_dir = cwd / "logs" / "run_evaluation" / norm_run_id
+    norm_exc: subprocess.SubprocessError | None = None
     try:
         subprocess.run(norm_cmd, check=True, timeout=timeout_s)
-    except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
-        pass
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
+        norm_exc = exc
     norm_reports = sorted(cwd.glob(f"*.{norm_run_id}.json"), key=lambda p: p.stat().st_mtime)
-    recheck_eval = (
-        _load_json_safe(norm_reports[-1])
-        if norm_reports
-        else _synthesize_eval_report_from_logs(norm_preds_path, norm_log_dir)
-    ) or {}
-    if recheck_eval and (output_dir / "eval_report.json").exists():
-        base_eval = _load_json_safe(output_dir / "eval_report.json") or {}
-        resolved_ids = sorted(
-            set(base_eval.get("resolved_ids", [])) | set(recheck_eval.get("resolved_ids", []))
-        )
-        base_eval["resolved_ids"] = resolved_ids
-        base_eval["resolved_instances"] = len(resolved_ids)
-        (output_dir / "eval_report_normalized.json").write_text(json.dumps(base_eval, indent=2))
-    for nr in norm_reports:
-        nr.unlink(missing_ok=True)
-    if norm_log_dir.exists():
-        shutil.rmtree(norm_log_dir, ignore_errors=True)
-        if (cwd / "logs" / "run_evaluation").exists() and not any(
-            (cwd / "logs" / "run_evaluation").iterdir()
-        ):
-            shutil.rmtree(cwd / "logs", ignore_errors=True)
+    try:
+        recheck_eval = (
+            _load_json_safe(norm_reports[-1])
+            if norm_reports
+            else _synthesize_eval_report_from_logs(norm_preds_path, norm_log_dir)
+        ) or {}
+        if recheck_eval and (output_dir / "eval_report.json").exists():
+            base_eval = _load_json_safe(output_dir / "eval_report.json") or {}
+            resolved_ids = sorted(
+                set(base_eval.get("resolved_ids", [])) | set(recheck_eval.get("resolved_ids", []))
+            )
+            base_eval["resolved_ids"] = resolved_ids
+            base_eval["resolved_instances"] = len(resolved_ids)
+            (output_dir / "eval_report_normalized.json").write_text(json.dumps(base_eval, indent=2))
+        elif not recheck_eval and norm_exc is not None:
+            raise norm_exc
+    finally:
+        for nr in norm_reports:
+            nr.unlink(missing_ok=True)
+        if norm_log_dir.exists():
+            shutil.rmtree(norm_log_dir, ignore_errors=True)
+            if (cwd / "logs" / "run_evaluation").exists() and not any(
+                (cwd / "logs" / "run_evaluation").iterdir()
+            ):
+                shutil.rmtree(cwd / "logs", ignore_errors=True)
 
 
 def main(argv: list[str] | None = None) -> int:
