@@ -728,8 +728,18 @@ fn run_qwen_image_dump_diff(options: CudaCliOptions) -> Result<ExitCode, String>
         use_cuda_graph,
         compare_tp2,
         golden_path,
+        out_json,
         ..
     } = options;
+    let write_report = |report: serde_json::Value| -> Result<(), String> {
+        if let Some(ref out_path) = out_json {
+            let text = serde_json::to_string_pretty(&report)
+                .map_err(|e| format!("failed to serialize dump-diff JSON: {e}"))?;
+            std::fs::write(out_path, text)
+                .map_err(|e| format!("failed to write dump-diff JSON '{out_path}': {e}"))?;
+        }
+        Ok(())
+    };
     let condition_images =
         crate::cli::commands::load_cli_condition_images(&image_urls, allow_remote_images)?;
     let (width, height) = crate::server::parse_size_spec(None, image_width, image_height)?;
@@ -809,7 +819,25 @@ fn run_qwen_image_dump_diff(options: CudaCliOptions) -> Result<ExitCode, String>
             } else {
                 35.0
             };
-        if psnr < min_tp2_psnr {
+        let passed = psnr >= min_tp2_psnr;
+        write_report(serde_json::json!({
+            "mode": "tp1-vs-tp2",
+            "model": model,
+            "width": res.width,
+            "height": res.height,
+            "channels": res.channels,
+            "steps": steps,
+            "cfg_scale": cfg_scale,
+            "seed": seed,
+            "rgba": want_rgba,
+            "psnr_db": psnr,
+            "max_px_diff": max_diff,
+            "min_psnr_db": min_tp2_psnr,
+            "tp1_ms": res.timings.total_ms,
+            "tp2_ms": res_tp2.timings.total_ms,
+            "pass": passed,
+        }))?;
+        if !passed {
             return Err(format!(
                 "dump-diff tp1-vs-tp2 PSNR {psnr:.2} dB below {min_tp2_psnr:.1} dB threshold"
             ));
@@ -837,7 +865,26 @@ fn run_qwen_image_dump_diff(options: CudaCliOptions) -> Result<ExitCode, String>
         } else {
             28.0
         };
-        if psnr < min_psnr {
+        let passed = psnr >= min_psnr;
+        write_report(serde_json::json!({
+            "mode": "golden",
+            "model": model,
+            "tp": engine.tp_size(),
+            "width": res.width,
+            "height": res.height,
+            "channels": res.channels,
+            "steps": steps,
+            "cfg_scale": cfg_scale,
+            "seed": seed,
+            "rgba": want_rgba,
+            "golden": golden,
+            "psnr_db": psnr,
+            "max_px_diff": max_diff,
+            "min_psnr_db": min_psnr,
+            "total_ms": res.timings.total_ms,
+            "pass": passed,
+        }))?;
+        if !passed {
             return Err(format!(
                 "dump-diff PSNR {psnr:.2} dB below {min_psnr:.1} dB threshold against '{golden}'"
             ));
@@ -851,6 +898,20 @@ fn run_qwen_image_dump_diff(options: CudaCliOptions) -> Result<ExitCode, String>
             res.channels,
             res.timings.total_ms,
         );
+        write_report(serde_json::json!({
+            "mode": "single",
+            "model": model,
+            "tp": engine.tp_size(),
+            "width": res.width,
+            "height": res.height,
+            "channels": res.channels,
+            "steps": steps,
+            "cfg_scale": cfg_scale,
+            "seed": seed,
+            "rgba": want_rgba,
+            "total_ms": res.timings.total_ms,
+            "pass": true,
+        }))?;
     }
     Ok(ExitCode::SUCCESS)
 }

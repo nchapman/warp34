@@ -1384,6 +1384,14 @@ fn gpu_qwen_image_cli_commands_and_dump_diff_end_to_end() {
         super::oracle::run_dump_diff(dump_opts, super::KvFormatPolicy::Fp16, None).unwrap(),
         ExitCode::SUCCESS
     );
+    let dump_report: serde_json::Value =
+        serde_json::from_slice(&fs::read(&dump_json_path).unwrap()).unwrap();
+    assert_eq!(dump_report["mode"], "golden");
+    assert_eq!(dump_report["width"], 64);
+    assert_eq!(dump_report["height"], 64);
+    assert_eq!(dump_report["channels"], 3);
+    assert_eq!(dump_report["pass"], true);
+    assert_eq!(dump_report["max_px_diff"], 0);
 
     // 3b. `run_dump_diff` without `--rgba` against a 4-channel RGBA golden PNG compares RGB
     // without appending the RGBA transparency clause to `effective_prompt`.

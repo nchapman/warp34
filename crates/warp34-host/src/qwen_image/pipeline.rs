@@ -1013,10 +1013,10 @@ impl QwenImage21PipelineEngine {
         let mut vae_cond_inputs = Vec::with_capacity(req.condition_images.len());
         let mut img_shapes = Vec::with_capacity(req.condition_images.len() + 1);
 
-        let vis_cfg = self.cfg.text_encoder.vision_config.as_ref();
-        let patch_size = vis_cfg.map_or(16, |v| v.patch_size);
-        let temporal_patch_size = vis_cfg.map_or(2, |v| v.temporal_patch_size);
-        let spatial_merge_size = vis_cfg.map_or(2, |v| v.spatial_merge_size);
+        let vis_pre = &self.cfg.text_encoder.vision_preprocessor;
+        let patch_size = vis_pre.patch_size;
+        let temporal_patch_size = vis_pre.temporal_patch_size;
+        let spatial_merge_size = vis_pre.spatial_merge_size;
 
         for cond_img in &req.condition_images {
             let (in_w, in_h) = calculate_dimensions(
@@ -1103,12 +1103,13 @@ impl QwenImage21PipelineEngine {
             .build_schedule(requested_steps, target_tokens, None, sigmas_override)
             .map_err(|e| CudaError::with_detail(-10, "build Euler schedule", e.to_string()))?;
         let num_steps = sched.num_steps();
+        let train_t = sched.num_train_timesteps as f32;
         let timesteps: Vec<f32> = sched
             .timesteps
             .iter()
             .map(|&t| {
                 let t_f16 = crate::cuda::f16_to_f32(f32_to_f16(t));
-                crate::cuda::f16_to_f32(f32_to_f16(t_f16 / 1000.0))
+                crate::cuda::f16_to_f32(f32_to_f16(t_f16 / train_t))
             })
             .collect();
         let neg_ref = neg_out

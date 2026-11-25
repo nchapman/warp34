@@ -607,6 +607,28 @@ impl QwenImage21VaeConfig {
                 ),
             ));
         }
+        let expected_spatial = 1usize << temperal_downsample.len();
+        if let Some(sf) = root.get("scale_factor_spatial").and_then(|v| v.as_u64())
+            && sf as usize != expected_spatial
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "vae scale_factor_spatial ({sf}) does not match temperal_downsample ({expected_spatial})"
+                ),
+            ));
+        }
+        let expected_temporal = 1usize << temperal_downsample.iter().filter(|&&b| b).count();
+        if let Some(tf) = root.get("scale_factor_temporal").and_then(|v| v.as_u64())
+            && tf as usize != expected_temporal
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "vae scale_factor_temporal ({tf}) does not match temperal_downsample ({expected_temporal})"
+                ),
+            ));
+        }
         let in_channels = root
             .get("in_channels")
             .and_then(|v| v.as_u64())
@@ -722,6 +744,17 @@ impl FlowMatchEulerSchedulerConfig {
     }
 
     pub fn from_json(root: &Json) -> io::Result<Self> {
+        if let Some(cls) = root.get("_class_name").and_then(|v| v.as_str())
+            && cls != "FlowMatchEulerDiscreteScheduler"
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "unsupported scheduler _class_name='{}' (expected 'FlowMatchEulerDiscreteScheduler')",
+                    sanitize_diag(cls)
+                ),
+            ));
+        }
         let base_image_seq_len = root
             .get("base_image_seq_len")
             .and_then(|v| v.as_u64())
@@ -921,6 +954,7 @@ impl FlowMatchEulerSchedulerConfig {
             sigmas,
             timesteps,
             mu: mu as f32,
+            num_train_timesteps: self.num_train_timesteps,
         })
     }
 }
@@ -931,6 +965,7 @@ pub struct FlowMatchSchedule {
     pub sigmas: Vec<f32>,
     pub timesteps: Vec<f32>,
     pub mu: f32,
+    pub num_train_timesteps: usize,
 }
 
 impl FlowMatchSchedule {
@@ -949,13 +984,13 @@ impl FlowMatchSchedule {
         Ok(s1 - s0)
     }
 
-    /// Normalized `[0, 1]` timestep `t / 1000.0` passed into `QwenImage21Transformer2DModel`.
+    /// Normalized `[0, 1]` timestep `t / num_train_timesteps` passed into `QwenImage21Transformer2DModel`.
     pub fn normalized_timestep(&self, step_idx: usize) -> io::Result<f32> {
         let t = *self
             .timesteps
             .get(step_idx)
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "step_idx out of bounds"))?;
-        Ok(t / 1000.0)
+        Ok(t / self.num_train_timesteps as f32)
     }
 
     /// Performs one deterministic Euler step `sample <- sample + dt * model_output` in `FP32`.
@@ -1078,7 +1113,14 @@ impl QwenImage21PipelineConfig {
         let transformer = QwenImage21TransformerConfig::from_dir(&transformer_dir)?;
         let vae = QwenImage21VaeConfig::from_dir(&vae_dir)?;
         let scheduler = FlowMatchEulerSchedulerConfig::from_dir(&scheduler_dir)?;
-        let text_encoder = ModelConfig::from_dir(&text_encoder_dir)?;
+        let mut text_encoder = ModelConfig::from_dir(&text_encoder_dir)?;
+        if processor_dir.join("preprocessor_config.json").is_file() {
+            text_encoder.vision_preprocessor =
+                crate::vision::VisionPreprocessorConfig::from_model_dir(
+                    &processor_dir,
+                    text_encoder.vision_config.as_ref(),
+                );
+        }
         if !text_encoder.is_qwen3_vl() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
