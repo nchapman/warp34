@@ -32,6 +32,7 @@ import {
 import { apiUrl, baseOriginUrl, detectBasePath } from "./basePath";
 import { Chart, type Point } from "./LazyChart";
 import { Playground } from "./Playground";
+import { isImageModel as isQwenImageModel } from "./playground";
 import {
   counterRate,
   duration,
@@ -968,6 +969,10 @@ function DashboardShell({ state }: { state: MetricsState }) {
   const location = useLocation();
   const latest = state.history.at(-1);
   const isPlayground = location.pathname.startsWith("/playground");
+  const isImageModel = isQwenImageModel(
+    latest?.model,
+    latest?.config.kv_format,
+  );
 
   useEffect(() => {
     document.title = titleFromPathname(location.pathname);
@@ -1017,6 +1022,7 @@ function DashboardShell({ state }: { state: MetricsState }) {
             element={
               <Playground
                 model={latest?.model ?? null}
+                imageMode={isImageModel}
                 loraAdapters={latest?.config.lora_adapters}
                 maxContextTokens={
                   latest?.config.max_model_len ??
@@ -1032,6 +1038,7 @@ function DashboardShell({ state }: { state: MetricsState }) {
             element={
               <Playground
                 model={latest?.model ?? null}
+                imageMode={isImageModel}
                 loraAdapters={latest?.config.lora_adapters}
                 maxContextTokens={
                   latest?.config.max_model_len ??

@@ -224,6 +224,106 @@ impl Drop for TurnLog {
     }
 }
 
+/// One content-free JSON line per image generation/edit request, including cancelled requests.
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+pub(super) struct ImageTurnLog {
+    id: String,
+    api: &'static str,
+    model: String,
+    images_requested: usize,
+    images_completed: usize,
+    condition_images: usize,
+    width: Option<u32>,
+    height: Option<u32>,
+    steps: usize,
+    guidance_scale: f32,
+    rgba: bool,
+    start: Instant,
+    finished: bool,
+}
+
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+impl ImageTurnLog {
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn new(
+        id: String,
+        api: &'static str,
+        model: String,
+        images_requested: usize,
+        condition_images: usize,
+        width: Option<u32>,
+        height: Option<u32>,
+        steps: usize,
+        guidance_scale: f32,
+        rgba: bool,
+    ) -> Self {
+        Self {
+            id,
+            api,
+            model,
+            images_requested,
+            images_completed: 0,
+            condition_images,
+            width,
+            height,
+            steps,
+            guidance_scale,
+            rgba,
+            start: Instant::now(),
+            finished: false,
+        }
+    }
+
+    pub(super) fn image_completed(&mut self, width: u32, height: u32) {
+        self.images_completed += 1;
+        self.width = Some(width);
+        self.height = Some(height);
+    }
+
+    fn record(&self, reason: &'static str, now: Instant) -> Value {
+        let guidance = self
+            .guidance_scale
+            .to_string()
+            .parse::<f64>()
+            .unwrap_or(f64::from(self.guidance_scale));
+        json!({
+            "event": "inference.image_end",
+            "timestamp_unix_ms": timestamp_ms(),
+            "level": if reason == "error" { "error" } else { "info" },
+            "request_id": self.id,
+            "api": self.api,
+            "model": self.model,
+            "finish_reason": reason,
+            "images_requested": self.images_requested,
+            "images_completed": self.images_completed,
+            "condition_images": self.condition_images,
+            "width": self.width,
+            "height": self.height,
+            "steps": self.steps,
+            "guidance_scale": guidance,
+            "rgba": self.rgba,
+            "duration_ms": (now - self.start).as_secs_f64() * 1000.0,
+        })
+    }
+
+    pub(super) fn finish(&mut self, reason: &'static str) {
+        if !self.finished {
+            self.finished = true;
+            emit(&self.record(reason, Instant::now()));
+        }
+    }
+}
+
+impl Drop for ImageTurnLog {
+    fn drop(&mut self) {
+        self.finish(if std::thread::panicking() {
+            "error"
+        } else {
+            "cancelled"
+        });
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -347,5 +447,41 @@ mod tests {
         assert_eq!(row["output_tokens"], 3);
         assert_eq!(row["reasoning_tokens"], 2);
         assert_eq!(row["tool_calls"], 1);
+    }
+
+    #[test]
+    fn image_turn_log_records_shape_completion_and_duration() {
+        let mut log = ImageTurnLog::new(
+            "img-0123456789abcdef".into(),
+            "images_edits",
+            "Qwen-Image-2.1-Turbo-W4A16-HGPTQ".into(),
+            2,
+            1,
+            None,
+            None,
+            8,
+            1.0,
+            true,
+        );
+        log.image_completed(1024, 1024);
+        let partial = log.record("cancelled", log.start + Duration::from_millis(500));
+        assert_eq!(partial["event"], "inference.image_end");
+        assert_eq!(partial["level"], "info");
+        assert_eq!(partial["api"], "images_edits");
+        assert_eq!(partial["finish_reason"], "cancelled");
+        assert_eq!(partial["images_requested"], 2);
+        assert_eq!(partial["images_completed"], 1);
+        assert_eq!(partial["condition_images"], 1);
+        assert_eq!(partial["width"], 1024);
+        assert_eq!(partial["height"], 1024);
+        assert_eq!(partial["steps"], 8);
+        assert_eq!(partial["guidance_scale"], 1.0);
+        assert_eq!(partial["rgba"], true);
+        assert_eq!(partial["duration_ms"], 500.0);
+
+        let err_row = log.record("error", log.start + Duration::from_millis(600));
+        assert_eq!(err_row["level"], "error");
+        assert_eq!(err_row["finish_reason"], "error");
+        log.finished = true;
     }
 }
