@@ -624,11 +624,11 @@ impl Qwen3_5MtpRank {
         } else {
             None
         };
-        let norm = |weights: &mut DeviceArena,
-                    ring: &mut crate::cuda::PinnedUploadRing,
-                    name: &str,
-                    size: usize|
-         -> Result<u64> {
+        let norm_with_signs = |weights: &mut DeviceArena,
+                               ring: &mut crate::cuda::PinnedUploadRing,
+                               name: &str,
+                               size: usize|
+         -> Result<(u64, bool)> {
             let key = archive
                 .resolve_name(&format!("mtp.{name}.weight"))
                 .ok_or_else(|| loader_err("missing MTP norm"))?;
@@ -638,7 +638,18 @@ impl Qwen3_5MtpRank {
             if v.len() != size {
                 return Err(loader_err("MTP norm shape"));
             }
-            ring.upload_slice(weights, &v, &target.stream)
+            let has_folded_signs = crate::model::weights::gemma_rms_norm_has_folded_signs(&v);
+            Ok((
+                ring.upload_slice(weights, &v, &target.stream)?,
+                has_folded_signs,
+            ))
+        };
+        let norm = |weights: &mut DeviceArena,
+                    ring: &mut crate::cuda::PinnedUploadRing,
+                    name: &str,
+                    size: usize|
+         -> Result<u64> {
+            norm_with_signs(weights, ring, name, size).map(|(ptr, _)| ptr)
         };
         let max_batch_rows = capacity.min(256);
         let (norms, residual, final_residual) = if uses_hc {
@@ -685,6 +696,8 @@ impl Qwen3_5MtpRank {
                 },
             )
         } else {
+            let (final_norm_ptr, norm_has_folded_signs) =
+                norm_with_signs(&mut weights, &mut upload_ring, "norm", h)?;
             let norms = [
                 norm(&mut weights, &mut upload_ring, "pre_fc_norm_embedding", h)?,
                 norm(&mut weights, &mut upload_ring, "pre_fc_norm_hidden", h)?,
@@ -700,7 +713,7 @@ impl Qwen3_5MtpRank {
                     "layers.0.post_attention_layernorm",
                     h,
                 )?,
-                norm(&mut weights, &mut upload_ring, "norm", h)?,
+                final_norm_ptr,
             ];
             (
                 norms,
@@ -708,7 +721,10 @@ impl Qwen3_5MtpRank {
                     input_layernorm_ptr: norms[2],
                     post_attention_layernorm_ptr: norms[3],
                 },
-                FinalResidual::SingleStream { norm_ptr: norms[4] },
+                FinalResidual::SingleStream {
+                    norm_ptr: norms[4],
+                    norm_has_folded_signs,
+                },
             )
         };
         let qsa = if qsa_indexer.is_some() {

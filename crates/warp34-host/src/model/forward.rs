@@ -283,7 +283,7 @@ impl Qwen3_5ModelRank {
     }
 
     fn final_norm_target(&self, rows: usize, fallback: u64) -> u64 {
-        if !self.final_residual.is_hyper_connection()
+        if !self.final_residual.exports_pre_norm_hidden()
             && rows <= self.max_tap_rows
             && let Some(buf) = &self.last_final_hidden_f16
         {

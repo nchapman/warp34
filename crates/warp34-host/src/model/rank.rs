@@ -1535,8 +1535,11 @@ impl Qwen3_5ModelRank {
             let norm_f16 = archive
                 .read_f16_bits(&norm_key)
                 .map_err(|_| loader_err("read model.norm.weight"))?;
+            let norm_has_folded_signs =
+                crate::model::weights::gemma_rms_norm_has_folded_signs(&norm_f16);
             FinalResidual::SingleStream {
                 norm_ptr: upload_ring.upload_slice(&mut weight_arena, &norm_f16, &stream)?,
+                norm_has_folded_signs,
             }
         };
 
