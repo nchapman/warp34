@@ -173,7 +173,7 @@ async fn run_candidate_queries_radix_shared(
         return Ok(Vec::new());
     }
     let (_dp_rank, target_worker, _inflight) = s
-        .select_worker(lora_id, &queries[0].0, None)
+        .select_worker(lora_id, &queries[0].0, images, None)
         .map_err(worker_api_err)?;
     let mut results = Vec::with_capacity(queries.len());
     let mut iter = queries.into_iter();
@@ -217,7 +217,7 @@ async fn run_code_readout_queries_raw(
         return Ok((Vec::new(), 0, 0));
     }
     let (_dp_rank, target_worker, _inflight) = s
-        .select_worker(lora_id, &queries[0].token_ids, None)
+        .select_worker(lora_id, &queries[0].token_ids, images, None)
         .map_err(worker_api_err)?;
     let mut input_tokens = 0usize;
     let mut cached_tokens = 0usize;

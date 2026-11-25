@@ -726,7 +726,10 @@ impl MambaRadixCache {
 
         if let Some((dp_rank, ref dir)) = self.dp_prefix_observer {
             let hashes = crate::dp_router::compute_chained_prefix_hashes_raw(token_ids);
-            dir.record_insert_hashes(dp_rank, &hashes);
+            let first_new_block = key_offset / crate::dp_router::DP_PREFIX_BLOCK_TOKENS;
+            if first_new_block < hashes.len() {
+                dir.record_insert_hashes(dp_rank, &hashes[first_new_block..]);
+            }
         }
 
         RadixInsertResult {

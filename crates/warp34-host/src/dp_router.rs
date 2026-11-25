@@ -26,15 +26,24 @@ pub const DP_PREFIX_BLOCK_TOKENS: usize = 64;
 /// Maximum supported in-process DP replicas (`u64` worker bitmask).
 pub const MAX_DP_WORKERS: usize = 64;
 
-/// Minimum matched prefix tokens required to override an idle GPU (`active + waiting + inflight == 0`).
+/// Minimum matched prefix tokens required to override an idle GPU when no idle worker
+/// already holds the shared harness prefix.
 const IDLE_SPREAD_MIN_MATCHED_TOKENS: usize = 4096;
 /// Minimum fraction of prompt tokens matched required to override an idle GPU.
 const IDLE_SPREAD_MIN_MATCH_RATIO: f64 = 0.75;
-/// Quadratic length-bonus scale (`matched_tokens / scale)^2`, matching `llm-d` default `8192`.
-const PREFIX_LENGTH_SCALE_TOKENS: f64 = 8192.0;
+/// Minimum fraction of prompt tokens matched to keep a multi-turn continuation pinned when
+/// an idle worker already holds the shallow shared harness (`best_idle_match > 0`).
+const IDLE_CONTINUATION_MIN_MATCH_RATIO: f64 = 0.65;
+/// Maximum shallow shared-harness match (tokens) that should still spread across cold idle
+/// workers when multiple workers are idle.
+const SHALLOW_HARNESS_MAX_TOKENS: usize = 2048;
+/// Minimum unique prefix-match advantage (tokens) required to award a non-zero prefix bonus.
+const MIN_PREFIX_BONUS_DELTA_TOKENS: usize = 256;
+/// Quadratic length-bonus scale `(delta_matched / scale)^2`.
+const PREFIX_LENGTH_SCALE_TOKENS: f64 = 4096.0;
 /// Active KV utilization above which a worker is treated as saturated for admission filtering.
 const SATURATED_KV_UTIL_THRESHOLD: f64 = 0.90;
-/// Maximum bounded session-affinity map entries before FIFO eviction.
+/// Maximum bounded session-affinity map entries before LRU eviction.
 const MAX_SESSION_AFFINITY_ENTRIES: usize = 4096;
 
 /// Request routing policy across in-process DP workers (`--dp-routing`).
@@ -92,15 +101,41 @@ pub fn compute_chained_prefix_hashes_raw(tokens: &[i32]) -> Vec<u64> {
 }
 
 /// Computes chained 64-bit block hashes for raw (unsalted) prompt tokens and `lora_id`,
-/// applying [`crate::lora::salt_radix_key_for_lora`] when `lora_id >= 0` so hashes match
-/// [`crate::radix::MambaRadixCache`] nodes identically for both base model and LoRA adapters.
+/// applying [`crate::lora::salt_radix_key_in_place`] to token 0 inline (zero allocation)
+/// when `lora_id >= 0` so hashes match [`crate::radix::MambaRadixCache`] nodes identically
+/// for both base model and LoRA adapters.
 pub fn compute_chained_prefix_hashes(lora_id: i32, tokens: &[i32]) -> Vec<u64> {
-    if lora_id >= 0 {
-        let salted = crate::lora::salt_radix_key_for_lora(tokens, lora_id);
-        compute_chained_prefix_hashes_raw(&salted)
-    } else {
-        compute_chained_prefix_hashes_raw(tokens)
+    let num_blocks = tokens.len() / DP_PREFIX_BLOCK_TOKENS;
+    if num_blocks == 0 {
+        return Vec::new();
     }
+    if lora_id < 0 {
+        return compute_chained_prefix_hashes_raw(tokens);
+    }
+    let mut first_salted = [tokens[0]];
+    crate::lora::salt_radix_key_in_place(&mut first_salted, lora_id);
+    let mut hashes = Vec::with_capacity(num_blocks);
+    let mut state = mix64(0x9e37_79b9_7f4a_7c15u64);
+    for (block_idx, block) in tokens
+        .as_chunks::<DP_PREFIX_BLOCK_TOKENS>()
+        .0
+        .iter()
+        .enumerate()
+    {
+        let mut h = state;
+        for (i, &raw_tok) in block.iter().enumerate() {
+            let tok = if block_idx == 0 && i == 0 {
+                first_salted[0]
+            } else {
+                raw_tok
+            };
+            h ^= (tok as u32) as u64;
+            h = h.wrapping_mul(0x1000_0000_01b3);
+        }
+        state = mix64(h);
+        hashes.push(state);
+    }
+    hashes
 }
 
 #[inline]
@@ -182,7 +217,8 @@ impl DpPrefixDirectory {
         }
     }
 
-    /// Clears `dp_rank`'s bit for the given evicted block hashes (removing empty entries).
+    /// Clears `dp_rank`'s bit for the given evicted block hashes in reverse order (tail-first)
+    /// so concurrent galloping/binary prefix readers never observe a non-monotonic hole.
     pub fn record_evict_hashes(&self, dp_rank: usize, hashes: &[u64]) {
         let Some(bit) = Self::rank_bit(dp_rank) else {
             return;
@@ -190,7 +226,7 @@ impl DpPrefixDirectory {
         if hashes.is_empty() {
             return;
         }
-        for &h in hashes {
+        for &h in hashes.iter().rev() {
             let mut guard = self.shard_for(h).write().unwrap_or_else(|e| e.into_inner());
             if let Some(mask) = guard.get_mut(&h) {
                 *mask &= !bit;
@@ -303,8 +339,9 @@ impl WorkerLoadSample {
 
     #[inline]
     pub fn total_load(self) -> usize {
-        self.effective_running()
+        self.active_requests
             .saturating_add(self.waiting_requests)
+            .max(self.router_inflight)
     }
 
     #[inline]
@@ -386,45 +423,69 @@ pub fn select_dp_worker(workers: &[WorkerLoadSample], ctx: &DpRouteContext<'_>) 
     let prompt_len = ctx.prompt_tokens.max(1);
 
     // Idle-GPU spread guard: if any admitted worker is completely idle, only stack onto a
-    // busy worker when the prefix match is a genuine multi-turn continuation (>= 4K tokens
-    // AND >= 75% of the prompt), preventing staggered agents sharing a 2K harness prefix
-    // from collapsing onto GPU 0.
+    // lightly-loaded busy worker when the prefix match is a genuine multi-turn continuation
+    // (either >= 4K tokens & >= 75% of the prompt, or > 256 unique tokens past an idle
+    // worker's shared harness with >= 65% prompt coverage).
     let idle_candidates: Vec<usize> = candidates
         .iter()
         .copied()
         .filter(|&i| workers[i].is_idle())
         .collect();
     if !idle_candidates.is_empty() {
+        let best_idle_match = idle_candidates
+            .iter()
+            .map(|&i| matched(i))
+            .max()
+            .unwrap_or(0);
         let best_busy_continuation = candidates
             .iter()
             .copied()
             .filter(|&i| !workers[i].is_idle())
             .filter(|&i| {
+                let w = workers[i];
                 let m = matched(i);
-                m >= IDLE_SPREAD_MIN_MATCHED_TOKENS
-                    && (m as f64 / prompt_len as f64) >= IDLE_SPREAD_MIN_MATCH_RATIO
+                let ratio = m as f64 / prompt_len as f64;
+                let light_load = w.router_inflight_prefill_tokens < 4096
+                    && w.total_load() < (w.max_num_seqs / 2).max(1);
+                let deep_continuation =
+                    m >= IDLE_SPREAD_MIN_MATCHED_TOKENS && ratio >= IDLE_SPREAD_MIN_MATCH_RATIO;
+                let unique_past_harness = best_idle_match > 0
+                    && m >= best_idle_match.saturating_add(MIN_PREFIX_BONUS_DELTA_TOKENS)
+                    && ratio >= IDLE_CONTINUATION_MIN_MATCH_RATIO;
+                light_load && (deep_continuation || unique_past_harness)
             })
             .max_by_key(|&i| matched(i));
 
-        if let Some(best_busy) = best_busy_continuation {
-            let best_idle_match = idle_candidates
+        if let Some(best_busy) = best_busy_continuation
+            && matched(best_busy) > best_idle_match.saturating_add(DP_PREFIX_BLOCK_TOKENS)
+        {
+            return Some(best_busy);
+        }
+
+        // Among multiple idle workers, if the best match is only a shallow shared harness
+        // (<= 2K tokens, < 85% of the prompt) and another idle worker is completely cold
+        // (0 matched tokens), warm the cold idle worker so staggered agents spread evenly.
+        if idle_candidates.len() > 1
+            && best_idle_match > 0
+            && best_idle_match <= SHALLOW_HARNESS_MAX_TOKENS
+            && (best_idle_match as f64 / prompt_len as f64) < 0.85
+        {
+            let cold_idle: Vec<usize> = idle_candidates
                 .iter()
-                .map(|&i| matched(i))
-                .max()
-                .unwrap_or(0);
-            if matched(best_busy) > best_idle_match.saturating_add(DP_PREFIX_BLOCK_TOKENS) {
-                return Some(best_busy);
+                .copied()
+                .filter(|&i| matched(i) == 0)
+                .collect();
+            if !cold_idle.is_empty() {
+                return pick_lowest_score(&cold_idle, n, ctx.tie_break_cursor, |idx| {
+                    workers[idx].active_kv_util
+                });
             }
         }
-        // Among idle workers, prefer any that already has a deeper prefix match, else rotate.
-        let max_idle_match = idle_candidates
-            .iter()
-            .map(|&i| matched(i))
-            .max()
-            .unwrap_or(0);
+
+        // Otherwise prefer idle workers with the deepest prefix match, rotating ties.
         let best_idle: Vec<usize> = idle_candidates
             .into_iter()
-            .filter(|&i| matched(i) == max_idle_match)
+            .filter(|&i| matched(i) == best_idle_match)
             .collect();
         return pick_lowest_score(&best_idle, n, ctx.tie_break_cursor, |idx| {
             workers[idx].active_kv_util
@@ -435,11 +496,15 @@ pub fn select_dp_worker(workers: &[WorkerLoadSample], ctx: &DpRouteContext<'_>) 
     let min_matched = candidates.iter().map(|&i| matched(i)).min().unwrap_or(0);
     pick_lowest_score(candidates, n, ctx.tie_break_cursor, |idx| {
         let delta_matched = matched(idx).saturating_sub(min_matched);
-        let len_factor = (delta_matched as f64 / PREFIX_LENGTH_SCALE_TOKENS)
-            .min(1.0)
-            .powi(2);
-        let ratio_factor = (delta_matched as f64 / prompt_len as f64).min(1.0);
-        let prefix_bonus = 2.5 * len_factor + 0.5 * ratio_factor;
+        let prefix_bonus = if delta_matched >= MIN_PREFIX_BONUS_DELTA_TOKENS {
+            let len_factor = (delta_matched as f64 / PREFIX_LENGTH_SCALE_TOKENS)
+                .min(1.0)
+                .powi(2);
+            let ratio_factor = (delta_matched as f64 / prompt_len as f64).min(1.0);
+            2.5 * len_factor + ratio_factor
+        } else {
+            0.0
+        };
         load_cost(workers[idx]) - prefix_bonus
     })
 }
@@ -482,7 +547,7 @@ fn pick_lowest_score(
     best_idx
 }
 
-/// Bounded FIFO session-affinity map (`session_key -> dp_rank`).
+/// Bounded LRU session-affinity map (`session_key -> dp_rank`).
 #[derive(Debug, Default)]
 pub struct SessionAffinityMap {
     map: HashMap<String, usize>,
@@ -490,12 +555,23 @@ pub struct SessionAffinityMap {
 }
 
 impl SessionAffinityMap {
-    pub fn get(&self, key: &str) -> Option<usize> {
-        self.map.get(key).copied()
+    pub fn get(&mut self, key: &str) -> Option<usize> {
+        let rank = self.map.get(key).copied()?;
+        if let Some(pos) = self.order.iter().position(|k| k == key)
+            && let Some(item) = self.order.remove(pos)
+        {
+            self.order.push_back(item);
+        }
+        Some(rank)
     }
 
     pub fn bind(&mut self, key: String, dp_rank: usize) {
-        if self.map.insert(key.clone(), dp_rank).is_none() {
+        if self.map.insert(key.clone(), dp_rank).is_some() {
+            if let Some(pos) = self.order.iter().position(|k| k == &key) {
+                self.order.remove(pos);
+            }
+            self.order.push_back(key);
+        } else {
             self.order.push_back(key);
             while self.order.len() > MAX_SESSION_AFFINITY_ENTRIES {
                 if let Some(evicted) = self.order.pop_front() {
@@ -514,27 +590,73 @@ pub struct DpRouterCore {
     pub prefix_dir: Arc<DpPrefixDirectory>,
     inflight: Vec<AtomicUsize>,
     inflight_prefill_tokens: Vec<AtomicUsize>,
+    /// Short critical section serializing load read -> `select_dp_worker` -> atomic increment
+    /// (after prefix hashing) so concurrent requests never race on stale `inflight == 0`.
+    select_lock: Mutex<()>,
     sessions: Mutex<SessionAffinityMap>,
     cursor: AtomicUsize,
 }
 
-/// RAII guard that decrements a worker's `router_inflight` and `inflight_prefill_tokens`
-/// counters when dropped.
+/// Idempotent RAII guard for a request's uncached prefill-token load.
+///
+/// Released by the worker as soon as prefill completes (first generated token or terminal
+/// event), and also on drop so cancelled/aborted requests never leak prefill weight.
+#[derive(Debug)]
+pub struct PrefillTokenGuard {
+    counter: Arc<DpRouterCore>,
+    dp_rank: usize,
+    remaining: AtomicUsize,
+}
+
+impl PrefillTokenGuard {
+    /// Releases any remaining prefill-token load immediately (idempotent).
+    #[inline]
+    pub fn release(&self) {
+        let prev = self.remaining.swap(0, Ordering::AcqRel);
+        if prev > 0
+            && let Some(slot) = self.counter.inflight_prefill_tokens.get(self.dp_rank)
+        {
+            slot.fetch_sub(prev, Ordering::AcqRel);
+        }
+    }
+}
+
+impl Drop for PrefillTokenGuard {
+    fn drop(&mut self) {
+        self.release();
+    }
+}
+
+/// RAII guard that decrements a worker's `router_inflight` counter when dropped and
+/// holds a handle to the request's [`PrefillTokenGuard`].
 pub struct InflightGuard {
     counter: Arc<DpRouterCore>,
     dp_rank: usize,
-    uncached_prompt_tokens: usize,
+    prefill: Option<Arc<PrefillTokenGuard>>,
+}
+
+impl InflightGuard {
+    /// Returns the shared [`PrefillTokenGuard`] so the worker can release prefill-token
+    /// load as soon as prefill finishes (before decode completes).
+    #[inline]
+    pub fn prefill_guard(&self) -> Option<Arc<PrefillTokenGuard>> {
+        self.prefill.clone()
+    }
+
+    /// Releases the prefill-token weight immediately (idempotent).
+    #[inline]
+    pub fn release_prefill(&self) {
+        if let Some(p) = &self.prefill {
+            p.release();
+        }
+    }
 }
 
 impl Drop for InflightGuard {
     fn drop(&mut self) {
+        self.release_prefill();
         if let Some(slot) = self.counter.inflight.get(self.dp_rank) {
             slot.fetch_sub(1, Ordering::AcqRel);
-        }
-        if self.uncached_prompt_tokens > 0
-            && let Some(slot) = self.counter.inflight_prefill_tokens.get(self.dp_rank)
-        {
-            slot.fetch_sub(self.uncached_prompt_tokens, Ordering::AcqRel);
         }
     }
 }
@@ -548,6 +670,7 @@ impl DpRouterCore {
             prefix_dir: Arc::new(DpPrefixDirectory::new()),
             inflight,
             inflight_prefill_tokens,
+            select_lock: Mutex::new(()),
             sessions: Mutex::new(SessionAffinityMap::default()),
             cursor: AtomicUsize::new(0),
         })
@@ -589,10 +712,8 @@ impl DpRouterCore {
         prompt_tokens: &[i32],
         session_key: Option<&str>,
     ) -> Option<(usize, InflightGuard)> {
-        for (i, sample) in samples.iter_mut().enumerate() {
-            sample.router_inflight = self.inflight_count(i);
-            sample.router_inflight_prefill_tokens = self.inflight_prefill_tokens(i);
-        }
+        // Compute prefix matches outside `select_lock` so heavy prompts never block
+        // concurrent routing decisions while hashing.
         let matched = if self.policy == DpRoutingPolicy::Prefix && !prompt_tokens.is_empty() {
             self.prefix_dir
                 .match_prefix_tokens_per_worker(samples.len(), lora_id, prompt_tokens)
@@ -600,33 +721,57 @@ impl DpRouterCore {
             Vec::new()
         };
         let pinned_worker = session_key.and_then(|k| self.lookup_session(k));
-        let cursor = self.cursor.fetch_add(1, Ordering::Relaxed);
-        let chosen = select_dp_worker(
-            &samples,
-            &DpRouteContext {
-                policy: self.policy,
-                prompt_tokens: prompt_tokens.len(),
-                matched_tokens: &matched,
-                pinned_worker,
-                tie_break_cursor: cursor,
-            },
-        )?;
-        let matched_on_chosen = matched.get(chosen).copied().unwrap_or(0);
-        let uncached_prompt_tokens = prompt_tokens.len().saturating_sub(matched_on_chosen);
-        self.inflight[chosen].fetch_add(1, Ordering::AcqRel);
-        if uncached_prompt_tokens > 0 {
-            self.inflight_prefill_tokens[chosen]
-                .fetch_add(uncached_prompt_tokens, Ordering::AcqRel);
-        }
+
+        let (chosen, uncached_prompt_tokens) = {
+            let _guard = self.select_lock.lock().unwrap_or_else(|e| e.into_inner());
+            for (i, sample) in samples.iter_mut().enumerate() {
+                sample.router_inflight = self.inflight_count(i);
+                sample.router_inflight_prefill_tokens = self.inflight_prefill_tokens(i);
+            }
+            let cursor = self.cursor.fetch_add(1, Ordering::Relaxed);
+            let chosen = select_dp_worker(
+                &samples,
+                &DpRouteContext {
+                    policy: self.policy,
+                    prompt_tokens: prompt_tokens.len(),
+                    matched_tokens: &matched,
+                    pinned_worker,
+                    tie_break_cursor: cursor,
+                },
+            )?;
+            let matched_on_chosen = matched.get(chosen).copied().unwrap_or(0);
+            let uncached_prompt_tokens = prompt_tokens.len().saturating_sub(matched_on_chosen);
+            self.inflight[chosen].fetch_add(1, Ordering::AcqRel);
+            if uncached_prompt_tokens > 0 {
+                self.inflight_prefill_tokens[chosen]
+                    .fetch_add(uncached_prompt_tokens, Ordering::AcqRel);
+            }
+            (chosen, uncached_prompt_tokens)
+        };
+
+        // Preserve an existing healthy session binding on transient saturation spillover;
+        // only bind when the session is new or its previous worker is unhealthy.
         if let Some(k) = session_key {
-            self.bind_session(k.to_owned(), chosen);
+            let keep_existing = pinned_worker
+                .is_some_and(|p| p != chosen && samples.get(p).is_some_and(|s| s.healthy));
+            if !keep_existing {
+                self.bind_session(k.to_owned(), chosen);
+            }
         }
+
+        let prefill = (uncached_prompt_tokens > 0).then(|| {
+            Arc::new(PrefillTokenGuard {
+                counter: Arc::clone(self),
+                dp_rank: chosen,
+                remaining: AtomicUsize::new(uncached_prompt_tokens),
+            })
+        });
         Some((
             chosen,
             InflightGuard {
                 counter: Arc::clone(self),
                 dp_rank: chosen,
-                uncached_prompt_tokens,
+                prefill,
             },
         ))
     }
@@ -963,5 +1108,77 @@ mod tests {
         assert_eq!(router.inflight_count(1), 0);
         assert_eq!(router.inflight_prefill_tokens(0), 0);
         assert_eq!(router.inflight_prefill_tokens(1), 0);
+    }
+
+    #[test]
+    fn total_load_does_not_double_count_waiting_and_prefill_guard_releases_before_decode() {
+        let w = WorkerLoadSample {
+            healthy: true,
+            active_requests: 12,
+            waiting_requests: 4,
+            router_inflight: 16,
+            router_inflight_prefill_tokens: 0,
+            max_num_seqs: 16,
+            active_kv_util: 0.2,
+        };
+        assert_eq!(w.total_load(), 16);
+
+        let router = DpRouterCore::new(2, DpRoutingPolicy::Prefix);
+        let heavy: Vec<i32> = (0..16_384).collect();
+        let (rank, guard) = router
+            .select_and_acquire(
+                vec![idle_worker(); 2],
+                crate::lora::BASE_MODEL_LORA_ID,
+                &heavy,
+                None,
+            )
+            .unwrap();
+        assert_eq!(rank, 0);
+        assert_eq!(router.inflight_count(0), 1);
+        assert_eq!(router.inflight_prefill_tokens(0), 16_384);
+
+        // Releasing prefill guard clears prefill weight while request stays in decode.
+        let pg = guard.prefill_guard().unwrap();
+        pg.release();
+        pg.release(); // idempotent
+        assert_eq!(router.inflight_prefill_tokens(0), 0);
+        assert_eq!(router.inflight_count(0), 1);
+
+        drop(guard);
+        assert_eq!(router.inflight_count(0), 0);
+    }
+
+    #[test]
+    fn both_idle_shallow_harness_warms_cold_gpu_and_unique_continuation_stays_pinned() {
+        // Both GPUs idle: GPU 0 has 2K harness cached, GPU 1 is cold (0).
+        // New agent Turn 0 (3K prompt, only 2K harness match < 85%) warms cold GPU 1!
+        let workers_both_idle = vec![idle_worker(), idle_worker()];
+        let turn0_new_agent = select_dp_worker(
+            &workers_both_idle,
+            &DpRouteContext {
+                policy: DpRoutingPolicy::Prefix,
+                prompt_tokens: 3000,
+                matched_tokens: &[2048, 0],
+                pinned_worker: None,
+                tie_break_cursor: 0,
+            },
+        );
+        assert_eq!(turn0_new_agent, Some(1));
+
+        // Now both GPUs have the 2K harness; GPU 0 is lightly busy (1 decode, 0 prefill)
+        // with Agent A's 2.8K Turn-2 history while GPU 1 is idle (2K harness only).
+        // Agent A Turn 2 (3.2K prompt, 2.8K matched on GPU 0 = 87.5%) stays pinned on GPU 0!
+        let workers_one_busy = vec![busy_worker(1, 0, 0.1), idle_worker()];
+        let turn2_agent_a = select_dp_worker(
+            &workers_one_busy,
+            &DpRouteContext {
+                policy: DpRoutingPolicy::Prefix,
+                prompt_tokens: 3200,
+                matched_tokens: &[2816, 2048],
+                pinned_worker: None,
+                tie_break_cursor: 1,
+            },
+        );
+        assert_eq!(turn2_agent_a, Some(0));
     }
 }

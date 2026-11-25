@@ -3512,7 +3512,7 @@ impl QwenImage21TransformerTp2Engine {
                 )
             },
             || {
-                let _dev = CudaDevice::set_current(1)?;
+                let _dev = CudaDevice::set_current(self.rank1.device_id)?;
                 self.rank1.forward_extract_with_allreduce_gated(
                     cond_latents_f16,
                     target_latents_f16,
@@ -3574,7 +3574,7 @@ impl QwenImage21TransformerTp2Engine {
                 )
             },
             || {
-                let _dev = CudaDevice::set_current(1)?;
+                let _dev = CudaDevice::set_current(self.rank1.device_id)?;
                 self.rank1.forward_cached_with_allreduce_gated(
                     target_latents_f16,
                     timestep,
@@ -3644,7 +3644,7 @@ impl QwenImage21TransformerTp2Engine {
                 )
             },
             || {
-                let _dev = CudaDevice::set_current(1)?;
+                let _dev = CudaDevice::set_current(self.rank1.device_id)?;
                 self.rank1.denoise_loop_with_allreduce(
                     cond_latents_f16,
                     init_target_latents_f16,

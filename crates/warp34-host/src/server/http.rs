@@ -290,10 +290,15 @@ impl OpenAiServerState {
 
     /// Selects a DP worker using the configured [`crate::dp_router::DpRoutingPolicy`],
     /// returning `(dp_rank, worker, Option<InflightGuard>)`.
+    ///
+    /// When `images` is non-empty and the model has a vision encoder, hashes the
+    /// content-hashed multimodal radix key (`vision::compute_multimodal_radix_key`) so
+    /// multi-turn VLM prompts match the exact keys stored in `MambaRadixCache`.
     pub(super) fn select_worker(
         &self,
         lora_id: i32,
         prompt_tokens: &[i32],
+        images: &[crate::vision::PreprocessedImage],
         session_key: Option<&str>,
     ) -> Result<
         (
@@ -326,9 +331,22 @@ impl OpenAiServerState {
                 }
             })
             .collect();
+        let mm_key = if !images.is_empty()
+            && let Some(vcfg) = self.worker.vision_config.as_ref()
+        {
+            Some(crate::vision::compute_multimodal_radix_key(
+                prompt_tokens,
+                images,
+                vcfg.image_token_id,
+                vcfg.spatial_merge_size,
+            ))
+        } else {
+            None
+        };
+        let routing_tokens = mm_key.as_deref().unwrap_or(prompt_tokens);
         let Some((rank, guard)) =
             self.dp_router
-                .select_and_acquire(samples, lora_id, prompt_tokens, session_key)
+                .select_and_acquire(samples, lora_id, routing_tokens, session_key)
         else {
             return Err(WorkerError::worker_stopped(
                 "all data-parallel workers are unavailable",
@@ -1150,7 +1168,7 @@ async fn generate(
         .get("x-session-id")
         .and_then(|v| v.to_str().ok())
         .filter(|s| !s.is_empty())
-        .map(str::to_owned);
+        .map(|s| format!("sess:{s}"));
     let (json, body_len) = read_json_with_len(&s, request).await?;
     let prep_state = s.clone();
     let inline_fast = !chat
@@ -1186,7 +1204,12 @@ async fn generate(
     );
     let prompt_len = prepared.prompt.len();
     let (_dp_rank, target_worker, inflight_guard) = s
-        .select_worker(prepared.lora_id, &prepared.prompt, session_key.as_deref())
+        .select_worker(
+            prepared.lora_id,
+            &prepared.prompt,
+            &prepared.images,
+            session_key.as_deref(),
+        )
         .inspect_err(|_| log.finish("error", false))
         .map_err(worker_api_err)?;
     let mut generation = target_worker
@@ -1200,7 +1223,7 @@ async fn generate(
         )
         .inspect_err(|_| log.finish("error", false))
         .map_err(worker_api_err)?;
-    generation.inflight_guard = inflight_guard;
+    generation.attach_inflight_guard(inflight_guard);
     log.track_cache(
         generation.cached_tokens.clone(),
         generation.cache_lookup.clone(),
@@ -1829,13 +1852,13 @@ async fn responses_create(
         .get("x-session-id")
         .and_then(|v| v.to_str().ok())
         .filter(|s| !s.is_empty())
-        .map(str::to_owned);
+        .map(|s| format!("sess:{s}"));
     let body = read_json(&s, request).await?;
     let prev_resp_session = body
         .get("previous_response_id")
         .and_then(Value::as_str)
         .filter(|s| !s.is_empty())
-        .map(str::to_owned);
+        .map(|s| format!("resp:{s}"));
     let session_key = prev_resp_session.or(header_session);
     let request_id = s.next_request_id.fetch_add(1, Ordering::Relaxed) + 1;
     let (chat_req, mut meta) = crate::responses_api::translate_responses_to_chat(
@@ -1864,10 +1887,15 @@ async fn responses_create(
     );
     let prompt_len = prepared.prompt.len();
     let (dp_rank, target_worker, inflight_guard) = s
-        .select_worker(prepared.lora_id, &prepared.prompt, session_key.as_deref())
+        .select_worker(
+            prepared.lora_id,
+            &prepared.prompt,
+            &prepared.images,
+            session_key.as_deref(),
+        )
         .inspect_err(|_| log.finish("error", false))
         .map_err(worker_api_err)?;
-    s.bind_session_to_worker(meta.response_id.clone(), dp_rank);
+    s.bind_session_to_worker(format!("resp:{}", meta.response_id), dp_rank);
     let mut generation = target_worker
         .submit_with_images_lora_and_budget_mode(
             prepared.prompt,
@@ -1879,7 +1907,7 @@ async fn responses_create(
         )
         .inspect_err(|_| log.finish("error", false))
         .map_err(worker_api_err)?;
-    generation.inflight_guard = inflight_guard;
+    generation.attach_inflight_guard(inflight_guard);
     log.track_cache(
         generation.cached_tokens.clone(),
         generation.cache_lookup.clone(),
@@ -2163,7 +2191,7 @@ async fn anthropic_messages(
         .get("x-session-id")
         .and_then(|v| v.to_str().ok())
         .filter(|s| !s.is_empty())
-        .map(str::to_owned);
+        .map(|s| format!("sess:{s}"));
     let body = read_json(&s, request).await.map_err(to_anthropic_err)?;
     let request_id = s.next_request_id.fetch_add(1, Ordering::Relaxed) + 1;
     let (chat_req, mut meta) =
@@ -2184,7 +2212,12 @@ async fn anthropic_messages(
     );
     let prompt_len = prepared.prompt.len();
     let (_dp_rank, target_worker, inflight_guard) = s
-        .select_worker(prepared.lora_id, &prepared.prompt, session_key.as_deref())
+        .select_worker(
+            prepared.lora_id,
+            &prepared.prompt,
+            &prepared.images,
+            session_key.as_deref(),
+        )
         .inspect_err(|_| log.finish("error", false))
         .map_err(worker_anthropic_err)?;
     let mut generation = target_worker
@@ -2198,7 +2231,7 @@ async fn anthropic_messages(
         )
         .inspect_err(|_| log.finish("error", false))
         .map_err(worker_anthropic_err)?;
-    generation.inflight_guard = inflight_guard;
+    generation.attach_inflight_guard(inflight_guard);
     log.track_cache(
         generation.cached_tokens.clone(),
         generation.cache_lookup.clone(),

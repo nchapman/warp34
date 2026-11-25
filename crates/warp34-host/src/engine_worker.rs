@@ -74,17 +74,53 @@ fn generation_channel(capacity: usize) -> (Sender<GenerationEvent>, GenerationEv
     )
 }
 
+#[derive(Default)]
+pub(super) struct PrefillReleaseSlot {
+    done: AtomicBool,
+    guard: OnceLock<Arc<crate::dp_router::PrefillTokenGuard>>,
+}
+
+impl PrefillReleaseSlot {
+    fn attach(&self, guard: Arc<crate::dp_router::PrefillTokenGuard>) {
+        let _ = self.guard.set(guard);
+        if self.done.load(Ordering::SeqCst)
+            && let Some(g) = self.guard.get()
+        {
+            g.release();
+        }
+    }
+
+    pub(super) fn mark_done(&self) {
+        self.done.store(true, Ordering::SeqCst);
+        if let Some(g) = self.guard.get() {
+            g.release();
+        }
+    }
+}
+
 pub struct GenerationStream {
     pub events: GenerationEvents,
     pub cached_tokens: Arc<AtomicU64>,
     pub cache_lookup: Arc<OnceLock<CacheLookup>>,
     pub hit_limit: Arc<AtomicBool>,
     cancelled: Arc<AtomicBool>,
+    prefill_release: Arc<PrefillReleaseSlot>,
     pub(crate) inflight_guard: Option<crate::dp_router::InflightGuard>,
 }
 impl GenerationStream {
     pub fn cancel_handle(&self) -> Arc<AtomicBool> {
         self.cancelled.clone()
+    }
+
+    /// Attaches a DP router [`crate::dp_router::InflightGuard`] to this stream and wires
+    /// its prefill-token weight to release as soon as the worker finishes prefill.
+    pub(crate) fn attach_inflight_guard(&mut self, guard: Option<crate::dp_router::InflightGuard>) {
+        if let Some(ref g) = guard
+            && let Some(pg) = g.prefill_guard()
+        {
+            self.prefill_release.attach(pg);
+        }
+        self.inflight_guard = guard;
     }
 
     #[cfg(test)]
@@ -98,6 +134,7 @@ impl GenerationStream {
                 cache_lookup: Arc::default(),
                 hit_limit: Arc::new(AtomicBool::new(false)),
                 cancelled: Arc::new(AtomicBool::new(false)),
+                prefill_release: Arc::default(),
                 inflight_guard: None,
             },
         )
@@ -163,6 +200,7 @@ struct Request {
     output: Sender<GenerationEvent>,
     terminal: Arc<OnceLock<GenerationEvent>>,
     cancelled: Arc<AtomicBool>,
+    prefill_release: Arc<PrefillReleaseSlot>,
     max_prefix_lookup_len: Option<usize>,
     mamba_branching_seqlen: Option<usize>,
     prefix_bidir_len: Option<usize>,
@@ -178,6 +216,7 @@ impl Request {
     }
 
     fn set_terminal(&self, event: GenerationEvent) {
+        self.prefill_release.mark_done();
         let outcome = match &event {
             GenerationEvent::Finished { .. } if self.cancelled.load(Ordering::Acquire) => {
                 Outcome::Cancelled
@@ -630,6 +669,7 @@ impl EngineWorker {
         let cached_tokens = Arc::new(AtomicU64::new(0));
         let hit_limit = Arc::new(AtomicBool::new(false));
         let cancelled = Arc::new(AtomicBool::new(false));
+        let prefill_release = Arc::new(PrefillReleaseSlot::default());
         let sampler = SamplerV1::new(params, &prompt, constraint);
         self.enqueue_request(Request {
             lifecycle: None,
@@ -645,6 +685,7 @@ impl EngineWorker {
             output,
             terminal: events.terminal.clone(),
             cancelled: cancelled.clone(),
+            prefill_release: prefill_release.clone(),
             max_prefix_lookup_len: None,
             mamba_branching_seqlen: None,
             prefix_bidir_len: None,
@@ -657,6 +698,7 @@ impl EngineWorker {
             cache_lookup,
             cached_tokens,
             hit_limit,
+            prefill_release,
             inflight_guard: None,
         })
     }
@@ -835,6 +877,7 @@ impl EngineWorker {
         let cached_tokens = Arc::new(AtomicU64::new(0));
         let hit_limit = Arc::new(AtomicBool::new(false));
         let cancelled = Arc::new(AtomicBool::new(false));
+        let prefill_release = Arc::new(PrefillReleaseSlot::default());
         let params = SamplingParams {
             temperature: 0.0,
             top_k: 1,
@@ -858,6 +901,7 @@ impl EngineWorker {
             output,
             terminal: events.terminal.clone(),
             cancelled: cancelled.clone(),
+            prefill_release: prefill_release.clone(),
             max_prefix_lookup_len,
             mamba_branching_seqlen,
             prefix_bidir_len,
@@ -870,6 +914,7 @@ impl EngineWorker {
             cache_lookup,
             cached_tokens,
             hit_limit,
+            prefill_release,
             inflight_guard: None,
         })
     }
@@ -967,6 +1012,7 @@ pub fn run_batch_in_place(
                     output,
                     terminal: events.terminal.clone(),
                     cancelled: cancelled.clone(),
+                    prefill_release: Arc::default(),
                     max_prefix_lookup_len: None,
                     mamba_branching_seqlen: None,
                     prefix_bidir_len: None,

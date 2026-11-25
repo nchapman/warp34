@@ -1473,6 +1473,8 @@ fn complete_tick(
 }
 
 pub(super) fn emit(request: &Request, id: i32, logprobs: Option<StepLogprobs>) {
+    // Prefill is complete as soon as the first generated token is produced.
+    request.prefill_release.mark_done();
     // Engine output exists even if the bounded delivery channel rejects it.
     if let Some(life) = &request.lifecycle {
         life.token();
