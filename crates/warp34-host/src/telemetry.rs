@@ -41,6 +41,14 @@ impl Histogram {
             }
         }
     }
+
+    fn merge_from(&mut self, other: &Self) {
+        self.count = self.count.saturating_add(other.count);
+        self.sum += other.sum;
+        for (dst, src) in self.buckets.iter_mut().zip(&other.buckets) {
+            *dst = dst.saturating_add(*src);
+        }
+    }
 }
 #[derive(Clone, Debug, Default, Serialize)]
 pub struct Requests {
@@ -119,6 +127,8 @@ pub struct HttpResponses {
 #[derive(Clone, Debug, Serialize)]
 pub struct Config {
     pub tp_size: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dp_size: Option<usize>,
     pub kv_format: String,
     pub speculation: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -140,6 +150,8 @@ pub struct Snapshot {
     pub pools: Pools,
     pub speculation: Speculation,
     pub http_responses: HttpResponses,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub workers: Vec<Self>,
     #[serde(skip)]
     peak_running: u64,
     #[serde(skip)]
@@ -170,6 +182,7 @@ impl Default for Telemetry {
     fn default() -> Self {
         Arc::try_unwrap(Self::new(Config {
             tp_size: 0,
+            dp_size: None,
             kv_format: "unknown".into(),
             speculation: "none".into(),
             max_model_len: None,
@@ -203,6 +216,7 @@ impl Telemetry {
                     ..Speculation::default()
                 },
                 http_responses: HttpResponses::default(),
+                workers: Vec::new(),
                 peak_running: 0,
                 decode_bucket_mask: 0,
             }),
@@ -577,17 +591,145 @@ impl Snapshot {
             writeln!(out, "warp34_http_responses_total{{class=\"{class}\"}} {n}").unwrap();
         }
         out.push_str("# HELP warp34_model_info Static worker model configuration.\n# TYPE warp34_model_info gauge\n");
+        let dp_size = self.config.dp_size.unwrap_or(1);
         writeln!(
             out,
-            "warp34_model_info{{model=\"{}\",tp_size=\"{}\",kv_format=\"{}\",speculation=\"{}\"}} 1",
+            "warp34_model_info{{model=\"{}\",tp_size=\"{}\",dp_size=\"{}\",kv_format=\"{}\",speculation=\"{}\"}} 1",
             escape(&self.model),
             self.config.tp_size,
+            dp_size,
             escape(&self.config.kv_format),
             escape(&self.config.speculation)
         )
         .unwrap();
+        if self.workers.len() > 1 {
+            out.push_str("# HELP warp34_dp_worker_requests In-flight requests per data-parallel worker.\n# TYPE warp34_dp_worker_requests gauge\n");
+            for (rank, w) in self.workers.iter().enumerate() {
+                writeln!(
+                    out,
+                    "warp34_dp_worker_requests{{dp_rank=\"{rank}\",state=\"running\"}} {}",
+                    w.requests.running
+                )
+                .unwrap();
+                writeln!(
+                    out,
+                    "warp34_dp_worker_requests{{dp_rank=\"{rank}\",state=\"waiting\"}} {}",
+                    w.requests.waiting
+                )
+                .unwrap();
+            }
+            out.push_str("# HELP warp34_dp_worker_kv_utilization Active KV pool utilization ratio per data-parallel worker.\n# TYPE warp34_dp_worker_kv_utilization gauge\n");
+            for (rank, w) in self.workers.iter().enumerate() {
+                let util = if w.pools.kv.capacity > 0 {
+                    w.pools.kv.active.unwrap_or(0) as f64 / w.pools.kv.capacity as f64
+                } else {
+                    0.0
+                };
+                writeln!(
+                    out,
+                    "warp34_dp_worker_kv_utilization{{dp_rank=\"{rank}\"}} {util:.6}"
+                )
+                .unwrap();
+            }
+        }
         out
     }
+
+    /// Aggregates per-worker snapshots from an in-process DP pool into a single server-level
+    /// snapshot while preserving per-worker details in `workers` for `/api/metrics` and `/metrics`.
+    pub fn aggregate(snapshots: &[Self]) -> Self {
+        assert!(
+            !snapshots.is_empty(),
+            "aggregate requires at least one snapshot"
+        );
+        if snapshots.len() == 1 {
+            return snapshots[0].clone();
+        }
+        let mut agg = snapshots[0].clone();
+        agg.config.dp_size = Some(snapshots.len());
+        agg.status = if snapshots.iter().any(|s| s.status == "ready") {
+            "ready"
+        } else if snapshots.iter().all(|s| s.status == "stopping") {
+            "stopping"
+        } else {
+            "error"
+        };
+        agg.workers = snapshots.to_vec();
+        for w in &snapshots[1..] {
+            agg.uptime_seconds = agg.uptime_seconds.max(w.uptime_seconds);
+            agg.requests.submitted = agg.requests.submitted.saturating_add(w.requests.submitted);
+            agg.requests.completed = agg.requests.completed.saturating_add(w.requests.completed);
+            agg.requests.cancelled = agg.requests.cancelled.saturating_add(w.requests.cancelled);
+            agg.requests.failed = agg.requests.failed.saturating_add(w.requests.failed);
+            agg.requests.running = agg.requests.running.saturating_add(w.requests.running);
+            agg.requests.waiting = agg.requests.waiting.saturating_add(w.requests.waiting);
+            agg.tokens.prompt = agg.tokens.prompt.saturating_add(w.tokens.prompt);
+            agg.tokens.computed = agg.tokens.computed.saturating_add(w.tokens.computed);
+            agg.tokens.cached = agg.tokens.cached.saturating_add(w.tokens.cached);
+            agg.tokens.generated = agg.tokens.generated.saturating_add(w.tokens.generated);
+            agg.latency.ttft.merge_from(&w.latency.ttft);
+            agg.latency.queue.merge_from(&w.latency.queue);
+            agg.latency.e2e.merge_from(&w.latency.e2e);
+            agg.latency
+                .time_per_output_token
+                .merge_from(&w.latency.time_per_output_token);
+            merge_pool(&mut agg.pools.kv, &w.pools.kv);
+            merge_pool(&mut agg.pools.gdn, &w.pools.gdn);
+            match (&mut agg.pools.gdn_checkpoints, &w.pools.gdn_checkpoints) {
+                (Some(dst), Some(src)) => {
+                    dst.vram_capacity = dst.vram_capacity.saturating_add(src.vram_capacity);
+                    dst.vram_used = dst.vram_used.saturating_add(src.vram_used);
+                    dst.host_capacity = dst.host_capacity.saturating_add(src.host_capacity);
+                    dst.host_used = dst.host_used.saturating_add(src.host_used);
+                }
+                (None, Some(src)) => agg.pools.gdn_checkpoints = Some(src.clone()),
+                _ => {}
+            }
+            agg.speculation.rounds = agg.speculation.rounds.saturating_add(w.speculation.rounds);
+            agg.speculation.accepted_tokens = agg
+                .speculation
+                .accepted_tokens
+                .saturating_add(w.speculation.accepted_tokens);
+            agg.speculation.draft_tokens =
+                match (agg.speculation.draft_tokens, w.speculation.draft_tokens) {
+                    (Some(a), Some(b)) => Some(a.saturating_add(b)),
+                    (Some(a), None) => Some(a),
+                    (None, Some(b)) => Some(b),
+                    (None, None) => None,
+                };
+            agg.http_responses.success = agg
+                .http_responses
+                .success
+                .saturating_add(w.http_responses.success);
+            agg.http_responses.client_error = agg
+                .http_responses
+                .client_error
+                .saturating_add(w.http_responses.client_error);
+            agg.http_responses.server_error = agg
+                .http_responses
+                .server_error
+                .saturating_add(w.http_responses.server_error);
+            agg.peak_running = agg.peak_running.max(w.peak_running);
+            agg.decode_bucket_mask |= w.decode_bucket_mask;
+        }
+        agg.peak_running = agg.peak_running.max(agg.requests.running);
+        agg
+    }
+}
+
+fn merge_pool(dst: &mut Pool, src: &Pool) {
+    dst.capacity = dst.capacity.saturating_add(src.capacity);
+    dst.cached = dst.cached.saturating_add(src.cached);
+    dst.active = match (dst.active, src.active) {
+        (Some(a), Some(b)) => Some(a.saturating_add(b)),
+        (Some(a), None) | (None, Some(a)) => Some(a),
+        (None, None) => None,
+    };
+    dst.free = match (dst.free, src.free) {
+        (Some(a), Some(b)) => Some(a.saturating_add(b)),
+        (Some(a), None) | (None, Some(a)) => Some(a),
+        (None, None) => None,
+    };
 }
 
 #[cfg(test)]
@@ -596,6 +738,7 @@ mod tests {
     fn telemetry() -> Arc<Telemetry> {
         Telemetry::new(Config {
             tp_size: 1,
+            dp_size: None,
             kv_format: "tq4".into(),
             speculation: "none".into(),
             max_model_len: None,
@@ -743,5 +886,54 @@ mod tests {
         assert!(p.contains("warp34_pool_units{pool=\"gdn_ckpt_host\",state=\"used\"} 34"));
         assert_eq!(Pool::known(100, 10, 70).active, Some(20));
         assert_eq!(t.snapshot().instance_id, telemetry().snapshot().instance_id);
+    }
+
+    #[test]
+    fn aggregate_dp_snapshots_sums_counters_pools_and_emits_per_rank_prometheus() {
+        let t0 = telemetry();
+        let t1 = telemetry();
+        let t2 = telemetry();
+        t0.set_model("m".into());
+        t1.set_model("m".into());
+        t2.set_model("m".into());
+        t0.publish_pools(Pools {
+            kv: Pool::known(100, 60, 20),
+            gdn: Pool::known(16, 12, 2),
+            gdn_checkpoints: None,
+        });
+        t1.publish_pools(Pools {
+            kv: Pool::known(100, 50, 10),
+            gdn: Pool::known(16, 10, 4),
+            gdn_checkpoints: None,
+        });
+        t2.publish_pools(Pools {
+            kv: Pool::known(100, 90, 5),
+            gdn: Pool::known(16, 15, 0),
+            gdn_checkpoints: None,
+        });
+        let r0 = t0.request(100);
+        r0.scheduled(40);
+        r0.computed(60);
+        r0.token();
+        r0.finish(Outcome::Completed);
+        let r1 = t1.request(200);
+        r1.scheduled(150);
+
+        let agg = Snapshot::aggregate(&[t0.snapshot(), t1.snapshot(), t2.snapshot()]);
+        assert_eq!(agg.config.dp_size, Some(3));
+        assert_eq!(agg.workers.len(), 3);
+        assert_eq!(agg.requests.submitted, 2);
+        assert_eq!(agg.requests.completed, 1);
+        assert_eq!(agg.requests.running, 1);
+        assert_eq!(agg.tokens.cached, 190);
+        assert_eq!(agg.tokens.generated, 1);
+        assert_eq!(agg.pools.kv.capacity, 300);
+        assert_eq!(agg.pools.kv.active, Some(65));
+        let prom = agg.prometheus();
+        assert!(prom.contains("dp_size=\"3\""));
+        assert!(prom.contains("warp34_dp_worker_requests{dp_rank=\"1\",state=\"running\"} 1"));
+        assert!(prom.contains("warp34_dp_worker_kv_utilization{dp_rank=\"0\"} 0.200000"));
+        assert!(prom.contains("warp34_dp_worker_kv_utilization{dp_rank=\"1\"} 0.400000"));
+        assert!(prom.contains("warp34_dp_worker_kv_utilization{dp_rank=\"2\"} 0.050000"));
     }
 }

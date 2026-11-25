@@ -3394,37 +3394,52 @@ impl QwenImage21TransformerTp2Engine {
         weight_prefix: &str,
         max_tokens: usize,
     ) -> Result<Self> {
-        prepare_qwen_image_execution_plan(0)?;
-        prepare_qwen_image_execution_plan(1)?;
-        let stream0 = CudaStream::new(0)?;
+        Self::load_with_prefix_on_devices(archive, cfg, quant, weight_prefix, max_tokens, [0, 1])
+    }
+
+    pub fn load_with_prefix_on_devices(
+        archive: &SafetensorsArchive,
+        cfg: &QwenImage21TransformerConfig,
+        quant: &QuantScheme,
+        weight_prefix: &str,
+        max_tokens: usize,
+        devices: [i32; 2],
+    ) -> Result<Self> {
+        prepare_qwen_image_execution_plan(devices[0])?;
+        prepare_qwen_image_execution_plan(devices[1])?;
+        let stream0 = CudaStream::new(devices[0])?;
         let cublas0 = CublasHandle::new(&stream0)?;
         let rank0 = QwenImage21TransformerEngine::load_with_prefix(
             archive,
             cfg,
             quant,
             weight_prefix,
-            0,
+            devices[0],
             0,
             2,
             &stream0,
         )?;
 
-        let stream1 = CudaStream::new(1)?;
+        let stream1 = CudaStream::new(devices[1])?;
         let cublas1 = CublasHandle::new(&stream1)?;
         let rank1 = QwenImage21TransformerEngine::load_with_prefix(
             archive,
             cfg,
             quant,
             weight_prefix,
-            1,
+            devices[1],
             1,
             2,
             &stream1,
         )?;
 
         let max_stage_bytes = (max_tokens.max(16384) * cfg.inner_dim() * 2).max(256 * 1024);
-        let comm = Arc::new(Tp2Collectives::new_for_tp(2, max_stage_bytes)?);
-        let worker1 = PersistentScopedWorker::new(1);
+        let comm = Arc::new(Tp2Collectives::new_for_tp_with_devices(
+            &devices,
+            max_stage_bytes,
+            true,
+        )?);
+        let worker1 = PersistentScopedWorker::new(devices[1]);
         Ok(Self {
             rank0,
             rank1,
@@ -3478,7 +3493,7 @@ impl QwenImage21TransformerTp2Engine {
         let gate = &self.capture_gate;
         let (r0, r1) = self.worker1.run_parallel(
             || {
-                let _dev = CudaDevice::set_current(0)?;
+                let _dev = CudaDevice::set_current(self.rank0.device_id)?;
                 self.rank0.forward_extract_with_allreduce_gated(
                     cond_latents_f16,
                     target_latents_f16,
@@ -3543,7 +3558,7 @@ impl QwenImage21TransformerTp2Engine {
         let (c0, c1) = kv_caches;
         let (r0, r1) = self.worker1.run_parallel(
             || {
-                let _dev = CudaDevice::set_current(0)?;
+                let _dev = CudaDevice::set_current(self.rank0.device_id)?;
                 self.rank0.forward_cached_with_allreduce_gated(
                     target_latents_f16,
                     timestep,
@@ -3605,7 +3620,7 @@ impl QwenImage21TransformerTp2Engine {
         let (neg_c0, neg_c1) = neg_caches;
         let (r0, r1) = self.worker1.run_parallel(
             || {
-                let _dev = CudaDevice::set_current(0)?;
+                let _dev = CudaDevice::set_current(self.rank0.device_id)?;
                 self.rank0.denoise_loop_with_allreduce(
                     cond_latents_f16,
                     init_target_latents_f16,

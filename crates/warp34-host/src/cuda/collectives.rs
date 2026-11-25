@@ -62,12 +62,25 @@ impl Tp2Collectives {
         Self::new_for_tp_with_p2p(tp_size, max_stage_bytes_per_epoch, true)
     }
 
-    /// Allocates collective buffers for `tp_size` (`2` or `4`), optionally allowing P2P VRAM staging.
+    /// Allocates collective buffers for `tp_size` (`2` or `4`) on devices `0..tp_size`,
+    /// optionally allowing P2P VRAM staging.
     pub fn new_for_tp_with_p2p(
         tp_size: usize,
         max_stage_bytes_per_epoch: usize,
         allow_p2p: bool,
     ) -> Result<Self> {
+        let devices: Vec<i32> = (0..tp_size).map(|r| r as i32).collect();
+        Self::new_for_tp_with_devices(&devices, max_stage_bytes_per_epoch, allow_p2p)
+    }
+
+    /// Allocates collective buffers for `devices.len()` (`2` or `4`) ranks bound to the
+    /// explicit CUDA device IDs in `devices` (e.g. `[0, 1]` or `[2, 3]` for `DP=2, TP=2`).
+    pub fn new_for_tp_with_devices(
+        devices: &[i32],
+        max_stage_bytes_per_epoch: usize,
+        allow_p2p: bool,
+    ) -> Result<Self> {
+        let tp_size = devices.len();
         if !matches!(tp_size, 2 | 4) {
             return Err(CudaError::new(
                 -1,
@@ -94,10 +107,19 @@ impl Tp2Collectives {
         if all_p2p {
             for i in 0..tp_size {
                 for j in (i + 1)..tp_size {
+                    if devices[i] == devices[j] {
+                        all_p2p = false;
+                        break;
+                    }
                     let mut can_p2p = 0i32;
-                    // SAFETY: queries and enables bidirectional peer access between `i` and `j`.
+                    // SAFETY: queries and enables bidirectional peer access between `devices[i]` and `devices[j]`.
                     let rc = unsafe {
-                        ffi::warp34_device_can_enable_p2p(i as i32, j as i32, 1, &raw mut can_p2p)
+                        ffi::warp34_device_can_enable_p2p(
+                            devices[i],
+                            devices[j],
+                            1,
+                            &raw mut can_p2p,
+                        )
                     };
                     if rc != 0 || can_p2p == 0 {
                         all_p2p = false;
@@ -117,24 +139,31 @@ impl Tp2Collectives {
             if let Some(slot) = sig_init.get_mut(SIG_EPOCH_CAP_U32_IDX) {
                 *slot = cap_u32;
             }
-            for r in 0..tp_size {
-                let sig = DeviceBuffer::alloc(r as i32, sig_bytes)?;
-                let stream = super::CudaStream::new(r as i32)?;
+            for &dev_id in devices {
+                let sig = DeviceBuffer::alloc(dev_id, sig_bytes)?;
+                let stream = super::CudaStream::new(dev_id)?;
                 sig.copy_from_host(&sig_init, &stream)?;
                 stream.synchronize()?;
                 sigs.push(CommBuffer::DeviceVram(sig));
                 stages.push(CommBuffer::DeviceVram(DeviceBuffer::alloc(
-                    r as i32,
+                    dev_id,
                     stage_bytes,
                 )?));
             }
         } else {
-            let num_gpus = super::CudaDevice::count()?.max(1) as usize;
-            for r in 0..tp_size {
-                let dev_id = (r % num_gpus) as i32;
+            let num_gpus = super::CudaDevice::count()?.max(1);
+            for &raw_dev in devices {
+                if raw_dev < 0 {
+                    return Err(CudaError::with_detail(
+                        -1,
+                        "Tp2Collectives::new_for_tp_with_devices",
+                        format!("requires non-negative device ids, got {raw_dev}"),
+                    ));
+                }
+                let dev_id = raw_dev.rem_euclid(num_gpus);
                 check_rc(
                     // SAFETY: binds calling thread to a valid visible device before allocating
-                    // portable mapped host memory for rank `r` (wraps modulo `num_gpus` so
+                    // portable mapped host memory for this rank (wraps modulo `num_gpus` so
                     // TP=4 mapped-host simulation tests work on 1- or 2-GPU hosts).
                     unsafe { ffi::warp34_set_device(dev_id) },
                     "warp34_set_device",
@@ -158,7 +187,7 @@ impl Tp2Collectives {
         }
         let mut dma_pipes = Vec::new();
         if tp_size == 2 && !all_p2p && super::CudaDevice::count().unwrap_or(0) >= 2 {
-            for dev in 0..2i32 {
+            for &dev in devices {
                 let stream = super::CudaStream::new(dev)?;
                 let ev_ready = super::CudaEvent::new(dev, false)?;
                 let ev0 = super::CudaEvent::new(dev, false)?;

@@ -37,6 +37,8 @@ pub struct ServeOptions {
     /// capped at `DEFAULT_MAX_REASONING_BUDGET_TOKENS = 32_768`) when no explicit token budget is specified.
     /// Enabled by default; disable with `--no-reasoning-effort-budget`.
     pub reasoning_effort_budget: bool,
+    /// Request routing policy when serving multiple data-parallel (`--dp > 1`) replicas.
+    pub dp_routing: crate::dp_router::DpRoutingPolicy,
 }
 
 impl Default for ServeOptions {
@@ -50,6 +52,7 @@ impl Default for ServeOptions {
             reasoning_budget: None,
             reasoning_budget_message: None,
             reasoning_effort_budget: true,
+            dp_routing: crate::dp_router::DpRoutingPolicy::Prefix,
         }
     }
 }

@@ -1033,6 +1033,7 @@ impl Qwen3_5ModelRank {
     }
 
     #[allow(clippy::cognitive_complexity, clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn fit_serving_plan(
         archive: &SafetensorsArchive,
         cfg: &ModelConfig,
@@ -1045,13 +1046,41 @@ impl Qwen3_5ModelRank {
         dflash_draft_dir: Option<&Path>,
         lora_reserve: LoraCapacityReserve,
     ) -> Result<(ServingAutoFitPlan, usize, usize)> {
+        let devices: Vec<i32> = (0..tp_size).map(|r| r as i32).collect();
+        Self::fit_serving_plan_on_devices(
+            archive,
+            cfg,
+            &devices,
+            requested_policy,
+            allow_kv_format_stepdown,
+            requested_kv_pages,
+            requested_state_slots,
+            native_mtp,
+            dflash_draft_dir,
+            lora_reserve,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn fit_serving_plan_on_devices(
+        archive: &SafetensorsArchive,
+        cfg: &ModelConfig,
+        devices: &[i32],
+        requested_policy: KvFormatPolicy,
+        allow_kv_format_stepdown: bool,
+        requested_kv_pages: Option<usize>,
+        requested_state_slots: usize,
+        native_mtp: bool,
+        dflash_draft_dir: Option<&Path>,
+        lora_reserve: LoraCapacityReserve,
+    ) -> Result<(ServingAutoFitPlan, usize, usize)> {
+        let tp_size = devices.len();
         Self::validate_tp_geometry(cfg, tp_size)?;
         let mut min_free_vram = usize::MAX;
         let mut min_total_vram = usize::MAX;
         let mut supports_fp8_kv = true;
         let mut marlin_ws_bytes = 0usize;
-        for r in 0..tp_size {
-            let device_id = r as i32;
+        for &device_id in devices {
             prepare_execution_plan(device_id)?;
             let device = CudaDevice::set_current(device_id)?;
             let dev_props = device.props()?;
@@ -1062,7 +1091,9 @@ impl Qwen3_5ModelRank {
             min_free_vram = min_free_vram.min(free_vram);
             min_total_vram = min_total_vram.min(total_vram);
         }
-        let _ = CudaDevice::set_current(0)?;
+        if let Some(&first_dev) = devices.first() {
+            let _ = CudaDevice::set_current(first_dev)?;
+        }
 
         let raw_est_default = Self::estimate_weight_arena_bytes(cfg, archive, tp_size, Some(0));
         let raw_est_extreme = Self::estimate_weight_arena_bytes(
@@ -2285,9 +2316,10 @@ impl PrePoolModelRank {
             kv_pool.init_qsa_indexer_caches(cfg.indexer_head_dim, cfg.indexer_compress_ratio)?;
         }
         if capacity.enable_checkpoint_pool {
+            let host_budget_ranks = tp_size.saturating_mul(capacity.dp_size.max(1));
             let host_kv_pages = crate::cache::plan_auto_host_kv_swap_pages(
                 kv_pool.page_bundle_bytes(),
-                tp_size,
+                host_budget_ranks,
                 crate::cache::detect_available_host_ram_bytes(),
             );
             kv_pool.enable_host_swap(host_kv_pages);
@@ -2407,7 +2439,7 @@ impl PrePoolModelRank {
             Some(h) => h,
             None => crate::cache::plan_auto_host_checkpoint_slots(
                 ckpt_layout.bundle_bytes,
-                tp_size,
+                tp_size.saturating_mul(capacity.dp_size.max(1)),
                 crate::cache::detect_available_host_ram_bytes(),
             ),
         };

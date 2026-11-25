@@ -146,6 +146,10 @@ Context & KV Cache Options:
 
 Parallelism & Speculative Decoding:
   --tp, --tp-size <1|2|4|auto>        Tensor parallelism degree (default: 1; alias: --tensor-parallel-size)
+  --dp, --dp-size <n|auto>            Data-parallel replicas in serve (default: 1; auto = visible_gpus / tp;
+                                      supports 2x/3x/4x GPU configs, e.g. --tp 1 --dp 3 or --tp 2 --dp 2;
+                                      alias: --data-parallel-size)
+  --dp-routing <policy>               DP request routing: prefix (default), least-loaded, round-robin
   --speculative auto|mtp|dflash2|off  Speculative decoding (default: auto in serve/chat/generate — uses native MTP
                                       when present or DFlash2 when --draft-model is set; off in bench/oracle)
   --draft-model <id|path>             DFlash2 draft checkpoint (implies --speculative dflash2 when --speculative is auto)
@@ -577,6 +581,8 @@ pub(crate) struct CudaCliOptions {
     pub(crate) tp: usize,
     pub(crate) tp_auto: bool,
     pub(crate) tp_explicit: bool,
+    pub(crate) dp: usize,
+    pub(crate) dp_auto: bool,
     pub(crate) prompt: String,
     pub(crate) prompt_explicit: bool,
     pub(crate) prompt_file: Option<String>,
@@ -658,6 +664,8 @@ pub(crate) fn parse_cuda_options(args: &[String]) -> Result<Option<CudaCliOption
     let mut tp = if is_image_sub { 2usize } else { 1usize };
     let mut tp_auto = is_image_sub;
     let mut tp_explicit = false;
+    let mut dp = 1usize;
+    let mut dp_auto = false;
     let mut prompt = if is_image_sub {
         "A cinematic macro photograph of a translucent mechanical watch movement on dark slate, studio lighting".to_string()
     } else {
@@ -798,6 +806,25 @@ pub(crate) fn parse_cuda_options(args: &[String]) -> Result<Option<CudaCliOption
                 tp_explicit = true;
                 tp_auto = raw.trim().eq_ignore_ascii_case("auto");
                 tp = parse_tp_arg(raw)?;
+            }
+            "--dp" | "-dp" | "--dp-size" | "--data-parallel-size" => {
+                i += 1;
+                let raw = args.get(i).ok_or("missing --dp value")?;
+                if raw.trim().eq_ignore_ascii_case("auto") {
+                    dp_auto = true;
+                    dp = 1;
+                } else {
+                    dp_auto = false;
+                    dp = raw
+                        .trim()
+                        .parse::<usize>()
+                        .map_err(|_| "invalid --dp value")?;
+                }
+            }
+            "--dp-routing" | "--load-balance-method" => {
+                i += 1;
+                let raw = args.get(i).ok_or("missing --dp-routing value")?;
+                serve.options.dp_routing = crate::dp_router::DpRoutingPolicy::parse(raw)?;
             }
             "--prompt" | "-p" => {
                 i += 1;
@@ -1155,6 +1182,8 @@ pub(crate) fn parse_cuda_options(args: &[String]) -> Result<Option<CudaCliOption
         tp,
         tp_auto,
         tp_explicit,
+        dp,
+        dp_auto,
         prompt,
         prompt_explicit,
         prompt_file,
@@ -1229,6 +1258,15 @@ pub(crate) fn validate_cuda_command(options: &CudaCliOptions, sub: &str) -> Resu
     }
     if !matches!(options.tp, 1 | 2 | 4) {
         return Err("--tp must be 1, 2, or 4".into());
+    }
+    if !options.dp_auto && (options.dp == 0 || options.dp > crate::dp_router::MAX_DP_WORKERS) {
+        return Err(format!(
+            "--dp must be between 1 and {} (or 'auto')",
+            crate::dp_router::MAX_DP_WORKERS
+        ));
+    }
+    if (options.dp > 1 || options.dp_auto) && sub != "serve" {
+        return Err("--dp > 1 (or --dp auto) is only supported by the serve subcommand".into());
     }
     if matches!(sub, "image" | "bench-image") && !options.tp_auto && !matches!(options.tp, 1 | 2) {
         return Err("--tp for image/bench-image must be 1, 2, or auto".into());

@@ -32,6 +32,12 @@ use tokio_stream::{Stream, StreamExt};
 const BODY_LIMIT: usize = 32 * 1024 * 1024;
 const BODY_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Loader closure for a single in-process DP LLM/Decision replica.
+pub type DpEngineLoader = Box<
+    dyn FnOnce(usize, Arc<crate::dp_router::DpPrefixDirectory>) -> Result<Qwen3_5Engine, String>
+        + Send,
+>;
+
 pub struct OpenAiServerState {
     pub model_name: String,
     api_key: Option<crate::api_auth::ApiKey>,
@@ -40,7 +46,10 @@ pub struct OpenAiServerState {
     pub default_reasoning_budget: Option<usize>,
     pub default_reasoning_budget_message: Option<String>,
     pub reasoning_effort_budget: bool,
+    max_num_seqs: usize,
     pub worker: EngineWorker,
+    extra_workers: Vec<EngineWorker>,
+    dp_router: Arc<crate::dp_router::DpRouterCore>,
     pub metrics: Arc<crate::telemetry::Telemetry>,
     next_request_id: AtomicU64,
     pub allow_remote_images: bool,
@@ -83,14 +92,87 @@ impl OpenAiServerState {
         options: super::ServeOptions,
         loader: impl FnOnce() -> Result<Qwen3_5Engine, String> + Send + 'static,
     ) -> Result<Arc<Self>, String> {
+        Self::from_loaders_with_options(
+            model_name,
+            allow_remote_images,
+            options,
+            vec![Box::new(move |_dp_rank, _dir| loader())],
+        )
+    }
+
+    /// Loads `loaders.len()` (`>= 1`) independent data-parallel engine replicas in parallel
+    /// and attaches a shared [`crate::dp_router::DpPrefixDirectory`] observer to each replica's
+    /// `MambaRadixCache` when `dp > 1`.
+    pub fn from_loaders_with_options(
+        model_name: String,
+        allow_remote_images: bool,
+        options: super::ServeOptions,
+        loaders: Vec<DpEngineLoader>,
+    ) -> Result<Arc<Self>, String> {
         options.validate()?;
+        if loaders.is_empty() {
+            return Err("from_loaders_with_options requires at least one loader".to_owned());
+        }
+        let dp_size = loaders.len();
+        let dp_router = crate::dp_router::DpRouterCore::new(dp_size, options.dp_routing);
         let config = SchedulerConfig {
             max_num_seqs: options.max_num_seqs,
             ..SchedulerConfig::default()
         };
-        let mut worker = EngineWorker::from_loader(loader, config)?;
-        worker.set_max_model_len(options.max_model_len)?;
-        let mut state = Self::with_worker(model_name, worker, allow_remote_images);
+        let mut workers = if dp_size == 1 {
+            let loader = loaders.into_iter().next().unwrap();
+            let dir = Arc::clone(&dp_router.prefix_dir);
+            let mut w = EngineWorker::from_loader(move || loader(0, dir), config)?;
+            w.set_max_model_len(options.max_model_len)?;
+            vec![w]
+        } else {
+            let max_model_len = options.max_model_len;
+            let results: Vec<Result<EngineWorker, String>> = std::thread::scope(|s| {
+                let handles: Vec<_> = loaders
+                    .into_iter()
+                    .enumerate()
+                    .map(|(dp_rank, loader)| {
+                        let cfg = config;
+                        let dir = Arc::clone(&dp_router.prefix_dir);
+                        s.spawn(move || {
+                            let mut w = EngineWorker::from_loader(
+                                move || {
+                                    let mut engine = loader(dp_rank, Arc::clone(&dir))?;
+                                    engine.radix.set_dp_prefix_observer(dp_rank, dir);
+                                    Ok(engine)
+                                },
+                                cfg,
+                            )?;
+                            w.set_max_model_len(max_model_len)?;
+                            Ok(w)
+                        })
+                    })
+                    .collect();
+                handles
+                    .into_iter()
+                    .map(|h| {
+                        h.join()
+                            .unwrap_or_else(|_| Err("DP replica loader thread panicked".to_owned()))
+                    })
+                    .collect()
+            });
+            let mut ok_workers = Vec::with_capacity(dp_size);
+            let mut first_err: Option<String> = None;
+            for res in results {
+                match res {
+                    Ok(w) => ok_workers.push(w),
+                    Err(e) if first_err.is_none() => first_err = Some(e),
+                    Err(_) => {}
+                }
+            }
+            if let Some(err) = first_err {
+                return Err(err);
+            }
+            ok_workers
+        };
+        let primary = workers.remove(0);
+        let mut state =
+            Self::with_workers(model_name, primary, workers, dp_router, allow_remote_images);
         // This newly created state has not been shared with any request handler.
         let unshared = Arc::get_mut(&mut state).expect("unshared server state");
         unshared.api_key = options.api_key;
@@ -99,13 +181,34 @@ impl OpenAiServerState {
         unshared.default_reasoning_budget = options.reasoning_budget;
         unshared.default_reasoning_budget_message = options.reasoning_budget_message;
         unshared.reasoning_effort_budget = options.reasoning_effort_budget;
+        unshared.max_num_seqs = options.max_num_seqs;
         Ok(state)
     }
+
     fn with_worker(
         model_name: String,
         worker: EngineWorker,
         allow_remote_images: bool,
     ) -> Arc<Self> {
+        let dp_router =
+            crate::dp_router::DpRouterCore::new(1, crate::dp_router::DpRoutingPolicy::Prefix);
+        Self::with_workers(
+            model_name,
+            worker,
+            Vec::new(),
+            dp_router,
+            allow_remote_images,
+        )
+    }
+
+    fn with_workers(
+        model_name: String,
+        worker: EngineWorker,
+        extra_workers: Vec<EngineWorker>,
+        dp_router: Arc<crate::dp_router::DpRouterCore>,
+        allow_remote_images: bool,
+    ) -> Arc<Self> {
+        let dp_size = 1 + extra_workers.len();
         let constraint_factory = worker.tokenizer.as_ref().and_then(|t| {
             let eos: Vec<u32> = worker
                 .eos_token_ids
@@ -130,6 +233,9 @@ impl OpenAiServerState {
         };
         let metrics = worker.stats.telemetry.clone();
         metrics.set_model(model_name.clone());
+        for w in &extra_workers {
+            w.stats.telemetry.set_model(model_name.clone());
+        }
         Arc::new(Self {
             model_name,
             api_key: None,
@@ -138,16 +244,118 @@ impl OpenAiServerState {
             default_reasoning_budget: None,
             default_reasoning_budget_message: None,
             reasoning_effort_budget: true,
+            max_num_seqs: SchedulerConfig::default().max_num_seqs,
             worker,
+            extra_workers,
+            dp_router,
             allow_remote_images,
             response_store: crate::responses_api::ResponseStore::default(),
             constraint_factory,
             decoded_vocab,
             metrics,
             next_request_id: AtomicU64::new(0),
-            preprocessing: Arc::new(Semaphore::new(32)),
-            admission: Arc::new(Semaphore::new(32)),
+            preprocessing: Arc::new(Semaphore::new(32 * dp_size)),
+            admission: Arc::new(Semaphore::new(32 * dp_size)),
         })
+    }
+
+    #[inline]
+    pub fn dp_size(&self) -> usize {
+        1 + self.extra_workers.len()
+    }
+
+    #[inline]
+    pub fn worker_at(&self, dp_rank: usize) -> &EngineWorker {
+        if dp_rank == 0 {
+            &self.worker
+        } else {
+            &self.extra_workers[dp_rank - 1]
+        }
+    }
+
+    pub fn all_workers(&self) -> impl Iterator<Item = &EngineWorker> {
+        std::iter::once(&self.worker).chain(self.extra_workers.iter())
+    }
+
+    pub fn snapshot_metrics(&self) -> crate::telemetry::Snapshot {
+        if self.extra_workers.is_empty() {
+            return self.metrics.snapshot();
+        }
+        let snaps: Vec<crate::telemetry::Snapshot> = self
+            .all_workers()
+            .map(|w| w.stats.telemetry.snapshot())
+            .collect();
+        crate::telemetry::Snapshot::aggregate(&snaps)
+    }
+
+    /// Selects a DP worker using the configured [`crate::dp_router::DpRoutingPolicy`],
+    /// returning `(dp_rank, worker, Option<InflightGuard>)`.
+    pub(super) fn select_worker(
+        &self,
+        lora_id: i32,
+        prompt_tokens: &[i32],
+        session_key: Option<&str>,
+    ) -> Result<
+        (
+            usize,
+            &EngineWorker,
+            Option<crate::dp_router::InflightGuard>,
+        ),
+        WorkerError,
+    > {
+        if self.extra_workers.is_empty() {
+            return Ok((0, &self.worker, None));
+        }
+        let samples: Vec<crate::dp_router::WorkerLoadSample> = self
+            .all_workers()
+            .map(|w| {
+                let snap = w.stats.telemetry.snapshot();
+                let active_kv_util = if snap.pools.kv.capacity > 0 {
+                    snap.pools.kv.active.unwrap_or(0) as f64 / snap.pools.kv.capacity as f64
+                } else {
+                    0.0
+                };
+                crate::dp_router::WorkerLoadSample {
+                    healthy: !w.is_panicked() && !w.is_stopping(),
+                    active_requests: snap.requests.running as usize,
+                    waiting_requests: snap.requests.waiting as usize,
+                    router_inflight: 0,
+                    router_inflight_prefill_tokens: 0,
+                    max_num_seqs: self.max_num_seqs,
+                    active_kv_util,
+                }
+            })
+            .collect();
+        let Some((rank, guard)) =
+            self.dp_router
+                .select_and_acquire(samples, lora_id, prompt_tokens, session_key)
+        else {
+            return Err(WorkerError::worker_stopped(
+                "all data-parallel workers are unavailable",
+            ));
+        };
+        Ok((rank, self.worker_at(rank), Some(guard)))
+    }
+
+    pub(super) fn bind_session_to_worker(&self, session_key: String, dp_rank: usize) {
+        if !self.extra_workers.is_empty() {
+            self.dp_router.bind_session(session_key, dp_rank);
+        }
+    }
+
+    pub async fn shutdown_all(&self) -> Result<(), String> {
+        let mut first_err: Option<String> = None;
+        for w in self.all_workers() {
+            if let Err(e) = w.shutdown().await
+                && first_err.is_none()
+            {
+                first_err = Some(e);
+            }
+        }
+        match first_err {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
     }
 
     pub fn resolve_request_lora(
@@ -219,10 +427,9 @@ pub(super) fn admission_error(err: tokio::sync::TryAcquireError) -> ApiError {
 }
 
 async fn health(State(s): State<Arc<OpenAiServerState>>) -> Response {
-    health_response(
-        s.worker.is_panicked(),
-        s.admission.is_closed() || s.worker.is_stopping(),
-    )
+    let all_panicked = s.all_workers().all(|w| w.is_panicked());
+    let all_stopping = s.admission.is_closed() || s.all_workers().all(|w| w.is_stopping());
+    health_response(all_panicked, all_stopping)
 }
 
 fn health_response(panicked: bool, stopping: bool) -> Response {
@@ -315,13 +522,13 @@ async fn metrics(State(s): State<Arc<OpenAiServerState>>) -> impl IntoResponse {
             axum::http::header::CONTENT_TYPE,
             "text/plain; version=0.0.4",
         )],
-        s.metrics.snapshot().prometheus(),
+        s.snapshot_metrics().prometheus(),
     )
 }
 async fn metrics_json(State(s): State<Arc<OpenAiServerState>>) -> impl IntoResponse {
     (
         [(axum::http::header::CACHE_CONTROL, "no-store")],
-        Json(s.metrics.snapshot()),
+        Json(s.snapshot_metrics()),
     )
 }
 fn is_inference_endpoint(method: &axum::http::Method, path: &str) -> bool {
@@ -938,6 +1145,12 @@ async fn generate(
         .clone()
         .try_acquire_owned()
         .map_err(admission_error)?;
+    let session_key = request
+        .headers()
+        .get("x-session-id")
+        .and_then(|v| v.to_str().ok())
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned);
     let (json, body_len) = read_json_with_len(&s, request).await?;
     let prep_state = s.clone();
     let inline_fast = !chat
@@ -972,8 +1185,11 @@ async fn generate(
         s.worker.max_model_len(),
     );
     let prompt_len = prepared.prompt.len();
-    let generation = s
-        .worker
+    let (_dp_rank, target_worker, inflight_guard) = s
+        .select_worker(prepared.lora_id, &prepared.prompt, session_key.as_deref())
+        .inspect_err(|_| log.finish("error", false))
+        .map_err(worker_api_err)?;
+    let mut generation = target_worker
         .submit_with_images_lora_and_budget_mode(
             prepared.prompt,
             prepared.images,
@@ -984,6 +1200,7 @@ async fn generate(
         )
         .inspect_err(|_| log.finish("error", false))
         .map_err(worker_api_err)?;
+    generation.inflight_guard = inflight_guard;
     log.track_cache(
         generation.cached_tokens.clone(),
         generation.cache_lookup.clone(),
@@ -1607,7 +1824,19 @@ async fn responses_create(
         .try_acquire_owned()
         .map_err(admission_error)?;
     let caller_scope = responses_caller_scope(&s, request.headers());
+    let header_session = request
+        .headers()
+        .get("x-session-id")
+        .and_then(|v| v.to_str().ok())
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned);
     let body = read_json(&s, request).await?;
+    let prev_resp_session = body
+        .get("previous_response_id")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned);
+    let session_key = prev_resp_session.or(header_session);
     let request_id = s.next_request_id.fetch_add(1, Ordering::Relaxed) + 1;
     let (chat_req, mut meta) = crate::responses_api::translate_responses_to_chat(
         &body,
@@ -1634,8 +1863,12 @@ async fn responses_create(
         s.worker.max_model_len(),
     );
     let prompt_len = prepared.prompt.len();
-    let generation = s
-        .worker
+    let (dp_rank, target_worker, inflight_guard) = s
+        .select_worker(prepared.lora_id, &prepared.prompt, session_key.as_deref())
+        .inspect_err(|_| log.finish("error", false))
+        .map_err(worker_api_err)?;
+    s.bind_session_to_worker(meta.response_id.clone(), dp_rank);
+    let mut generation = target_worker
         .submit_with_images_lora_and_budget_mode(
             prepared.prompt,
             prepared.images,
@@ -1646,6 +1879,7 @@ async fn responses_create(
         )
         .inspect_err(|_| log.finish("error", false))
         .map_err(worker_api_err)?;
+    generation.inflight_guard = inflight_guard;
     log.track_cache(
         generation.cached_tokens.clone(),
         generation.cache_lookup.clone(),
@@ -1924,6 +2158,12 @@ async fn anthropic_messages(
         .clone()
         .try_acquire_owned()
         .map_err(|err| to_anthropic_err(admission_error(err)))?;
+    let session_key = request
+        .headers()
+        .get("x-session-id")
+        .and_then(|v| v.to_str().ok())
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned);
     let body = read_json(&s, request).await.map_err(to_anthropic_err)?;
     let request_id = s.next_request_id.fetch_add(1, Ordering::Relaxed) + 1;
     let (chat_req, mut meta) =
@@ -1943,8 +2183,11 @@ async fn anthropic_messages(
         s.worker.max_model_len(),
     );
     let prompt_len = prepared.prompt.len();
-    let generation = s
-        .worker
+    let (_dp_rank, target_worker, inflight_guard) = s
+        .select_worker(prepared.lora_id, &prepared.prompt, session_key.as_deref())
+        .inspect_err(|_| log.finish("error", false))
+        .map_err(worker_anthropic_err)?;
+    let mut generation = target_worker
         .submit_with_images_lora_and_budget_mode(
             prepared.prompt,
             prepared.images,
@@ -1955,6 +2198,7 @@ async fn anthropic_messages(
         )
         .inspect_err(|_| log.finish("error", false))
         .map_err(worker_anthropic_err)?;
+    generation.inflight_guard = inflight_guard;
     log.track_cache(
         generation.cached_tokens.clone(),
         generation.cache_lookup.clone(),
@@ -2273,16 +2517,14 @@ pub async fn serve(
     let drain_state = state.clone();
     let result =
         serve_with_graceful_shutdown(listener, router(state.clone()), shutdown, move || {
-            drain_state.metrics.set_status("stopping");
+            for w in drain_state.all_workers() {
+                w.stats.telemetry.set_status("stopping");
+            }
             drain_state.admission.close();
             drain_state.preprocessing.close();
         })
         .await;
-    state
-        .worker
-        .shutdown()
-        .await
-        .map_err(std::io::Error::other)?;
+    state.shutdown_all().await.map_err(std::io::Error::other)?;
     result
 }
 /// Format only deployment state, never credentials or user-supplied hostnames.
@@ -2315,11 +2557,7 @@ pub fn run_blocking_server(addr: &str, state: Arc<OpenAiServerState>) -> std::io
         let listener = match tokio::net::TcpListener::bind(addr).await {
             Ok(listener) => listener,
             Err(error) => {
-                state
-                    .worker
-                    .shutdown()
-                    .await
-                    .map_err(std::io::Error::other)?;
+                state.shutdown_all().await.map_err(std::io::Error::other)?;
                 return Err(error);
             }
         };

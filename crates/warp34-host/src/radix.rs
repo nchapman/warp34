@@ -16,6 +16,7 @@
 //!    **committed** (`emitted_len`) snapshots into `MambaRadixCache`.
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 /// Maximum uncheckpointed KV page span (`512` pages = `8,192` tokens at `page_size = 16`)
 /// allowed when tombstoning a superseded linear internal node at Priority 1, or when
@@ -112,6 +113,7 @@ pub struct MambaRadixCache {
     mamba_evictable_slots: usize,
     mamba_protected_slots: usize,
     promoted_host_to_vram: std::collections::HashMap<i32, i32>,
+    dp_prefix_observer: Option<(usize, Arc<crate::dp_router::DpPrefixDirectory>)>,
     pub total_lookups: u64,
     pub total_lookup_tokens: u64,
     pub total_hit_tokens: u64,
@@ -142,6 +144,7 @@ impl MambaRadixCache {
             mamba_evictable_slots: 0,
             mamba_protected_slots: 0,
             promoted_host_to_vram: std::collections::HashMap::new(),
+            dp_prefix_observer: None,
             total_lookups: 0,
             total_lookup_tokens: 0,
             total_hit_tokens: 0,
@@ -158,7 +161,21 @@ impl MambaRadixCache {
         self.tick_counter
     }
 
+    /// Attaches a shared [`crate::dp_router::DpPrefixDirectory`] observer for in-process
+    /// data-parallel routing (`DP > 1`). Every `insert`, leaf eviction, and `reset` updates
+    /// the directory directly with zero drift.
+    pub fn set_dp_prefix_observer(
+        &mut self,
+        dp_rank: usize,
+        dir: Arc<crate::dp_router::DpPrefixDirectory>,
+    ) {
+        self.dp_prefix_observer = Some((dp_rank, dir));
+    }
+
     pub fn reset(&mut self) {
+        if let Some((dp_rank, ref dir)) = self.dp_prefix_observer {
+            dir.clear_worker(dp_rank);
+        }
         self.nodes.clear();
         self.free_nodes.clear();
         self.full_lru.clear();
@@ -707,6 +724,11 @@ impl MambaRadixCache {
             terminal_node = cur_node;
         }
 
+        if let Some((dp_rank, ref dir)) = self.dp_prefix_observer {
+            let hashes = crate::dp_router::compute_chained_prefix_hashes_raw(token_ids);
+            dir.record_insert_hashes(dp_rank, &hashes);
+        }
+
         RadixInsertResult {
             existing_prefix_tokens: key_offset,
             mamba_already_existed,
@@ -785,9 +807,39 @@ impl MambaRadixCache {
         }
     }
 
+    fn notify_retire_node(&self, id: RadixNodeId) {
+        let Some((dp_rank, ref dir)) = self.dp_prefix_observer else {
+            return;
+        };
+        let mut chain = Vec::new();
+        let mut cur = id;
+        while cur != RadixNodeId::ROOT {
+            chain.push(cur);
+            match self.nodes[cur.0].parent {
+                Some(p) => cur = p,
+                None => break,
+            }
+        }
+        chain.reverse();
+        let mut full_tokens = Vec::new();
+        let mut start_offset = 0usize;
+        for &nid in &chain {
+            if nid == id {
+                start_offset = full_tokens.len();
+            }
+            full_tokens.extend_from_slice(&self.nodes[nid.0].key);
+        }
+        let all_hashes = crate::dp_router::compute_chained_prefix_hashes_raw(&full_tokens);
+        let first_owned = start_offset / crate::dp_router::DP_PREFIX_BLOCK_TOKENS;
+        if first_owned < all_hashes.len() {
+            dir.record_evict_hashes(dp_rank, &all_hashes[first_owned..]);
+        }
+    }
+
     #[inline]
     fn retire_dead_node(&mut self, id: RadixNodeId) {
         debug_assert!(id != RadixNodeId::ROOT);
+        self.notify_retire_node(id);
         let node = &mut self.nodes[id.0];
         debug_assert!(node.alive);
         node.alive = false;

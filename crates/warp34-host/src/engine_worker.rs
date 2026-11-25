@@ -80,6 +80,7 @@ pub struct GenerationStream {
     pub cache_lookup: Arc<OnceLock<CacheLookup>>,
     pub hit_limit: Arc<AtomicBool>,
     cancelled: Arc<AtomicBool>,
+    pub(crate) inflight_guard: Option<crate::dp_router::InflightGuard>,
 }
 impl GenerationStream {
     pub fn cancel_handle(&self) -> Arc<AtomicBool> {
@@ -97,6 +98,7 @@ impl GenerationStream {
                 cache_lookup: Arc::default(),
                 hit_limit: Arc::new(AtomicBool::new(false)),
                 cancelled: Arc::new(AtomicBool::new(false)),
+                inflight_guard: None,
             },
         )
     }
@@ -313,6 +315,7 @@ impl EngineWorker {
                     worker_stats.telemetry.initialize(
                         TelemetryConfig {
                             tp_size: engine.tp_size,
+                            dp_size: None,
                             kv_format: kv_format_name(&engine),
                             speculation: engine
                                 .speculative
@@ -654,6 +657,7 @@ impl EngineWorker {
             cache_lookup,
             cached_tokens,
             hit_limit,
+            inflight_guard: None,
         })
     }
 
@@ -866,6 +870,7 @@ impl EngineWorker {
             cache_lookup,
             cached_tokens,
             hit_limit,
+            inflight_guard: None,
         })
     }
 }

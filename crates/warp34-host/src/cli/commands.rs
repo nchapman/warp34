@@ -1023,6 +1023,8 @@ pub(crate) struct ServeBootSummary {
     pub(crate) gpu_sm_tag: String,
     pub(crate) gpu_sm_count: i32,
     pub(crate) tp_size: usize,
+    pub(crate) dp_size: usize,
+    pub(crate) dp_routing: &'static str,
     pub(crate) total_vram_bytes: usize,
     pub(crate) post_load_free_vram_bytes: usize,
     pub(crate) kv_policy: KvFormatPolicy,
@@ -1238,6 +1240,24 @@ pub(crate) fn format_serve_boot_banner(s: &ServeBootSummary) -> String {
         .as_deref()
         .map(|v| format!("  Vision       : {v}\n"))
         .unwrap_or_default();
+    let total_gpus = s.tp_size.saturating_mul(s.dp_size.max(1));
+    let topology_tag = if s.dp_size > 1 {
+        format!(
+            "tp={}, dp={}, routing={}",
+            s.tp_size, s.dp_size, s.dp_routing
+        )
+    } else {
+        format!("tp={}", s.tp_size)
+    };
+    let seqs_label = if s.dp_size > 1 {
+        format!(
+            "{}/replica ({} total)",
+            s.max_num_seqs,
+            s.max_num_seqs.saturating_mul(s.dp_size)
+        )
+    } else {
+        s.max_num_seqs.to_string()
+    };
     format!(
         concat!(
             "\n",
@@ -1250,7 +1270,7 @@ pub(crate) fn format_serve_boot_banner(s: &ServeBootSummary) -> String {
             "\n",
             "  Model        : {}\n",
             "{}",
-            "  Hardware     : {}x {} ({}, {} SMs, {:.2} GiB VRAM) [tp={}]\n",
+            "  Hardware     : {}x {} ({}, {} SMs, {:.2} GiB VRAM) [{}]\n",
             "  Speculative  : {}\n",
             "  Sampling     : {}\n",
             "  Template     : {} (preserve_thinking={})\n",
@@ -1265,12 +1285,12 @@ pub(crate) fn format_serve_boot_banner(s: &ServeBootSummary) -> String {
         env!("CARGO_PKG_VERSION"),
         model_line,
         lora_line,
-        s.tp_size,
+        total_gpus,
         s.gpu_name,
         s.gpu_sm_tag,
         s.gpu_sm_count,
         s.total_vram_bytes as f64 / gib,
-        s.tp_size,
+        topology_tag,
         s.speculative_label,
         sampling_line,
         s.chat_template_source,
@@ -1285,7 +1305,7 @@ pub(crate) fn format_serve_boot_banner(s: &ServeBootSummary) -> String {
         ctx_mode_tag,
         s.state_slots,
         s.state_pool_bytes_per_rank as f64 / gib,
-        s.max_num_seqs,
+        seqs_label,
         ckpt_desc,
         s.weight_bytes_per_rank as f64 / gib,
         s.scratch_bytes_per_rank as f64 / mib,
@@ -1323,6 +1343,8 @@ pub(crate) fn run_serve(
         tp,
         tp_auto,
         tp_explicit,
+        dp,
+        dp_auto,
         host,
         explicit_host,
         port,
@@ -1386,11 +1408,84 @@ pub(crate) fn run_serve(
     );
     let bind_addr = format!("{host}:{port}");
     preflight_bind_addr(&bind_addr, port)?;
+    let num_gpus = crate::cuda::CudaDevice::count()
+        .map_err(|e| format!("failed to query CUDA device count: {e}"))?
+        .max(1) as usize;
+
     if is_qwen_image_model(&resolved_model) {
         if tp_explicit && !tp_auto && !matches!(tp, 1 | 2) {
             return Err("--tp for QwenImage21 models must be 1, 2, or auto".into());
         }
-        let requested_tp = if !tp_explicit || tp_auto { 0 } else { tp };
+        let dp_routing = serve.options.dp_routing;
+        let (effective_tp, effective_dp) = if dp_auto {
+            let t = if tp_explicit && !tp_auto { tp } else { 1 };
+            (t, (num_gpus / t).max(1))
+        } else if dp > 1 {
+            let t = if tp_explicit && !tp_auto { tp } else { 1 };
+            (t, dp)
+        } else {
+            let t = if !tp_explicit || tp_auto { 0 } else { tp };
+            (t, 1)
+        };
+        if effective_dp > 1 {
+            let needed = effective_tp.saturating_mul(effective_dp);
+            if needed > num_gpus {
+                return Err(format!(
+                    "--tp {effective_tp} --dp {effective_dp} requires {needed} CUDA GPUs, but only {num_gpus} visible"
+                ));
+            }
+            println!(
+                "[warp34 serve] loading QwenImage21 model={model} tp={effective_tp} dp={effective_dp} routing={} for http://{bind_addr}",
+                dp_routing.as_str()
+            );
+            let webui_enabled = serve.options.webui;
+            let loaders: Vec<
+                Box<
+                    dyn FnOnce() -> Result<crate::qwen_image::QwenImage21PipelineEngine, String>
+                        + Send,
+                >,
+            > = (0..effective_dp)
+                .map(|dp_rank| {
+                    let worker_model = resolved_model.clone();
+                    let devices: Vec<i32> = (0..effective_tp)
+                        .map(|r| (dp_rank * effective_tp + r) as i32)
+                        .collect();
+                    Box::new(move || {
+                        crate::qwen_image::QwenImage21PipelineEngine::load_with_devices(
+                            std::path::Path::new(&worker_model),
+                            &devices,
+                        )
+                        .map_err(|e| e.to_string())
+                    })
+                        as Box<
+                            dyn FnOnce() -> Result<
+                                    crate::qwen_image::QwenImage21PipelineEngine,
+                                    String,
+                                > + Send,
+                        >
+                })
+                .collect();
+            let state = crate::server::QwenImage21ServerState::from_loaders_with_options(
+                model,
+                allow_remote_images,
+                use_cuda_graph,
+                serve.options,
+                loaders,
+            )?;
+            println!(
+                "[warp34 serve] QwenImage21 api_auth={} webui={} tp={} dp={} default_steps={} max_num_seqs={} (per replica)",
+                if auth_enabled { "enabled" } else { "disabled" },
+                if webui_enabled { "enabled" } else { "disabled" },
+                state.worker.tp_size,
+                state.dp_size(),
+                state.worker.default_steps,
+                max_num_seqs,
+            );
+            crate::server::run_blocking_image_server(&bind_addr, state)
+                .map_err(|e| format!("server error: {e}"))?;
+            return Ok(ExitCode::SUCCESS);
+        }
+        let requested_tp = effective_tp;
         println!(
             "[warp34 serve] loading QwenImage21 model={model} tp={} for http://{bind_addr}",
             if requested_tp == 0 {
@@ -1425,155 +1520,197 @@ pub(crate) fn run_serve(
             .map_err(|e| format!("server error: {e}"))?;
         return Ok(ExitCode::SUCCESS);
     }
+
+    let effective_dp = if dp_auto { (num_gpus / tp).max(1) } else { dp };
+    let needed_gpus = tp.saturating_mul(effective_dp);
+    if needed_gpus > num_gpus {
+        return Err(format!(
+            "--tp {tp} --dp {effective_dp} requires {needed_gpus} CUDA GPUs, but only {num_gpus} visible"
+        ));
+    }
+
     let kv_mode_init = if explicit_kv_format {
         kv_format.clone()
     } else {
         format!("{kv_format} (auto)")
     };
-    println!(
-        "[warp34 serve] loading model={model} tp={tp} kv={kv_mode_init} speculative={spec_label} for http://{bind_addr}"
-    );
-    let worker_model = resolved_model;
+    if effective_dp > 1 {
+        println!(
+            "[warp34 serve] loading model={model} tp={tp} dp={effective_dp} routing={} kv={kv_mode_init} speculative={spec_label} for http://{bind_addr}",
+            serve.options.dp_routing.as_str()
+        );
+    } else {
+        println!(
+            "[warp34 serve] loading model={model} tp={tp} kv={kv_mode_init} speculative={spec_label} for http://{bind_addr}"
+        );
+    }
     let boot_info = std::sync::Arc::new(std::sync::OnceLock::new());
-    let boot_info_loader = std::sync::Arc::clone(&boot_info);
-    let spec_label_loader = spec_label.clone();
-    let checkpoint_label_loader = checkpoint_label.clone();
-    let model_loader = model.clone();
-    let bind_addr_loader = bind_addr.clone();
-    let state = crate::server::OpenAiServerState::from_loader_with_options(
+    let loaders: Vec<crate::server::DpEngineLoader> = (0..effective_dp)
+        .map(|dp_rank| {
+            let devices: Vec<i32> = (0..tp).map(|r| (dp_rank * tp + r) as i32).collect();
+            let worker_model = resolved_model.clone();
+            let boot_info_loader = std::sync::Arc::clone(&boot_info);
+            let spec_label_loader = spec_label.clone();
+            let checkpoint_label_loader = checkpoint_label.clone();
+            let model_loader = model.clone();
+            let bind_addr_loader = bind_addr.clone();
+            let spec_config_loader = spec_config.clone();
+            let lora_modules_loader = lora_modules.clone();
+            Box::new(
+                move |_dp_rank, _dir: std::sync::Arc<crate::dp_router::DpPrefixDirectory>| {
+                    let pages = ServeCliConfig::effective_kv_pages(
+                        kv_pages,
+                        max_model_len,
+                        spec_config_loader.as_ref(),
+                    );
+                    let state_slot_seqs =
+                        serve_state_slot_seqs(max_num_seqs, spec_config_loader.as_ref());
+                    let mut engine = Qwen3_5Engine::load_for_serving_with_auto_fit_on_devices(
+                        &worker_model,
+                        &devices,
+                        effective_dp,
+                        policy,
+                        !explicit_kv_format,
+                        pages,
+                        use_cuda_graph,
+                        state_slot_seqs,
+                        spec_config_loader.as_ref(),
+                        &lora_modules_loader,
+                    )
+                    .map_err(|e| e.to_string())?;
+                    attach_cli_lora(&mut engine, &lora_modules_loader, None, false)
+                        .map_err(|e| e.to_string())?;
+                    if dp_rank == 0
+                        && let Some(r0) = engine.ranks.first()
+                    {
+                        let props = r0.device.props().ok();
+                        let (post_free, total_vram) = r0.device.mem_info().unwrap_or((0, 0));
+                        let supports_fp8 = engine
+                            .ranks
+                            .iter()
+                            .all(|r| r.device.props().is_ok_and(|p| p.supports_fp8_kv()));
+                        let fit = engine.serving_fit;
+                        let selected_kv_policy = fit.map_or(policy, |f| f.kv_policy);
+                        let (page_bytes, state_bytes) =
+                            crate::model::Qwen3_5ModelRank::pool_geometry(
+                                &engine.cfg,
+                                tp,
+                                selected_kv_policy,
+                                supports_fp8,
+                            );
+                        let (fp16_page_bytes, _) = crate::model::Qwen3_5ModelRank::pool_geometry(
+                            &engine.cfg,
+                            tp,
+                            KvFormatPolicy::Fp16,
+                            false,
+                        );
+                        let kv_compression_ratio = if page_bytes > 0 {
+                            fp16_page_bytes as f64 / page_bytes as f64
+                        } else {
+                            1.0
+                        };
+                        let max_model_ctx = fit.map_or_else(
+                            || engine.cfg.max_position_embeddings.unwrap_or(262_144),
+                            |f| f.max_model_context_tokens,
+                        );
+                        let _ = boot_info_loader.set(ServeBootSummary {
+                            served_model: model_loader,
+                            checkpoint_label: checkpoint_label_loader,
+                            gpu_name: props
+                                .as_ref()
+                                .map_or_else(|| "CUDA GPU".to_string(), |p| p.name.clone()),
+                            gpu_sm_tag: props
+                                .as_ref()
+                                .map_or_else(|| "sm_80+".to_string(), |p| p.sm_tag()),
+                            gpu_sm_count: props.as_ref().map_or(0, |p| p.multi_processor_count),
+                            tp_size: tp,
+                            dp_size: effective_dp,
+                            dp_routing: serve.options.dp_routing.as_str(),
+                            total_vram_bytes: total_vram,
+                            post_load_free_vram_bytes: post_free,
+                            kv_policy: selected_kv_policy,
+                            supports_fp8_kv: supports_fp8,
+                            kv_compression_ratio,
+                            kv_policy_explicit: explicit_kv_format,
+                            kv_policy_auto_adjusted: fit.is_some_and(|f| f.kv_policy_auto_adjusted),
+                            kv_pages: r0.kv_pool.num_pages,
+                            context_limit: max_model_len
+                                .unwrap_or_else(|| r0.kv_pool.num_pages.saturating_mul(16)),
+                            max_model_context_tokens: max_model_ctx,
+                            context_auto_fitted: kv_pages.is_none() && max_model_len.is_none(),
+                            kv_pool_bytes_per_rank: page_bytes.saturating_mul(r0.kv_pool.num_pages),
+                            state_slots: r0.state_pool.total_slots,
+                            state_pool_bytes_per_rank: state_bytes
+                                .saturating_mul(r0.state_pool.total_slots),
+                            ckpt_vram_slots: r0
+                                .checkpoint_pool
+                                .as_ref()
+                                .map_or(0, |c| c.vram_slots),
+                            ckpt_host_slots: r0
+                                .checkpoint_pool
+                                .as_ref()
+                                .map_or(0, |c| c.host_slots),
+                            ckpt_bytes_per_slot: r0
+                                .checkpoint_pool
+                                .as_ref()
+                                .map_or(0, |c| c.layout.bundle_bytes),
+                            weight_bytes_per_rank: r0.weight_arena.used(),
+                            scratch_bytes_per_rank: r0.scratch_arena.capacity(),
+                            host_embed_offload: r0.host_embed_tokens.is_some(),
+                            embed_saved_bytes: engine
+                                .cfg
+                                .vocab_size
+                                .saturating_mul(engine.cfg.hidden_size)
+                                .saturating_mul(2),
+                            speculative_label: spec_label_loader,
+                            max_num_seqs,
+                            bind_addr: bind_addr_loader,
+                            auth_enabled,
+                            webui_enabled,
+                            use_cuda_graph,
+                            default_sampling_params:
+                                crate::parser::SamplingParams::from_generation_config_dir(
+                                    &engine.model_dir,
+                                ),
+                            sampling_from_generation_config: engine
+                                .model_dir
+                                .join("generation_config.json")
+                                .is_file(),
+                            chat_template_source: String::new(),
+                            preserve_thinking: false,
+                            default_reasoning_effort: None,
+                            reasoning_effort_budget: false,
+                            default_reasoning_budget: None,
+                            default_reasoning_budget_message: None,
+                            vision_banner: engine.cfg.vision_config.as_ref().map(|_| {
+                                let vp = &engine.cfg.vision_preprocessor;
+                                format!(
+                                    "{} (patch={}, merge={}, pixels={}..{})",
+                                    vp.source_name,
+                                    vp.patch_size,
+                                    vp.spatial_merge_size,
+                                    vp.min_pixels,
+                                    vp.max_pixels,
+                                )
+                            }),
+                            lora_adapters: engine
+                                .lora_registry
+                                .entries()
+                                .iter()
+                                .map(|e| e.name.clone())
+                                .collect(),
+                        });
+                    }
+                    Ok(engine)
+                },
+            ) as crate::server::DpEngineLoader
+        })
+        .collect();
+    let state = crate::server::OpenAiServerState::from_loaders_with_options(
         model,
         allow_remote_images,
         serve.options,
-        move || {
-            let pages =
-                ServeCliConfig::effective_kv_pages(kv_pages, max_model_len, spec_config.as_ref());
-            let state_slot_seqs = serve_state_slot_seqs(max_num_seqs, spec_config.as_ref());
-            let mut engine = Qwen3_5Engine::load_for_serving_with_auto_fit(
-                &worker_model,
-                tp,
-                policy,
-                !explicit_kv_format,
-                pages,
-                use_cuda_graph,
-                state_slot_seqs,
-                spec_config.as_ref(),
-                &lora_modules,
-            )
-            .map_err(|e| e.to_string())?;
-            attach_cli_lora(&mut engine, &lora_modules, None, false).map_err(|e| e.to_string())?;
-            if let Some(r0) = engine.ranks.first() {
-                let props = r0.device.props().ok();
-                let (post_free, total_vram) = r0.device.mem_info().unwrap_or((0, 0));
-                let supports_fp8 = engine
-                    .ranks
-                    .iter()
-                    .all(|r| r.device.props().is_ok_and(|p| p.supports_fp8_kv()));
-                let fit = engine.serving_fit;
-                let selected_kv_policy = fit.map_or(policy, |f| f.kv_policy);
-                let (page_bytes, state_bytes) = crate::model::Qwen3_5ModelRank::pool_geometry(
-                    &engine.cfg,
-                    tp,
-                    selected_kv_policy,
-                    supports_fp8,
-                );
-                let (fp16_page_bytes, _) = crate::model::Qwen3_5ModelRank::pool_geometry(
-                    &engine.cfg,
-                    tp,
-                    KvFormatPolicy::Fp16,
-                    false,
-                );
-                let kv_compression_ratio = if page_bytes > 0 {
-                    fp16_page_bytes as f64 / page_bytes as f64
-                } else {
-                    1.0
-                };
-                let max_model_ctx = fit.map_or_else(
-                    || engine.cfg.max_position_embeddings.unwrap_or(262_144),
-                    |f| f.max_model_context_tokens,
-                );
-                let _ =
-                    boot_info_loader.set(ServeBootSummary {
-                        served_model: model_loader,
-                        checkpoint_label: checkpoint_label_loader,
-                        gpu_name: props
-                            .as_ref()
-                            .map_or_else(|| "CUDA GPU".to_string(), |p| p.name.clone()),
-                        gpu_sm_tag: props
-                            .as_ref()
-                            .map_or_else(|| "sm_80+".to_string(), |p| p.sm_tag()),
-                        gpu_sm_count: props.as_ref().map_or(0, |p| p.multi_processor_count),
-                        tp_size: tp,
-                        total_vram_bytes: total_vram,
-                        post_load_free_vram_bytes: post_free,
-                        kv_policy: selected_kv_policy,
-                        supports_fp8_kv: supports_fp8,
-                        kv_compression_ratio,
-                        kv_policy_explicit: explicit_kv_format,
-                        kv_policy_auto_adjusted: fit.is_some_and(|f| f.kv_policy_auto_adjusted),
-                        kv_pages: r0.kv_pool.num_pages,
-                        context_limit: max_model_len
-                            .unwrap_or_else(|| r0.kv_pool.num_pages.saturating_mul(16)),
-                        max_model_context_tokens: max_model_ctx,
-                        context_auto_fitted: kv_pages.is_none() && max_model_len.is_none(),
-                        kv_pool_bytes_per_rank: page_bytes.saturating_mul(r0.kv_pool.num_pages),
-                        state_slots: r0.state_pool.total_slots,
-                        state_pool_bytes_per_rank: state_bytes
-                            .saturating_mul(r0.state_pool.total_slots),
-                        ckpt_vram_slots: r0.checkpoint_pool.as_ref().map_or(0, |c| c.vram_slots),
-                        ckpt_host_slots: r0.checkpoint_pool.as_ref().map_or(0, |c| c.host_slots),
-                        ckpt_bytes_per_slot: r0
-                            .checkpoint_pool
-                            .as_ref()
-                            .map_or(0, |c| c.layout.bundle_bytes),
-                        weight_bytes_per_rank: r0.weight_arena.used(),
-                        scratch_bytes_per_rank: r0.scratch_arena.capacity(),
-                        host_embed_offload: r0.host_embed_tokens.is_some(),
-                        embed_saved_bytes: engine
-                            .cfg
-                            .vocab_size
-                            .saturating_mul(engine.cfg.hidden_size)
-                            .saturating_mul(2),
-                        speculative_label: spec_label_loader,
-                        max_num_seqs,
-                        bind_addr: bind_addr_loader,
-                        auth_enabled,
-                        webui_enabled,
-                        use_cuda_graph,
-                        default_sampling_params:
-                            crate::parser::SamplingParams::from_generation_config_dir(
-                                &engine.model_dir,
-                            ),
-                        sampling_from_generation_config: engine
-                            .model_dir
-                            .join("generation_config.json")
-                            .is_file(),
-                        chat_template_source: String::new(),
-                        preserve_thinking: false,
-                        default_reasoning_effort: None,
-                        reasoning_effort_budget: false,
-                        default_reasoning_budget: None,
-                        default_reasoning_budget_message: None,
-                        vision_banner: engine.cfg.vision_config.as_ref().map(|_| {
-                            let vp = &engine.cfg.vision_preprocessor;
-                            format!(
-                                "{} (patch={}, merge={}, pixels={}..{})",
-                                vp.source_name,
-                                vp.patch_size,
-                                vp.spatial_merge_size,
-                                vp.min_pixels,
-                                vp.max_pixels,
-                            )
-                        }),
-                        lora_adapters: engine
-                            .lora_registry
-                            .entries()
-                            .iter()
-                            .map(|e| e.name.clone())
-                            .collect(),
-                    });
-            }
-            Ok(engine)
-        },
+        loaders,
     )?;
     if let Some(mut summary) = boot_info.get().cloned() {
         summary.context_limit = state.worker.max_model_len();

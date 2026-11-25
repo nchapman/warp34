@@ -57,6 +57,7 @@ fn terminal_test_request() -> (
             cached_tokens,
             hit_limit,
             cancelled,
+            inflight_guard: None,
         },
         rx,
     )
