@@ -971,7 +971,7 @@ impl Qwen3_5ModelRank {
                         num_bits: 2,
                         group_size: embed_group_size,
                         symmetric: !has_zp,
-                        code_offset_half: false,
+                        code_offset_half: embed_spec.is_none() && cfg.quant.u2_code_offset_half(),
                         ignore: Vec::new(),
                         rules: None,
                     };
@@ -992,6 +992,16 @@ impl Qwen3_5ModelRank {
                     return Err(loader_err_msg(format!(
                         "embed_tokens hidden_size {} is not divisible by warp_quant_embed_w2 hadamard_block_size {}",
                         cfg.hidden_size, spec.hadamard_block_size
+                    )));
+                }
+                if spec.signs.len() != cfg.hidden_size
+                    && spec.signs.len() != spec.hadamard_block_size
+                {
+                    return Err(loader_err_msg(format!(
+                        "warp_quant_embed_w2 signs len {} != hidden_size {} or hadamard_block_size {}",
+                        spec.signs.len(),
+                        cfg.hidden_size,
+                        spec.hadamard_block_size
                     )));
                 }
                 super::weights::hgptq::hadamard_f16_rows_with_post_signs(

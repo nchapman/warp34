@@ -836,6 +836,18 @@ unsafe extern "C" {
         eps: f32,
     ) -> i32;
 
+    pub fn warp34_gemma_rms_norm_hadamard1024_f16(
+        ex: *const Warp34Exec,
+        x: *const c_void,
+        weight: *const c_void,
+        out: *mut c_void,
+        out_had1024: *mut c_void,
+        valid_token_mask: *const u8,
+        num_tokens: i32,
+        hidden_size: i32,
+        eps: f32,
+    ) -> i32;
+
     pub fn warp34_fused_add_gemma_rms_norm_tap_hadamard512_f16(
         ex: *const Warp34Exec,
         x: *const c_void,
@@ -843,6 +855,22 @@ unsafe extern "C" {
         weight: *const c_void,
         out: *mut c_void,
         out_had512: *mut c_void,
+        tap_dst_bf16: *mut c_void,
+        valid_token_mask: *const u8,
+        num_tokens: i32,
+        hidden_size: i32,
+        eps: f32,
+        tap_row_stride: i32,
+        tap_col_offset: i32,
+    ) -> i32;
+
+    pub fn warp34_fused_add_gemma_rms_norm_tap_hadamard1024_f16(
+        ex: *const Warp34Exec,
+        x: *const c_void,
+        residual: *mut c_void,
+        weight: *const c_void,
+        out: *mut c_void,
+        out_had1024: *mut c_void,
         tap_dst_bf16: *mut c_void,
         valid_token_mask: *const u8,
         num_tokens: i32,
@@ -969,6 +997,15 @@ unsafe extern "C" {
         intermediate_size: i32,
     ) -> i32;
 
+    pub fn warp34_silu_and_mul_hadamard1024_f16(
+        ex: *const Warp34Exec,
+        gate_up: *const c_void,
+        out: *mut c_void,
+        valid_token_mask: *const u8,
+        num_tokens: i32,
+        intermediate_size: i32,
+    ) -> i32;
+
     pub fn warp34_apply_attn_output_gate_hadamard_f16(
         ex: *const Warp34Exec,
         attn_out: *const c_void,
@@ -980,6 +1017,16 @@ unsafe extern "C" {
     ) -> i32;
 
     pub fn warp34_apply_attn_output_gate_hadamard512_f16(
+        ex: *const Warp34Exec,
+        attn_out: *const c_void,
+        gate: *const c_void,
+        out: *mut c_void,
+        valid_token_mask: *const u8,
+        num_tokens: i32,
+        total_dim: i32,
+    ) -> i32;
+
+    pub fn warp34_apply_attn_output_gate_hadamard1024_f16(
         ex: *const Warp34Exec,
         attn_out: *const c_void,
         gate: *const c_void,

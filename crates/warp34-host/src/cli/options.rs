@@ -52,7 +52,7 @@ pub(crate) fn parse_byte_size(raw: &str, flag: &str) -> Result<usize, String> {
         return Err(format!("{flag} must be positive (got '{raw}')"));
     }
     let bytes = (val * mult).round();
-    if !bytes.is_finite() || bytes < (256.0 * 1024.0 * 1024.0) || bytes > (usize::MAX as f64) {
+    if !bytes.is_finite() || bytes < (256.0 * 1024.0 * 1024.0) || bytes >= (usize::MAX as f64) {
         return Err(format!("{flag} must be at least 256m (got '{raw}')"));
     }
     Ok(bytes as usize)

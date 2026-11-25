@@ -172,4 +172,82 @@ __device__ __forceinline__ uint4 hadamard512_vec8_f16(
     return out;
 }
 
+// In-CTA 4-warp normalized Sylvester Hadamard H_1024 on 8 contiguous FP16 values per thread.
+// All threads in the CTA must execute this function together (contains 2 `__syncthreads()`).
+// `smem` has layout `[NUM_WARPS][32][8]` (`NUM_WARPS` must be >= 4 and a multiple of 4).
+// Matches `block_hadamard_1024_16bit` bit-for-bit (FP32 butterflies + 1/32 scale + RN half).
+template <int NUM_WARPS>
+__device__ __forceinline__ uint4 hadamard1024_vec8_f16(
+    uint4 raw,
+    bool active,
+    float (&smem)[NUM_WARPS][32][8]) {
+    static_assert(NUM_WARPS >= 4 && (NUM_WARPS % 4) == 0, "hadamard1024_vec8_f16 requires multiples of 4 warps");
+    constexpr float kScale1024 = 0.03125f; // 1 / sqrt(1024) = 1 / 32
+    const int warp = (int)threadIdx.x >> 5;
+    const int lane = (int)threadIdx.x & 31;
+
+    float v[8] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+    if (active) {
+        const __half2* in_h2 = reinterpret_cast<const __half2*>(&raw);
+        const float2 f01 = __half22float2(in_h2[0]);
+        const float2 f23 = __half22float2(in_h2[1]);
+        const float2 f45 = __half22float2(in_h2[2]);
+        const float2 f67 = __half22float2(in_h2[3]);
+        v[0] = f01.x; v[1] = f01.y; v[2] = f23.x; v[3] = f23.y;
+        v[4] = f45.x; v[5] = f45.y; v[6] = f67.x; v[7] = f67.y;
+
+        // Stages h = 1, 2, 4 in registers (H_8).
+        const float a0 = v[0] + v[1], a1 = v[0] - v[1];
+        const float a2 = v[2] + v[3], a3 = v[2] - v[3];
+        const float a4 = v[4] + v[5], a5 = v[4] - v[5];
+        const float a6 = v[6] + v[7], a7 = v[6] - v[7];
+        const float b0 = a0 + a2, b1 = a1 + a3, b2 = a0 - a2, b3 = a1 - a3;
+        const float b4 = a4 + a6, b5 = a5 + a7, b6 = a4 - a6, b7 = a5 - a7;
+        v[0] = b0 + b4; v[1] = b1 + b5; v[2] = b2 + b6; v[3] = b3 + b7;
+        v[4] = b0 - b4; v[5] = b1 - b5; v[6] = b2 - b6; v[7] = b3 - b7;
+
+        // Stages h = 8, 16, 32, 64, 128 across all 32 warp lanes (H_256).
+        #pragma unroll
+        for (int d = 1; d <= 16; d <<= 1) {
+            const bool sub = (lane & d) != 0;
+            #pragma unroll
+            for (int j = 0; j < 8; ++j) {
+                const float o = __shfl_xor_sync(0xffffffffu, v[j], d, 32);
+                v[j] = sub ? (o - v[j]) : (v[j] + o);
+            }
+        }
+
+        #pragma unroll
+        for (int j = 0; j < 8; ++j) {
+            smem[warp][lane][j] = v[j];
+        }
+    }
+    __syncthreads();
+
+    uint4 out = make_uint4(0u, 0u, 0u, 0u);
+    if (active) {
+        const int w_base = warp & ~3;
+        const int w_off = warp & 3;
+        const bool sub8 = (w_off & 1) != 0;
+        const bool sub9 = (w_off & 2) != 0;
+        #pragma unroll
+        for (int j = 0; j < 8; ++j) {
+            const float c0 = smem[w_base + 0][lane][j];
+            const float c1 = smem[w_base + 1][lane][j];
+            const float c2 = smem[w_base + 2][lane][j];
+            const float c3 = smem[w_base + 3][lane][j];
+            const float a = sub8 ? (c0 - c1) : (c0 + c1);
+            const float b = sub8 ? (c2 - c3) : (c2 + c3);
+            v[j] = (sub9 ? (a - b) : (a + b)) * kScale1024;
+        }
+        __half2* out_h2 = reinterpret_cast<__half2*>(&out);
+        out_h2[0] = __floats2half2_rn(v[0], v[1]);
+        out_h2[1] = __floats2half2_rn(v[2], v[3]);
+        out_h2[2] = __floats2half2_rn(v[4], v[5]);
+        out_h2[3] = __floats2half2_rn(v[6], v[7]);
+    }
+    __syncthreads();
+    return out;
+}
+
 }  // namespace warp34

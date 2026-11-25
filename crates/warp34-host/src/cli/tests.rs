@@ -916,6 +916,14 @@ fn max_vram_parsing_and_cap_math() {
         crate::cuda::apply_vram_cap(23_500 * mib, 24_576 * mib, None),
         (23_500 * mib, 24_576 * mib)
     );
+    // profile-diff --live forwards --max-vram to the spawned bench child.
+    let opts = parse(&["profile-diff", "--live", "--max-vram", "8g"]);
+    let bench_args = super::oracle::profile_bench_args(&opts, Path::new("/bin/warp34"));
+    let pos = bench_args
+        .iter()
+        .position(|a| a == "--max-vram")
+        .expect("missing --max-vram in profile_bench_args");
+    assert_eq!(bench_args[pos + 1], (8 * gib).to_string());
 }
 
 #[cfg(feature = "cuda")]

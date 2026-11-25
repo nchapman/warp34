@@ -304,7 +304,7 @@ impl LinearProj {
     /// Extra workspace beyond existing GEMM workspace, for this projection.
     pub fn input_transform_workspace_bytes(&self, rows: usize) -> Option<usize> {
         let trit5_prefill_bytes = |proj: &Self| -> Option<usize> {
-            if rows <= 8 {
+            if rows <= 16 {
                 return Some(0);
             }
             if let Self::Ternary5Trit { size_n, size_k, .. } = proj {
@@ -369,8 +369,15 @@ impl LinearProj {
         self.can_fuse_hadamard_from_producer(512)
     }
 
+    /// Whether this projection is a `B == 1024` Hadamard projection with unpadded `K` and `N`,
+    /// allowing its producer kernel to emit `H_1024`-rotated activations directly.
+    #[inline]
+    pub fn can_fuse_h1024_from_producer(&self) -> bool {
+        self.can_fuse_hadamard_from_producer(1024)
+    }
+
     /// Executes the underlying GEMM directly when `input` has already been rotated by a
-    /// producer-fused Hadamard kernel (`H_64`, `H_128`, or `H_512`), or falls back to `forward` otherwise.
+    /// producer-fused Hadamard kernel (`H_64`, `H_128`, `H_512`, or `H_1024`), or falls back to `forward` otherwise.
     #[allow(clippy::too_many_arguments)]
     #[inline]
     pub fn forward_prerotated(
@@ -399,13 +406,22 @@ impl LinearProj {
                 let input_bytes = rows
                     .saturating_mul(*size_k)
                     .saturating_mul(2)
-                    .next_multiple_of(HADAMARD_WORKSPACE_ALIGN_BYTES);
-                let sub_ex = if input == ex.scratch_ptr && ex.scratch_size >= input_bytes {
-                    Warp34Exec {
-                        stream: ex.stream,
-                        scratch_ptr: ex.scratch_ptr + input_bytes as u64,
-                        scratch_size: ex.scratch_size - input_bytes,
-                        flags: ex.flags,
+                    .next_multiple_of(256);
+                let sub_ex = if input == ex.scratch_ptr && ex.scratch_ptr != 0 {
+                    if ex.scratch_size >= input_bytes {
+                        Warp34Exec {
+                            stream: ex.stream,
+                            scratch_ptr: ex.scratch_ptr + input_bytes as u64,
+                            scratch_size: ex.scratch_size - input_bytes,
+                            flags: ex.flags,
+                        }
+                    } else {
+                        Warp34Exec {
+                            stream: ex.stream,
+                            scratch_ptr: 0,
+                            scratch_size: 0,
+                            flags: ex.flags,
+                        }
                     }
                 } else {
                     *ex

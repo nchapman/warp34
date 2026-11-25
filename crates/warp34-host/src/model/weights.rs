@@ -475,7 +475,7 @@ impl LinearProj {
                 let repack_total = w_aligned.saturating_add(s_aligned);
                 let a8_reserve =
                     (m.saturating_mul(size_k).saturating_add(m.saturating_mul(4)) + 511) & !255;
-                if m > 8
+                if m > 16
                     && size_k > 0
                     && size_n > 0
                     && size_n.is_multiple_of(64)
@@ -531,7 +531,9 @@ impl LinearProj {
                 } else {
                     const MAX_FP16_STRIP_BYTES: usize = 16 * 1024 * 1024;
                     let min_strip_bytes = 8usize.saturating_mul(size_k).saturating_mul(2);
-                    if m > 8
+                    if m > 256
+                        && (ex.flags & ffi::WARP34_EXEC_FLAG_ALLOW_W4A8_PREFILL) != 0
+                        && ex.stream == cublas.stream_handle
                         && size_k > 0
                         && size_n >= 8
                         && size_n.is_multiple_of(8)
@@ -906,59 +908,83 @@ impl RawLinearHost {
 
         // Fast path 0: native PTQ1_0 5-trit (`*.weight_5trit` + `*.weight_scale`).
         let trit5_key = format!("{base_prefix}.weight_5trit");
-        if !has_unquantized_weight
-            && let Some(real_5trit) = archive.resolve_name(&trit5_key)
-            && let Some(scale_key) = archive.resolve_name(&format!("{base_prefix}.weight_scale"))
-        {
+        if !has_unquantized_weight && let Some(real_5trit) = archive.resolve_name(&trit5_key) {
+            let scale_key = archive
+                .resolve_name(&format!("{base_prefix}.weight_scale"))
+                .ok_or_else(|| {
+                    loader_err_msg(format!(
+                        "missing '{base_prefix}.weight_scale' for 5-trit tensor '{real_5trit}'"
+                    ))
+                })?;
             let p_info = archive
                 .tensor_info(&real_5trit)
                 .map_err(|e| loader_err_msg(format!("tensor_info('{real_5trit}') failed: {e}")))?;
             let s_info = archive
                 .tensor_info(&scale_key)
                 .map_err(|e| loader_err_msg(format!("tensor_info('{scale_key}') failed: {e}")))?;
-            if p_info.shape.len() == 3
-                && p_info.shape[2] == 26
-                && p_info.dtype == "U8"
-                && s_info.shape.len() == 2
-                && s_info.shape[0] == p_info.shape[0]
-                && s_info.shape[1] == p_info.shape[1]
-                && matches!(s_info.dtype.as_str(), "F16" | "BF16" | "F32")
+            if p_info.shape.len() != 3
+                || p_info.shape[0] == 0
+                || p_info.shape[1] == 0
+                || p_info.shape[2] != 26
+                || p_info.dtype != "U8"
+                || s_info.shape.len() != 2
+                || s_info.shape[0] != p_info.shape[0]
+                || s_info.shape[1] != p_info.shape[1]
+                || !matches!(s_info.dtype.as_str(), "F16" | "BF16" | "F32")
             {
-                let full_n = p_info.shape[0];
-                let groups = p_info.shape[1];
-                let k = groups * 128;
-                if row_end > full_n {
-                    return Err(loader_err_msg(format!(
-                        "5-trit row shard [{row_start}..{row_end}) exceeds N={full_n} on '{real_5trit}'"
-                    )));
-                }
-                let out_n = row_end - row_start;
-                if !out_n.is_multiple_of(8) {
-                    return Err(loader_err_msg(format!(
-                        "5-trit row shard N={out_n} must be a multiple of 8 on '{real_5trit}'"
-                    )));
-                }
-                let packed_bytes = archive
-                    .read_u8_subslice(&real_5trit, row_start * groups * 26, out_n * groups * 26)
-                    .map_err(|e| {
-                        loader_err_msg(format!("read_u8_subslice('{real_5trit}') failed: {e}"))
-                    })?;
-                let scales = archive
-                    .read_f16_bits_subslice(&scale_key, row_start * groups, out_n * groups)
-                    .map_err(|e| {
-                        loader_err_msg(format!("read_f16_bits_subslice('{scale_key}') failed: {e}"))
-                    })?;
-                let packed_gpu =
-                    crate::loader::repack_5trit_n_major_to_gpu(&packed_bytes, &scales, out_n, k);
-                return Ok((
-                    Self::Ternary5Trit {
-                        packed_gpu,
-                        n: out_n,
-                        k,
-                    },
-                    full_n,
-                ));
+                return Err(loader_err_msg(format!(
+                    "invalid 5-trit shapes/dtypes for '{base_prefix}': weight_5trit={:?} ({}), weight_scale={:?} ({})",
+                    p_info.shape, p_info.dtype, s_info.shape, s_info.dtype
+                )));
             }
+            let full_n = p_info.shape[0];
+            let groups = p_info.shape[1];
+            let k = groups
+                .checked_mul(128)
+                .ok_or_else(|| loader_err_msg(format!("5-trit K overflow on '{real_5trit}'")))?;
+            if row_end > full_n {
+                return Err(loader_err_msg(format!(
+                    "5-trit row shard [{row_start}..{row_end}) exceeds N={full_n} on '{real_5trit}'"
+                )));
+            }
+            let out_n = row_end - row_start;
+            if out_n == 0 || !out_n.is_multiple_of(8) {
+                return Err(loader_err_msg(format!(
+                    "5-trit row shard N={out_n} must be a non-zero multiple of 8 on '{real_5trit}'"
+                )));
+            }
+            let scale_off = row_start
+                .checked_mul(groups)
+                .ok_or_else(|| loader_err("5-trit row_start * groups overflow"))?;
+            let scale_len = out_n
+                .checked_mul(groups)
+                .ok_or_else(|| loader_err("5-trit out_n * groups overflow"))?;
+            let byte_off = scale_off
+                .checked_mul(26)
+                .ok_or_else(|| loader_err("5-trit byte offset overflow"))?;
+            let byte_len = scale_len
+                .checked_mul(26)
+                .ok_or_else(|| loader_err("5-trit byte length overflow"))?;
+            let packed_bytes = archive
+                .read_u8_subslice(&real_5trit, byte_off, byte_len)
+                .map_err(|e| {
+                    loader_err_msg(format!("read_u8_subslice('{real_5trit}') failed: {e}"))
+                })?;
+            let scales = archive
+                .read_f16_bits_subslice(&scale_key, scale_off, scale_len)
+                .map_err(|e| {
+                    loader_err_msg(format!("read_f16_bits_subslice('{scale_key}') failed: {e}"))
+                })?;
+            let packed_gpu =
+                crate::loader::repack_5trit_n_major_to_gpu(&packed_bytes, &scales, out_n, k);
+            return Ok((
+                Self::Ternary5Trit {
+                    packed_gpu,
+                    n: out_n,
+                    k,
+                },
+                full_n,
+            ));
         }
 
         // Fast path A: compressed-tensors row-major `weight_packed` + `weight_scale` without g_idx.
@@ -1256,6 +1282,8 @@ impl RawLinearHost {
                 .tensor_info(&scale_key)
                 .map_err(|e| loader_err_msg(format!("tensor_info('{scale_key}') failed: {e}")))?;
             if p_info.shape.len() != 3
+                || p_info.shape[0] == 0
+                || p_info.shape[1] == 0
                 || p_info.shape[2] != 26
                 || p_info.dtype != "U8"
                 || s_info.shape.len() != 2
@@ -1269,18 +1297,38 @@ impl RawLinearHost {
             }
             let n = p_info.shape[0];
             let groups = p_info.shape[1];
-            let k = groups * 128;
+            let k = groups
+                .checked_mul(128)
+                .ok_or_else(|| loader_err_msg(format!("5-trit K overflow on '{real_5trit}'")))?;
             if !n.is_multiple_of(8) {
                 return Err(loader_err_msg(format!(
                     "5-trit N={n} must be a multiple of 8 on '{real_5trit}'"
                 )));
             }
+            let expected_scales = n
+                .checked_mul(groups)
+                .ok_or_else(|| loader_err("5-trit scale count overflow"))?;
+            let expected_bytes = expected_scales
+                .checked_mul(26)
+                .ok_or_else(|| loader_err("5-trit byte count overflow"))?;
             let packed_bytes = archive
                 .read_bytes(&real_5trit)
                 .map_err(|e| loader_err_msg(format!("read_bytes('{real_5trit}') failed: {e}")))?;
+            if packed_bytes.len() != expected_bytes {
+                return Err(loader_err_msg(format!(
+                    "'{real_5trit}' byte length {} != expected {expected_bytes}",
+                    packed_bytes.len()
+                )));
+            }
             let scales = archive
                 .read_f16_bits(&scale_key)
                 .map_err(|e| loader_err_msg(format!("read_f16_bits('{scale_key}') failed: {e}")))?;
+            if scales.len() != expected_scales {
+                return Err(loader_err_msg(format!(
+                    "'{scale_key}' element count {} != expected {expected_scales}",
+                    scales.len()
+                )));
+            }
             let packed_gpu =
                 crate::loader::repack_5trit_n_major_to_gpu(&packed_bytes, &scales, n, k);
             return Ok(Self::Ternary5Trit { packed_gpu, n, k });
@@ -1842,18 +1890,23 @@ impl RawLinearHost {
                 pre_signs: pre_signs.clone(),
             },
             Self::Ternary5Trit { packed_gpu, k, .. } => {
-                assert!(
-                    row_start.is_multiple_of(8) && row_end.is_multiple_of(8),
-                    "5-trit slice_rows requires 8-row alignment"
-                );
-                let groups = k / 128;
-                let words_per_blk = groups * 56;
-                Self::Ternary5Trit {
-                    packed_gpu: packed_gpu
-                        [(row_start / 8) * words_per_blk..(row_end / 8) * words_per_blk]
-                        .to_vec(),
-                    n: out_n,
-                    k: *k,
+                if row_start.is_multiple_of(8) && row_end.is_multiple_of(8) {
+                    let groups = k / 128;
+                    let words_per_blk = groups * 56;
+                    Self::Ternary5Trit {
+                        packed_gpu: packed_gpu
+                            [(row_start / 8) * words_per_blk..(row_end / 8) * words_per_blk]
+                            .to_vec(),
+                        n: out_n,
+                        k: *k,
+                    }
+                } else {
+                    let f16_all = self.to_f16_vec();
+                    Self::DenseF16 {
+                        weight: f16_all[row_start * k..row_end * k].to_vec(),
+                        n: out_n,
+                        k: *k,
+                    }
                 }
             }
             Self::U2B2NMajor {
@@ -1973,7 +2026,9 @@ impl RawLinearHost {
             } => Self::Hadamard {
                 inner: Box::new(inner.slice_cols_inner(col_start, col_end)),
                 block_size: *block_size,
-                pre_signs: pre_signs.clone(),
+                pre_signs: pre_signs
+                    .as_ref()
+                    .map(|s| std::sync::Arc::from(&s[col_start..col_end])),
             },
             Self::Ternary5Trit { packed_gpu, n, k } => {
                 if !col_start.is_multiple_of(128) || !out_k.is_multiple_of(128) {

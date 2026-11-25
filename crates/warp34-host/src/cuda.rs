@@ -781,6 +781,7 @@ impl Drop for CudaEvent {
 pub struct CublasHandle {
     pub device_id: i32,
     pub handle: usize,
+    pub stream_handle: usize,
 }
 
 #[cfg(feature = "cuda")]
@@ -800,6 +801,7 @@ impl CublasHandle {
         Ok(Self {
             device_id: stream.device_id,
             handle,
+            stream_handle: stream.handle,
         })
     }
 

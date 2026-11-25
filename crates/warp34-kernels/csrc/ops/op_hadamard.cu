@@ -166,8 +166,18 @@ __global__ void block_hadamard_512_16bit(const T* __restrict__ src,
         int col = 0;
 
         if (active) {
-            row = group / blocks_per_row;
-            col = int(group % blocks_per_row) * 512 + warp_in_grp * 128 + lane * 4;
+            if (blocks_per_row == 1) {
+                row = group;
+                col = warp_in_grp * 128 + lane * 4;
+            } else if (static_cast<uint64_t>(group) <= 0xFFFFFFFFull) {
+                const uint32_t g32 = static_cast<uint32_t>(group);
+                const uint32_t bpr = static_cast<uint32_t>(blocks_per_row);
+                row = static_cast<int64_t>(g32 / bpr);
+                col = static_cast<int>(g32 % bpr) * 512 + warp_in_grp * 128 + lane * 4;
+            } else {
+                row = group / blocks_per_row;
+                col = int(group % blocks_per_row) * 512 + warp_in_grp * 128 + lane * 4;
+            }
             float v0 = 0.0f, v1 = 0.0f, v2 = 0.0f, v3 = 0.0f;
             if (col < k) {
                 const T* sp = src + row * k + col;
@@ -265,7 +275,9 @@ __global__ void block_hadamard_512_16bit(const T* __restrict__ src,
             }
         }
 
-        __syncthreads();
+        if (iter + gridDim.x < num_cta_iters) {
+            __syncthreads();
+        }
     }
 }
 
@@ -300,10 +312,14 @@ __global__ __launch_bounds__(256) void block_hadamard_1024_16bit(
         if (blocks_per_row == 1) {
             row = group;
             base_col = 0;
+        } else if (static_cast<uint64_t>(group) <= 0xFFFFFFFFull) {
+            const uint32_t g32 = static_cast<uint32_t>(group);
+            const uint32_t bpr = static_cast<uint32_t>(blocks_per_row);
+            row = static_cast<int64_t>(g32 / bpr);
+            base_col = static_cast<int>(g32 % bpr) << 10;
         } else {
-            const int g32 = static_cast<int>(group);
-            row = static_cast<int64_t>(g32 / blocks_per_row);
-            base_col = (g32 % blocks_per_row) << 10;
+            row = group / blocks_per_row;
+            base_col = static_cast<int>(group % blocks_per_row) << 10;
         }
         const int col = base_col + warp_id * 128 + lane * 4;
 
@@ -448,10 +464,14 @@ __global__ __launch_bounds__(512) void block_hadamard_4096_16bit(
         if (blocks_per_row == 1) {
             row = group;
             base_col = 0;
+        } else if (static_cast<uint64_t>(group) <= 0xFFFFFFFFull) {
+            const uint32_t g32 = static_cast<uint32_t>(group);
+            const uint32_t bpr = static_cast<uint32_t>(blocks_per_row);
+            row = static_cast<int64_t>(g32 / bpr);
+            base_col = static_cast<int>(g32 % bpr) << 12;
         } else {
-            const int g32 = static_cast<int>(group);
-            row = static_cast<int64_t>(g32 / blocks_per_row);
-            base_col = (g32 % blocks_per_row) << 12;
+            row = group / blocks_per_row;
+            base_col = static_cast<int>(group % blocks_per_row) << 12;
         }
 
         // Pass 1: H_64 along each of the 64 rows (low 6 bits: h = 1..32).
@@ -608,6 +628,13 @@ int launch_block_hadamard(const warp34_exec* ex, const void* src,
         s > UINTPTR_MAX - src_bytes || d > UINTPTR_MAX - dst_bytes ||
         (s < d + dst_bytes && d < s + src_bytes)) {
         return int(cudaErrorInvalidValue);
+    }
+    if (pre_signs != nullptr) {
+        const uintptr_t ps = reinterpret_cast<uintptr_t>(pre_signs);
+        const uint64_t ps_bytes = uint64_t(k);
+        if (ps > UINTPTR_MAX - ps_bytes || (ps < d + dst_bytes && d < ps + ps_bytes)) {
+            return int(cudaErrorInvalidValue);
+        }
     }
     const int64_t groups = int64_t(rows) * (padded_k / block_size);
     const int64_t needed = (block_size == 1024 || block_size == 4096)

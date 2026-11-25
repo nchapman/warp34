@@ -53,6 +53,12 @@ impl FullAttentionLayerWeights {
             && self.qkv_proj.can_fuse_h512_from_producer()
         {
             512
+        } else if allow_h512
+            && h_dim <= PRODUCER_FUSED_H64_MAX_HIDDEN_SIZE
+            && h_dim.is_multiple_of(1024)
+            && self.qkv_proj.can_fuse_h1024_from_producer()
+        {
+            1024
         } else {
             return ([normed_buf, 0], 0);
         };
@@ -536,7 +542,9 @@ impl LayerResidual {
                 ..
             } => {
                 if layer_idx == 0 {
-                    let norm_fn = if had_block == 512 && norm_had != 0 {
+                    let norm_fn = if had_block == 1024 && norm_had != 0 {
+                        ffi::warp34_gemma_rms_norm_hadamard1024_f16
+                    } else if had_block == 512 && norm_had != 0 {
                         ffi::warp34_gemma_rms_norm_hadamard512_f16
                     } else {
                         ffi::warp34_gemma_rms_norm_hadamard_f16
@@ -647,7 +655,9 @@ impl LayerResidual {
                         0,
                     )
                 } else {
-                    let norm_fn = if had_block == 512 && norm_had64 != 0 {
+                    let norm_fn = if had_block == 1024 && norm_had64 != 0 {
+                        ffi::warp34_fused_add_gemma_rms_norm_tap_hadamard1024_f16
+                    } else if had_block == 512 && norm_had64 != 0 {
                         ffi::warp34_fused_add_gemma_rms_norm_tap_hadamard512_f16
                     } else {
                         ffi::warp34_fused_add_gemma_rms_norm_tap_hadamard_f16
@@ -785,7 +795,9 @@ impl LayerResidual {
                         tap.offset,
                     )
                 } else {
-                    let norm_fn = if next_had_block == 512 && next_norm_had64 != 0 {
+                    let norm_fn = if next_had_block == 1024 && next_norm_had64 != 0 {
+                        ffi::warp34_fused_add_gemma_rms_norm_tap_hadamard1024_f16
+                    } else if next_had_block == 512 && next_norm_had64 != 0 {
                         ffi::warp34_fused_add_gemma_rms_norm_tap_hadamard512_f16
                     } else {
                         ffi::warp34_fused_add_gemma_rms_norm_tap_hadamard_f16
@@ -1182,6 +1194,12 @@ impl LayerBlockWeights {
                     && gdn.in_proj_qkvz.can_fuse_h512_from_producer()
                 {
                     512
+                } else if allow_h512
+                    && h_dim <= PRODUCER_FUSED_H64_MAX_HIDDEN_SIZE
+                    && h_dim.is_multiple_of(1024)
+                    && gdn.in_proj_qkvz.can_fuse_h1024_from_producer()
+                {
+                    1024
                 } else {
                     0
                 };

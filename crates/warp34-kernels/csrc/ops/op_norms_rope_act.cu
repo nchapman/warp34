@@ -86,7 +86,7 @@ __global__ void copy_masked_rows_f16_kernel(
     }
 }
 
-template <int VEC_ITERS, int HAD512_WARPS = 0>
+template <int VEC_ITERS, int HAD512_WARPS = 0, int HAD_BLOCK = 512>
 __global__ void gemma_rms_norm_vec8_f16_kernel(
     const __half* __restrict__ x,
     const __half* __restrict__ weight,
@@ -154,7 +154,9 @@ __global__ void gemma_rms_norm_vec8_f16_kernel(
             }
         }
         if constexpr (HAD512_WARPS > 0) {
-            const uint4 rot = hadamard512_vec8_f16(ov, active, s_had512);
+            const uint4 rot = (HAD_BLOCK == 1024)
+                ? hadamard1024_vec8_f16(ov, active, s_had512)
+                : hadamard512_vec8_f16(ov, active, s_had512);
             if (active && out_had64_v != nullptr) {
                 out_had64_v[vi] = rot;
             }
@@ -269,7 +271,7 @@ __global__ void gemma_rms_norm_strided_f16_kernel(
     }
 }
 
-template <int VEC_ITERS, int HAD512_WARPS = 0>
+template <int VEC_ITERS, int HAD512_WARPS = 0, int HAD_BLOCK = 512>
 __global__ void fused_add_gemma_rms_norm_vec8_f16_kernel(
     const __half* __restrict__ x,
     __half* __restrict__ residual,
@@ -359,7 +361,9 @@ __global__ void fused_add_gemma_rms_norm_vec8_f16_kernel(
             }
         }
         if constexpr (HAD512_WARPS > 0) {
-            const uint4 rot = hadamard512_vec8_f16(ov, active, s_had512);
+            const uint4 rot = (HAD_BLOCK == 1024)
+                ? hadamard1024_vec8_f16(ov, active, s_had512)
+                : hadamard512_vec8_f16(ov, active, s_had512);
             if (active && out_had64_v != nullptr) {
                 out_had64_v[vi] = rot;
             }
@@ -873,6 +877,7 @@ __global__ void apply_attn_output_gate_hadamard_f16_kernel(
     }
 }
 
+template <int HAD_BLOCK = 512>
 __global__ void silu_and_mul_hadamard512_f16_kernel(
     const __half* __restrict__ gate_up,
     __half* __restrict__ out,
@@ -912,7 +917,9 @@ __global__ void silu_and_mul_hadamard512_f16_kernel(
             }
         }
     }
-    const uint4 rot = hadamard512_vec8_f16(ov, active, s_had512);
+    const uint4 rot = (HAD_BLOCK == 1024)
+        ? hadamard1024_vec8_f16(ov, active, s_had512)
+        : hadamard512_vec8_f16(ov, active, s_had512);
     if (active) {
         if (aligned) {
             reinterpret_cast<uint4*>(row_out)[vcol] = rot;
@@ -926,6 +933,7 @@ __global__ void silu_and_mul_hadamard512_f16_kernel(
     }
 }
 
+template <int HAD_BLOCK = 512>
 __global__ void apply_attn_output_gate_hadamard512_f16_kernel(
     const __half* __restrict__ attn_out,
     const __half* __restrict__ gate,
@@ -964,7 +972,9 @@ __global__ void apply_attn_output_gate_hadamard512_f16_kernel(
             }
         }
     }
-    const uint4 rot = hadamard512_vec8_f16(ov, active, s_had512);
+    const uint4 rot = (HAD_BLOCK == 1024)
+        ? hadamard1024_vec8_f16(ov, active, s_had512)
+        : hadamard512_vec8_f16(ov, active, s_had512);
     if (active) {
         if (aligned) {
             reinterpret_cast<uint4*>(out + row_off)[vcol] = rot;
@@ -1128,6 +1138,42 @@ extern "C" int warp34_gemma_rms_norm_hadamard512_f16(
     return (int)cudaGetLastError();
 }
 
+extern "C" int warp34_gemma_rms_norm_hadamard1024_f16(
+    const warp34_exec* ex,
+    const void* x,
+    const void* weight,
+    void* out,
+    void* out_had1024,
+    const uint8_t* valid_token_mask,
+    int num_tokens,
+    int hidden_size,
+    float eps) {
+    if (ex == nullptr || x == nullptr || weight == nullptr || out_had1024 == nullptr ||
+        (hidden_size & 1023) != 0 || hidden_size > 12288 ||
+        ((((uintptr_t)x | (uintptr_t)weight | (uintptr_t)out | (uintptr_t)out_had1024) & 15u) != 0u)) {
+        return (int)cudaErrorInvalidValue;
+    }
+    if (num_tokens <= 0 || hidden_size <= 0) return 0;
+    if (hidden_size <= 2048) {
+        warp34::gemma_rms_norm_vec8_f16_kernel<1, 8, 1024><<<num_tokens, 256, 0, (cudaStream_t)ex->stream>>>(
+            (const __half*)x, (const __half*)weight, (__half*)out, (__half*)out_had1024,
+            valid_token_mask, hidden_size, eps, 1.0f);
+    } else if (hidden_size <= 4096) {
+        warp34::gemma_rms_norm_vec8_f16_kernel<1, 16, 1024><<<num_tokens, 512, 0, (cudaStream_t)ex->stream>>>(
+            (const __half*)x, (const __half*)weight, (__half*)out, (__half*)out_had1024,
+            valid_token_mask, hidden_size, eps, 1.0f);
+    } else if (hidden_size <= 8192) {
+        warp34::gemma_rms_norm_vec8_f16_kernel<2, 16, 1024><<<num_tokens, 512, 0, (cudaStream_t)ex->stream>>>(
+            (const __half*)x, (const __half*)weight, (__half*)out, (__half*)out_had1024,
+            valid_token_mask, hidden_size, eps, 1.0f);
+    } else {
+        warp34::gemma_rms_norm_vec8_f16_kernel<3, 16, 1024><<<num_tokens, 512, 0, (cudaStream_t)ex->stream>>>(
+            (const __half*)x, (const __half*)weight, (__half*)out, (__half*)out_had1024,
+            valid_token_mask, hidden_size, eps, 1.0f);
+    }
+    return (int)cudaGetLastError();
+}
+
 extern "C" int warp34_fused_add_gemma_rms_norm_tap_hadamard512_f16(
     const warp34_exec* ex,
     const void* x,
@@ -1165,6 +1211,49 @@ extern "C" int warp34_fused_add_gemma_rms_norm_tap_hadamard512_f16(
     } else {
         warp34::fused_add_gemma_rms_norm_vec8_f16_kernel<2, 16><<<num_tokens, 512, 0, (cudaStream_t)ex->stream>>>(
             (const __half*)x, (__half*)residual, (const __half*)weight, (__half*)out, (__half*)out_had512,
+            (__nv_bfloat16*)tap_dst_bf16, valid_token_mask, hidden_size, eps,
+            tap_row_stride, tap_col_offset, 1.0f);
+    }
+    return (int)cudaGetLastError();
+}
+
+extern "C" int warp34_fused_add_gemma_rms_norm_tap_hadamard1024_f16(
+    const warp34_exec* ex,
+    const void* x,
+    void* residual,
+    const void* weight,
+    void* out,
+    void* out_had1024,
+    void* tap_dst_bf16,
+    const uint8_t* valid_token_mask,
+    int num_tokens,
+    int hidden_size,
+    float eps,
+    int tap_row_stride,
+    int tap_col_offset) {
+    if (ex == nullptr || x == nullptr || residual == nullptr || weight == nullptr ||
+        out_had1024 == nullptr || (hidden_size & 1023) != 0 || hidden_size > 6144 ||
+        ((tap_dst_bf16 != nullptr) &&
+         (tap_col_offset < 0 || tap_row_stride < tap_col_offset + hidden_size ||
+          (((tap_row_stride | tap_col_offset) & 7) != 0))) ||
+        ((((uintptr_t)x | (uintptr_t)residual | (uintptr_t)tap_dst_bf16 |
+           (uintptr_t)weight | (uintptr_t)out | (uintptr_t)out_had1024) & 15u) != 0u)) {
+        return (int)cudaErrorInvalidValue;
+    }
+    if (num_tokens <= 0 || hidden_size <= 0) return 0;
+    if (hidden_size <= 2048) {
+        warp34::fused_add_gemma_rms_norm_vec8_f16_kernel<1, 8, 1024><<<num_tokens, 256, 0, (cudaStream_t)ex->stream>>>(
+            (const __half*)x, (__half*)residual, (const __half*)weight, (__half*)out, (__half*)out_had1024,
+            (__nv_bfloat16*)tap_dst_bf16, valid_token_mask, hidden_size, eps,
+            tap_row_stride, tap_col_offset, 1.0f);
+    } else if (hidden_size <= 4096) {
+        warp34::fused_add_gemma_rms_norm_vec8_f16_kernel<1, 16, 1024><<<num_tokens, 512, 0, (cudaStream_t)ex->stream>>>(
+            (const __half*)x, (__half*)residual, (const __half*)weight, (__half*)out, (__half*)out_had1024,
+            (__nv_bfloat16*)tap_dst_bf16, valid_token_mask, hidden_size, eps,
+            tap_row_stride, tap_col_offset, 1.0f);
+    } else {
+        warp34::fused_add_gemma_rms_norm_vec8_f16_kernel<2, 16, 1024><<<num_tokens, 512, 0, (cudaStream_t)ex->stream>>>(
+            (const __half*)x, (__half*)residual, (const __half*)weight, (__half*)out, (__half*)out_had1024,
             (__nv_bfloat16*)tap_dst_bf16, valid_token_mask, hidden_size, eps,
             tap_row_stride, tap_col_offset, 1.0f);
     }
@@ -1633,7 +1722,25 @@ extern "C" int warp34_silu_and_mul_hadamard512_f16(const warp34_exec* ex, const 
     const unsigned col_blocks = (cols + blk - 1u) / blk;
     if (col_blocks > 65535u) return (int)cudaErrorInvalidValue;
     dim3 grid((unsigned)num_tokens, col_blocks);
-    warp34::silu_and_mul_hadamard512_f16_kernel<<<grid, blk, 0, (cudaStream_t)ex->stream>>>(
+    warp34::silu_and_mul_hadamard512_f16_kernel<512><<<grid, blk, 0, (cudaStream_t)ex->stream>>>(
+        (const __half*)gate_up, (__half*)out, valid_token_mask, intermediate_size);
+    return (int)cudaGetLastError();
+}
+
+extern "C" int warp34_silu_and_mul_hadamard1024_f16(const warp34_exec* ex, const void* gate_up, void* out,
+                                                 const uint8_t* valid_token_mask,
+                                                 int num_tokens, int intermediate_size) {
+    if (ex == nullptr || gate_up == nullptr || out == nullptr || (intermediate_size & 1023) != 0 ||
+        ((((uintptr_t)gate_up | (uintptr_t)out) & 1u) != 0u)) {
+        return (int)cudaErrorInvalidValue;
+    }
+    if (num_tokens <= 0 || intermediate_size <= 0) return 0;
+    const unsigned blk = 128u;
+    const unsigned cols = (unsigned)(intermediate_size >> 3);
+    const unsigned col_blocks = (cols + blk - 1u) / blk;
+    if (col_blocks > 65535u) return (int)cudaErrorInvalidValue;
+    dim3 grid((unsigned)num_tokens, col_blocks);
+    warp34::silu_and_mul_hadamard512_f16_kernel<1024><<<grid, blk, 0, (cudaStream_t)ex->stream>>>(
         (const __half*)gate_up, (__half*)out, valid_token_mask, intermediate_size);
     return (int)cudaGetLastError();
 }
@@ -2544,7 +2651,32 @@ extern "C" int warp34_apply_attn_output_gate_hadamard512_f16(
     const unsigned col_blocks = (cols + blk - 1u) / blk;
     if (col_blocks > 65535u) return (int)cudaErrorInvalidValue;
     dim3 grid((unsigned)num_tokens, col_blocks);
-    warp34::apply_attn_output_gate_hadamard512_f16_kernel<<<grid, blk, 0, (cudaStream_t)ex->stream>>>(
+    warp34::apply_attn_output_gate_hadamard512_f16_kernel<512><<<grid, blk, 0, (cudaStream_t)ex->stream>>>(
+        (const __half*)attn_out, (const __half*)gate, (__half*)out,
+        valid_token_mask, total_dim);
+    return (int)cudaGetLastError();
+}
+
+extern "C" int warp34_apply_attn_output_gate_hadamard1024_f16(
+    const warp34_exec* ex,
+    const void* attn_out,
+    const void* gate,
+    void* out,
+    const uint8_t* valid_token_mask,
+    int num_tokens,
+    int total_dim) {
+    if (ex == nullptr || attn_out == nullptr || gate == nullptr || out == nullptr ||
+        (total_dim & 1023) != 0 ||
+        ((((uintptr_t)attn_out | (uintptr_t)gate | (uintptr_t)out) & 1u) != 0u)) {
+        return (int)cudaErrorInvalidValue;
+    }
+    if (num_tokens <= 0 || total_dim <= 0) return 0;
+    const unsigned blk = 128u;
+    const unsigned cols = (unsigned)(total_dim >> 3);
+    const unsigned col_blocks = (cols + blk - 1u) / blk;
+    if (col_blocks > 65535u) return (int)cudaErrorInvalidValue;
+    dim3 grid((unsigned)num_tokens, col_blocks);
+    warp34::apply_attn_output_gate_hadamard512_f16_kernel<1024><<<grid, blk, 0, (cudaStream_t)ex->stream>>>(
         (const __half*)attn_out, (const __half*)gate, (__half*)out,
         valid_token_mask, total_dim);
     return (int)cudaGetLastError();

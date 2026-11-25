@@ -692,13 +692,23 @@ pub fn repack_5trit_n_major_to_gpu(
         "5-trit K must be a multiple of 128"
     );
     let groups = size_k / 128;
-    assert_eq!(packed_5trit.len(), size_n * groups * 26);
-    assert_eq!(scales_f16.len(), size_n * groups);
+    let total_groups = size_n
+        .checked_mul(groups)
+        .expect("5-trit N * groups overflow");
+    let total_trit_bytes = total_groups
+        .checked_mul(26)
+        .expect("5-trit byte count overflow");
+    assert_eq!(packed_5trit.len(), total_trit_bytes);
+    assert_eq!(scales_f16.len(), total_groups);
     if size_n == 0 || size_k == 0 {
         return Vec::new();
     }
     let n_blks = size_n / 8;
-    let mut out = vec![0u32; n_blks * groups * 56];
+    let out_words = n_blks
+        .checked_mul(groups)
+        .and_then(|v| v.checked_mul(56))
+        .expect("5-trit packed word count overflow");
+    let mut out = vec![0u32; out_words];
     let repack_range = |blk_start: usize, dst: &mut [u32]| {
         for (rel_blk, blk_dst) in dst.chunks_exact_mut(groups * 56).enumerate() {
             let n_blk = blk_start + rel_blk;
@@ -776,12 +786,21 @@ pub fn dequant_5trit_n_major_to_f16(
 ) -> Vec<u16> {
     assert!(size_k.is_multiple_of(128));
     let groups = size_k / 128;
-    assert_eq!(packed_5trit.len(), size_n * groups * 26);
-    assert_eq!(scales_f16.len(), size_n * groups);
+    let total_groups = size_n
+        .checked_mul(groups)
+        .expect("5-trit N * groups overflow");
+    let total_trit_bytes = total_groups
+        .checked_mul(26)
+        .expect("5-trit byte count overflow");
+    assert_eq!(packed_5trit.len(), total_trit_bytes);
+    assert_eq!(scales_f16.len(), total_groups);
     if size_n == 0 || size_k == 0 {
         return Vec::new();
     }
-    let mut out = vec![0u16; size_n * size_k];
+    let out_elems = size_n
+        .checked_mul(size_k)
+        .expect("5-trit N * K element overflow");
+    let mut out = vec![0u16; out_elems];
     let dequant_rows = |row_start: usize, dst_rows: &mut [u16]| {
         for (rel_n, dst_row) in dst_rows.chunks_exact_mut(size_k).enumerate() {
             let n = row_start + rel_n;
@@ -817,8 +836,15 @@ pub fn dequant_5trit_gpu_to_f16(packed_gpu: &[u32], size_n: usize, size_k: usize
     assert!(size_n.is_multiple_of(8) && size_k.is_multiple_of(128));
     let groups = size_k / 128;
     let n_blks = size_n / 8;
-    assert_eq!(packed_gpu.len(), n_blks * groups * 56);
-    let mut out = vec![0u16; size_n * size_k];
+    let expected_words = n_blks
+        .checked_mul(groups)
+        .and_then(|v| v.checked_mul(56))
+        .expect("5-trit GPU word count overflow");
+    assert_eq!(packed_gpu.len(), expected_words);
+    let out_elems = size_n
+        .checked_mul(size_k)
+        .expect("5-trit N * K element overflow");
+    let mut out = vec![0u16; out_elems];
     for n_blk in 0..n_blks {
         for g in 0..groups {
             let g_src = &packed_gpu[(n_blk * groups + g) * 56..][..56];

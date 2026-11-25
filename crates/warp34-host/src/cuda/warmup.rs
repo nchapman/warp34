@@ -24,7 +24,7 @@ fn warmup_norms(
     buf_d: u64,
     buf_ws: u64,
 ) -> Result<()> {
-    for hs in [128i32, 3072, 5120, 6144, 10240] {
+    for hs in [128i32, 2048, 3072, 4096, 5120, 6144, 10240] {
         for byte_off in [0u64, 4u64] {
             let out_had = if byte_off == 0 && hs <= 6144 {
                 buf_d as *mut c_void
@@ -117,6 +117,48 @@ fn warmup_norms(
                     )?;
                 }
             }
+            if byte_off == 0 && (hs & 1023) == 0 && hs <= 12288 {
+                check_rc(
+                    // SAFETY: Warmup arena buffers are 16-byte aligned and sized for this launch.
+                    unsafe {
+                        ffi::warp34_gemma_rms_norm_hadamard1024_f16(
+                            ex,
+                            buf_a as *const c_void,
+                            buf_b as *const c_void,
+                            buf_c as *mut c_void,
+                            buf_ws as *mut c_void,
+                            core::ptr::null(),
+                            1,
+                            hs,
+                            1e-6,
+                        )
+                    },
+                    "warmup warp34_gemma_rms_norm_hadamard1024_f16",
+                )?;
+                if hs <= 6144 {
+                    check_rc(
+                        // SAFETY: Warmup arena buffers are 16-byte aligned and sized for this launch.
+                        unsafe {
+                            ffi::warp34_fused_add_gemma_rms_norm_tap_hadamard1024_f16(
+                                ex,
+                                buf_a as *const c_void,
+                                buf_b as *mut c_void,
+                                buf_c as *const c_void,
+                                buf_d as *mut c_void,
+                                buf_ws as *mut c_void,
+                                core::ptr::null_mut(),
+                                core::ptr::null(),
+                                1,
+                                hs,
+                                1e-6,
+                                0,
+                                0,
+                            )
+                        },
+                        "warmup warp34_fused_add_gemma_rms_norm_tap_hadamard1024_f16",
+                    )?;
+                }
+            }
         }
     }
     Ok(())
@@ -193,7 +235,14 @@ fn warmup_hadamard_and_bonsai_kernels(
             "warmup warp34_block_hadamard_signed_f16",
         )?;
     }
-    for (m, n, k) in [(1i32, 32, 128), (1, 32, 4096), (2, 32, 128), (4, 32, 128)] {
+    for (m, n, k) in [
+        (1i32, 32, 128),
+        (1, 32, 1024),
+        (1, 8, 6144),
+        (2, 32, 128),
+        (2, 16, 1024),
+        (2, 8, 4096),
+    ] {
         check_rc(
             // SAFETY: warmup buffers `buf_a`, `buf_b`, and `buf_c` are live device allocations sized for this launch.
             unsafe {
@@ -421,6 +470,17 @@ pub fn prepare_execution_plan(device_id: i32) -> Result<()> {
         ),
         "warmup warp34_silu_and_mul_hadamard512_f16"
     )?;
+    warmup_ffi!(
+        ffi::warp34_silu_and_mul_hadamard1024_f16(
+            &ex,
+            buf_a as *const c_void,
+            buf_c as *mut c_void,
+            core::ptr::null(),
+            1,
+            1024,
+        ),
+        "warmup warp34_silu_and_mul_hadamard1024_f16"
+    )?;
     type GateFn = unsafe extern "C" fn(
         *const ffi::Warp34Exec,
         *const c_void,
@@ -430,18 +490,26 @@ pub fn prepare_execution_plan(device_id: i32) -> Result<()> {
         i32,
         i32,
     ) -> i32;
-    for (gate_fn, label) in [
+    for (gate_fn, gate_dim, label) in [
         (
             ffi::warp34_apply_attn_output_gate_f16 as GateFn,
+            512,
             "warmup warp34_apply_attn_output_gate_f16",
         ),
         (
             ffi::warp34_apply_attn_output_gate_hadamard_f16 as GateFn,
+            512,
             "warmup warp34_apply_attn_output_gate_hadamard_f16",
         ),
         (
             ffi::warp34_apply_attn_output_gate_hadamard512_f16 as GateFn,
+            512,
             "warmup warp34_apply_attn_output_gate_hadamard512_f16",
+        ),
+        (
+            ffi::warp34_apply_attn_output_gate_hadamard1024_f16 as GateFn,
+            1024,
+            "warmup warp34_apply_attn_output_gate_hadamard1024_f16",
         ),
     ] {
         warmup_ffi!(
@@ -452,7 +520,7 @@ pub fn prepare_execution_plan(device_id: i32) -> Result<()> {
                 buf_c as *mut c_void,
                 core::ptr::null(),
                 1,
-                512,
+                gate_dim,
             ),
             label
         )?;

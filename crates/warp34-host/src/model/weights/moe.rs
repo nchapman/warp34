@@ -99,6 +99,11 @@ impl FfnBlockWeights {
                     && gate_up_proj.can_fuse_h512_from_producer()
                 {
                     ([0, normed_buf], 512)
+                } else if allow_h512
+                    && h_dim.is_multiple_of(1024)
+                    && gate_up_proj.can_fuse_h1024_from_producer()
+                {
+                    ([0, normed_buf], 1024)
                 } else {
                     ([normed_buf, 0], 0)
                 }
@@ -120,6 +125,15 @@ impl FfnBlockWeights {
                         .is_none_or(LinearProj::can_fuse_h512_from_producer)
                 {
                     512
+                } else if allow_h512
+                    && moe.routed_input_hadamard == 1024
+                    && h_dim.is_multiple_of(1024)
+                    && moe
+                        .shared_gate_up_proj
+                        .as_ref()
+                        .is_none_or(LinearProj::can_fuse_h1024_from_producer)
+                {
+                    1024
                 } else {
                     return ([normed_buf, 0], 0);
                 };
@@ -139,7 +153,9 @@ impl FfnBlockWeights {
                             .shared_down_proj
                             .as_ref()
                             .filter(|p| {
-                                !p.can_fuse_h64_from_producer() && !p.can_fuse_h512_from_producer()
+                                !p.can_fuse_h64_from_producer()
+                                    && !p.can_fuse_h512_from_producer()
+                                    && !p.can_fuse_h1024_from_producer()
                             })
                             .and_then(|p| p.input_transform_workspace_bytes(rows))
                             .unwrap_or(0);
@@ -282,10 +298,14 @@ impl FfnBlockWeights {
                 }
                 let fuse_down_h64 = down_proj.can_fuse_h64_from_producer();
                 let fuse_down_h512 = !fuse_down_h64 && down_proj.can_fuse_h512_from_producer();
+                let fuse_down_h1024 =
+                    !fuse_down_h64 && !fuse_down_h512 && down_proj.can_fuse_h1024_from_producer();
                 let silu_fn = if fuse_down_h64 {
                     ffi::warp34_silu_and_mul_hadamard_f16
                 } else if fuse_down_h512 {
                     ffi::warp34_silu_and_mul_hadamard512_f16
+                } else if fuse_down_h1024 {
+                    ffi::warp34_silu_and_mul_hadamard1024_f16
                 } else {
                     ffi::warp34_silu_and_mul_f16
                 };
@@ -306,7 +326,7 @@ impl FfnBlockWeights {
                     },
                     "warp34_silu_and_mul_f16",
                 )?;
-                if fuse_down_h64 || fuse_down_h512 {
+                if fuse_down_h64 || fuse_down_h512 || fuse_down_h1024 {
                     down_proj.forward_prerotated(
                         ex,
                         cublas,
@@ -482,10 +502,15 @@ impl FfnBlockWeights {
                     let fuse_sh_down_h64 = sh_dn.can_fuse_h64_from_producer();
                     let fuse_sh_down_h512 =
                         !fuse_sh_down_h64 && sh_dn.can_fuse_h512_from_producer();
+                    let fuse_sh_down_h1024 = !fuse_sh_down_h64
+                        && !fuse_sh_down_h512
+                        && sh_dn.can_fuse_h1024_from_producer();
                     let sh_silu_fn = if fuse_sh_down_h64 {
                         ffi::warp34_silu_and_mul_hadamard_f16
                     } else if fuse_sh_down_h512 {
                         ffi::warp34_silu_and_mul_hadamard512_f16
+                    } else if fuse_sh_down_h1024 {
+                        ffi::warp34_silu_and_mul_hadamard1024_f16
                     } else {
                         ffi::warp34_silu_and_mul_f16
                     };
@@ -505,7 +530,7 @@ impl FfnBlockWeights {
                         },
                         "warp34_silu_and_mul_f16 (shared_expert)",
                     )?;
-                    if fuse_sh_down_h64 || fuse_sh_down_h512 {
+                    if fuse_sh_down_h64 || fuse_sh_down_h512 || fuse_sh_down_h1024 {
                         sh_dn.forward_prerotated(
                             ex,
                             cublas,
@@ -1052,10 +1077,14 @@ impl FfnBlockWeights {
                 }
                 let fuse_sh_down_h64 = sh_dn.can_fuse_h64_from_producer();
                 let fuse_sh_down_h512 = !fuse_sh_down_h64 && sh_dn.can_fuse_h512_from_producer();
+                let fuse_sh_down_h1024 =
+                    !fuse_sh_down_h64 && !fuse_sh_down_h512 && sh_dn.can_fuse_h1024_from_producer();
                 let sh_silu_fn = if fuse_sh_down_h64 {
                     ffi::warp34_silu_and_mul_hadamard_f16
                 } else if fuse_sh_down_h512 {
                     ffi::warp34_silu_and_mul_hadamard512_f16
+                } else if fuse_sh_down_h1024 {
+                    ffi::warp34_silu_and_mul_hadamard1024_f16
                 } else {
                     ffi::warp34_silu_and_mul_f16
                 };
@@ -1073,7 +1102,7 @@ impl FfnBlockWeights {
                     },
                     "warp34_silu_and_mul_f16 (shared_expert)",
                 )?;
-                if fuse_sh_down_h64 || fuse_sh_down_h512 {
+                if fuse_sh_down_h64 || fuse_sh_down_h512 || fuse_sh_down_h1024 {
                     sh_dn.forward_prerotated(
                         ex,
                         cublas,

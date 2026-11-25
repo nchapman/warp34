@@ -560,8 +560,11 @@ impl SafetensorsArchive {
                 format!("shard '{}' not open", info.shard_file),
             )
         })?;
+        let file_off = info.offset.checked_add(elem_offset as u64).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "u8 file offset overflow")
+        })?;
         let mut buf = vec![0u8; elem_len];
-        f.read_exact_at(&mut buf, info.offset + elem_offset as u64)?;
+        f.read_exact_at(&mut buf, file_off)?;
         Ok(buf)
     }
 
