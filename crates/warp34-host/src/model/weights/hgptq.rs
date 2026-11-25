@@ -23,7 +23,7 @@ impl RawLinearHost {
         quant: &QuantScheme,
         row_range: Option<(usize, usize)>,
     ) -> Result<(Self, usize)> {
-        let name = ["weight_packed", "qweight", "weight"]
+        let name = ["weight_5trit", "weight_packed", "qweight", "weight"]
             .into_iter()
             .find_map(|suffix| {
                 archive

@@ -560,7 +560,8 @@ extern "C" int warp34_cublas_gemm_f16(uintptr_t handle, const void* a, const voi
 
 extern "C" int warp34_cublas_gemm_f16_ldc(uintptr_t handle, const void* a, const void* b, void* c,
                                        int m, int n, int k, int ldc) {
-    if (handle == 0 || a == nullptr || b == nullptr || c == nullptr || ldc < n) return (int)cudaErrorInvalidValue;
+    if (handle == 0 || a == nullptr || b == nullptr || c == nullptr
+        || m <= 0 || n <= 0 || k <= 0 || ldc < n) return (int)cudaErrorInvalidValue;
     std::lock_guard<std::mutex> lock(((Warp34Blas*)handle)->mutex);
     const float alpha = 1.0f;
     const float beta = 0.0f;

@@ -209,6 +209,8 @@ int warp34_gemm_5trit_f16(const warp34_exec* ex, const void* a,
                           int m, int n, int k);
 int warp34_dequant_5trit_to_f16(const warp34_exec* ex, const uint32_t* packed_w,
                                 void* dst_f16, int n_start, int n_chunk, int k);
+int warp34_repack_5trit_to_marlin_u2(const warp34_exec* ex, const uint32_t* packed_w,
+                                     uint32_t* dst_marlin, uint16_t* dst_scales, int n, int k);
 int warp34_block_hadamard_inplace_f16(const warp34_exec* ex, void* buf,
                                    int rows, int k, int block_size);
 int warp34_block_hadamard_bf16(const warp34_exec* ex, const void* src, void* dst,

@@ -191,7 +191,7 @@ fn warmup_hadamard_and_bonsai_kernels(
         },
         "warmup warp34_block_hadamard_signed_f16",
     )?;
-    for m in [1i32, 2, 4, 8] {
+    for (m, n, k) in [(1i32, 32, 128), (1, 32, 4096), (2, 32, 128), (4, 32, 128)] {
         check_rc(
             // SAFETY: warmup buffers `buf_a`, `buf_b`, and `buf_c` are live device allocations sized for this launch.
             unsafe {
@@ -201,8 +201,8 @@ fn warmup_hadamard_and_bonsai_kernels(
                     buf_c as *const u32,
                     buf_b as *mut c_void,
                     m,
-                    32,
-                    128,
+                    n,
+                    k,
                 )
             },
             "warmup warp34_gemm_5trit_f16",
@@ -221,6 +221,21 @@ fn warmup_hadamard_and_bonsai_kernels(
             )
         },
         "warmup warp34_dequant_5trit_to_f16",
+    )?;
+    check_rc(
+        // SAFETY: warmup buffers `buf_a`, `buf_b`, and `buf_c` are live 64 KiB device allocations
+        // (64*128/4 = 2 KiB marlin weights, 64*2 = 128 B scales, 8*1*56*4 = 1792 B 5-trit).
+        unsafe {
+            ffi::warp34_repack_5trit_to_marlin_u2(
+                ex,
+                buf_c as *const u32,
+                buf_b as *mut u32,
+                buf_a as *mut u16,
+                64,
+                128,
+            )
+        },
+        "warmup warp34_repack_5trit_to_marlin_u2",
     )?;
     Ok(())
 }

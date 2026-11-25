@@ -247,31 +247,56 @@ __global__ void block_hadamard_512_16bit(const T* src, T* dst,
     }
 }
 
-// H_4096 factored as H_64 ⊗ H_64 in shared memory (`64 × 65` float = 16.25 KiB, zero bank
-// conflicts on transpose). Supports optional per-channel `pre_signs` (`{-1, +1}` in `int8_t`,
-// length 4096) fused into the load so `v_o_proj` (`H_4096(x * signs)`) takes a single pass.
-// One CTA (256 threads = 16 half-warps × 16 lanes) handles one 4096-element block per iteration.
+__device__ __forceinline__ float xor_sign_byte_f32(float v, uint32_t s_byte) {
+    return __uint_as_float(__float_as_uint(v) ^ ((s_byte & 0x80u) << 24));
+}
+
+// H_4096 factored as H_64 ⊗ H_64 in shared memory (`64 × 65` float = 16.25 KiB).
+// 512 threads (16 warps = 32 half-warps × 16 lanes, p = 0..1) halves single-CTA M=1 latency
+// while preserving 100% occupancy (3 CTAs/SM = 1536 threads/SM) on prefill.
+// Bank-conflict-free across all 3 passes:
+//   - Two half-warps in each warp own rows/cols separated by 16 (16*65 ≡ 16 mod 32 banks).
+//   - Within each half-warp, lane=0..15 writes/reads contiguous stride-1 indices lane+{0,16,32,48}
+//     (bijection on 0..63; Pass 2 evaluates H_64 = H_4(bits 4..5) ⊗ H_16(bits 0..3) identically).
 template <typename T>
-__global__ void block_hadamard_4096_16bit(const T* src, const int8_t* pre_signs, T* dst,
-                                          int k, int padded_k, int64_t groups) {
+__global__ __launch_bounds__(512) void block_hadamard_4096_16bit(
+    const T* __restrict__ src,
+    const int8_t* __restrict__ pre_signs,
+    T* __restrict__ dst,
+    int k,
+    int padded_k,
+    int64_t groups
+) {
     using S = HadScalar<T>;
     constexpr float scale = 0.015625f; // 1 / sqrt(4096) = 1 / 64
     __shared__ float smem[64][65];
 
-    const int hw = threadIdx.x >> 4;   // 0..15 half-warp index
-    const int lane = threadIdx.x & 15; // 0..15 lane within half-warp
-    const int blocks_per_row = padded_k / 4096;
+    const int warp_id = threadIdx.x >> 5;       // 0..15
+    const int sub_hw  = (threadIdx.x >> 4) & 1; // 0..1
+    const int lane    = threadIdx.x & 15;       // 0..15
+    const int rc_base = warp_id + sub_hw * 16;  // 0..31 (half-warps in a warp differ by 16)
+    const int blocks_per_row = padded_k >> 12;
     const bool vec_aligned =
         ((reinterpret_cast<uintptr_t>(src) | reinterpret_cast<uintptr_t>(dst)) & 7u) == 0u;
+    const bool signs_u32_aligned =
+        pre_signs != nullptr && ((reinterpret_cast<uintptr_t>(pre_signs) & 3u) == 0u);
 
     for (int64_t group = blockIdx.x; group < groups; group += gridDim.x) {
-        const int64_t row = group / blocks_per_row;
-        const int base_col = int(group % blocks_per_row) * 4096;
+        int64_t row;
+        int base_col;
+        if (blocks_per_row == 1) {
+            row = group;
+            base_col = 0;
+        } else {
+            const int g32 = static_cast<int>(group);
+            row = static_cast<int64_t>(g32 / blocks_per_row);
+            base_col = (g32 % blocks_per_row) << 12;
+        }
 
         // Pass 1: H_64 along each of the 64 rows (low 6 bits: h = 1..32).
         #pragma unroll
-        for (int p = 0; p < 4; ++p) {
-            const int r = hw + p * 16;
+        for (int p = 0; p < 2; ++p) {
+            const int r = rc_base + p * 32;
             const int c = lane * 4;
             const int in_blk = r * 64 + c;
             const int col = base_col + in_blk;
@@ -293,10 +318,18 @@ __global__ void block_hadamard_4096_16bit(const T* src, const int8_t* pre_signs,
                     v3 = S::to_float(sp[3]);
                 }
                 if (pre_signs) {
-                    v0 *= float(pre_signs[in_blk + 0]);
-                    v1 *= float(pre_signs[in_blk + 1]);
-                    v2 *= float(pre_signs[in_blk + 2]);
-                    v3 *= float(pre_signs[in_blk + 3]);
+                    if (signs_u32_aligned) {
+                        const uint32_t s4 = *reinterpret_cast<const uint32_t*>(pre_signs + in_blk);
+                        v0 = xor_sign_byte_f32(v0, s4 >>  0);
+                        v1 = xor_sign_byte_f32(v1, s4 >>  8);
+                        v2 = xor_sign_byte_f32(v2, s4 >> 16);
+                        v3 = xor_sign_byte_f32(v3, s4 >> 24);
+                    } else {
+                        v0 = xor_sign_byte_f32(v0, static_cast<uint8_t>(pre_signs[in_blk + 0]));
+                        v1 = xor_sign_byte_f32(v1, static_cast<uint8_t>(pre_signs[in_blk + 1]));
+                        v2 = xor_sign_byte_f32(v2, static_cast<uint8_t>(pre_signs[in_blk + 2]));
+                        v3 = xor_sign_byte_f32(v3, static_cast<uint8_t>(pre_signs[in_blk + 3]));
+                    }
                 }
             }
             {
@@ -321,22 +354,22 @@ __global__ void block_hadamard_4096_16bit(const T* src, const int8_t* pre_signs,
                 v2 = sub ? (o2 - v2) : (v2 + o2);
                 v3 = sub ? (o3 - v3) : (v3 + o3);
             }
-            smem[r][c + 0] = v0;
-            smem[r][c + 1] = v1;
-            smem[r][c + 2] = v2;
-            smem[r][c + 3] = v3;
+            // Store at stride-1 across lane (zero bank conflicts for all 32 warp lanes).
+            smem[r][lane +  0] = v0;
+            smem[r][lane + 16] = v1;
+            smem[r][lane + 32] = v2;
+            smem[r][lane + 48] = v3;
         }
         __syncthreads();
 
-        // Pass 2: H_64 along each of the 64 columns (high 6 bits: h = 64..2048), scaled by 1/64.
+        // Pass 2: H_64 along each of the 64 columns (H_4 on bits 4..5 ⊗ H_16 on bits 0..3), scaled by 1/64.
         #pragma unroll
-        for (int p = 0; p < 4; ++p) {
-            const int c = hw + p * 16;
-            const int r = lane * 4;
-            float v0 = smem[r + 0][c];
-            float v1 = smem[r + 1][c];
-            float v2 = smem[r + 2][c];
-            float v3 = smem[r + 3][c];
+        for (int p = 0; p < 2; ++p) {
+            const int c = rc_base + p * 32;
+            float v0 = smem[lane +  0][c];
+            float v1 = smem[lane + 16][c];
+            float v2 = smem[lane + 32][c];
+            float v3 = smem[lane + 48][c];
             {
                 const float a0 = v0 + v1;
                 const float a1 = v0 - v1;
@@ -359,21 +392,21 @@ __global__ void block_hadamard_4096_16bit(const T* src, const int8_t* pre_signs,
                 v2 = sub ? (o2 - v2) : (v2 + o2);
                 v3 = sub ? (o3 - v3) : (v3 + o3);
             }
-            smem[r + 0][c] = v0 * scale;
-            smem[r + 1][c] = v1 * scale;
-            smem[r + 2][c] = v2 * scale;
-            smem[r + 3][c] = v3 * scale;
+            smem[lane +  0][c] = v0 * scale;
+            smem[lane + 16][c] = v1 * scale;
+            smem[lane + 32][c] = v2 * scale;
+            smem[lane + 48][c] = v3 * scale;
         }
         __syncthreads();
 
-        // Pass 3: coalesced row-major stores back to global memory.
+        // Pass 3: coalesced row-major stores back to global memory (zero SMEM bank conflicts).
         #pragma unroll
-        for (int p = 0; p < 4; ++p) {
-            const int r = hw + p * 16;
+        for (int p = 0; p < 2; ++p) {
+            const int r = rc_base + p * 32;
             const int c = lane * 4;
             T* dp = dst + row * padded_k + base_col + r * 64 + c;
-            const typename S::Vec2 out01 = S::from_floats2(smem[r][c + 0], smem[r][c + 1]);
-            const typename S::Vec2 out23 = S::from_floats2(smem[r][c + 2], smem[r][c + 3]);
+            const typename S::Vec2 out01 = S::from_floats2(smem[r][lane +  0], smem[r][lane + 16]);
+            const typename S::Vec2 out23 = S::from_floats2(smem[r][lane + 32], smem[r][lane + 48]);
             if (vec_aligned) {
                 uint2 packed_out;
                 packed_out.x = *reinterpret_cast<const uint32_t*>(&out01);
@@ -386,7 +419,9 @@ __global__ void block_hadamard_4096_16bit(const T* src, const int8_t* pre_signs,
                 dp[3] = S::high(out23);
             }
         }
-        __syncthreads();
+        if (group + gridDim.x < groups) {
+            __syncthreads();
+        }
     }
 }
 
@@ -432,7 +467,7 @@ int launch_block_hadamard(const warp34_exec* ex, const void* src,
         block_hadamard_512_16bit<T><<<grid, 256, 0, stream>>>(
             static_cast<const T*>(src), static_cast<T*>(dst), k, padded_k, groups);
     } else {
-        block_hadamard_4096_16bit<T><<<grid, 256, 0, stream>>>(
+        block_hadamard_4096_16bit<T><<<grid, 512, 0, stream>>>(
             static_cast<const T*>(src), pre_signs, static_cast<T*>(dst), k, padded_k, groups);
     }
     return int(cudaGetLastError());
@@ -486,7 +521,7 @@ extern "C" int warp34_block_hadamard_inplace_f16(const warp34_exec* ex, void* bu
         block_hadamard_512_16bit<__half><<<grid, 256, 0, stream>>>(
             static_cast<const __half*>(buf), static_cast<__half*>(buf), k, k, groups);
     } else {
-        block_hadamard_4096_16bit<__half><<<grid, 256, 0, stream>>>(
+        block_hadamard_4096_16bit<__half><<<grid, 512, 0, stream>>>(
             static_cast<const __half*>(buf), nullptr, static_cast<__half*>(buf), k, k, groups);
     }
     return int(cudaGetLastError());

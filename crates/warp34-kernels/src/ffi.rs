@@ -428,6 +428,14 @@ unsafe extern "C" {
         n_chunk: i32,
         k: i32,
     ) -> i32;
+    pub fn warp34_repack_5trit_to_marlin_u2(
+        ex: *const Warp34Exec,
+        packed_w: *const u32,
+        dst_marlin: *mut u32,
+        dst_scales: *mut u16,
+        n: i32,
+        k: i32,
+    ) -> i32;
     pub fn warp34_block_hadamard_bf16(
         ex: *const Warp34Exec,
         src: *const c_void,

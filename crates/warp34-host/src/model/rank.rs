@@ -908,16 +908,22 @@ impl Qwen3_5ModelRank {
                 cfg.hidden_size,
             );
             if let Some(spec) = cfg.quant.embed_quant() {
-                if spec.signs.len() != cfg.hidden_size {
+                if !cfg.hidden_size.is_multiple_of(spec.hadamard_block_size) {
                     return Err(loader_err_msg(format!(
-                        "warp_quant_embed_w2 signs len {} != hidden_size {}",
+                        "warp_quant_embed_w2 hadamard_block_size {} does not divide hidden_size {}",
+                        spec.hadamard_block_size, cfg.hidden_size
+                    )));
+                }
+                if spec.signs.len() != spec.hadamard_block_size {
+                    return Err(loader_err_msg(format!(
+                        "warp_quant_embed_w2 signs len {} != hadamard_block_size {}",
                         spec.signs.len(),
-                        cfg.hidden_size
+                        spec.hadamard_block_size
                     )));
                 }
                 crate::model::weights::hgptq::hadamard_f16_rows_with_post_signs(
                     &mut embed_f16,
-                    cfg.hidden_size,
+                    spec.hadamard_block_size,
                     Some(&spec.signs),
                 );
             }

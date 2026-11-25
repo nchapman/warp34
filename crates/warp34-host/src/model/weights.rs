@@ -191,7 +191,7 @@ impl LinearProj {
     #[inline]
     pub fn can_fork_on_aux_stream(&self) -> bool {
         match *self {
-            Self::Hadamard { .. } => false,
+            Self::Hadamard { .. } | Self::Ternary5Trit { .. } => false,
             Self::WithLora {
                 ref inner,
                 ref lora,
@@ -202,8 +202,7 @@ impl LinearProj {
             Self::MarlinW2A16 { .. }
             | Self::MarlinW4A16 { .. }
             | Self::MarlinW4A16Zp { .. }
-            | Self::MarlinW8A16 { .. }
-            | Self::Ternary5Trit { .. } => true,
+            | Self::MarlinW8A16 { .. } => true,
         }
     }
 
@@ -464,59 +463,135 @@ impl LinearProj {
                 size_n,
                 size_k,
             } => {
-                // For prefill (M > 8), dequantize N-strips into `ex.scratch_ptr` and run cuBLAS
-                // Tensor Core GEMM so prefill runs at full TFLOPS with zero extra VRAM.
-                let min_strip_bytes = 8usize.saturating_mul(size_k).saturating_mul(2);
-                if m > 8 && ex.scratch_ptr != 0 && ex.scratch_size >= min_strip_bytes {
-                    let max_chunk = (ex.scratch_size / (size_k * 2)).min(size_n) & !7;
-                    let mut n_start = 0usize;
-                    while n_start < size_n {
-                        let n_chunk = (size_n - n_start).min(max_chunk);
-                        check_rc(
-                            // SAFETY: `packed_ptr` holds `[size_n/8, size_k/128, 7, 8]` u32 words
-                            // and `ex.scratch_ptr` holds at least `n_chunk * size_k * 2` bytes.
-                            unsafe {
-                                ffi::warp34_dequant_5trit_to_f16(
-                                    ex,
-                                    packed_ptr as *const u32,
-                                    ex.scratch_ptr as *mut c_void,
-                                    n_start as i32,
-                                    n_chunk as i32,
-                                    size_k as i32,
-                                )
-                            },
-                            "warp34_dequant_5trit_to_f16",
-                        )?;
-                        cublas.gemm_f16_ldc(
-                            x_ptr,
-                            ex.scratch_ptr,
-                            out_ptr + (n_start as u64) * 2,
-                            m as i32,
-                            n_chunk as i32,
-                            size_k as i32,
-                            size_n as i32,
-                        )?;
-                        n_start += n_chunk;
-                    }
-                    Ok(())
-                } else {
+                // For prefill (M > 8), prefer repacking 5-Trit -> 2.0 bpw Marlin U2B2 into
+                // `ex.scratch_ptr` and executing `warp34_marlin_gemm_f16u2` (unlocks W2A8 INT8
+                // IMMA 337/660 TOPS on sm_86/sm_89 and full-rate HMMA on sm_80, with 8x less
+                // scratch traffic than FP16 dequant). Fall back to FP16 strip dequant + cuBLAS
+                // if scratch is smaller than the full Marlin U2B2 tile.
+                let w_bytes = size_k.saturating_mul(size_n) / 4;
+                let s_bytes = (size_k / 128).saturating_mul(size_n).saturating_mul(2);
+                let w_aligned = (w_bytes + 255) & !255;
+                let s_aligned = (s_bytes + 255) & !255;
+                let repack_total = w_aligned.saturating_add(s_aligned);
+                let a8_reserve =
+                    (m.saturating_mul(size_k).saturating_add(m.saturating_mul(4)) + 511) & !255;
+                if m > 8
+                    && size_k > 0
+                    && size_n > 0
+                    && size_n.is_multiple_of(64)
+                    && size_k.is_multiple_of(128)
+                    && marlin_ws_ptr != 0
+                    && ex.scratch_ptr != 0
+                    && ex.scratch_size >= repack_total.saturating_add(a8_reserve)
+                {
+                    let marlin_w_ptr = ex.scratch_ptr;
+                    let marlin_s_ptr = marlin_w_ptr + w_aligned as u64;
+                    let sub_ex = ffi::Warp34Exec {
+                        scratch_ptr: marlin_w_ptr + repack_total as u64,
+                        scratch_size: ex.scratch_size - repack_total,
+                        ..*ex
+                    };
                     check_rc(
-                        // SAFETY: `packed_ptr` holds `[size_n/8, size_k/128, 7, 8]` u32 words
-                        // repacked at upload time; `x_ptr` and `out_ptr` are caller-managed
-                        // `[m, size_k]` and `[m, size_n]` FP16 buffers on `ex.stream`.
+                        // SAFETY: `packed_ptr` holds `[size_n/8, size_k/128, 7, 8]` u32 words;
+                        // `marlin_w_ptr` and `marlin_s_ptr` are disjoint 256B-aligned regions
+                        // inside `ex.scratch_ptr`.
                         unsafe {
-                            ffi::warp34_gemm_5trit_f16(
+                            ffi::warp34_repack_5trit_to_marlin_u2(
                                 ex,
-                                x_ptr as *const c_void,
                                 packed_ptr as *const u32,
-                                out_ptr as *mut c_void,
-                                m as i32,
+                                marlin_w_ptr as *mut u32,
+                                marlin_s_ptr as *mut u16,
                                 size_n as i32,
                                 size_k as i32,
                             )
                         },
-                        "warp34_gemm_5trit_f16",
+                        "warp34_repack_5trit_to_marlin_u2",
+                    )?;
+                    check_rc(
+                        // SAFETY: `marlin_w_ptr` and `marlin_s_ptr` hold Marlin U2B2 weights and
+                        // permuted g128 scales; `sub_ex` points strictly past both buffers so W2A8
+                        // dynamic activation quantization cannot alias them.
+                        unsafe {
+                            ffi::warp34_marlin_gemm_f16u2(
+                                &sub_ex,
+                                x_ptr as *const c_void,
+                                marlin_w_ptr as *const c_void,
+                                marlin_s_ptr as *const c_void,
+                                out_ptr as *mut c_void,
+                                marlin_ws_ptr as *mut i32,
+                                m as i64,
+                                size_n as i64,
+                                size_k as i64,
+                                marlin_ws_ints as i64,
+                                8,
+                            )
+                        },
+                        "warp34_marlin_gemm_f16u2(5trit)",
                     )
+                } else {
+                    const MAX_FP16_STRIP_BYTES: usize = 16 * 1024 * 1024;
+                    let min_strip_bytes = 8usize.saturating_mul(size_k).saturating_mul(2);
+                    if m > 8
+                        && size_k > 0
+                        && size_n >= 8
+                        && size_n.is_multiple_of(8)
+                        && ex.scratch_ptr != 0
+                        && ex.scratch_size >= min_strip_bytes
+                    {
+                        let strip_budget = ex
+                            .scratch_size
+                            .min(MAX_FP16_STRIP_BYTES)
+                            .max(min_strip_bytes);
+                        let max_chunk = (strip_budget / (size_k * 2)).min(size_n) & !7;
+                        let mut n_start = 0usize;
+                        while n_start < size_n {
+                            let n_chunk = (size_n - n_start).min(max_chunk);
+                            check_rc(
+                                // SAFETY: `packed_ptr` holds `[size_n/8, size_k/128, 7, 8]` u32 words
+                                // and `ex.scratch_ptr` holds at least `n_chunk * size_k * 2` bytes.
+                                unsafe {
+                                    ffi::warp34_dequant_5trit_to_f16(
+                                        ex,
+                                        packed_ptr as *const u32,
+                                        ex.scratch_ptr as *mut c_void,
+                                        n_start as i32,
+                                        n_chunk as i32,
+                                        size_k as i32,
+                                    )
+                                },
+                                "warp34_dequant_5trit_to_f16",
+                            )?;
+                            cublas.gemm_f16_ldc(
+                                x_ptr,
+                                ex.scratch_ptr,
+                                out_ptr + (n_start as u64) * 2,
+                                m as i32,
+                                n_chunk as i32,
+                                size_k as i32,
+                                size_n as i32,
+                            )?;
+                            n_start += n_chunk;
+                        }
+                        Ok(())
+                    } else {
+                        check_rc(
+                            // SAFETY: `packed_ptr` holds `[size_n/8, size_k/128, 7, 8]` u32 words
+                            // repacked at upload time; `x_ptr` and `out_ptr` are caller-managed
+                            // `[m, size_k]` and `[m, size_n]` FP16 buffers on `ex.stream`.
+                            unsafe {
+                                ffi::warp34_gemm_5trit_f16(
+                                    ex,
+                                    x_ptr as *const c_void,
+                                    packed_ptr as *const u32,
+                                    out_ptr as *mut c_void,
+                                    m as i32,
+                                    size_n as i32,
+                                    size_k as i32,
+                                )
+                            },
+                            "warp34_gemm_5trit_f16",
+                        )
+                    }
                 }
             }
             Self::DenseF16 {

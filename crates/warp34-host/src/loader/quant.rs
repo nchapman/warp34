@@ -694,6 +694,9 @@ pub fn repack_5trit_n_major_to_gpu(
     let groups = size_k / 128;
     assert_eq!(packed_5trit.len(), size_n * groups * 26);
     assert_eq!(scales_f16.len(), size_n * groups);
+    if size_n == 0 || size_k == 0 {
+        return Vec::new();
+    }
     let n_blks = size_n / 8;
     let mut out = vec![0u32; n_blks * groups * 56];
     let repack_range = |blk_start: usize, dst: &mut [u32]| {
@@ -775,6 +778,9 @@ pub fn dequant_5trit_n_major_to_f16(
     let groups = size_k / 128;
     assert_eq!(packed_5trit.len(), size_n * groups * 26);
     assert_eq!(scales_f16.len(), size_n * groups);
+    if size_n == 0 || size_k == 0 {
+        return Vec::new();
+    }
     let mut out = vec![0u16; size_n * size_k];
     let dequant_rows = |row_start: usize, dst_rows: &mut [u16]| {
         for (rel_n, dst_row) in dst_rows.chunks_exact_mut(size_k).enumerate() {

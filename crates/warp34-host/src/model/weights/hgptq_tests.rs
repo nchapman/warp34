@@ -1368,6 +1368,102 @@ fn dequant_5trit_to_f16_matches_cpu_reference() {
 
 #[cfg(feature = "cuda")]
 #[test]
+fn repack_5trit_to_marlin_u2_matches_cpu_reference() {
+    let stream = CudaStream::new(0).unwrap();
+    let dev_props = CudaDevice::set_current(0).unwrap().props().unwrap();
+    let ws_bytes = dev_props.marlin_workspace_bytes();
+    let ws_ints = ws_bytes / 4;
+    let d_ws = DeviceBuffer::alloc(0, ws_bytes).unwrap();
+    let scratch_bytes = 4 * 1024 * 1024;
+    let d_scratch = DeviceBuffer::alloc(0, scratch_bytes).unwrap();
+
+    for (m, n, k) in [(16usize, 64usize, 128usize), (128, 128, 512)] {
+        let groups = k / 128;
+        let packed_bytes: Vec<u8> = (0..n * groups * 26)
+            .map(|i| ((i * 67 + 23) % 243) as u8)
+            .collect();
+        let scales: Vec<u16> = (0..n * groups)
+            .map(|i| f32_to_f16((((i * 31 + 7) % 39) as f32 + 1.0) / 64.0))
+            .collect();
+        let a_f16: Vec<u16> = (0..m * k)
+            .map(|i| f32_to_f16((((i * 43 + 5) % 73) as f32 - 36.0) / 32.0))
+            .collect();
+
+        let packed_gpu = crate::loader::repack_5trit_n_major_to_gpu(&packed_bytes, &scales, n, k);
+        let w_f16 = crate::loader::dequant_5trit_gpu_to_f16(&packed_gpu, n, k);
+
+        let d_a = DeviceBuffer::alloc(0, a_f16.len() * 2).unwrap();
+        let d_w = DeviceBuffer::alloc(0, packed_gpu.len() * 4).unwrap();
+        let d_marlin = DeviceBuffer::alloc(0, k * n / 4).unwrap();
+        let d_scales = DeviceBuffer::alloc(0, groups * n * 2).unwrap();
+        let d_out = DeviceBuffer::alloc(0, m * n * 2).unwrap();
+        d_a.copy_from_host(&a_f16, &stream).unwrap();
+        d_w.copy_from_host(&packed_gpu, &stream).unwrap();
+
+        let ex = stream.exec(d_scratch.addr(), scratch_bytes);
+        check_rc(
+            // SAFETY: all device buffers are disjoint and sized for `(m, n, k)`.
+            unsafe {
+                ffi::warp34_repack_5trit_to_marlin_u2(
+                    &ex,
+                    d_w.addr() as *const u32,
+                    d_marlin.addr() as *mut u32,
+                    d_scales.addr() as *mut u16,
+                    n as i32,
+                    k as i32,
+                )
+            },
+            "warp34_repack_5trit_to_marlin_u2",
+        )
+        .unwrap();
+        check_rc(
+            // SAFETY: `d_marlin` and `d_scales` hold repacked Marlin U2B2 weights & scales;
+            // `d_ws` and `ex.scratch_ptr` are disjoint workspaces.
+            unsafe {
+                ffi::warp34_marlin_gemm_f16u2(
+                    &ex,
+                    d_a.addr() as *const _,
+                    d_marlin.addr() as *const _,
+                    d_scales.addr() as *const _,
+                    d_out.addr() as *mut _,
+                    d_ws.addr() as *mut i32,
+                    m as i64,
+                    n as i64,
+                    k as i64,
+                    ws_ints as i64,
+                    8,
+                )
+            },
+            "warp34_marlin_gemm_f16u2(5trit)",
+        )
+        .unwrap();
+
+        let mut got = vec![0u16; m * n];
+        d_out.copy_to_host(&mut got, &stream).unwrap();
+        stream.synchronize().unwrap();
+
+        // Check against CPU FP32 reference (allow W2A8 INT8 dynamic quantization tolerance at M=128).
+        let tol = if m >= 128 { 0.15f32 } else { 2e-2f32 };
+        let mut max_abs = 0.0f32;
+        for r in 0..m {
+            for col in 0..n {
+                let mut acc = 0.0f32;
+                for kk in 0..k {
+                    acc += f16_to_f32(a_f16[r * k + kk]) * f16_to_f32(w_f16[col * k + kk]);
+                }
+                let diff = (f16_to_f32(got[r * n + col]) - acc).abs();
+                max_abs = max_abs.max(diff);
+            }
+        }
+        assert!(
+            max_abs <= tol,
+            "repack_5trit_to_marlin_u2 GEMM mismatch M={m} N={n} K={k}: max_abs={max_abs} > tol={tol}"
+        );
+    }
+}
+
+#[cfg(feature = "cuda")]
+#[test]
 fn marlin_w2a16_sym_half_offset_matches_dilated_w4a16_zero_ulp() {
     let stream = CudaStream::new(0).unwrap();
     let cublas = CublasHandle::new(&stream).unwrap();
