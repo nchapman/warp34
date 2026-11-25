@@ -346,8 +346,16 @@ impl QwenImage21ServerState {
         if self.extra_workers.is_empty() {
             return self.metrics.snapshot();
         }
-        let snaps: Vec<crate::telemetry::Snapshot> =
-            self.all_workers().map(|w| w.telemetry.snapshot()).collect();
+        let snaps: Vec<crate::telemetry::Snapshot> = self
+            .all_workers()
+            .map(|w| {
+                let mut snap = w.telemetry.snapshot();
+                if w.is_panicked() || w.is_stopping() {
+                    snap.status = "unavailable";
+                }
+                snap
+            })
+            .collect();
         crate::telemetry::Snapshot::aggregate(&snaps)
     }
 
@@ -373,6 +381,7 @@ impl QwenImage21ServerState {
                     router_inflight: 0,
                     router_inflight_prefill_tokens: 0,
                     max_num_seqs: self.max_num_seqs,
+                    kv_token_capacity: 0,
                     active_kv_util: kv_util,
                 }
             })

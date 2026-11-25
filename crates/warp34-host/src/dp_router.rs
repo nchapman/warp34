@@ -151,16 +151,24 @@ const DP_PREFIX_SHARDS: usize = 64;
 /// Uncached prompt tokens equivalent to 1 sequence slot of prefill work in [`load_cost`].
 const PREFILL_TOKEN_LOAD_UNIT: f64 = 1024.0;
 
-/// Exact in-process directory mapping chained 64-token prefix block hashes to a `u64` bitmask
-/// of DP ranks that currently hold that block in their [`crate::radix::MambaRadixCache`].
+/// Per-block worker residency bitmasks inside [`DpPrefixDirectory`].
+#[derive(Clone, Copy, Debug, Default)]
+struct BlockEntry {
+    /// Bit `dp_rank` is set iff worker `dp_rank` currently holds KV pages covering this block.
+    kv_mask: u64,
+    /// Bit `dp_rank` is set iff worker `dp_rank` currently holds a live Mamba/GDN checkpoint
+    /// at or terminating on this block (cleared on checkpoint tombstoning/reclamation).
+    ckpt_mask: u64,
+}
+
+/// Exact in-process directory mapping chained 64-token prefix block hashes to per-worker
+/// KV residency and live Mamba-checkpoint bitmasks in [`crate::radix::MambaRadixCache`].
 ///
 /// Sharded across `DP_PREFIX_SHARDS` (64) independent `RwLock` buckets so concurrent worker
 /// inserts/evictions and HTTP prefix lookups never contend on a single global lock.
 #[derive(Debug)]
 pub struct DpPrefixDirectory {
-    /// `shards[hash & (DP_PREFIX_SHARDS - 1)]`: `block_hash -> bitmask` where bit `dp_rank`
-    /// is set iff worker `dp_rank` currently holds that block.
-    shards: Box<[RwLock<HashMap<u64, u64>>; DP_PREFIX_SHARDS]>,
+    shards: Box<[RwLock<HashMap<u64, BlockEntry>>; DP_PREFIX_SHARDS]>,
 }
 
 impl Default for DpPrefixDirectory {
@@ -178,18 +186,18 @@ impl DpPrefixDirectory {
     }
 
     #[inline]
-    fn shard_for(&self, hash: u64) -> &RwLock<HashMap<u64, u64>> {
+    fn shard_for(&self, hash: u64) -> &RwLock<HashMap<u64, BlockEntry>> {
         &self.shards[(hash as usize) & (DP_PREFIX_SHARDS - 1)]
     }
 
     #[inline]
-    fn lookup_mask(&self, hash: u64) -> u64 {
+    fn lookup_entry(&self, hash: u64) -> BlockEntry {
         self.shard_for(hash)
             .read()
             .unwrap_or_else(|e| e.into_inner())
             .get(&hash)
             .copied()
-            .unwrap_or(0)
+            .unwrap_or_default()
     }
 
     #[inline]
@@ -197,13 +205,14 @@ impl DpPrefixDirectory {
         (dp_rank < MAX_DP_WORKERS).then_some(1u64 << dp_rank)
     }
 
-    /// Marks every complete 64-token block in `tokens` (for `lora_id`) as resident on `dp_rank`.
+    /// Marks every complete 64-token block in `tokens` (for `lora_id`) as resident and
+    /// checkpoint-usable on `dp_rank` (convenience helper for tests and pure-attention models).
     pub fn record_insert(&self, dp_rank: usize, lora_id: i32, tokens: &[i32]) {
         let hashes = compute_chained_prefix_hashes(lora_id, tokens);
         self.record_insert_hashes(dp_rank, &hashes);
     }
 
-    /// Marks pre-computed chained block hashes as resident on `dp_rank`.
+    /// Marks pre-computed chained block hashes as KV-resident and checkpoint-usable on `dp_rank`.
     pub fn record_insert_hashes(&self, dp_rank: usize, hashes: &[u64]) {
         let Some(bit) = Self::rank_bit(dp_rank) else {
             return;
@@ -213,12 +222,65 @@ impl DpPrefixDirectory {
         }
         for &h in hashes {
             let mut guard = self.shard_for(h).write().unwrap_or_else(|e| e.into_inner());
-            *guard.entry(h).or_insert(0) |= bit;
+            let entry = guard.entry(h).or_default();
+            entry.kv_mask |= bit;
+            entry.ckpt_mask |= bit;
         }
     }
 
-    /// Clears `dp_rank`'s bit for the given evicted block hashes in reverse order (tail-first)
-    /// so concurrent galloping/binary prefix readers never observe a non-monotonic hole.
+    /// Marks newly inserted KV blocks `hashes[first_new_block..]` as KV-resident on `dp_rank`
+    /// and marks the terminal block (`hashes.last()`) as holding a live Mamba/GDN checkpoint.
+    pub fn record_insert_with_checkpoint(
+        &self,
+        dp_rank: usize,
+        hashes: &[u64],
+        first_new_block: usize,
+    ) {
+        let Some(bit) = Self::rank_bit(dp_rank) else {
+            return;
+        };
+        if hashes.is_empty() {
+            return;
+        }
+        let start = first_new_block.min(hashes.len());
+        let last_idx = hashes.len() - 1;
+        for &h in &hashes[start..] {
+            let mut guard = self.shard_for(h).write().unwrap_or_else(|e| e.into_inner());
+            guard.entry(h).or_default().kv_mask |= bit;
+        }
+        // Always mark the terminal block's checkpoint bit (including when reviving a tombstone
+        // on an existing internal node where `start == hashes.len()`).
+        let term_h = hashes[last_idx];
+        let mut guard = self
+            .shard_for(term_h)
+            .write()
+            .unwrap_or_else(|e| e.into_inner());
+        let entry = guard.entry(term_h).or_default();
+        entry.kv_mask |= bit;
+        entry.ckpt_mask |= bit;
+    }
+
+    /// Clears `dp_rank`'s live Mamba-checkpoint bit on `hash` (called when a live radix node's
+    /// `mamba_value` is tombstoned via `reclaim_internal_mamba`, `evict_mamba`, or
+    /// `invalidate_mamba_slot` without retiring its KV pages).
+    pub fn record_tombstone_hash(&self, dp_rank: usize, hash: u64) {
+        let Some(bit) = Self::rank_bit(dp_rank) else {
+            return;
+        };
+        let mut guard = self
+            .shard_for(hash)
+            .write()
+            .unwrap_or_else(|e| e.into_inner());
+        if let Some(entry) = guard.get_mut(&hash) {
+            entry.ckpt_mask &= !bit;
+            if entry.kv_mask == 0 && entry.ckpt_mask == 0 {
+                guard.remove(&hash);
+            }
+        }
+    }
+
+    /// Clears `dp_rank`'s KV and checkpoint bits for the given evicted block hashes in reverse
+    /// order (tail-first) so concurrent galloping/binary readers never observe a hole.
     pub fn record_evict_hashes(&self, dp_rank: usize, hashes: &[u64]) {
         let Some(bit) = Self::rank_bit(dp_rank) else {
             return;
@@ -228,31 +290,34 @@ impl DpPrefixDirectory {
         }
         for &h in hashes.iter().rev() {
             let mut guard = self.shard_for(h).write().unwrap_or_else(|e| e.into_inner());
-            if let Some(mask) = guard.get_mut(&h) {
-                *mask &= !bit;
-                if *mask == 0 {
+            if let Some(entry) = guard.get_mut(&h) {
+                entry.kv_mask &= !bit;
+                entry.ckpt_mask &= !bit;
+                if entry.kv_mask == 0 && entry.ckpt_mask == 0 {
                     guard.remove(&h);
                 }
             }
         }
     }
 
-    /// Clears all blocks belonging to `dp_rank` (called on `MambaRadixCache::reset`).
+    /// Clears all blocks belonging to `dp_rank` (called on `MambaRadixCache::reset` or worker panic).
     pub fn clear_worker(&self, dp_rank: usize) {
         let Some(bit) = Self::rank_bit(dp_rank) else {
             return;
         };
         for shard in &*self.shards {
             let mut guard = shard.write().unwrap_or_else(|e| e.into_inner());
-            guard.retain(|_, mask| {
-                *mask &= !bit;
-                *mask != 0
+            guard.retain(|_, entry| {
+                entry.kv_mask &= !bit;
+                entry.ckpt_mask &= !bit;
+                entry.kv_mask != 0 || entry.ckpt_mask != 0
             });
         }
     }
 
     /// Returns the number of matched prefix tokens (multiple of [`DP_PREFIX_BLOCK_TOKENS`])
-    /// on each worker `0..num_workers` using galloping + binary search across lock shards.
+    /// backed by a live Mamba/GDN checkpoint on each worker `0..num_workers`, using galloping
+    /// + binary search over KV blocks followed by stepping back to the deepest live checkpoint.
     pub fn match_prefix_tokens_per_worker(
         &self,
         num_workers: usize,
@@ -264,8 +329,8 @@ impl DpPrefixDirectory {
         if hashes.is_empty() || num_workers == 0 {
             return matched;
         }
-        let first_mask = self.lookup_mask(hashes[0]);
-        if first_mask == 0 {
+        let first_kv_mask = self.lookup_entry(hashes[0]).kv_mask;
+        if first_kv_mask == 0 {
             return matched;
         }
         let n = hashes.len();
@@ -275,16 +340,16 @@ impl DpPrefixDirectory {
             .take(num_workers.min(MAX_DP_WORKERS))
         {
             let bit = 1u64 << rank;
-            if (first_mask & bit) == 0 {
+            if (first_kv_mask & bit) == 0 {
                 continue;
             }
-            // Galloping (exponential) search from index 1, then binary search.
-            let mut lo = 1usize; // known: hashes[0..lo] are present
+            // Galloping (exponential) search from index 1, then binary search over `kv_mask`.
+            let mut lo = 1usize; // known: hashes[0..lo] are KV-present
             let mut step = 1usize;
             let mut hi = n;
             while lo < n {
                 let probe = (lo + step - 1).min(n - 1);
-                let present = (self.lookup_mask(hashes[probe]) & bit) != 0;
+                let present = (self.lookup_entry(hashes[probe]).kv_mask & bit) != 0;
                 if present {
                     lo = probe + 1;
                     step = step.saturating_mul(2);
@@ -295,12 +360,17 @@ impl DpPrefixDirectory {
             }
             while lo < hi {
                 let mid = lo + (hi - lo) / 2;
-                let present = (self.lookup_mask(hashes[mid]) & bit) != 0;
+                let present = (self.lookup_entry(hashes[mid]).kv_mask & bit) != 0;
                 if present {
                     lo = mid + 1;
                 } else {
                     hi = mid;
                 }
+            }
+            // Step back from the deepest KV-matched block to the deepest live Mamba checkpoint
+            // so tombstoned spans never produce false-positive prefix hits.
+            while lo > 0 && (self.lookup_entry(hashes[lo - 1]).ckpt_mask & bit) == 0 {
+                lo -= 1;
             }
             *slot = lo * DP_PREFIX_BLOCK_TOKENS;
         }
@@ -327,6 +397,8 @@ pub struct WorkerLoadSample {
     /// requests from piling up behind a heavy 16K–32K prefill on another GPU).
     pub router_inflight_prefill_tokens: usize,
     pub max_num_seqs: usize,
+    /// Maximum context/KV token capacity of this worker (`0` = unconstrained / unknown).
+    pub kv_token_capacity: usize,
     /// Active (non-evictable) KV utilization in `[0.0, 1.0]`.
     pub active_kv_util: f64,
 }
@@ -393,14 +465,28 @@ pub fn select_dp_worker(workers: &[WorkerLoadSample], ctx: &DpRouteContext<'_>) 
         return Some(healthy[0]);
     }
 
-    // Hard admission filter: exclude KV/queue-saturated workers if any non-saturated worker exists.
-    let admitted: Vec<usize> = healthy
+    // Hard capacity + admission filter: exclude workers whose KV capacity cannot fit the
+    // prompt (heterogeneous VRAM) or that are KV/queue-saturated, if any other healthy
+    // worker remains available.
+    let fits_prompt: Vec<usize> = healthy
+        .iter()
+        .copied()
+        .filter(|&i| {
+            workers[i].kv_token_capacity == 0 || workers[i].kv_token_capacity >= ctx.prompt_tokens
+        })
+        .collect();
+    let cap_pool = if fits_prompt.is_empty() {
+        &healthy
+    } else {
+        &fits_prompt
+    };
+    let admitted: Vec<usize> = cap_pool
         .iter()
         .copied()
         .filter(|&i| !workers[i].is_saturated())
         .collect();
     let candidates = if admitted.is_empty() {
-        &healthy
+        cap_pool
     } else {
         &admitted
     };
@@ -789,6 +875,7 @@ mod tests {
             router_inflight: 0,
             router_inflight_prefill_tokens: 0,
             max_num_seqs: 16,
+            kv_token_capacity: 0,
             active_kv_util: 0.0,
         }
     }
@@ -801,6 +888,7 @@ mod tests {
             router_inflight: 0,
             router_inflight_prefill_tokens: 0,
             max_num_seqs: 16,
+            kv_token_capacity: 0,
             active_kv_util: kv_util,
         }
     }
@@ -1024,20 +1112,23 @@ mod tests {
         let pages_b: Vec<i32> = (100..116).collect();
         cache1.insert(&seq_b, &pages_b, &[], 0, 2);
 
+        // Each worker only has a live Mamba checkpoint at its terminal token (256), not at
+        // the divergence point (128), so checkpoint-aware matching accurately reports 0 for
+        // the non-matching branch.
         assert_eq!(
             dir.match_prefix_tokens_per_worker(2, base, &seq_a),
-            vec![256, 128]
+            vec![256, 0]
         );
         assert_eq!(
             dir.match_prefix_tokens_per_worker(2, base, &seq_b),
-            vec![128, 256]
+            vec![0, 256]
         );
 
         // Evict all pages from cache0 -> worker 0's entries vanish while worker 1's stay intact.
         let _ = cache0.evict_full_pages(16);
         assert_eq!(
             dir.match_prefix_tokens_per_worker(2, base, &seq_a),
-            vec![0, 128]
+            vec![0, 0]
         );
         assert_eq!(
             dir.match_prefix_tokens_per_worker(2, base, &seq_b),
@@ -1046,14 +1137,14 @@ mod tests {
 
         // LoRA insert + evict also matches raw unsalted tokens queried with that lora_id.
         cache0.active_lora_id = 3;
-        cache0.insert(&seq_a, &pages_a, &[], 0, 3);
+        cache0.insert(&seq_a, &pages_a, &[], 3, 0);
         assert_eq!(
             dir.match_prefix_tokens_per_worker(2, 3, &seq_a),
             vec![256, 0]
         );
         assert_eq!(
             dir.match_prefix_tokens_per_worker(2, base, &seq_a),
-            vec![0, 128]
+            vec![0, 0]
         );
         let _ = cache0.evict_full_pages(16);
         assert_eq!(dir.match_prefix_tokens_per_worker(2, 3, &seq_a), vec![0, 0]);
@@ -1119,6 +1210,7 @@ mod tests {
             router_inflight: 16,
             router_inflight_prefill_tokens: 0,
             max_num_seqs: 16,
+            kv_token_capacity: 0,
             active_kv_util: 0.2,
         };
         assert_eq!(w.total_load(), 16);
@@ -1180,5 +1272,58 @@ mod tests {
             },
         );
         assert_eq!(turn2_agent_a, Some(0));
+    }
+
+    #[test]
+    fn mamba_checkpoint_tombstoning_falls_back_to_live_ancestor_and_capacity_filter_excludes_small_gpu()
+     {
+        let base = crate::lora::BASE_MODEL_LORA_ID;
+        let dir = Arc::new(DpPrefixDirectory::new());
+        let mut cache0 = crate::radix::MambaRadixCache::new(16, 64);
+        cache0.set_dp_prefix_observer(0, Arc::clone(&dir));
+
+        // Insert 3 chained turns: 128 -> 256 -> 384 tokens (checkpoints at slots 0, 1, 2).
+        let seq: Vec<i32> = (1..=384).collect();
+        let pages: Vec<i32> = (0..24).collect();
+        cache0.insert(&seq[..128], &pages[..8], &[], 0, 0);
+        cache0.insert(&seq[..256], &pages[..16], &[], 1, 0);
+        cache0.insert(&seq[..384], &pages[..24], &[], 2, 0);
+
+        // Before tombstoning, querying 256 tokens matches 256 on worker 0.
+        assert_eq!(
+            dir.match_prefix_tokens_per_worker(2, base, &seq[..256]),
+            vec![256, 0]
+        );
+
+        // Tombstone slot 1 (the internal node at 256 tokens) without retiring KV pages.
+        let _ = cache0.invalidate_mamba_slot(1);
+
+        // Now querying 256 tokens steps back to the live ancestor checkpoint at 128 tokens!
+        // Meanwhile querying the full 384 tokens still matches the live leaf checkpoint at 384!
+        assert_eq!(
+            dir.match_prefix_tokens_per_worker(2, base, &seq[..256]),
+            vec![128, 0]
+        );
+        assert_eq!(
+            dir.match_prefix_tokens_per_worker(2, base, &seq[..384]),
+            vec![384, 0]
+        );
+
+        // Heterogeneous GPU KV capacity filter: worker 0 has 16K cap, worker 1 has 64K cap.
+        let mut small = idle_worker();
+        small.kv_token_capacity = 16_384;
+        let mut large = idle_worker();
+        large.kv_token_capacity = 65_536;
+        let chosen = select_dp_worker(
+            &[small, large],
+            &DpRouteContext {
+                policy: DpRoutingPolicy::Prefix,
+                prompt_tokens: 32_768,
+                matched_tokens: &[16_384, 0],
+                pinned_worker: None,
+                tie_break_cursor: 0,
+            },
+        );
+        assert_eq!(chosen, Some(1));
     }
 }

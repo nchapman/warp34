@@ -2078,12 +2078,16 @@ impl PrePoolModelRank {
                     capacity.dflash_reserve_bytes,
                 );
                 let stage_cap = select_tiered_moe_stage_capacity(&cfg, tp_size, hot_per_layer);
-                let tm = crate::moe_offload::RankTieredMoe::load_for_rank(
+                let eff_dp = capacity.dp_size.max(1);
+                let dp_rank = (device_id.max(0) as usize / tp_size.max(1)).min(eff_dp - 1);
+                let tm = crate::moe_offload::RankTieredMoe::load_for_rank_with_dp(
                     archive,
                     &cfg,
                     device_id,
                     rank,
                     tp_size,
+                    dp_rank,
+                    eff_dp,
                     hot_per_layer,
                     stage_cap,
                     &stream,

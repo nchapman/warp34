@@ -631,6 +631,15 @@ impl Snapshot {
                 )
                 .unwrap();
             }
+            out.push_str("# HELP warp34_dp_worker_healthy Health status (1=healthy, 0=unavailable) per data-parallel worker.\n# TYPE warp34_dp_worker_healthy gauge\n");
+            for (rank, w) in self.workers.iter().enumerate() {
+                let healthy = i32::from(w.status == "ok");
+                writeln!(
+                    out,
+                    "warp34_dp_worker_healthy{{dp_rank=\"{rank}\"}} {healthy}"
+                )
+                .unwrap();
+            }
         }
         out
     }

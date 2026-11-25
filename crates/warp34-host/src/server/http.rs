@@ -283,7 +283,13 @@ impl OpenAiServerState {
         }
         let snaps: Vec<crate::telemetry::Snapshot> = self
             .all_workers()
-            .map(|w| w.stats.telemetry.snapshot())
+            .map(|w| {
+                let mut snap = w.stats.telemetry.snapshot();
+                if w.is_panicked() || w.is_stopping() {
+                    snap.status = "unavailable";
+                }
+                snap
+            })
             .collect();
         crate::telemetry::Snapshot::aggregate(&snaps)
     }
@@ -313,7 +319,12 @@ impl OpenAiServerState {
         }
         let samples: Vec<crate::dp_router::WorkerLoadSample> = self
             .all_workers()
-            .map(|w| {
+            .enumerate()
+            .map(|(dp_rank, w)| {
+                let panicked = w.is_panicked();
+                if panicked {
+                    self.dp_router.prefix_dir.clear_worker(dp_rank);
+                }
                 let snap = w.stats.telemetry.snapshot();
                 let active_kv_util = if snap.pools.kv.capacity > 0 {
                     snap.pools.kv.active.unwrap_or(0) as f64 / snap.pools.kv.capacity as f64
@@ -321,12 +332,13 @@ impl OpenAiServerState {
                     0.0
                 };
                 crate::dp_router::WorkerLoadSample {
-                    healthy: !w.is_panicked() && !w.is_stopping(),
+                    healthy: !panicked && !w.is_stopping(),
                     active_requests: snap.requests.running as usize,
                     waiting_requests: snap.requests.waiting as usize,
                     router_inflight: 0,
                     router_inflight_prefill_tokens: 0,
                     max_num_seqs: self.max_num_seqs,
+                    kv_token_capacity: w.max_model_len(),
                     active_kv_util,
                 }
             })

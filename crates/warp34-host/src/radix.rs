@@ -727,9 +727,7 @@ impl MambaRadixCache {
         if let Some((dp_rank, ref dir)) = self.dp_prefix_observer {
             let hashes = crate::dp_router::compute_chained_prefix_hashes_raw(token_ids);
             let first_new_block = key_offset / crate::dp_router::DP_PREFIX_BLOCK_TOKENS;
-            if first_new_block < hashes.len() {
-                dir.record_insert_hashes(dp_rank, &hashes[first_new_block..]);
-            }
+            dir.record_insert_with_checkpoint(dp_rank, &hashes, first_new_block);
         }
 
         RadixInsertResult {
@@ -807,6 +805,30 @@ impl MambaRadixCache {
             self.nodes[grand_parent.0].children.remove(&p_first_page);
             self.retire_dead_node(cur_parent);
             cur_parent = grand_parent;
+        }
+    }
+
+    fn notify_tombstone_node(&self, id: RadixNodeId) {
+        let Some((dp_rank, ref dir)) = self.dp_prefix_observer else {
+            return;
+        };
+        let mut chain = Vec::new();
+        let mut cur = id;
+        while cur != RadixNodeId::ROOT {
+            chain.push(cur);
+            match self.nodes[cur.0].parent {
+                Some(p) => cur = p,
+                None => break,
+            }
+        }
+        chain.reverse();
+        let mut full_tokens = Vec::new();
+        for &nid in &chain {
+            full_tokens.extend_from_slice(&self.nodes[nid.0].key);
+        }
+        let all_hashes = crate::dp_router::compute_chained_prefix_hashes_raw(&full_tokens);
+        if let Some(&term_hash) = all_hashes.last() {
+            dir.record_tombstone_hash(dp_rank, term_hash);
         }
     }
 
@@ -1039,6 +1061,7 @@ impl MambaRadixCache {
             }
             if !self.nodes[nid.0].children.is_empty() || self.nodes[nid.0].full_lock_ref > 0 {
                 self.nodes[nid.0].mamba_value = None;
+                self.notify_tombstone_node(nid);
                 if self.nodes[nid.0].mamba_lock_ref == 0 {
                     self.mamba_evictable_slots = self.mamba_evictable_slots.saturating_sub(1);
                     self.mamba_lru_remove(nid);
@@ -1061,6 +1084,7 @@ impl MambaRadixCache {
             return None;
         }
         let slot = self.nodes[nid.0].mamba_value.take()?;
+        self.notify_tombstone_node(nid);
         self.mamba_evictable_slots = self.mamba_evictable_slots.saturating_sub(1);
         self.mamba_lru_remove(nid);
         Some(slot)
@@ -1121,6 +1145,7 @@ impl MambaRadixCache {
             if !self.nodes[nid.0].children.is_empty() {
                 // Internal node: tombstone its Mamba state while preserving KV pages for children.
                 if let Some(ms) = self.nodes[nid.0].mamba_value.take() {
+                    self.notify_tombstone_node(nid);
                     out.freed_mamba_slots.push(ms);
                     self.mamba_evictable_slots = self.mamba_evictable_slots.saturating_sub(1);
                 }
