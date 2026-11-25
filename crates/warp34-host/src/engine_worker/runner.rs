@@ -305,6 +305,9 @@ fn cancel_requests(
             }
         }
         finish_early(engine, sched, id);
+        if let Some(p) = engine.speculative.as_mut() {
+            p.finish_plain_memo(id);
+        }
         release(engine, sched.cancel_request(id));
         if let Some(mut r) = requests.remove(&id)
             && let Some(tap) = r.decision_tap.take()
@@ -712,20 +715,30 @@ fn extend_or_yield_mtp_batch(
         } else {
             sched.cfg.max_num_seqs.min(slot_limit)
         };
-        let desired_active = if engine.cfg.uses_tiered_moe() {
-            1
-        } else {
-            (active_mtp + sched.waiting.len()).min(sched.cfg.max_num_seqs)
-        };
-        let open_slots = active_cap.saturating_sub(active_mtp);
         let active_reserved: usize = sched
             .active
             .iter()
             .map(|seq| requests[&seq.req_id].reserved_pages)
             .sum();
-        let front_plain_fits = active_reserved + requests[&sched.waiting[0].req_id].reserved_pages
-            <= engine.ranks[0].kv_pool.num_pages;
-        let check_waiting = open_slots.min(sched.waiting.len());
+        let kv_cap = engine.ranks[0].kv_pool.num_pages;
+        let mut fit_pages = active_reserved;
+        let mut fit_waiting = 0usize;
+        for w in &sched.waiting {
+            let need = requests[&w.req_id].reserved_pages;
+            if fit_pages + need > kv_cap {
+                break;
+            }
+            fit_pages += need;
+            fit_waiting += 1;
+        }
+        let desired_active = if engine.cfg.uses_tiered_moe() {
+            1
+        } else {
+            (active_mtp + fit_waiting).min(sched.cfg.max_num_seqs)
+        };
+        let open_slots = active_cap.saturating_sub(active_mtp);
+        let front_plain_fits = fit_waiting > 0;
+        let check_waiting = open_slots.min(fit_waiting);
         let should_yield = front_plain_fits
             && (desired_active > slot_limit
                 || (check_waiting > 0
@@ -984,11 +997,15 @@ fn admit_requests(
                     let lookup_len = waiting.radix_key_tokens.len() - 1;
                     let lora_id = waiting.lora_id;
                     let key_tokens = waiting.radix_key_tokens[..lookup_len].to_vec();
-                    let _ = engine.try_hydrate_waiting_from_shared_pool(
+                    if let Some(entry) = engine.try_hydrate_waiting_from_shared_pool(
                         &mut sched.radix,
                         lora_id,
                         &key_tokens,
-                    );
+                    ) && let Some(feats) = &entry.proposer_features
+                        && let Some(proposer) = engine.speculative.as_mut()
+                    {
+                        proposer.import_shared_memo_features(&entry.token_ids, feats);
+                    }
                 }
                 let before = sched.active.len();
                 // Admit exactly one request so its complete budget is reserved before
@@ -1582,6 +1599,9 @@ pub(super) fn fail_request(
             tap.fail_and_recycle(engine, error.clone());
         }
         r.set_terminal(GenerationEvent::Error(error));
+    }
+    if let Some(p) = engine.speculative.as_mut() {
+        p.discard_plain_memo(id);
     }
     release(engine, sched.cancel_request(id));
 }

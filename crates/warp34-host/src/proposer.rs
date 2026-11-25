@@ -70,6 +70,7 @@ pub struct NativeProposer {
     shifted: Vec<DeviceBuffer>,
     memos: Vec<PrefixMemo>,
     current: Option<PrefixMemo>,
+    plain_memos: std::collections::HashMap<u64, PrefixMemo>,
     memo_pinned_staging: Option<crate::cuda::MappedHostBuffer>,
     resident_tokens: Vec<i32>,
     resident_valid_from: usize,
@@ -442,6 +443,7 @@ impl NativeProposer {
             shifted,
             memos: vec![],
             current: None,
+            plain_memos: std::collections::HashMap::new(),
             memo_pinned_staging,
             resident_tokens: vec![],
             resident_valid_from: 0,
@@ -465,6 +467,7 @@ impl NativeProposer {
         self.abort_scheduled();
         self.memos.clear();
         self.current = None;
+        self.plain_memos.clear();
         self.reset()
     }
     pub(crate) fn reset(&mut self) -> Result<()> {
@@ -549,6 +552,7 @@ impl NativeProposer {
                 self.memos
                     .iter()
                     .chain(self.current.iter())
+                    .chain(self.plain_memos.values())
                     .chain(
                         self.mtp_batch_slots
                             .iter()
@@ -557,6 +561,155 @@ impl NativeProposer {
                     .any(|m| m.tokens.starts_with(tokens) && m.features.len() >= need_bytes)
             }
         }
+    }
+
+    pub(crate) fn row_bytes(&self) -> usize {
+        self.row_bytes
+    }
+
+    /// Initializes a per-request MTP host memo for a request running in `step_plain`,
+    /// cloning/moving any aligned prefix from `self.memos` when `prefix_tokens` is non-empty.
+    pub(crate) fn init_plain_memo(&mut self, req_id: u64, prefix_tokens: &[i32]) {
+        if !self.is_mtp() || self.row_bytes == 0 || self.plain_memos.contains_key(&req_id) {
+            return;
+        }
+        if prefix_tokens.is_empty() {
+            self.plain_memos.insert(
+                req_id,
+                PrefixMemo {
+                    tokens: Vec::new(),
+                    features: Vec::new(),
+                },
+            );
+            return;
+        }
+        let Some(need_bytes) = prefix_tokens.len().checked_mul(self.row_bytes) else {
+            return;
+        };
+        if !self
+            .memos
+            .iter()
+            .any(|m| m.tokens.starts_with(prefix_tokens) && m.features.len() >= need_bytes)
+        {
+            return;
+        }
+        let memo = Self::clone_aligned_memo_prefix(
+            &mut self.memos,
+            prefix_tokens,
+            need_bytes,
+            self.row_bytes,
+        );
+        if memo.tokens.len() == prefix_tokens.len() && memo.features.len() == need_bytes {
+            self.plain_memos.insert(req_id, memo);
+        }
+    }
+
+    pub(crate) fn has_plain_memo(&self, req_id: u64) -> bool {
+        self.plain_memos.contains_key(&req_id)
+    }
+
+    /// Appends committed `(tokens, raw_hidden_bytes)` rows captured from `step_plain` to a
+    /// request's in-flight MTP memo. Drops the memo cleanly if it would exceed `MEMO_BUDGET`.
+    pub(crate) fn append_plain_memo_bytes(
+        &mut self,
+        req_id: u64,
+        tokens: &[i32],
+        raw_hidden_bytes: &[u8],
+    ) {
+        if !self.is_mtp() || tokens.is_empty() || self.row_bytes == 0 {
+            return;
+        }
+        if raw_hidden_bytes.len() != tokens.len().saturating_mul(self.row_bytes) {
+            self.plain_memos.remove(&req_id);
+            return;
+        }
+        let Some(memo) = self.plain_memos.get_mut(&req_id) else {
+            return;
+        };
+        if !memo_fits_budget(
+            SpeculativeKind::Mtp,
+            memo.tokens.len(),
+            tokens.len(),
+            self.row_bytes,
+        ) {
+            self.plain_memos.remove(&req_id);
+            return;
+        }
+        let old_len = memo.features.len();
+        grow_memo_features(
+            &mut memo.features,
+            old_len + raw_hidden_bytes.len(),
+            self.row_bytes,
+        );
+        memo.features[old_len..].copy_from_slice(raw_hidden_bytes);
+        memo.tokens.extend_from_slice(tokens);
+    }
+
+    /// Copies `total_rows` FP16 hidden rows from `dev_src` (already synchronized on `stream`)
+    /// via the proposer's pinned staging buffer when possible, returning the host bytes.
+    pub(crate) fn copy_plain_hidden_d2h(
+        &mut self,
+        dev_src: u64,
+        total_rows: usize,
+        stream: &crate::cuda::CudaStream,
+    ) -> Result<Vec<u8>> {
+        let bytes = total_rows.saturating_mul(self.row_bytes);
+        if bytes == 0 {
+            return Ok(Vec::new());
+        }
+        let mut out = vec![0u8; bytes];
+        if let Some(stage) = self.memo_pinned_staging.as_ref()
+            && stage.len_bytes >= bytes
+        {
+            check_rc(
+                // SAFETY: `stage.host_ptr` is pinned and `stage.len_bytes >= bytes`; `dev_src`
+                // holds at least `bytes` valid FP16 hidden bytes on `stream`.
+                unsafe {
+                    ffi::warp34_memcpy_d2h_async(
+                        stage.host_ptr,
+                        dev_src as *const std::ffi::c_void,
+                        bytes,
+                        stream.handle,
+                    )
+                },
+                "plain MTP memo pinned D2H",
+            )?;
+            stream.synchronize()?;
+            // SAFETY: `stream.synchronize()` completed the D2H into `stage.host_ptr`, and
+            // `out` is a distinct allocation of `bytes` bytes.
+            unsafe {
+                std::ptr::copy_nonoverlapping(stage.host_ptr.cast::<u8>(), out.as_mut_ptr(), bytes);
+            }
+        } else {
+            check_rc(
+                // SAFETY: `out` has capacity `bytes` and `dev_src` holds at least `bytes` valid
+                // FP16 hidden bytes; `stream.synchronize()` completes before returning.
+                unsafe {
+                    ffi::warp34_memcpy_d2h_async(
+                        out.as_mut_ptr().cast(),
+                        dev_src as *const std::ffi::c_void,
+                        bytes,
+                        stream.handle,
+                    )
+                },
+                "plain MTP memo D2H",
+            )?;
+            stream.synchronize()?;
+        }
+        Ok(out)
+    }
+
+    /// Commits a finished or cancelled `step_plain` request's memo into `self.memos` so
+    /// subsequent turns can immediately resume MTP-3 with 100% cache hit.
+    pub(crate) fn finish_plain_memo(&mut self, req_id: u64) {
+        if let Some(memo) = self.plain_memos.remove(&req_id) {
+            push_mtp_memo(&mut self.memos, memo);
+        }
+    }
+
+    /// Discards an errored `step_plain` request's in-flight memo without polluting `self.memos`.
+    pub(crate) fn discard_plain_memo(&mut self, req_id: u64) {
+        self.plain_memos.remove(&req_id);
     }
 
     /// Exports cached speculative proposer features for `prefix_tokens` (if present in host
@@ -569,6 +722,7 @@ impl NativeProposer {
         self.memos
             .iter()
             .chain(self.current.iter())
+            .chain(self.plain_memos.values())
             .chain(
                 self.mtp_batch_slots
                     .iter()

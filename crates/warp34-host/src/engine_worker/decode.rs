@@ -625,6 +625,7 @@ pub(super) fn step_plain(
     engine.clear_slice_lora_ids();
     let greedy = greedy?;
     record_computed_prefill(&slices, requests);
+    record_plain_eager_hidden(engine, sched, &slices);
     capture_batch_decision_taps(engine, sched, &slices, &emit_mask, requests);
     let mut pending_errors: Vec<Option<WorkerError>> = vec![None; slices.len()];
     let sampled = if needs_gpu {
@@ -755,12 +756,23 @@ pub(super) fn step_plain(
             && engine.dp_prefix_pool.is_some()
             && let Some(seq) = sched.active.iter().find(|seq| seq.req_id == s.req_id)
             && seq.prefix_bidir_len.is_none()
+            && let Some((num_tokens, _, _)) = sched
+                .radix
+                .node_kv_pages_and_mamba(seq.radix_state.last_locked_node)
+            && num_tokens <= seq.radix_key_tokens.len()
         {
-            engine.try_publish_radix_node_to_shared_pool(
+            let has_mtp = engine.speculative.as_ref().is_some_and(|p| p.is_mtp());
+            engine.try_publish_radix_node_to_shared_pool_with_features(
                 &sched.radix,
                 seq.radix_state.last_locked_node,
                 seq.lora_id,
                 &seq.radix_key_tokens,
+                has_mtp,
+                || {
+                    engine.speculative.as_ref().and_then(|p| {
+                        p.export_shared_memo_features(&seq.radix_key_tokens[..num_tokens])
+                    })
+                },
             );
         }
         if requests
@@ -769,6 +781,15 @@ pub(super) fn step_plain(
             .is_some_and(|c| c.is_terminal_eos())
         {
             finish_early(engine, sched, s.req_id);
+        }
+        if sched
+            .active
+            .iter()
+            .find(|seq| seq.req_id == s.req_id)
+            .is_none_or(|seq| seq.finished)
+            && let Some(p) = engine.speculative.as_mut()
+        {
+            p.finish_plain_memo(s.req_id);
         }
     }
     Ok(())
@@ -893,10 +914,14 @@ fn run_pipelined_decode_burst(
             });
 
         if !can_overlap_next {
+            let has_hidden = ticket_cur.has_hidden;
             let out_cur = engine.wait_pipelined_decode_step(ticket_cur).map_err(|e| {
                 engine.abort_pipelined_decode();
                 WorkerError::Cuda(e)
             })?;
+            if has_hidden {
+                record_plain_pipelined_hidden(engine, sched, cur_slot, &slices_cur, None);
+            }
             commit_pipelined_step(engine, sched, requests, &slices_cur, &out_cur, None);
             return Ok(());
         }
@@ -962,10 +987,14 @@ fn run_pipelined_decode_burst(
                 })?
         };
 
+        let cur_has_hidden = ticket_cur.has_hidden;
         let out_cur = engine.wait_pipelined_decode_step(ticket_cur).map_err(|e| {
             engine.abort_pipelined_decode();
             WorkerError::Cuda(e)
         })?;
+        if cur_has_hidden {
+            record_plain_pipelined_hidden(engine, sched, cur_slot, &slices_cur, None);
+        }
 
         let mut deferred_releases = Vec::new();
         let mut deferred_failures = Vec::new();
@@ -1012,6 +1041,15 @@ fn run_pipelined_decode_burst(
             let outcome = sched.commit_slice_with_radix(s, Some(id), |radix| {
                 engine.alloc_checkpoint_slot_from(radix)
             });
+            if sched
+                .active
+                .iter()
+                .find(|seq| seq.req_id == s.req_id)
+                .is_none_or(|seq| seq.finished)
+                && let Some(p) = engine.speculative.as_mut()
+            {
+                p.finish_plain_memo(s.req_id);
+            }
             if outcome.is_some() || r.cancelled.load(Ordering::Acquire) {
                 any_stopped = true;
             }
@@ -1019,6 +1057,7 @@ fn run_pipelined_decode_burst(
         }
 
         if any_stopped {
+            let next_has_hidden = ticket_next.has_hidden;
             let out_next = wait_and_release_deferred(
                 engine,
                 |engine| engine.wait_pipelined_decode_step(ticket_next),
@@ -1043,6 +1082,15 @@ fn run_pipelined_decode_burst(
                             .is_some_and(|r| !r.cancelled.load(Ordering::Acquire));
                     active_mask[i] = still_running;
                 }
+            }
+            if next_has_hidden {
+                record_plain_pipelined_hidden(
+                    engine,
+                    sched,
+                    next_slot,
+                    &slices_next,
+                    Some(&active_mask),
+                );
             }
             commit_pipelined_step(
                 engine,
@@ -1143,7 +1191,157 @@ fn commit_pipelined_step(
             engine.alloc_checkpoint_slot_from(radix)
         });
         release(engine, out);
+        if sched
+            .active
+            .iter()
+            .find(|seq| seq.req_id == s.req_id)
+            .is_none_or(|seq| seq.finished)
+            && let Some(p) = engine.speculative.as_mut()
+        {
+            p.finish_plain_memo(s.req_id);
+        }
     }
+}
+
+/// Captures committed FP16 hidden rows from `ranks[0].last_final_hidden_f16` into per-request
+/// MTP host memos after an eager `step_plain` forward pass so sessions that transiently run
+/// through `step_plain` seamlessly resume MTP-3 on the next turn without losing cached tokens.
+fn record_plain_eager_hidden(
+    engine: &mut Qwen3_5Engine,
+    sched: &SchedulerV1,
+    slices: &[ScheduledReqSlice],
+) {
+    let Some(mut proposer) = engine.speculative.take() else {
+        return;
+    };
+    if !proposer.is_mtp() || proposer.row_bytes() == 0 {
+        engine.speculative = Some(proposer);
+        return;
+    }
+    let total_tokens: usize = slices.iter().map(|s| s.query_tokens.len()).sum();
+    let r0 = &engine.ranks[0];
+    let dev_src = if total_tokens > 0
+        && total_tokens <= r0.max_tap_rows
+        && let Some(buf) = r0.last_final_hidden_f16.as_ref()
+        && total_tokens.saturating_mul(proposer.row_bytes()) <= buf.len_bytes
+    {
+        Some(buf.addr())
+    } else if total_tokens > 0
+        && !r0.final_residual.exports_pre_norm_hidden()
+        && r0.last_norm_hidden_ptr != 0
+        && r0.last_norm_hidden_rows >= total_tokens
+    {
+        // `forward_selected_rows_device` writes all `total_tokens` post-norm FP16 hidden rows
+        // to `last_norm_hidden_ptr` (`s.normed`) even when `total_tokens > max_tap_rows`
+        // (e.g. `max_model_len = 32768` where `max_tap_rows = 256`).
+        Some(r0.last_norm_hidden_ptr)
+    } else {
+        None
+    };
+    let Some(dev_src) = dev_src else {
+        for s in slices {
+            proposer.discard_plain_memo(s.req_id);
+        }
+        engine.speculative = Some(proposer);
+        return;
+    };
+    let mut any_tracked = false;
+    for s in slices {
+        if let Some(seq) = sched.active.iter().find(|seq| seq.req_id == s.req_id) {
+            if seq.prefix_bidir_len.is_none() && !seq.custom_prefill {
+                proposer.init_plain_memo(s.req_id, &seq.radix_state.token_ids);
+                if proposer.has_plain_memo(s.req_id) {
+                    any_tracked = true;
+                }
+            } else {
+                proposer.discard_plain_memo(s.req_id);
+            }
+        }
+    }
+    if any_tracked {
+        match proposer.copy_plain_hidden_d2h(dev_src, total_tokens, &r0.stream) {
+            Ok(host_bytes) => {
+                let row_bytes = proposer.row_bytes();
+                let mut tok_off = 0usize;
+                for s in slices {
+                    let n = s.query_tokens.len();
+                    let byte_start = tok_off.saturating_mul(row_bytes);
+                    let byte_end = (tok_off + n).saturating_mul(row_bytes);
+                    tok_off += n;
+                    if let Some(seq) = sched.active.iter().find(|seq| seq.req_id == s.req_id)
+                        && proposer.has_plain_memo(s.req_id)
+                    {
+                        let radix_slice = if s.is_prefill_chunk {
+                            &seq.radix_key_tokens[s.ctx_len_before..s.ctx_len_before + n]
+                        } else {
+                            &s.query_tokens
+                        };
+                        proposer.append_plain_memo_bytes(
+                            s.req_id,
+                            radix_slice,
+                            &host_bytes[byte_start..byte_end],
+                        );
+                    }
+                }
+            }
+            Err(_) => {
+                for s in slices {
+                    proposer.discard_plain_memo(s.req_id);
+                }
+            }
+        }
+    }
+    engine.speculative = Some(proposer);
+}
+
+/// Appends race-free hidden rows captured into `batched_decode_io.pipeline_hidden_pinned[slot]`
+/// during a pipelined decode step into per-request MTP host memos.
+fn record_plain_pipelined_hidden(
+    engine: &mut Qwen3_5Engine,
+    sched: &SchedulerV1,
+    slot: usize,
+    slices: &[ScheduledReqSlice],
+    active_mask: Option<&[bool]>,
+) {
+    let Some(mut proposer) = engine.speculative.take() else {
+        return;
+    };
+    if !proposer.is_mtp() || proposer.row_bytes() == 0 {
+        engine.speculative = Some(proposer);
+        return;
+    }
+    let row_bytes = proposer.row_bytes();
+    let Some(host_bytes) = engine.ranks[0]
+        .batched_decode_io
+        .pipeline_hidden_slot_slice(slot, slices.len(), row_bytes)
+    else {
+        for s in slices {
+            proposer.discard_plain_memo(s.req_id);
+        }
+        engine.speculative = Some(proposer);
+        return;
+    };
+    for (i, s) in slices.iter().enumerate() {
+        if active_mask.is_some_and(|m| !m[i]) {
+            continue;
+        }
+        if let Some(seq) = sched.active.iter().find(|seq| seq.req_id == s.req_id)
+            && seq.prefix_bidir_len.is_none()
+            && !seq.custom_prefill
+        {
+            proposer.init_plain_memo(s.req_id, &seq.radix_state.token_ids);
+            if proposer.has_plain_memo(s.req_id) {
+                let start = i * row_bytes;
+                let end = start + row_bytes;
+                proposer.append_plain_memo_bytes(
+                    s.req_id,
+                    &s.query_tokens,
+                    &host_bytes[start..end],
+                );
+            }
+        }
+    }
+    engine.speculative = Some(proposer);
 }
 
 #[cfg(test)]

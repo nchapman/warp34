@@ -171,17 +171,20 @@ impl NativeProposer {
                     if engine.dp_prefix_pool.is_some()
                         && let Some((num_tokens, _, _)) =
                             radix.node_kv_pages_and_mamba(seq.radix_state.last_locked_node)
-                        && (num_tokens == 2048 || num_tokens.is_multiple_of(4096))
+                        && (num_tokens == 2048 || num_tokens == 4096)
                         && num_tokens <= seq.radix_key_tokens.len()
                     {
-                        let feats =
-                            self.export_shared_memo_features(&seq.radix_key_tokens[..num_tokens]);
                         engine.try_publish_radix_node_to_shared_pool_with_features(
                             radix,
                             seq.radix_state.last_locked_node,
                             seq.lora_id,
                             &seq.radix_key_tokens,
-                            feats,
+                            true,
+                            || {
+                                self.export_shared_memo_features(
+                                    &seq.radix_key_tokens[..num_tokens],
+                                )
+                            },
                         );
                     }
                 } else {
@@ -239,14 +242,13 @@ impl NativeProposer {
                         radix.node_kv_pages_and_mamba(seq.radix_state.last_locked_node)
                     && num_tokens <= seq.radix_key_tokens.len()
                 {
-                    let feats =
-                        self.export_shared_memo_features(&seq.radix_key_tokens[..num_tokens]);
                     engine.try_publish_radix_node_to_shared_pool_with_features(
                         radix,
                         seq.radix_state.last_locked_node,
                         seq.lora_id,
                         &seq.radix_key_tokens,
-                        feats,
+                        true,
+                        || self.export_shared_memo_features(&seq.radix_key_tokens[..num_tokens]),
                     );
                 }
             } else {

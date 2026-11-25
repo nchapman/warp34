@@ -448,20 +448,26 @@ impl Qwen3_5Engine {
             node_id,
             lora_id,
             raw_radix_tokens,
-            None,
+            false,
+            || None,
         );
     }
 
     /// Publishes a newly committed radix checkpoint (`node_id`) along with optional speculative
     /// proposer features (`MTP` / `DFlash2`) into the shared cross-replica L2 Host-RAM prefix pool.
-    pub fn try_publish_radix_node_to_shared_pool_with_features(
+    /// `make_features` is invoked lazily only after fast-path deduplication, stride throttling,
+    /// and base-size checks pass.
+    pub fn try_publish_radix_node_to_shared_pool_with_features<F>(
         &self,
         radix: &MambaRadixCache,
         node_id: crate::radix::RadixNodeId,
         lora_id: i32,
         raw_radix_tokens: &[i32],
-        proposer_features: Option<Vec<u8>>,
-    ) {
+        has_features_hint: bool,
+        make_features: F,
+    ) where
+        F: FnOnce() -> Option<Vec<u8>>,
+    {
         let Some(pool) = &self.dp_prefix_pool else {
             return;
         };
@@ -482,7 +488,7 @@ impl Qwen3_5Engine {
             return;
         }
         let prefix_tokens = &raw_radix_tokens[..num_tokens];
-        if pool.contains_and_touch(lora_id, prefix_tokens) {
+        if pool.contains_and_touch_with_features(lora_id, prefix_tokens, has_features_hint) {
             return;
         }
         // Throttle redundant synchronous D2H publishes on every short turn of a long pinned
@@ -523,12 +529,16 @@ impl Qwen3_5Engine {
         } else {
             0
         };
-        let est_feat_bytes = proposer_features.as_ref().map_or(0, Vec::len);
-        let est_total = est_kv_bytes
+        let est_base = est_kv_bytes
             .saturating_add(est_ckpt_bytes)
-            .saturating_add(est_feat_bytes)
             .saturating_add(std::mem::size_of_val(prefix_tokens));
-        if est_total == 0 || est_total > pool.max_bytes() / 2 {
+        if est_base == 0 || est_base > pool.max_bytes() / 2 {
+            return;
+        }
+        let proposer_features = make_features();
+        let est_feat_bytes = proposer_features.as_ref().map_or(0, Vec::len);
+        let est_total = est_base.saturating_add(est_feat_bytes);
+        if est_total > pool.max_bytes() / 2 {
             return;
         }
         let mut kv_ranks = Vec::with_capacity(self.ranks.len());
@@ -589,7 +599,14 @@ impl Qwen3_5Engine {
         let local_matched = radix.peek_matched_tokens(raw_radix_tokens);
         radix.active_lora_id = prev_lora;
 
-        let entry = pool.lookup_longest_match(lora_id, raw_radix_tokens, local_matched)?;
+        // Require a meaningful net gain (>= 1024 tokens) before hydrating over a warm local
+        // prefix so we never reclaim/copy a full 48K-token entry just to gain +16 tokens.
+        let min_tokens = if local_matched > 0 {
+            local_matched.saturating_add(1024)
+        } else {
+            0
+        };
+        let entry = pool.lookup_longest_match(lora_id, raw_radix_tokens, min_tokens)?;
         if entry.kv_ranks.len() != self.ranks.len()
             || entry.ckpt_ranks.len() != if is_hybrid_gdn { self.ranks.len() } else { 0 }
         {
@@ -1362,12 +1379,43 @@ impl Qwen3_5Engine {
             },
             "pipelined decode D2H output",
         )?;
+        let mtp_row_bytes = self
+            .speculative
+            .as_ref()
+            .filter(|p| p.is_mtp())
+            .map_or(0, |p| p.row_bytes());
+        let has_hidden = if mtp_row_bytes > 0
+            && let Some(hidden_buf) = r0.last_final_hidden_f16.as_ref()
+            && n.saturating_mul(mtp_row_bytes) <= hidden_buf.len_bytes
+        {
+            let hidden_addr = hidden_buf.addr();
+            let dst = r0
+                .batched_decode_io
+                .ensure_pipeline_hidden_slot_ptr(slot, mtp_row_bytes)?;
+            check_rc(
+                // SAFETY: n <= MAX_BATCHED_DECODE_REQS and n * mtp_row_bytes <= hidden_buf.len_bytes.
+                // Ordered on r0.stream strictly after graph.launch(t) and before pipeline_done_events[slot].
+                unsafe {
+                    ffi::warp34_memcpy_d2h_async(
+                        dst.cast(),
+                        hidden_addr as *const c_void,
+                        n * mtp_row_bytes,
+                        r0.stream.handle,
+                    )
+                },
+                "pipelined decode D2H MTP hidden",
+            )?;
+            true
+        } else {
+            false
+        };
         r0.batched_decode_io.pipeline_done_events[slot].record(&r0.stream)?;
 
         Ok(InFlightDecodeTicket {
             slot,
             num_reqs: n,
             fast_greedy: fast_greedy_inputs.is_some(),
+            has_hidden,
         })
     }
 

@@ -188,9 +188,15 @@ impl SharedDpPrefixPool {
         self.entry_count.load(Ordering::Relaxed) == 0
     }
 
-    /// Fast O(L) check whether `(lora_id, tokens)` is already stored in the pool, touching
-    /// its LRU position if found so callers can skip redundant D2H copies.
-    pub fn contains_and_touch(&self, lora_id: i32, tokens: &[i32]) -> bool {
+    /// Fast O(L) check whether `(lora_id, tokens)` is already stored in the pool (and, when
+    /// `require_features` is `true`, carries speculative proposer features), touching its LRU
+    /// position if found so callers can skip redundant D2H copies.
+    pub fn contains_and_touch_with_features(
+        &self,
+        lora_id: i32,
+        tokens: &[i32],
+        require_features: bool,
+    ) -> bool {
         if self.max_bytes == 0 || tokens.len() < DP_L2_MIN_PREFIX_TOKENS || self.is_empty() {
             return false;
         }
@@ -200,10 +206,9 @@ impl SharedDpPrefixPool {
             hash: hash_prefix_tokens(lora_id, tokens),
         };
         let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        let found = st
-            .entries
-            .get(&key)
-            .is_some_and(|e| e.token_ids.as_slice() == tokens);
+        let found = st.entries.get(&key).is_some_and(|e| {
+            e.token_ids.as_slice() == tokens && (!require_features || e.proposer_features.is_some())
+        });
         if found {
             if let Some(pos) = st.lru.iter().position(|k| *k == key) {
                 st.lru.remove(pos);
@@ -211,6 +216,12 @@ impl SharedDpPrefixPool {
             st.lru.push_back(key);
         }
         found
+    }
+
+    /// Fast O(L) check whether `(lora_id, tokens)` is already stored in the pool, touching
+    /// its LRU position if found so callers can skip redundant D2H copies.
+    pub fn contains_and_touch(&self, lora_id: i32, tokens: &[i32]) -> bool {
+        self.contains_and_touch_with_features(lora_id, tokens, false)
     }
 
     /// Returns `true` if the pool already holds a prefix of `tokens` (under `lora_id`) whose
@@ -251,6 +262,28 @@ impl SharedDpPrefixPool {
         false
     }
 
+    fn evict_lru_until_fits(&self, st: &mut PoolState, incoming_bytes: usize) {
+        let mut evicted = 0u64;
+        while st.used_bytes.saturating_add(incoming_bytes) > self.max_bytes {
+            let Some(victim_key) = st.lru.pop_front() else {
+                break;
+            };
+            if let Some(victim) = st.entries.remove(&victim_key) {
+                st.used_bytes = st.used_bytes.saturating_sub(victim.total_bytes);
+                if let Some(cnt) = st.lengths.get_mut(&victim_key.len) {
+                    *cnt = cnt.saturating_sub(1);
+                    if *cnt == 0 {
+                        st.lengths.remove(&victim_key.len);
+                    }
+                }
+                evicted += 1;
+            }
+        }
+        if evicted > 0 {
+            self.evictions.fetch_add(evicted, Ordering::Relaxed);
+        }
+    }
+
     /// Inserts `entry` into the pool, evicting LRU entries if needed to stay within `max_bytes`.
     /// Entries larger than `max_bytes / 2` or shorter than [`DP_L2_MIN_PREFIX_TOKENS`] are
     /// ignored so a single oversized prompt cannot thrash the shared pool.
@@ -272,6 +305,21 @@ impl SharedDpPrefixPool {
         if let Some(existing) = st.entries.get(&key)
             && existing.token_ids == entry.token_ids
         {
+            if existing.proposer_features.is_none() && entry.proposer_features.is_some() {
+                // Upgrade a plain-mode entry with speculative proposer features in place.
+                let old_bytes = existing.total_bytes;
+                st.used_bytes = st.used_bytes.saturating_sub(old_bytes);
+                if let Some(pos) = st.lru.iter().position(|k| *k == key) {
+                    st.lru.remove(pos);
+                }
+                self.evict_lru_until_fits(&mut st, entry.total_bytes);
+                st.used_bytes = st.used_bytes.saturating_add(entry.total_bytes);
+                st.entries.insert(key, Arc::new(entry));
+                st.lru.push_back(key);
+                self.entry_count.store(st.entries.len(), Ordering::Relaxed);
+                self.publishes.fetch_add(1, Ordering::Relaxed);
+                return true;
+            }
             if let Some(pos) = st.lru.iter().position(|k| *k == key) {
                 st.lru.remove(pos);
             }
@@ -326,25 +374,7 @@ impl SharedDpPrefixPool {
         }
 
         // Evict LRU entries until there is room for `entry.total_bytes`.
-        let mut evicted = 0u64;
-        while st.used_bytes.saturating_add(entry.total_bytes) > self.max_bytes {
-            let Some(victim_key) = st.lru.pop_front() else {
-                break;
-            };
-            if let Some(victim) = st.entries.remove(&victim_key) {
-                st.used_bytes = st.used_bytes.saturating_sub(victim.total_bytes);
-                if let Some(cnt) = st.lengths.get_mut(&victim_key.len) {
-                    *cnt = cnt.saturating_sub(1);
-                    if *cnt == 0 {
-                        st.lengths.remove(&victim_key.len);
-                    }
-                }
-                evicted += 1;
-            }
-        }
-        if evicted > 0 {
-            self.evictions.fetch_add(evicted, Ordering::Relaxed);
-        }
+        self.evict_lru_until_fits(&mut st, entry.total_bytes);
 
         if let Some(prev) = st.entries.insert(key, Arc::new(entry)) {
             st.used_bytes = st.used_bytes.saturating_sub(prev.total_bytes);
@@ -518,5 +548,28 @@ mod tests {
         assert!(pool.contains_and_touch(-1, &harness_4k));
         assert!(!pool.contains_and_touch(-1, &turn1_6k));
         assert!(pool.contains_and_touch(-1, &turn3_11k));
+
+        // Upgrading a plain-mode entry (proposer_features: None) with proposer_features: Some(...)
+        // replaces the entry in place and satisfies `contains_and_touch_with_features(..., true)`.
+        assert!(!pool.contains_and_touch_with_features(-1, &harness_4k, true));
+        let upgraded = SharedPrefixEntry::new(
+            -1,
+            harness_4k.clone(),
+            harness_4k.len() / 16,
+            vec![vec![0xAB; 1024]],
+            vec![SharedGdnCheckpoint {
+                frame: vec![0xCD; 64],
+                ple_ngram_context: [1, 2],
+            }],
+            Some(vec![0xEF; 512]),
+            0,
+        );
+        assert!(pool.insert(upgraded));
+        assert_eq!(pool.stats().entries, 2);
+        assert!(pool.contains_and_touch_with_features(-1, &harness_4k, true));
+        let hit = pool
+            .lookup_longest_match(-1, &harness_4k, 0)
+            .expect("upgraded harness should match");
+        assert_eq!(hit.proposer_features.as_deref(), Some(&[0xEF; 512][..]));
     }
 }
