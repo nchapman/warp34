@@ -40,6 +40,8 @@ pub struct Qwen3_5Engine {
     pub active_lora_id: i32,
     pub slice_lora_ids: Vec<i32>,
     pub serving_fit: Option<ServingAutoFitPlan>,
+    pub dp_rank: usize,
+    pub dp_prefix_pool: Option<std::sync::Arc<crate::dp_prefix_pool::SharedDpPrefixPool>>,
 }
 
 #[derive(Clone, Debug)]
@@ -738,7 +740,19 @@ impl Qwen3_5Engine {
             active_lora_id: crate::lora::BASE_MODEL_LORA_ID,
             slice_lora_ids: Vec::new(),
             serving_fit: None,
+            dp_rank: 0,
+            dp_prefix_pool: None,
         })
+    }
+
+    /// Attaches the process-wide L2 Host-RAM prefix pool shared across DP replicas.
+    pub fn set_dp_prefix_pool(
+        &mut self,
+        dp_rank: usize,
+        pool: std::sync::Arc<crate::dp_prefix_pool::SharedDpPrefixPool>,
+    ) {
+        self.dp_rank = dp_rank;
+        self.dp_prefix_pool = Some(pool);
     }
 
     /// Loads and attaches one or more PEFT LoRA adapters onto all TP ranks of this engine.

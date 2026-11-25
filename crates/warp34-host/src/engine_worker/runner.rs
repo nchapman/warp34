@@ -390,6 +390,20 @@ fn admit_into_mtp_batch_slots(
         };
         let prev_reserved = requests[&id].reserved_pages;
         requests.get_mut(&id).unwrap().reserved_pages = need_pages;
+        if engine.dp_prefix_pool.is_some()
+            && w.prefix_bidir_len.is_none()
+            && w.radix_key_tokens.len() > 1
+        {
+            let lookup_len = w.radix_key_tokens.len() - 1;
+            let lora_id = w.lora_id;
+            let key_tokens = w.radix_key_tokens[..lookup_len].to_vec();
+            if let Some(entry) =
+                engine.try_hydrate_waiting_from_shared_pool(&mut sched.radix, lora_id, &key_tokens)
+                && let Some(feats) = &entry.proposer_features
+            {
+                proposer.import_shared_memo_features(&entry.token_ids, feats);
+            }
+        }
         let before = sched.active.len();
         sched.cfg.max_num_seqs = before + 1;
         sched.admit_waiting_with_filter(
@@ -860,6 +874,22 @@ fn admit_requests(
                 && init_need <= engine.ranks[0].kv_pool.num_pages
             {
                 requests.get_mut(&id).unwrap().reserved_pages = init_need;
+                if engine.dp_prefix_pool.is_some()
+                    && p.prefix_bidir_len.is_none()
+                    && p.radix_key_tokens.len() > 1
+                {
+                    let lookup_len = p.radix_key_tokens.len() - 1;
+                    let lora_id = p.lora_id;
+                    let key_tokens = p.radix_key_tokens[..lookup_len].to_vec();
+                    if let Some(entry) = engine.try_hydrate_waiting_from_shared_pool(
+                        &mut sched.radix,
+                        lora_id,
+                        &key_tokens,
+                    ) && let Some(feats) = &entry.proposer_features
+                    {
+                        proposer.import_shared_memo_features(&entry.token_ids, feats);
+                    }
+                }
                 let saved_max = sched.cfg.max_num_seqs;
                 sched.cfg.max_num_seqs = 1;
                 sched.admit_waiting_with_filter(
@@ -907,6 +937,19 @@ fn admit_requests(
                 let pages = requests[&waiting.req_id].reserved_pages;
                 if reserved + pages > engine.ranks[0].kv_pool.num_pages {
                     break;
+                }
+                if engine.dp_prefix_pool.is_some()
+                    && waiting.prefix_bidir_len.is_none()
+                    && waiting.radix_key_tokens.len() > 1
+                {
+                    let lookup_len = waiting.radix_key_tokens.len() - 1;
+                    let lora_id = waiting.lora_id;
+                    let key_tokens = waiting.radix_key_tokens[..lookup_len].to_vec();
+                    let _ = engine.try_hydrate_waiting_from_shared_pool(
+                        &mut sched.radix,
+                        lora_id,
+                        &key_tokens,
+                    );
                 }
                 let before = sched.active.len();
                 // Admit exactly one request so its complete budget is reserved before

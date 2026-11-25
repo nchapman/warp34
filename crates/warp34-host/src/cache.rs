@@ -502,6 +502,231 @@ impl KvPool {
         )
     }
 
+    /// Copies `vram_pages` (`0..num_pages`) from GPU VRAM into a single contiguous host byte
+    /// buffer (layer-major: K, V, optional QSA raw K, optional QSA comp K) on `stream`.
+    /// Used by the cross-replica DP L2 prefix pool to publish warm KV pages without mutating
+    /// this rank's L1 VRAM ownership.
+    pub fn export_pages_to_host_bytes(
+        &self,
+        vram_pages: &[i32],
+        stream: &crate::cuda::CudaStream,
+    ) -> Result<Vec<u8>> {
+        if vram_pages.is_empty() || self.layers.is_empty() {
+            return Ok(Vec::new());
+        }
+        for &pid in vram_pages {
+            if pid < 0 || (pid as usize) >= self.num_pages {
+                return Err(crate::cuda::CudaError::with_detail(
+                    -2,
+                    "invalid VRAM page ID in export_pages_to_host_bytes",
+                    format!("pid={pid} not in 0..{}", self.num_pages),
+                ));
+            }
+        }
+        let n = vram_pages.len();
+        let total_bytes: usize = self
+            .layers
+            .iter()
+            .map(|l| {
+                let k_stride = l.k_buf.len_bytes / self.num_pages;
+                let v_stride = l.v_buf.len_bytes / self.num_pages;
+                let raw_stride = l
+                    .qsa_raw_k_buf
+                    .as_ref()
+                    .map_or(0, |b| b.len_bytes / self.num_pages);
+                let comp_stride = l
+                    .qsa_comp_k_buf
+                    .as_ref()
+                    .map_or(0, |b| b.len_bytes / self.num_pages);
+                (k_stride + v_stride + raw_stride + comp_stride) * n
+            })
+            .sum();
+        let mut out = vec![0u8; total_bytes];
+        crate::cuda::CudaDevice {
+            device_id: self.device_id,
+        }
+        .make_current()?;
+
+        // Coalesce contiguous VRAM page runs to minimize per-page D2H memcpy launches.
+        let mut runs: Vec<(usize, usize, usize)> = Vec::new();
+        let mut i = 0usize;
+        while i < n {
+            let start_pid = vram_pages[i] as usize;
+            let mut len = 1usize;
+            while i + len < n && vram_pages[i + len] as usize == start_pid + len {
+                len += 1;
+            }
+            runs.push((i, start_pid, len));
+            i += len;
+        }
+
+        let mut cursor = 0usize;
+        for layer in &self.layers {
+            let k_stride = layer.k_buf.len_bytes / self.num_pages;
+            let v_stride = layer.v_buf.len_bytes / self.num_pages;
+            let raw_stride = layer
+                .qsa_raw_k_buf
+                .as_ref()
+                .map_or(0, |b| b.len_bytes / self.num_pages);
+            let comp_stride = layer
+                .qsa_comp_k_buf
+                .as_ref()
+                .map_or(0, |b| b.len_bytes / self.num_pages);
+
+            let mut copy_buf = |dev_addr: u64, stride: usize, label: &'static str| -> Result<()> {
+                if stride == 0 {
+                    return Ok(());
+                }
+                for &(page_idx, vram_start, run_len) in &runs {
+                    let bytes = run_len * stride;
+                    let dst_off = cursor + page_idx * stride;
+                    let src = dev_addr + (vram_start * stride) as u64;
+                    crate::cuda::check_rc(
+                        // SAFETY: `out` is sized to `total_bytes` covering every layer and
+                        // page; `src` is bounds-checked within `0..self.num_pages`.
+                        unsafe {
+                            warp34_kernels::ffi::warp34_memcpy_d2h_async(
+                                out.as_mut_ptr().add(dst_off).cast(),
+                                src as *const core::ffi::c_void,
+                                bytes,
+                                stream.handle,
+                            )
+                        },
+                        label,
+                    )?;
+                }
+                cursor += n * stride;
+                Ok(())
+            };
+
+            copy_buf(layer.k_buf.addr(), k_stride, "KvPool export K D2H")?;
+            copy_buf(layer.v_buf.addr(), v_stride, "KvPool export V D2H")?;
+            if let Some(raw) = &layer.qsa_raw_k_buf {
+                copy_buf(raw.addr(), raw_stride, "KvPool export QSA raw K D2H")?;
+            }
+            if let Some(comp) = &layer.qsa_comp_k_buf {
+                copy_buf(comp.addr(), comp_stride, "KvPool export QSA comp K D2H")?;
+            }
+        }
+        stream.synchronize()?;
+        Ok(out)
+    }
+
+    /// Copies a host byte buffer produced by [`Self::export_pages_to_host_bytes`] into
+    /// freshly allocated `dst_vram_pages` (`0..num_pages`) on `stream`.
+    pub fn import_pages_from_host_bytes(
+        &self,
+        dst_vram_pages: &[i32],
+        bytes: &[u8],
+        stream: &crate::cuda::CudaStream,
+    ) -> Result<()> {
+        if dst_vram_pages.is_empty() || self.layers.is_empty() {
+            return Ok(());
+        }
+        for &pid in dst_vram_pages {
+            if pid < 0 || (pid as usize) >= self.num_pages {
+                return Err(crate::cuda::CudaError::with_detail(
+                    -2,
+                    "invalid VRAM page ID in import_pages_from_host_bytes",
+                    format!("pid={pid} not in 0..{}", self.num_pages),
+                ));
+            }
+        }
+        let n = dst_vram_pages.len();
+        let expected_bytes: usize = self
+            .layers
+            .iter()
+            .map(|l| {
+                let k_stride = l.k_buf.len_bytes / self.num_pages;
+                let v_stride = l.v_buf.len_bytes / self.num_pages;
+                let raw_stride = l
+                    .qsa_raw_k_buf
+                    .as_ref()
+                    .map_or(0, |b| b.len_bytes / self.num_pages);
+                let comp_stride = l
+                    .qsa_comp_k_buf
+                    .as_ref()
+                    .map_or(0, |b| b.len_bytes / self.num_pages);
+                (k_stride + v_stride + raw_stride + comp_stride) * n
+            })
+            .sum();
+        if bytes.len() != expected_bytes {
+            return Err(crate::cuda::CudaError::with_detail(
+                -2,
+                "KvPool import byte length mismatch",
+                format!("got {} bytes, expected {expected_bytes}", bytes.len()),
+            ));
+        }
+
+        crate::cuda::CudaDevice {
+            device_id: self.device_id,
+        }
+        .make_current()?;
+
+        let mut runs: Vec<(usize, usize, usize)> = Vec::new();
+        let mut i = 0usize;
+        while i < n {
+            let start_pid = dst_vram_pages[i] as usize;
+            let mut len = 1usize;
+            while i + len < n && dst_vram_pages[i + len] as usize == start_pid + len {
+                len += 1;
+            }
+            runs.push((i, start_pid, len));
+            i += len;
+        }
+
+        let mut cursor = 0usize;
+        for layer in &self.layers {
+            let k_stride = layer.k_buf.len_bytes / self.num_pages;
+            let v_stride = layer.v_buf.len_bytes / self.num_pages;
+            let raw_stride = layer
+                .qsa_raw_k_buf
+                .as_ref()
+                .map_or(0, |b| b.len_bytes / self.num_pages);
+            let comp_stride = layer
+                .qsa_comp_k_buf
+                .as_ref()
+                .map_or(0, |b| b.len_bytes / self.num_pages);
+
+            let mut copy_buf = |dev_addr: u64, stride: usize, label: &'static str| -> Result<()> {
+                if stride == 0 {
+                    return Ok(());
+                }
+                for &(page_idx, vram_start, run_len) in &runs {
+                    let copy_bytes = run_len * stride;
+                    let src_off = cursor + page_idx * stride;
+                    let dst = dev_addr + (vram_start * stride) as u64;
+                    crate::cuda::check_rc(
+                        // SAFETY: `bytes.len() == expected_bytes`; `dst` is bounds-checked
+                        // within `0..self.num_pages`, and we sync before returning.
+                        unsafe {
+                            warp34_kernels::ffi::warp34_memcpy_h2d_async(
+                                dst as *mut core::ffi::c_void,
+                                bytes.as_ptr().add(src_off).cast(),
+                                copy_bytes,
+                                stream.handle,
+                            )
+                        },
+                        label,
+                    )?;
+                }
+                cursor += n * stride;
+                Ok(())
+            };
+
+            copy_buf(layer.k_buf.addr(), k_stride, "KvPool import K H2D")?;
+            copy_buf(layer.v_buf.addr(), v_stride, "KvPool import V H2D")?;
+            if let Some(raw) = &layer.qsa_raw_k_buf {
+                copy_buf(raw.addr(), raw_stride, "KvPool import QSA raw K H2D")?;
+            }
+            if let Some(comp) = &layer.qsa_comp_k_buf {
+                copy_buf(comp.addr(), comp_stride, "KvPool import QSA comp K H2D")?;
+            }
+        }
+        stream.synchronize()?;
+        Ok(())
+    }
+
     /// Clamps logical page capacity downward so `TP=2` ranks operate in lockstep even when
     /// per-GPU free VRAM or rank-0 vision reservation produces slightly different initial budgets.
     pub fn truncate_pages(&mut self, max_pages: usize) {

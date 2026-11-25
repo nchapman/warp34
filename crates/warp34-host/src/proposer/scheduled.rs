@@ -168,6 +168,22 @@ impl NativeProposer {
             if seq.prefix_bidir_len.is_none() && seq.radix_state.has_donatable_checkpoint() {
                 if engine.has_checkpoint_pool() {
                     engine.donate_req_checkpoint(radix, &mut seq.radix_state, false)?;
+                    if engine.dp_prefix_pool.is_some()
+                        && let Some((num_tokens, _, _)) =
+                            radix.node_kv_pages_and_mamba(seq.radix_state.last_locked_node)
+                        && (num_tokens == 2048 || num_tokens.is_multiple_of(4096))
+                        && num_tokens <= seq.radix_key_tokens.len()
+                    {
+                        let feats =
+                            self.export_shared_memo_features(&seq.radix_key_tokens[..num_tokens]);
+                        engine.try_publish_radix_node_to_shared_pool_with_features(
+                            radix,
+                            seq.radix_state.last_locked_node,
+                            seq.lora_id,
+                            &seq.radix_key_tokens,
+                            feats,
+                        );
+                    }
                 } else {
                     let can_recycle =
                         radix.can_recycle_locked_mamba(seq.radix_state.last_locked_node);
@@ -218,6 +234,21 @@ impl NativeProposer {
         {
             if engine.has_checkpoint_pool() {
                 engine.donate_req_checkpoint(radix, &mut seq.radix_state, false)?;
+                if engine.dp_prefix_pool.is_some()
+                    && let Some((num_tokens, _, _)) =
+                        radix.node_kv_pages_and_mamba(seq.radix_state.last_locked_node)
+                    && num_tokens <= seq.radix_key_tokens.len()
+                {
+                    let feats =
+                        self.export_shared_memo_features(&seq.radix_key_tokens[..num_tokens]);
+                    engine.try_publish_radix_node_to_shared_pool_with_features(
+                        radix,
+                        seq.radix_state.last_locked_node,
+                        seq.lora_id,
+                        &seq.radix_key_tokens,
+                        feats,
+                    );
+                }
             } else {
                 let can_recycle = radix.can_recycle_locked_mamba(seq.radix_state.last_locked_node);
                 let rep = engine

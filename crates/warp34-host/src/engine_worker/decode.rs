@@ -491,6 +491,18 @@ fn run_single_vision_prefill(
         }
     });
     release(engine, out);
+    if slice.is_final_prefill_chunk
+        && engine.dp_prefix_pool.is_some()
+        && let Some(seq) = sched.active.iter().find(|seq| seq.req_id == id)
+        && seq.prefix_bidir_len.is_none()
+    {
+        engine.try_publish_radix_node_to_shared_pool(
+            &sched.radix,
+            seq.radix_state.last_locked_node,
+            seq.lora_id,
+            &seq.radix_key_tokens,
+        );
+    }
     Ok(())
 }
 
@@ -739,6 +751,18 @@ pub(super) fn step_plain(
             }
         });
         release(engine, out);
+        if s.is_final_prefill_chunk
+            && engine.dp_prefix_pool.is_some()
+            && let Some(seq) = sched.active.iter().find(|seq| seq.req_id == s.req_id)
+            && seq.prefix_bidir_len.is_none()
+        {
+            engine.try_publish_radix_node_to_shared_pool(
+                &sched.radix,
+                seq.radix_state.last_locked_node,
+                seq.lora_id,
+                &seq.radix_key_tokens,
+            );
+        }
         if requests
             .get(&s.req_id)
             .and_then(|r| r.sampler.constraint.as_ref())

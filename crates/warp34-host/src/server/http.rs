@@ -50,6 +50,7 @@ pub struct OpenAiServerState {
     pub worker: EngineWorker,
     extra_workers: Vec<EngineWorker>,
     dp_router: Arc<crate::dp_router::DpRouterCore>,
+    dp_prefix_pool: Option<Arc<crate::dp_prefix_pool::SharedDpPrefixPool>>,
     pub metrics: Arc<crate::telemetry::Telemetry>,
     next_request_id: AtomicU64,
     pub allow_remote_images: bool,
@@ -119,6 +120,7 @@ impl OpenAiServerState {
             max_num_seqs: options.max_num_seqs,
             ..SchedulerConfig::default()
         };
+        let mut shared_l2_pool: Option<Arc<crate::dp_prefix_pool::SharedDpPrefixPool>> = None;
         let mut workers = if dp_size == 1 {
             let loader = loaders.into_iter().next().unwrap();
             let dir = Arc::clone(&dp_router.prefix_dir);
@@ -127,6 +129,13 @@ impl OpenAiServerState {
             vec![w]
         } else {
             let max_model_len = options.max_model_len;
+            shared_l2_pool = crate::dp_prefix_pool::SharedDpPrefixPool::auto_sized(16);
+            if let Some(pool) = &shared_l2_pool {
+                eprintln!(
+                    "[warp34] DP shared L2 host-RAM prefix pool enabled ({:.2} GiB cap across {dp_size} replicas)",
+                    pool.max_bytes() as f64 / (1024.0 * 1024.0 * 1024.0)
+                );
+            }
             let results: Vec<Result<EngineWorker, String>> = std::thread::scope(|s| {
                 let handles: Vec<_> = loaders
                     .into_iter()
@@ -134,11 +143,15 @@ impl OpenAiServerState {
                     .map(|(dp_rank, loader)| {
                         let cfg = config;
                         let dir = Arc::clone(&dp_router.prefix_dir);
+                        let pool = shared_l2_pool.clone();
                         s.spawn(move || {
                             let mut w = EngineWorker::from_loader(
                                 move || {
                                     let mut engine = loader(dp_rank, Arc::clone(&dir))?;
                                     engine.radix.set_dp_prefix_observer(dp_rank, dir);
+                                    if let Some(pool) = pool {
+                                        engine.set_dp_prefix_pool(dp_rank, pool);
+                                    }
                                     Ok(engine)
                                 },
                                 cfg,
@@ -182,6 +195,7 @@ impl OpenAiServerState {
         unshared.default_reasoning_budget_message = options.reasoning_budget_message;
         unshared.reasoning_effort_budget = options.reasoning_effort_budget;
         unshared.max_num_seqs = options.max_num_seqs;
+        unshared.dp_prefix_pool = shared_l2_pool;
         Ok(state)
     }
 
@@ -248,6 +262,7 @@ impl OpenAiServerState {
             worker,
             extra_workers,
             dp_router,
+            dp_prefix_pool: None,
             allow_remote_images,
             response_store: crate::responses_api::ResponseStore::default(),
             constraint_factory,
@@ -547,12 +562,36 @@ async fn models(State(s): State<Arc<OpenAiServerState>>) -> Json<Value> {
     Json(json!({"object":"list","data":data}))
 }
 async fn metrics(State(s): State<Arc<OpenAiServerState>>) -> impl IntoResponse {
+    let mut body = s.snapshot_metrics().prometheus();
+    if let Some(pool) = &s.dp_prefix_pool {
+        use std::fmt::Write as _;
+        let st = pool.stats();
+        let _ = writeln!(
+            body,
+            "# HELP warp34_dp_l2_pool_entries Entries in the shared cross-replica DP L2 host-RAM prefix pool\n\
+             # TYPE warp34_dp_l2_pool_entries gauge\n\
+             warp34_dp_l2_pool_entries {}\n\
+             # HELP warp34_dp_l2_pool_used_bytes Host RAM bytes used by the shared DP L2 prefix pool\n\
+             # TYPE warp34_dp_l2_pool_used_bytes gauge\n\
+             warp34_dp_l2_pool_used_bytes {}\n\
+             # HELP warp34_dp_l2_pool_publishes_total Total prefixes published to the shared DP L2 prefix pool\n\
+             # TYPE warp34_dp_l2_pool_publishes_total counter\n\
+             warp34_dp_l2_pool_publishes_total {}\n\
+             # HELP warp34_dp_l2_pool_hits_total Total cross-replica L2 prefix hydrations\n\
+             # TYPE warp34_dp_l2_pool_hits_total counter\n\
+             warp34_dp_l2_pool_hits_total {}\n\
+             # HELP warp34_dp_l2_pool_hydrated_tokens_total Total prompt tokens hydrated across DP replicas from L2\n\
+             # TYPE warp34_dp_l2_pool_hydrated_tokens_total counter\n\
+             warp34_dp_l2_pool_hydrated_tokens_total {}",
+            st.entries, st.used_bytes, st.publishes, st.hits, st.hydrated_tokens
+        );
+    }
     (
         [(
             axum::http::header::CONTENT_TYPE,
             "text/plain; version=0.0.4",
         )],
-        s.snapshot_metrics().prometheus(),
+        body,
     )
 }
 async fn metrics_json(State(s): State<Arc<OpenAiServerState>>) -> impl IntoResponse {

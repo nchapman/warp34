@@ -558,6 +558,45 @@ impl NativeProposer {
             }
         }
     }
+
+    /// Exports cached speculative proposer features for `prefix_tokens` (if present in host
+    /// memos) so another DP replica can hydrate both KV/GDN and the speculative memo together.
+    pub(crate) fn export_shared_memo_features(&self, prefix_tokens: &[i32]) -> Option<Vec<u8>> {
+        if prefix_tokens.is_empty() || self.row_bytes == 0 {
+            return None;
+        }
+        let need_bytes = prefix_tokens.len().checked_mul(self.row_bytes)?;
+        self.memos
+            .iter()
+            .chain(self.current.iter())
+            .chain(
+                self.mtp_batch_slots
+                    .iter()
+                    .filter_map(|s| s.current.as_ref()),
+            )
+            .find(|m| m.tokens.starts_with(prefix_tokens) && m.features.len() >= need_bytes)
+            .map(|m| m.features[..need_bytes].to_vec())
+    }
+
+    /// Imports a shared speculative proposer prefix memo hydrated from [`crate::dp_prefix_pool::SharedDpPrefixPool`].
+    pub(crate) fn import_shared_memo_features(&mut self, prefix_tokens: &[i32], features: &[u8]) {
+        if prefix_tokens.is_empty()
+            || self.row_bytes == 0
+            || features.len() != prefix_tokens.len().saturating_mul(self.row_bytes)
+        {
+            return;
+        }
+        if self.can_restore_for_prompt(prefix_tokens, prefix_tokens.len().saturating_add(1)) {
+            return;
+        }
+        push_mtp_memo(
+            &mut self.memos,
+            PrefixMemo {
+                tokens: prefix_tokens.to_vec(),
+                features: features.to_vec(),
+            },
+        );
+    }
 }
 
 struct StagedMemoAppend {

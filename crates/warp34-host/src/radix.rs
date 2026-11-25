@@ -521,6 +521,82 @@ impl MambaRadixCache {
         }
     }
 
+    /// Returns `(total_tokens, kv_pages, mamba_slot)` for `node_id` along its root-to-node
+    /// chain if `node_id` holds a live checkpoint slot and all KV pages reside in L1 VRAM.
+    /// Used by the cross-replica DP L2 prefix pool to export newly committed prefixes.
+    pub fn node_kv_pages_and_mamba(&self, node_id: RadixNodeId) -> Option<(usize, Vec<i32>, i32)> {
+        if self.disable || node_id == RadixNodeId::ROOT || node_id.0 >= self.nodes.len() {
+            return None;
+        }
+        let mamba_slot = self.nodes[node_id.0].mamba_value?;
+        if mamba_slot < 0 {
+            return None;
+        }
+        let mut chain = Vec::new();
+        let mut cur = node_id;
+        while cur != RadixNodeId::ROOT {
+            chain.push(cur);
+            cur = self.nodes[cur.0].parent?;
+        }
+        chain.reverse();
+        let total_pages: usize = chain.iter().map(|&nid| self.nodes[nid.0].value.len()).sum();
+        if total_pages == 0 {
+            return None;
+        }
+        let mut kv_pages = Vec::with_capacity(total_pages);
+        for nid in chain {
+            for &pid in &self.nodes[nid.0].value {
+                if pid < 0 || crate::cache::is_host_kv_page(pid) {
+                    return None;
+                }
+                kv_pages.push(pid);
+            }
+        }
+        Some((kv_pages.len() * self.page_size, kv_pages, mamba_slot))
+    }
+
+    /// Read-only prefix lookup returning the longest matched token count with a live
+    /// checkpoint under `self.active_lora_id`, without mutating LRU order or hit counters.
+    pub fn peek_matched_tokens(&self, token_ids: &[i32]) -> usize {
+        if self.disable || token_ids.len() < self.page_size {
+            return 0;
+        }
+        let aligned_len = (token_ids.len() / self.page_size) * self.page_size;
+        let salted_buf;
+        let key = if self.active_lora_id >= 0 {
+            salted_buf = crate::lora::salt_radix_key_for_lora(
+                &token_ids[..aligned_len],
+                self.active_lora_id,
+            );
+            salted_buf.as_slice()
+        } else {
+            &token_ids[..aligned_len]
+        };
+        let mut cur = RadixNodeId::ROOT;
+        let mut offset = 0usize;
+        let mut best = 0usize;
+        while offset < key.len() {
+            let first_page = &key[offset..offset + self.page_size];
+            let Some(&child_id) = self.nodes[cur.0].children.get(first_page) else {
+                break;
+            };
+            let child = &self.nodes[child_id.0];
+            let prefix_len = self.page_aligned_common_prefix_len(&child.key, &key[offset..]);
+            if prefix_len == 0 {
+                break;
+            }
+            if prefix_len < child.key.len() {
+                break;
+            }
+            offset += child.key.len();
+            if child.mamba_value.is_some() {
+                best = offset;
+            }
+            cur = child_id;
+        }
+        best
+    }
+
     /// Increments `mamba_lock_ref` on `node_id` (if `mamba_value.is_some()`) and `full_lock_ref`
     /// on `[node_id .. root)` (`mamba_radix_cache.py:922-948`).
     pub fn inc_lock_ref(&mut self, node_id: RadixNodeId) {
