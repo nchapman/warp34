@@ -534,6 +534,53 @@ def stop_process_cleanly(proc: subprocess.Popen[Any] | None) -> None:
             pass
 
 
+def _synthesize_eval_report_from_logs(
+    preds_path: pathlib.Path,
+    run_log_dir: pathlib.Path,
+) -> dict[str, Any] | None:
+    preds = _load_json_safe(preds_path)
+    if not isinstance(preds, dict) or not preds or not run_log_dir.exists():
+        return None
+    report_files = list(run_log_dir.glob("*/*/report.json"))
+    if not report_files:
+        return None
+    per_instance: dict[str, dict[str, Any]] = {}
+    for rpath in report_files:
+        data = _load_json_safe(rpath)
+        if isinstance(data, dict):
+            for iid, info in data.items():
+                if isinstance(info, dict):
+                    per_instance[iid] = info
+    resolved_ids: list[str] = []
+    unresolved_ids: list[str] = []
+    error_ids: list[str] = []
+    empty_patch_ids: list[str] = []
+    for iid in sorted(preds.keys()):
+        entry = preds[iid]
+        patch = str(entry.get("model_patch") or "").strip() if isinstance(entry, dict) else ""
+        if not patch:
+            empty_patch_ids.append(iid)
+        elif iid not in per_instance:
+            error_ids.append(iid)
+        elif per_instance[iid].get("resolved"):
+            resolved_ids.append(iid)
+        else:
+            unresolved_ids.append(iid)
+    return {
+        "total_instances": len(preds),
+        "submitted_instances": len(preds),
+        "completed_instances": len(resolved_ids) + len(unresolved_ids),
+        "resolved_instances": len(resolved_ids),
+        "unresolved_instances": len(unresolved_ids),
+        "empty_patch_instances": len(empty_patch_ids),
+        "error_instances": len(error_ids),
+        "resolved_ids": resolved_ids,
+        "unresolved_ids": unresolved_ids,
+        "error_ids": error_ids,
+        "empty_patch_ids": empty_patch_ids,
+    }
+
+
 def run_evaluation_harness(
     output_dir: pathlib.Path,
     *,
@@ -551,14 +598,23 @@ def run_evaluation_harness(
         run_id=run_id,
         max_workers=max_workers,
     )
-    subprocess.run(cmd, check=True, timeout=timeout_s)
-
     cwd = pathlib.Path.cwd()
+    run_log_dir = cwd / "logs" / "run_evaluation" / run_id
+    eval_exc: subprocess.CalledProcessError | None = None
+    try:
+        subprocess.run(cmd, check=True, timeout=timeout_s)
+    except subprocess.CalledProcessError as exc:
+        eval_exc = exc
+
     reports = sorted(cwd.glob(f"*.{run_id}.json"), key=lambda p: p.stat().st_mtime)
     if reports:
         shutil.move(str(reports[-1]), str(output_dir / "eval_report.json"))
-    if (cwd / "logs" / "run_evaluation" / run_id).exists():
-        shutil.rmtree(cwd / "logs" / "run_evaluation" / run_id, ignore_errors=True)
+    elif (synth := _synthesize_eval_report_from_logs(preds_path, run_log_dir)) is not None:
+        (output_dir / "eval_report.json").write_text(json.dumps(synth, indent=2) + "\n")
+    elif eval_exc is not None:
+        raise eval_exc
+    if run_log_dir.exists():
+        shutil.rmtree(run_log_dir, ignore_errors=True)
         if (cwd / "logs" / "run_evaluation").exists() and not any(
             (cwd / "logs" / "run_evaluation").iterdir()
         ):
@@ -596,20 +652,29 @@ def run_evaluation_harness(
         max_workers=min(max_workers, len(changed_ids)),
         instance_ids=changed_ids,
     )
-    subprocess.run(norm_cmd, check=True, timeout=timeout_s)
+    norm_log_dir = cwd / "logs" / "run_evaluation" / norm_run_id
+    try:
+        subprocess.run(norm_cmd, check=True, timeout=timeout_s)
+    except subprocess.CalledProcessError:
+        pass
     norm_reports = sorted(cwd.glob(f"*.{norm_run_id}.json"), key=lambda p: p.stat().st_mtime)
-    if norm_reports and (output_dir / "eval_report.json").exists():
+    recheck_eval = (
+        _load_json_safe(norm_reports[-1])
+        if norm_reports
+        else _synthesize_eval_report_from_logs(norm_preds_path, norm_log_dir)
+    ) or {}
+    if recheck_eval and (output_dir / "eval_report.json").exists():
         base_eval = _load_json_safe(output_dir / "eval_report.json") or {}
-        recheck_eval = _load_json_safe(norm_reports[-1]) or {}
         resolved_ids = sorted(
             set(base_eval.get("resolved_ids", [])) | set(recheck_eval.get("resolved_ids", []))
         )
         base_eval["resolved_ids"] = resolved_ids
         base_eval["resolved_instances"] = len(resolved_ids)
         (output_dir / "eval_report_normalized.json").write_text(json.dumps(base_eval, indent=2))
-        norm_reports[-1].unlink(missing_ok=True)
-    if (cwd / "logs" / "run_evaluation" / norm_run_id).exists():
-        shutil.rmtree(cwd / "logs" / "run_evaluation" / norm_run_id, ignore_errors=True)
+    for nr in norm_reports:
+        nr.unlink(missing_ok=True)
+    if norm_log_dir.exists():
+        shutil.rmtree(norm_log_dir, ignore_errors=True)
         if (cwd / "logs" / "run_evaluation").exists() and not any(
             (cwd / "logs" / "run_evaluation").iterdir()
         ):

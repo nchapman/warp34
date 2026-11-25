@@ -195,6 +195,35 @@ class RunSwebenchTests(unittest.TestCase):
             self.assertIn("**RESOLVED**", md)
             self.assertIn("`1 / 1 (100.0%)`", md)
 
+    def test_synthesize_eval_report_from_logs_recovers_partial_runs(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            preds_path = root / "preds.json"
+            preds_path.write_text(
+                json.dumps(
+                    {
+                        "repo__ok-1": {"model_patch": "diff --git a/a.py b/a.py\n"},
+                        "repo__fail-2": {"model_patch": "diff --git a/b.py b/b.py\n"},
+                        "repo__empty-3": {"model_patch": "   "},
+                        "repo__crashed-4": {"model_patch": "diff --git a/d.py b/d.py\n"},
+                    }
+                )
+            )
+            log_dir = root / "logs" / "run_evaluation" / "run1"
+            for iid, resolved in [("repo__ok-1", True), ("repo__fail-2", False)]:
+                rdir = log_dir / "model" / iid
+                rdir.mkdir(parents=True)
+                (rdir / "report.json").write_text(json.dumps({iid: {"resolved": resolved}}))
+
+            synth = run_swebench._synthesize_eval_report_from_logs(preds_path, log_dir)
+            assert synth is not None
+            self.assertEqual(synth["submitted_instances"], 4)
+            self.assertEqual(synth["completed_instances"], 2)
+            self.assertEqual(synth["resolved_ids"], ["repo__ok-1"])
+            self.assertEqual(synth["unresolved_ids"], ["repo__fail-2"])
+            self.assertEqual(synth["empty_patch_ids"], ["repo__empty-3"])
+            self.assertEqual(synth["error_ids"], ["repo__crashed-4"])
+
 
 if __name__ == "__main__":
     unittest.main()
