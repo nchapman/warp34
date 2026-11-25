@@ -914,10 +914,13 @@ impl Qwen3_5ModelRank {
                         spec.hadamard_block_size, cfg.hidden_size
                     )));
                 }
-                if spec.signs.len() != spec.hadamard_block_size {
+                if spec.signs.len() != cfg.hidden_size
+                    && spec.signs.len() != spec.hadamard_block_size
+                {
                     return Err(loader_err_msg(format!(
-                        "warp_quant_embed_w2 signs len {} != hadamard_block_size {}",
+                        "warp_quant_embed_w2 signs len {} != hidden_size {} or hadamard_block_size {}",
                         spec.signs.len(),
+                        cfg.hidden_size,
                         spec.hadamard_block_size
                     )));
                 }

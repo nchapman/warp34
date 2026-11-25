@@ -1167,73 +1167,78 @@ fn block_hadamard_f16_128_and_512_match_cpu_reference() {
 #[test]
 fn block_hadamard_4096_signed_f16_matches_cpu_reference() {
     let stream = CudaStream::new(0).unwrap();
-    let block_size = 4096usize;
-    let dim = 4096usize;
     let rows = 3usize;
-    let input: Vec<u16> = (0..rows * dim)
-        .map(|i| f32_to_f16((((i * 41 + 7) % 89) as f32 - 44.0) / 32.0))
-        .collect();
-    let signs: Vec<i8> = (0..block_size)
-        .map(|i| {
-            if (i.wrapping_mul(2654435761) >> 31) == 0 {
-                1
-            } else {
-                -1
-            }
-        })
-        .collect();
-    let mut expected = vec![0u16; rows * dim];
-    let inv_sqrt = 1.0f32 / (block_size as f32).sqrt();
-    for r in 0..rows {
-        let base = r * dim;
-        let mut v: Vec<f32> = input[base..base + block_size]
-            .iter()
-            .zip(&signs)
-            .map(|(&b, &s)| f16_to_f32(b) * (s as f32))
+    for (block_size, dim) in [(512usize, 2048usize), (1024, 6144), (4096, 4096)] {
+        let input: Vec<u16> = (0..rows * dim)
+            .map(|i| f32_to_f16((((i * 41 + 7) % 89) as f32 - 44.0) / 32.0))
             .collect();
-        let mut step = 1usize;
-        while step < block_size {
-            for off in (0..block_size).step_by(2 * step) {
-                for j in 0..step {
-                    let a = v[off + j];
-                    let b = v[off + j + step];
-                    v[off + j] = a + b;
-                    v[off + j + step] = a - b;
+        let signs: Vec<i8> = (0..dim)
+            .map(|i| {
+                if (i.wrapping_mul(2654435761) >> 31) == 0 {
+                    1
+                } else {
+                    -1
+                }
+            })
+            .collect();
+        let mut expected = vec![0u16; rows * dim];
+        let inv_sqrt = 1.0f32 / (block_size as f32).sqrt();
+        for r in 0..rows {
+            for blk_off in (0..dim).step_by(block_size) {
+                let base = r * dim + blk_off;
+                let mut v: Vec<f32> = input[base..base + block_size]
+                    .iter()
+                    .zip(&signs[blk_off..blk_off + block_size])
+                    .map(|(&b, &s)| f16_to_f32(b) * (s as f32))
+                    .collect();
+                let mut step = 1usize;
+                while step < block_size {
+                    for off in (0..block_size).step_by(2 * step) {
+                        for j in 0..step {
+                            let a = v[off + j];
+                            let b = v[off + j + step];
+                            v[off + j] = a + b;
+                            v[off + j + step] = a - b;
+                        }
+                    }
+                    step *= 2;
+                }
+                for j in 0..block_size {
+                    expected[base + j] = f32_to_f16(v[j] * inv_sqrt);
                 }
             }
-            step *= 2;
         }
-        for j in 0..block_size {
-            expected[base + j] = f32_to_f16(v[j] * inv_sqrt);
-        }
-    }
 
-    let d_in = DeviceBuffer::alloc(0, input.len() * 2).unwrap();
-    let d_signs = DeviceBuffer::alloc(0, signs.len()).unwrap();
-    let d_out = DeviceBuffer::alloc(0, input.len() * 2).unwrap();
-    d_in.copy_from_host(&input, &stream).unwrap();
-    d_signs.copy_from_host(&signs, &stream).unwrap();
-    let ex = stream.exec(0, 0);
-    check_rc(
-        // SAFETY: `d_in`, `d_signs`, and `d_out` are disjoint live device buffers sized for this launch.
-        unsafe {
-            ffi::warp34_block_hadamard_signed_f16(
-                &ex,
-                d_in.addr() as *const _,
-                d_signs.addr() as *const i8,
-                d_out.addr() as *mut _,
-                rows as i32,
-                dim as i32,
-                dim as i32,
-                block_size as i32,
-            )
-        },
-        "warp34_block_hadamard_signed_f16",
-    )
-    .unwrap();
-    let mut got = vec![0u16; rows * dim];
-    d_out.copy_to_host(&mut got, &stream).unwrap();
-    assert_eq!(got, expected, "0-ULP mismatch for signed H_4096");
+        let d_in = DeviceBuffer::alloc(0, input.len() * 2).unwrap();
+        let d_signs = DeviceBuffer::alloc(0, signs.len()).unwrap();
+        let d_out = DeviceBuffer::alloc(0, input.len() * 2).unwrap();
+        d_in.copy_from_host(&input, &stream).unwrap();
+        d_signs.copy_from_host(&signs, &stream).unwrap();
+        let ex = stream.exec(0, 0);
+        check_rc(
+            // SAFETY: `d_in`, `d_signs`, and `d_out` are disjoint live device buffers sized for this launch.
+            unsafe {
+                ffi::warp34_block_hadamard_signed_f16(
+                    &ex,
+                    d_in.addr() as *const _,
+                    d_signs.addr() as *const i8,
+                    d_out.addr() as *mut _,
+                    rows as i32,
+                    dim as i32,
+                    dim as i32,
+                    block_size as i32,
+                )
+            },
+            "warp34_block_hadamard_signed_f16",
+        )
+        .unwrap();
+        let mut got = vec![0u16; rows * dim];
+        d_out.copy_to_host(&mut got, &stream).unwrap();
+        assert_eq!(
+            got, expected,
+            "0-ULP mismatch for signed H_{block_size} (dim={dim})"
+        );
+    }
 }
 
 #[cfg(feature = "cuda")]

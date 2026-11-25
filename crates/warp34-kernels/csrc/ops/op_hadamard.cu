@@ -134,8 +134,14 @@ __global__ void block_hadamard_16bit(const T* src, T* dst,
 // Bits 0..1 execute via an in-register H4 butterfly, bits 2..6 via full-warp shuffles (H128),
 // and bits 7..8 across the 4 warps through 4 KiB shared memory, preserving exact bit-order
 // FP32 summation and coalesced 8-byte (uint2) loads/stores (race-free for in-place src == dst).
+__device__ __forceinline__ float xor_sign_byte_f32(float v, uint32_t s_byte) {
+    return __uint_as_float(__float_as_uint(v) ^ ((s_byte & 0x80u) << 24));
+}
+
 template <typename T>
-__global__ void block_hadamard_512_16bit(const T* src, T* dst,
+__global__ void block_hadamard_512_16bit(const T* __restrict__ src,
+                                         const int8_t* __restrict__ pre_signs,
+                                         T* __restrict__ dst,
                                          int k, int padded_k, int64_t groups) {
     using S = HadScalar<T>;
     constexpr float scale = 0.04419417382415922f; // 1 / sqrt(512)
@@ -147,6 +153,8 @@ __global__ void block_hadamard_512_16bit(const T* src, T* dst,
     const int blocks_per_row = padded_k / 512;
     const bool vec_aligned =
         ((reinterpret_cast<uintptr_t>(src) | reinterpret_cast<uintptr_t>(dst)) & 7u) == 0u;
+    const bool signs_u32_aligned =
+        pre_signs != nullptr && ((reinterpret_cast<uintptr_t>(pre_signs) & 3u) == 0u);
     const bool sub7 = (warp_in_grp & 1) != 0;
     const bool sub8 = (warp_in_grp & 2) != 0;
 
@@ -176,6 +184,20 @@ __global__ void block_hadamard_512_16bit(const T* src, T* dst,
                     v1 = S::to_float(sp[1]);
                     v2 = S::to_float(sp[2]);
                     v3 = S::to_float(sp[3]);
+                }
+                if (pre_signs) {
+                    if (signs_u32_aligned) {
+                        const uint32_t s4 = *reinterpret_cast<const uint32_t*>(pre_signs + col);
+                        v0 = xor_sign_byte_f32(v0, s4 >>  0);
+                        v1 = xor_sign_byte_f32(v1, s4 >>  8);
+                        v2 = xor_sign_byte_f32(v2, s4 >> 16);
+                        v3 = xor_sign_byte_f32(v3, s4 >> 24);
+                    } else {
+                        v0 = xor_sign_byte_f32(v0, static_cast<uint8_t>(pre_signs[col + 0]));
+                        v1 = xor_sign_byte_f32(v1, static_cast<uint8_t>(pre_signs[col + 1]));
+                        v2 = xor_sign_byte_f32(v2, static_cast<uint8_t>(pre_signs[col + 2]));
+                        v3 = xor_sign_byte_f32(v3, static_cast<uint8_t>(pre_signs[col + 3]));
+                    }
                 }
             }
 
@@ -247,8 +269,147 @@ __global__ void block_hadamard_512_16bit(const T* src, T* dst,
     }
 }
 
-__device__ __forceinline__ float xor_sign_byte_f32(float v, uint32_t s_byte) {
-    return __uint_as_float(__float_as_uint(v) ^ ((s_byte & 0x80u) << 24));
+// H_1024 factored as H_8 (8 warps in SMEM) ⊗ H_128 (in-warp): 256 threads, 4 KiB SMEM, 1 barrier.
+template <typename T>
+__global__ __launch_bounds__(256) void block_hadamard_1024_16bit(
+    const T* __restrict__ src,
+    const int8_t* __restrict__ pre_signs,
+    T* __restrict__ dst,
+    int k,
+    int padded_k,
+    int64_t groups
+) {
+    using S = HadScalar<T>;
+    constexpr float scale = 0.03125f; // 1 / sqrt(1024) = 1 / 32
+    __shared__ float4 smem[8][32];
+
+    const int warp_id = threadIdx.x >> 5; // 0..7
+    const int lane    = threadIdx.x & 31; // 0..31
+    const int blocks_per_row = padded_k >> 10;
+    const bool vec_aligned =
+        ((reinterpret_cast<uintptr_t>(src) | reinterpret_cast<uintptr_t>(dst)) & 7u) == 0u;
+    const bool signs_u32_aligned =
+        pre_signs != nullptr && ((reinterpret_cast<uintptr_t>(pre_signs) & 3u) == 0u);
+    const bool sub7 = (warp_id & 1) != 0;
+    const bool sub8 = (warp_id & 2) != 0;
+    const bool sub9 = (warp_id & 4) != 0;
+
+    for (int64_t group = blockIdx.x; group < groups; group += gridDim.x) {
+        int64_t row;
+        int base_col;
+        if (blocks_per_row == 1) {
+            row = group;
+            base_col = 0;
+        } else {
+            const int g32 = static_cast<int>(group);
+            row = static_cast<int64_t>(g32 / blocks_per_row);
+            base_col = (g32 % blocks_per_row) << 10;
+        }
+        const int col = base_col + warp_id * 128 + lane * 4;
+
+        float v0 = 0.0f, v1 = 0.0f, v2 = 0.0f, v3 = 0.0f;
+        if (col < k) {
+            const T* sp = src + row * k + col;
+            if (vec_aligned) {
+                const uint2 raw = *reinterpret_cast<const uint2*>(sp);
+                const float2 f01 = S::to_float2(raw.x);
+                const float2 f23 = S::to_float2(raw.y);
+                v0 = f01.x;
+                v1 = f01.y;
+                v2 = f23.x;
+                v3 = f23.y;
+            } else {
+                v0 = S::to_float(sp[0]);
+                v1 = S::to_float(sp[1]);
+                v2 = S::to_float(sp[2]);
+                v3 = S::to_float(sp[3]);
+            }
+            if (pre_signs) {
+                if (signs_u32_aligned) {
+                    const uint32_t s4 = *reinterpret_cast<const uint32_t*>(pre_signs + col);
+                    v0 = xor_sign_byte_f32(v0, s4 >>  0);
+                    v1 = xor_sign_byte_f32(v1, s4 >>  8);
+                    v2 = xor_sign_byte_f32(v2, s4 >> 16);
+                    v3 = xor_sign_byte_f32(v3, s4 >> 24);
+                } else {
+                    v0 = xor_sign_byte_f32(v0, static_cast<uint8_t>(pre_signs[col + 0]));
+                    v1 = xor_sign_byte_f32(v1, static_cast<uint8_t>(pre_signs[col + 1]));
+                    v2 = xor_sign_byte_f32(v2, static_cast<uint8_t>(pre_signs[col + 2]));
+                    v3 = xor_sign_byte_f32(v3, static_cast<uint8_t>(pre_signs[col + 3]));
+                }
+            }
+        }
+
+        // H_4 in registers + H_32 across warp lanes = H_128.
+        {
+            const float a0 = v0 + v1;
+            const float a1 = v0 - v1;
+            const float a2 = v2 + v3;
+            const float a3 = v2 - v3;
+            v0 = a0 + a2;
+            v1 = a1 + a3;
+            v2 = a0 - a2;
+            v3 = a1 - a3;
+        }
+        #pragma unroll
+        for (int h = 1; h < 32; h *= 2) {
+            const float o0 = __shfl_xor_sync(0xffffffffu, v0, h, 32);
+            const float o1 = __shfl_xor_sync(0xffffffffu, v1, h, 32);
+            const float o2 = __shfl_xor_sync(0xffffffffu, v2, h, 32);
+            const float o3 = __shfl_xor_sync(0xffffffffu, v3, h, 32);
+            const bool sub = (lane & h) != 0;
+            v0 = sub ? (o0 - v0) : (v0 + o0);
+            v1 = sub ? (o1 - v1) : (v1 + o1);
+            v2 = sub ? (o2 - v2) : (v2 + o2);
+            v3 = sub ? (o3 - v3) : (v3 + o3);
+        }
+
+        smem[warp_id][lane] = make_float4(v0, v1, v2, v3);
+        __syncthreads();
+
+        const float4 w0 = smem[0][lane];
+        const float4 w1 = smem[1][lane];
+        const float4 w2 = smem[2][lane];
+        const float4 w3 = smem[3][lane];
+        const float4 w4 = smem[4][lane];
+        const float4 w5 = smem[5][lane];
+        const float4 w6 = smem[6][lane];
+        const float4 w7 = smem[7][lane];
+
+        auto combine8 = [&](float c0, float c1, float c2, float c3,
+                            float c4, float c5, float c6, float c7) -> float {
+            const float a0 = sub7 ? (c0 - c1) : (c0 + c1);
+            const float a1 = sub7 ? (c2 - c3) : (c2 + c3);
+            const float a2 = sub7 ? (c4 - c5) : (c4 + c5);
+            const float a3 = sub7 ? (c6 - c7) : (c6 + c7);
+            const float b0 = sub8 ? (a0 - a1) : (a0 + a1);
+            const float b1 = sub8 ? (a2 - a3) : (a2 + a3);
+            return (sub9 ? (b0 - b1) : (b0 + b1)) * scale;
+        };
+
+        const float r0 = combine8(w0.x, w1.x, w2.x, w3.x, w4.x, w5.x, w6.x, w7.x);
+        const float r1 = combine8(w0.y, w1.y, w2.y, w3.y, w4.y, w5.y, w6.y, w7.y);
+        const float r2 = combine8(w0.z, w1.z, w2.z, w3.z, w4.z, w5.z, w6.z, w7.z);
+        const float r3 = combine8(w0.w, w1.w, w2.w, w3.w, w4.w, w5.w, w6.w, w7.w);
+
+        T* dp = dst + row * padded_k + col;
+        const typename S::Vec2 out01 = S::from_floats2(r0, r1);
+        const typename S::Vec2 out23 = S::from_floats2(r2, r3);
+        if (vec_aligned) {
+            uint2 packed_out;
+            packed_out.x = *reinterpret_cast<const uint32_t*>(&out01);
+            packed_out.y = *reinterpret_cast<const uint32_t*>(&out23);
+            *reinterpret_cast<uint2*>(dp) = packed_out;
+        } else {
+            dp[0] = S::low(out01);
+            dp[1] = S::high(out01);
+            dp[2] = S::low(out23);
+            dp[3] = S::high(out23);
+        }
+        if (group + gridDim.x < groups) {
+            __syncthreads();
+        }
+    }
 }
 
 // H_4096 factored as H_64 ⊗ H_64 in shared memory (`64 × 65` float = 16.25 KiB).
@@ -319,16 +480,16 @@ __global__ __launch_bounds__(512) void block_hadamard_4096_16bit(
                 }
                 if (pre_signs) {
                     if (signs_u32_aligned) {
-                        const uint32_t s4 = *reinterpret_cast<const uint32_t*>(pre_signs + in_blk);
+                        const uint32_t s4 = *reinterpret_cast<const uint32_t*>(pre_signs + col);
                         v0 = xor_sign_byte_f32(v0, s4 >>  0);
                         v1 = xor_sign_byte_f32(v1, s4 >>  8);
                         v2 = xor_sign_byte_f32(v2, s4 >> 16);
                         v3 = xor_sign_byte_f32(v3, s4 >> 24);
                     } else {
-                        v0 = xor_sign_byte_f32(v0, static_cast<uint8_t>(pre_signs[in_blk + 0]));
-                        v1 = xor_sign_byte_f32(v1, static_cast<uint8_t>(pre_signs[in_blk + 1]));
-                        v2 = xor_sign_byte_f32(v2, static_cast<uint8_t>(pre_signs[in_blk + 2]));
-                        v3 = xor_sign_byte_f32(v3, static_cast<uint8_t>(pre_signs[in_blk + 3]));
+                        v0 = xor_sign_byte_f32(v0, static_cast<uint8_t>(pre_signs[col + 0]));
+                        v1 = xor_sign_byte_f32(v1, static_cast<uint8_t>(pre_signs[col + 1]));
+                        v2 = xor_sign_byte_f32(v2, static_cast<uint8_t>(pre_signs[col + 2]));
+                        v3 = xor_sign_byte_f32(v3, static_cast<uint8_t>(pre_signs[col + 3]));
                     }
                 }
             }
@@ -431,8 +592,8 @@ int launch_block_hadamard(const warp34_exec* ex, const void* src,
                           int padded_k, int block_size) {
     if (!ex || rows < 0 || k <= 0 || padded_k < k ||
         (block_size != 16 && block_size != 64 && block_size != 128 &&
-         block_size != 512 && block_size != 4096) ||
-        (pre_signs != nullptr && block_size != 4096) ||
+         block_size != 512 && block_size != 1024 && block_size != 4096) ||
+        (pre_signs != nullptr && block_size != 512 && block_size != 1024 && block_size != 4096) ||
         k % block_size != 0 || padded_k % block_size != 0) {
         return int(cudaErrorInvalidValue);
     }
@@ -449,7 +610,7 @@ int launch_block_hadamard(const warp34_exec* ex, const void* src,
         return int(cudaErrorInvalidValue);
     }
     const int64_t groups = int64_t(rows) * (padded_k / block_size);
-    const int64_t needed = (block_size == 4096)
+    const int64_t needed = (block_size == 1024 || block_size == 4096)
         ? groups
         : ((groups + (256 / (block_size / 4)) - 1) / (256 / (block_size / 4)));
     const int grid = int(needed < 65535 ? needed : 65535);
@@ -465,7 +626,10 @@ int launch_block_hadamard(const warp34_exec* ex, const void* src,
             static_cast<const T*>(src), static_cast<T*>(dst), k, padded_k, groups);
     } else if (block_size == 512) {
         block_hadamard_512_16bit<T><<<grid, 256, 0, stream>>>(
-            static_cast<const T*>(src), static_cast<T*>(dst), k, padded_k, groups);
+            static_cast<const T*>(src), pre_signs, static_cast<T*>(dst), k, padded_k, groups);
+    } else if (block_size == 1024) {
+        block_hadamard_1024_16bit<T><<<grid, 256, 0, stream>>>(
+            static_cast<const T*>(src), pre_signs, static_cast<T*>(dst), k, padded_k, groups);
     } else {
         block_hadamard_4096_16bit<T><<<grid, 512, 0, stream>>>(
             static_cast<const T*>(src), pre_signs, static_cast<T*>(dst), k, padded_k, groups);
@@ -492,7 +656,7 @@ extern "C" int warp34_block_hadamard_inplace_f16(const warp34_exec* ex, void* bu
                                               int rows, int k, int block_size) {
     if (!ex || rows < 0 || k <= 0 ||
         (block_size != 16 && block_size != 64 && block_size != 128 &&
-         block_size != 512 && block_size != 4096) ||
+         block_size != 512 && block_size != 1024 && block_size != 4096) ||
         k % block_size != 0) {
         return int(cudaErrorInvalidValue);
     }
@@ -503,7 +667,7 @@ extern "C" int warp34_block_hadamard_inplace_f16(const warp34_exec* ex, void* bu
         return int(cudaErrorInvalidValue);
     }
     const int64_t groups = int64_t(rows) * (k / block_size);
-    const int64_t needed = (block_size == 4096)
+    const int64_t needed = (block_size == 1024 || block_size == 4096)
         ? groups
         : ((groups + (256 / (block_size / 4)) - 1) / (256 / (block_size / 4)));
     const int grid = int(needed < 65535 ? needed : 65535);
@@ -519,7 +683,10 @@ extern "C" int warp34_block_hadamard_inplace_f16(const warp34_exec* ex, void* bu
             static_cast<const __half*>(buf), static_cast<__half*>(buf), k, k, groups);
     } else if (block_size == 512) {
         block_hadamard_512_16bit<__half><<<grid, 256, 0, stream>>>(
-            static_cast<const __half*>(buf), static_cast<__half*>(buf), k, k, groups);
+            static_cast<const __half*>(buf), nullptr, static_cast<__half*>(buf), k, k, groups);
+    } else if (block_size == 1024) {
+        block_hadamard_1024_16bit<__half><<<grid, 256, 0, stream>>>(
+            static_cast<const __half*>(buf), nullptr, static_cast<__half*>(buf), k, k, groups);
     } else {
         block_hadamard_4096_16bit<__half><<<grid, 512, 0, stream>>>(
             static_cast<const __half*>(buf), nullptr, static_cast<__half*>(buf), k, k, groups);

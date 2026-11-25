@@ -6,12 +6,14 @@ pub const HADAMARD_BLOCK_16: usize = 16;
 pub const HADAMARD_BLOCK_64: usize = 64;
 pub const HADAMARD_BLOCK_128: usize = 128;
 pub const HADAMARD_BLOCK_512: usize = 512;
+pub const HADAMARD_BLOCK_1024: usize = 1024;
 pub const HADAMARD_BLOCK_4096: usize = 4096;
-pub const SUPPORTED_HADAMARD_BLOCKS: [usize; 5] = [
+pub const SUPPORTED_HADAMARD_BLOCKS: [usize; 6] = [
     HADAMARD_BLOCK_16,
     HADAMARD_BLOCK_64,
     HADAMARD_BLOCK_128,
     HADAMARD_BLOCK_512,
+    HADAMARD_BLOCK_1024,
     HADAMARD_BLOCK_4096,
 ];
 pub const SUPPORTED_MARLIN_U2_GROUP_SIZES: [usize; 4] = [0, 32, 64, 128];
@@ -19,13 +21,13 @@ pub const SUPPORTED_MARLIN_U4_GROUP_SIZES: [usize; 4] = [0, 32, 64, 128];
 pub const SUPPORTED_MARLIN_U8_GROUP_SIZES: [usize; 4] = [0, 32, 64, 128];
 
 /// Returns `true` when `block` is either disabled (`0`) or a supported Hadamard block size
-/// (`16`, `64`, `128`, `512`, or `4096`) that evenly divides non-zero `dim`.
+/// (`16`, `64`, `128`, `512`, `1024`, or `4096`) that evenly divides non-zero `dim`.
 #[inline]
 pub const fn is_valid_hadamard_block_for_dim(block: usize, dim: usize) -> bool {
     match block {
         0 => true,
         HADAMARD_BLOCK_16 | HADAMARD_BLOCK_64 | HADAMARD_BLOCK_128 | HADAMARD_BLOCK_512
-        | HADAMARD_BLOCK_4096 => dim != 0 && dim.is_multiple_of(block),
+        | HADAMARD_BLOCK_1024 | HADAMARD_BLOCK_4096 => dim != 0 && dim.is_multiple_of(block),
         _ => false,
     }
 }
@@ -107,21 +109,17 @@ struct TransformRule {
     input_signs: Option<std::sync::Arc<[i8]>>,
 }
 
-fn parse_sign_array(
-    v: &Json,
-    expected_len: usize,
-    label: &str,
-) -> io::Result<std::sync::Arc<[i8]>> {
+fn parse_sign_array(v: &Json, block_size: usize, label: &str) -> io::Result<std::sync::Arc<[i8]>> {
     let arr = v
         .as_array()
         .ok_or_else(|| invalid(format!("{label} must be an array of -1/+1")))?;
-    if arr.len() != expected_len {
+    if arr.is_empty() || !arr.len().is_multiple_of(block_size) {
         return Err(invalid(format!(
-            "{label} length ({}) does not match expected {expected_len}",
+            "{label} length ({}) must be a positive multiple of block_size {block_size}",
             arr.len()
         )));
     }
-    let mut out = Vec::with_capacity(expected_len);
+    let mut out = Vec::with_capacity(arr.len());
     for item in arr {
         match item.as_i64() {
             Some(1) => out.push(1i8),

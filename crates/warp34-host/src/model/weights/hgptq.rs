@@ -59,12 +59,14 @@ impl RawLinearHost {
         if n == 0
             || k == 0
             || !k.is_multiple_of(block_size)
+            || pre_signs.as_ref().is_some_and(|s| s.len() != k)
             || n > i32::MAX as usize - MARLIN_TILE_K_W4
             || k > i32::MAX as usize - MARLIN_TILE_K_W4
             || group_size != resolved.group_size_or(k)
         {
             return Err(loader_err_msg(format!(
-                "HGPTQ geometry/group mismatch for {name}: N={n} K={k} group={group_size} block={block_size}"
+                "HGPTQ geometry/group mismatch for {name}: N={n} K={k} group={group_size} block={block_size} pre_signs={:?}",
+                pre_signs.as_ref().map(|s| s.len())
             )));
         }
         Ok((
@@ -252,7 +254,7 @@ pub(crate) fn hadamard_f16_rows_with_post_signs(
 ) {
     let inv_sqrt = 1.0f32 / (block as f32).sqrt();
     let mut values = vec![0.0f32; block];
-    for chunk in dense.chunks_exact_mut(block) {
+    for (chunk_idx, chunk) in dense.chunks_exact_mut(block).enumerate() {
         for (v, &bits) in values.iter_mut().zip(chunk.iter()) {
             *v = f16_to_f32(bits);
         }
@@ -269,7 +271,12 @@ pub(crate) fn hadamard_f16_rows_with_post_signs(
             step *= 2;
         }
         if let Some(signs) = post_signs {
-            for ((bits, &v), &s) in chunk.iter_mut().zip(&values).zip(signs.iter()) {
+            let off = (chunk_idx * block) % signs.len();
+            for ((bits, &v), &s) in chunk
+                .iter_mut()
+                .zip(&values)
+                .zip(signs[off..off + block].iter())
+            {
                 *bits = f32_to_f16(v * inv_sqrt * (s as f32));
             }
         } else {

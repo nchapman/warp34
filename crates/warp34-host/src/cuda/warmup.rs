@@ -138,9 +138,9 @@ fn warmup_hadamard_and_bonsai_kernels(
     buf_b: u64,
     buf_c: u64,
 ) -> Result<()> {
-    for block_size in [16, 64, 128, 512, 4096] {
+    for block_size in [16, 64, 128, 512, 1024, 4096] {
         let k_warm = block_size.max(512);
-        let padded_k_warm = if block_size == 4096 { 4096 } else { 1024 };
+        let padded_k_warm = block_size.max(1024);
         for had_fn in [
             ffi::warp34_block_hadamard_f16,
             ffi::warp34_block_hadamard_bf16,
@@ -175,22 +175,24 @@ fn warmup_hadamard_and_bonsai_kernels(
             "warmup warp34_block_hadamard_inplace_f16",
         )?;
     }
-    check_rc(
-        // SAFETY: warmup buffers `buf_a`, `buf_b`, and `buf_c` are live device allocations sized for this launch.
-        unsafe {
-            ffi::warp34_block_hadamard_signed_f16(
-                ex,
-                buf_a as *const c_void,
-                buf_c as *const i8,
-                buf_b as *mut c_void,
-                2,
-                4096,
-                4096,
-                4096,
-            )
-        },
-        "warmup warp34_block_hadamard_signed_f16",
-    )?;
+    for block_size in [512, 1024, 4096] {
+        check_rc(
+            // SAFETY: warmup buffers `buf_a`, `buf_b`, and `buf_c` are live device allocations sized for this launch.
+            unsafe {
+                ffi::warp34_block_hadamard_signed_f16(
+                    ex,
+                    buf_a as *const c_void,
+                    buf_c as *const i8,
+                    buf_b as *mut c_void,
+                    2,
+                    block_size,
+                    block_size,
+                    block_size,
+                )
+            },
+            "warmup warp34_block_hadamard_signed_f16",
+        )?;
+    }
     for (m, n, k) in [(1i32, 32, 128), (1, 32, 4096), (2, 32, 128), (4, 32, 128)] {
         check_rc(
             // SAFETY: warmup buffers `buf_a`, `buf_b`, and `buf_c` are live device allocations sized for this launch.
