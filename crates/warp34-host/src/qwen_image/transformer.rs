@@ -983,43 +983,44 @@ impl QwenImage21TransformerEngine {
         })
     }
 
-    fn w4a8_prefill_scratch_bytes(&self, rows: usize, had_scratch_bytes: usize) -> usize {
-        fn is_w4a8_eligible(p: &LinearProj) -> bool {
-            match p {
-                LinearProj::MarlinW4A16 { .. } => true,
-                LinearProj::Hadamard { inner, .. } => {
-                    matches!(inner.as_ref(), LinearProj::MarlinW4A16 { .. })
-                }
-                _ => false,
+    fn w4a8_prefill_scratch_bytes(&self, rows: usize) -> usize {
+        fn w4a8_proj_scratch(p: &LinearProj, rows: usize, producer_fused_h64: bool) -> usize {
+            let LinearProj::Hadamard { inner, .. } = p else {
+                return 0;
+            };
+            if !matches!(inner.as_ref(), LinearProj::MarlinW4A16 { .. }) {
+                return 0;
             }
+            let had_bytes = if producer_fused_h64 && p.can_fuse_h64_from_producer() {
+                0
+            } else {
+                p.input_transform_workspace_bytes(rows).unwrap_or(0)
+            };
+            let q_bytes = rows.saturating_mul(inner.size_k()).next_multiple_of(256);
+            let s_bytes = rows.saturating_mul(4).next_multiple_of(256);
+            had_bytes
+                .saturating_add(q_bytes)
+                .saturating_add(s_bytes)
+                .saturating_add(512)
         }
         if rows < 128 {
             return 0;
         }
-        let max_k = self
-            .blocks
+        self.blocks
             .iter()
             .flat_map(|b| {
                 [
-                    &b.to_q,
-                    &b.to_k,
-                    &b.to_v,
-                    &b.to_out,
-                    &b.mlp_gate_up,
-                    &b.mlp_out,
+                    (&b.to_q, true),
+                    (&b.to_k, true),
+                    (&b.to_v, true),
+                    (&b.to_out, false),
+                    (&b.mlp_gate_up, true),
+                    (&b.mlp_out, true),
                 ]
             })
-            .filter(|p| is_w4a8_eligible(p))
-            .map(|p| p.size_k())
+            .map(|(p, fused)| w4a8_proj_scratch(p, rows, fused))
             .max()
-            .unwrap_or(0);
-        if max_k == 0 {
-            return 0;
-        }
-        let q_bytes = rows.saturating_mul(max_k).next_multiple_of(256);
-        let s_bytes = rows.saturating_mul(4).next_multiple_of(256);
-        let base_w4a8 = q_bytes.saturating_add(s_bytes).saturating_add(512);
-        had_scratch_bytes.saturating_add(base_w4a8)
+            .unwrap_or(0)
     }
 
     #[allow(clippy::too_many_arguments, clippy::cognitive_complexity)]
@@ -1233,7 +1234,7 @@ impl QwenImage21TransformerEngine {
         }))
         .max()
         .unwrap_or(0);
-        let w4a8_scratch_bytes = self.w4a8_prefill_scratch_bytes(total_seq_len, had_scratch_bytes);
+        let w4a8_scratch_bytes = self.w4a8_prefill_scratch_bytes(total_seq_len);
         let exec_scratch_bytes = lse_scratch_bytes
             .max(had_scratch_bytes)
             .max(w4a8_scratch_bytes)
@@ -1244,7 +1245,8 @@ impl QwenImage21TransformerEngine {
             self.device_id,
             exec_scratch_bytes,
         )?;
-        let mut ex = stream.exec(exec_scratch_addr, exec_scratch_bytes);
+        let ex_no_w4a8 = stream.exec(exec_scratch_addr, exec_scratch_bytes);
+        let mut ex = ex_no_w4a8;
         if w4a8_scratch_bytes > 0 {
             ex.flags |= warp34_kernels::ffi::WARP34_EXEC_FLAG_ALLOW_W4A8_PREFILL;
         }
@@ -1982,10 +1984,11 @@ impl QwenImage21TransformerEngine {
             }
         }
 
-        // 4. Final proj_out (`d_norm` is already normalized + modulated + optionally H_64-rotated)
+        // 4. Final proj_out (`d_norm` is already normalized + modulated + optionally H_64-rotated).
+        // Keep the final velocity projection in W4A16/FP16 (matching LLM's lm_head exclusion).
         if proj_out_h64 {
             self.proj_out.forward_prerotated(
-                &ex,
+                &ex_no_w4a8,
                 cublas,
                 marlin_ws_addr,
                 marlin_ws_ints,
@@ -1995,7 +1998,7 @@ impl QwenImage21TransformerEngine {
             )?;
         } else {
             self.proj_out.forward(
-                &ex,
+                &ex_no_w4a8,
                 cublas,
                 marlin_ws_addr,
                 marlin_ws_ints,
@@ -2204,7 +2207,7 @@ impl QwenImage21TransformerEngine {
         }))
         .max()
         .unwrap_or(0);
-        let w4a8_scratch_bytes = self.w4a8_prefill_scratch_bytes(target_tokens, had_scratch_bytes);
+        let w4a8_scratch_bytes = self.w4a8_prefill_scratch_bytes(target_tokens);
         let exec_scratch_bytes = lse_scratch_bytes
             .max(had_scratch_bytes)
             .max(w4a8_scratch_bytes)
@@ -2215,7 +2218,8 @@ impl QwenImage21TransformerEngine {
             self.device_id,
             exec_scratch_bytes,
         )?;
-        let mut ex = stream.exec(exec_scratch_addr, exec_scratch_bytes);
+        let ex_no_w4a8 = stream.exec(exec_scratch_addr, exec_scratch_bytes);
+        let mut ex = ex_no_w4a8;
         if w4a8_scratch_bytes > 0 {
             ex.flags |= warp34_kernels::ffi::WARP34_EXEC_FLAG_ALLOW_W4A8_PREFILL;
         }
@@ -2744,7 +2748,7 @@ impl QwenImage21TransformerEngine {
 
             if proj_out_h64 {
                 self.proj_out.forward_prerotated(
-                    &ex,
+                    &ex_no_w4a8,
                     cublas,
                     marlin_ws_addr,
                     marlin_ws_ints,
@@ -2754,7 +2758,7 @@ impl QwenImage21TransformerEngine {
                 )
             } else {
                 self.proj_out.forward(
-                    &ex,
+                    &ex_no_w4a8,
                     cublas,
                     marlin_ws_addr,
                     marlin_ws_ints,
