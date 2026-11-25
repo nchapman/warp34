@@ -51,6 +51,7 @@ pub enum LinearProj {
         size_n: usize,
         size_k: usize,
         block_size: usize,
+        pre_signs_ptr: u64,
     },
     WithLora {
         inner: Box<Self>,
@@ -86,6 +87,11 @@ pub enum LinearProj {
         size_k: usize,
         group_blocks: i32,
     },
+    Ternary5Trit {
+        packed_ptr: u64,
+        size_n: usize,
+        size_k: usize,
+    },
     DenseF16 {
         weight_ptr: u64,
         size_n: usize,
@@ -103,6 +109,7 @@ impl LinearProj {
             | Self::MarlinW4A16 { size_n, .. }
             | Self::MarlinW4A16Zp { size_n, .. }
             | Self::MarlinW8A16 { size_n, .. }
+            | Self::Ternary5Trit { size_n, .. }
             | Self::DenseF16 { size_n, .. } => *size_n,
         }
     }
@@ -115,6 +122,7 @@ impl LinearProj {
             | Self::MarlinW4A16 { size_k, .. }
             | Self::MarlinW4A16Zp { size_k, .. }
             | Self::MarlinW8A16 { size_k, .. }
+            | Self::Ternary5Trit { size_k, .. }
             | Self::DenseF16 { size_k, .. } => *size_k,
         }
     }
@@ -170,6 +178,7 @@ impl LinearProj {
                 };
                 (size_n * size_k) + (size_n * num_groups * 2)
             }
+            Self::Ternary5Trit { size_n, size_k, .. } => size_n * (size_k / 128) * 28,
             Self::DenseF16 { size_n, size_k, .. } => size_n * size_k * 2,
         }
     }
@@ -182,7 +191,7 @@ impl LinearProj {
     #[inline]
     pub fn can_fork_on_aux_stream(&self) -> bool {
         match *self {
-            Self::Hadamard { .. } => false,
+            Self::Hadamard { .. } | Self::Ternary5Trit { .. } => false,
             Self::WithLora {
                 ref inner,
                 ref lora,
@@ -295,6 +304,7 @@ impl LinearProj {
             size_n,
             size_k,
             block_size,
+            pre_signs_ptr,
         } = self
         {
             return Self::forward_hadamard(
@@ -302,6 +312,7 @@ impl LinearProj {
                 *size_n,
                 *size_k,
                 *block_size,
+                *pre_signs_ptr,
                 ex,
                 cublas,
                 marlin_ws_ptr,
@@ -447,6 +458,144 @@ impl LinearProj {
                 },
                 "warp34_marlin_gemm_f16u8",
             ),
+            Self::Ternary5Trit {
+                packed_ptr,
+                size_n,
+                size_k,
+            } => {
+                // For prefill (M > 8), prefer repacking 5-Trit -> 2.0 bpw Marlin U2B2 into
+                // `ex.scratch_ptr` and executing `warp34_marlin_gemm_f16u2` (unlocks W2A8 INT8
+                // IMMA 337/660 TOPS on sm_86/sm_89 and full-rate HMMA on sm_80, with 8x less
+                // scratch traffic than FP16 dequant). Fall back to FP16 strip dequant + cuBLAS
+                // if scratch is smaller than the full Marlin U2B2 tile.
+                let w_bytes = size_k.saturating_mul(size_n) / 4;
+                let s_bytes = (size_k / 128).saturating_mul(size_n).saturating_mul(2);
+                let w_aligned = (w_bytes + 255) & !255;
+                let s_aligned = (s_bytes + 255) & !255;
+                let repack_total = w_aligned.saturating_add(s_aligned);
+                let a8_reserve =
+                    (m.saturating_mul(size_k).saturating_add(m.saturating_mul(4)) + 511) & !255;
+                if m > 16
+                    && size_k > 0
+                    && size_n > 0
+                    && size_n.is_multiple_of(64)
+                    && size_k.is_multiple_of(128)
+                    && marlin_ws_ptr != 0
+                    && ex.scratch_ptr != 0
+                    && ex.scratch_size >= repack_total.saturating_add(a8_reserve)
+                {
+                    let marlin_w_ptr = ex.scratch_ptr;
+                    let marlin_s_ptr = marlin_w_ptr + w_aligned as u64;
+                    let sub_ex = ffi::Warp34Exec {
+                        scratch_ptr: marlin_w_ptr + repack_total as u64,
+                        scratch_size: ex.scratch_size - repack_total,
+                        ..*ex
+                    };
+                    check_rc(
+                        // SAFETY: `packed_ptr` holds `[size_n/8, size_k/128, 7, 8]` u32 words;
+                        // `marlin_w_ptr` and `marlin_s_ptr` are disjoint 256B-aligned regions
+                        // inside `ex.scratch_ptr`.
+                        unsafe {
+                            ffi::warp34_repack_5trit_to_marlin_u2(
+                                ex,
+                                packed_ptr as *const u32,
+                                marlin_w_ptr as *mut u32,
+                                marlin_s_ptr as *mut u16,
+                                size_n as i32,
+                                size_k as i32,
+                            )
+                        },
+                        "warp34_repack_5trit_to_marlin_u2",
+                    )?;
+                    check_rc(
+                        // SAFETY: `marlin_w_ptr` and `marlin_s_ptr` hold Marlin U2B2 weights and
+                        // permuted g128 scales; `sub_ex` points strictly past both buffers so W2A8
+                        // dynamic activation quantization cannot alias them.
+                        unsafe {
+                            ffi::warp34_marlin_gemm_f16u2(
+                                &sub_ex,
+                                x_ptr as *const c_void,
+                                marlin_w_ptr as *const c_void,
+                                marlin_s_ptr as *const c_void,
+                                out_ptr as *mut c_void,
+                                marlin_ws_ptr as *mut i32,
+                                m as i64,
+                                size_n as i64,
+                                size_k as i64,
+                                marlin_ws_ints as i64,
+                                8,
+                            )
+                        },
+                        "warp34_marlin_gemm_f16u2(5trit)",
+                    )
+                } else {
+                    const MAX_FP16_STRIP_BYTES: usize = 16 * 1024 * 1024;
+                    let min_strip_bytes = 8usize.saturating_mul(size_k).saturating_mul(2);
+                    if m > 256
+                        && (ex.flags & ffi::WARP34_EXEC_FLAG_ALLOW_W4A8_PREFILL) != 0
+                        && ex.stream == cublas.stream_handle
+                        && size_k > 0
+                        && size_n >= 8
+                        && size_n.is_multiple_of(8)
+                        && ex.scratch_ptr != 0
+                        && ex.scratch_size >= min_strip_bytes
+                    {
+                        let strip_budget = ex
+                            .scratch_size
+                            .min(MAX_FP16_STRIP_BYTES)
+                            .max(min_strip_bytes);
+                        let max_chunk = (strip_budget / (size_k * 2)).min(size_n) & !7;
+                        let mut n_start = 0usize;
+                        while n_start < size_n {
+                            let n_chunk = (size_n - n_start).min(max_chunk);
+                            check_rc(
+                                // SAFETY: `packed_ptr` holds `[size_n/8, size_k/128, 7, 8]` u32 words
+                                // and `ex.scratch_ptr` holds at least `n_chunk * size_k * 2` bytes.
+                                unsafe {
+                                    ffi::warp34_dequant_5trit_to_f16(
+                                        ex,
+                                        packed_ptr as *const u32,
+                                        ex.scratch_ptr as *mut c_void,
+                                        n_start as i32,
+                                        n_chunk as i32,
+                                        size_k as i32,
+                                    )
+                                },
+                                "warp34_dequant_5trit_to_f16",
+                            )?;
+                            cublas.gemm_f16_ldc(
+                                x_ptr,
+                                ex.scratch_ptr,
+                                out_ptr + (n_start as u64) * 2,
+                                m as i32,
+                                n_chunk as i32,
+                                size_k as i32,
+                                size_n as i32,
+                            )?;
+                            n_start += n_chunk;
+                        }
+                        Ok(())
+                    } else {
+                        check_rc(
+                            // SAFETY: `packed_ptr` holds `[size_n/8, size_k/128, 7, 8]` u32 words
+                            // repacked at upload time; `x_ptr` and `out_ptr` are caller-managed
+                            // `[m, size_k]` and `[m, size_n]` FP16 buffers on `ex.stream`.
+                            unsafe {
+                                ffi::warp34_gemm_5trit_f16(
+                                    ex,
+                                    x_ptr as *const c_void,
+                                    packed_ptr as *const u32,
+                                    out_ptr as *mut c_void,
+                                    m as i32,
+                                    size_n as i32,
+                                    size_k as i32,
+                                )
+                            },
+                            "warp34_gemm_5trit_f16",
+                        )
+                    }
+                }
+            }
             Self::DenseF16 {
                 weight_ptr,
                 size_n,
@@ -505,6 +654,7 @@ pub(crate) enum RawLinearHost {
     Hadamard {
         inner: Box<Self>,
         block_size: usize,
+        pre_signs: Option<std::sync::Arc<[i8]>>,
     },
     U2B2NMajor {
         packed: Vec<u32>,
@@ -537,6 +687,11 @@ pub(crate) enum RawLinearHost {
         k: usize,
         group_size: usize,
         channelwise: bool,
+    },
+    Ternary5Trit {
+        packed_gpu: Vec<u32>,
+        n: usize,
+        k: usize,
     },
     DenseF16 {
         weight: Vec<u16>,
@@ -596,6 +751,7 @@ impl RawLinearHost {
             | Self::U4B8NMajor { n, k, .. }
             | Self::U4ZpNMajor { n, k, .. }
             | Self::U8B128NMajor { n, k, .. }
+            | Self::Ternary5Trit { n, k, .. }
             | Self::DenseF16 { n, k, .. } => (*n, *k),
         }
     }
@@ -603,9 +759,14 @@ impl RawLinearHost {
     #[cfg(test)]
     pub(crate) fn into_u4b8_if_u2b2(self) -> Self {
         match self {
-            Self::Hadamard { inner, block_size } => Self::Hadamard {
+            Self::Hadamard {
+                inner,
+                block_size,
+                pre_signs,
+            } => Self::Hadamard {
                 inner: Box::new(inner.into_u4b8_if_u2b2()),
                 block_size,
+                pre_signs,
             },
             Self::U2B2NMajor {
                 packed,
@@ -635,7 +796,11 @@ impl RawLinearHost {
 
     pub(crate) fn to_f16_vec(&self) -> Vec<u16> {
         match self {
-            Self::Hadamard { inner, block_size } => hgptq::unrotate_weights(inner, *block_size),
+            Self::Hadamard {
+                inner,
+                block_size,
+                pre_signs,
+            } => hgptq::unrotate_weights(inner, *block_size, pre_signs.as_deref()),
             Self::DenseF16 { weight, .. } => weight.clone(),
             Self::U2B2NMajor {
                 packed,
@@ -675,6 +840,9 @@ impl RawLinearHost {
                 group_size,
                 ..
             } => dequant_u8b128_n_major_to_f16(packed, scales, *n, *k, *group_size),
+            Self::Ternary5Trit { packed_gpu, n, k } => {
+                crate::loader::dequant_5trit_gpu_to_f16(packed_gpu, *n, *k)
+            }
         }
     }
 
@@ -737,6 +905,87 @@ impl RawLinearHost {
                             .resolve_name(&format!("{base_prefix}.weight_packed"))
                             .is_some())
             });
+
+        // Fast path 0: native PTQ1_0 5-trit (`*.weight_5trit` + `*.weight_scale`).
+        let trit5_key = format!("{base_prefix}.weight_5trit");
+        if !has_unquantized_weight && let Some(real_5trit) = archive.resolve_name(&trit5_key) {
+            let scale_key = archive
+                .resolve_name(&format!("{base_prefix}.weight_scale"))
+                .ok_or_else(|| {
+                    loader_err_msg(format!(
+                        "missing '{base_prefix}.weight_scale' for 5-trit tensor '{real_5trit}'"
+                    ))
+                })?;
+            let p_info = archive
+                .tensor_info(&real_5trit)
+                .map_err(|e| loader_err_msg(format!("tensor_info('{real_5trit}') failed: {e}")))?;
+            let s_info = archive
+                .tensor_info(&scale_key)
+                .map_err(|e| loader_err_msg(format!("tensor_info('{scale_key}') failed: {e}")))?;
+            if p_info.shape.len() != 3
+                || p_info.shape[0] == 0
+                || p_info.shape[1] == 0
+                || p_info.shape[2] != 26
+                || p_info.dtype != "U8"
+                || s_info.shape.len() != 2
+                || s_info.shape[0] != p_info.shape[0]
+                || s_info.shape[1] != p_info.shape[1]
+                || !matches!(s_info.dtype.as_str(), "F16" | "BF16" | "F32")
+            {
+                return Err(loader_err_msg(format!(
+                    "invalid 5-trit shapes/dtypes for '{base_prefix}': weight_5trit={:?} ({}), weight_scale={:?} ({})",
+                    p_info.shape, p_info.dtype, s_info.shape, s_info.dtype
+                )));
+            }
+            let full_n = p_info.shape[0];
+            let groups = p_info.shape[1];
+            let k = groups
+                .checked_mul(128)
+                .ok_or_else(|| loader_err_msg(format!("5-trit K overflow on '{real_5trit}'")))?;
+            if row_end > full_n {
+                return Err(loader_err_msg(format!(
+                    "5-trit row shard [{row_start}..{row_end}) exceeds N={full_n} on '{real_5trit}'"
+                )));
+            }
+            let out_n = row_end - row_start;
+            if out_n == 0 || !out_n.is_multiple_of(8) {
+                return Err(loader_err_msg(format!(
+                    "5-trit row shard N={out_n} must be a non-zero multiple of 8 on '{real_5trit}'"
+                )));
+            }
+            let scale_off = row_start
+                .checked_mul(groups)
+                .ok_or_else(|| loader_err("5-trit row_start * groups overflow"))?;
+            let scale_len = out_n
+                .checked_mul(groups)
+                .ok_or_else(|| loader_err("5-trit out_n * groups overflow"))?;
+            let byte_off = scale_off
+                .checked_mul(26)
+                .ok_or_else(|| loader_err("5-trit byte offset overflow"))?;
+            let byte_len = scale_len
+                .checked_mul(26)
+                .ok_or_else(|| loader_err("5-trit byte length overflow"))?;
+            let packed_bytes = archive
+                .read_u8_subslice(&real_5trit, byte_off, byte_len)
+                .map_err(|e| {
+                    loader_err_msg(format!("read_u8_subslice('{real_5trit}') failed: {e}"))
+                })?;
+            let scales = archive
+                .read_f16_bits_subslice(&scale_key, scale_off, scale_len)
+                .map_err(|e| {
+                    loader_err_msg(format!("read_f16_bits_subslice('{scale_key}') failed: {e}"))
+                })?;
+            let packed_gpu =
+                crate::loader::repack_5trit_n_major_to_gpu(&packed_bytes, &scales, out_n, k);
+            return Ok((
+                Self::Ternary5Trit {
+                    packed_gpu,
+                    n: out_n,
+                    k,
+                },
+                full_n,
+            ));
+        }
 
         // Fast path A: compressed-tensors row-major `weight_packed` + `weight_scale` without g_idx.
         let packed_key = format!("{base_prefix}.weight_packed");
@@ -1016,6 +1265,75 @@ impl RawLinearHost {
                             .resolve_name(&format!("{base_prefix}.weight_packed"))
                             .is_some())
             });
+        // 0. native PTQ1_0 5-trit (`*.weight_5trit` + `*.weight_scale`)
+        let trit5_key = format!("{base_prefix}.weight_5trit");
+        if !has_unquantized_weight && let Some(real_5trit) = archive.resolve_name(&trit5_key) {
+            let scale_key = archive
+                .resolve_name(&format!("{base_prefix}.weight_scale"))
+                .ok_or_else(|| {
+                    loader_err_msg(format!(
+                        "missing '{base_prefix}.weight_scale' for 5-trit tensor '{real_5trit}'"
+                    ))
+                })?;
+            let p_info = archive
+                .tensor_info(&real_5trit)
+                .map_err(|e| loader_err_msg(format!("tensor_info('{real_5trit}') failed: {e}")))?;
+            let s_info = archive
+                .tensor_info(&scale_key)
+                .map_err(|e| loader_err_msg(format!("tensor_info('{scale_key}') failed: {e}")))?;
+            if p_info.shape.len() != 3
+                || p_info.shape[0] == 0
+                || p_info.shape[1] == 0
+                || p_info.shape[2] != 26
+                || p_info.dtype != "U8"
+                || s_info.shape.len() != 2
+                || s_info.shape[0] != p_info.shape[0]
+                || s_info.shape[1] != p_info.shape[1]
+            {
+                return Err(loader_err_msg(format!(
+                    "invalid 5-trit shapes/dtypes for '{base_prefix}': weight_5trit={:?} ({}), weight_scale={:?} ({})",
+                    p_info.shape, p_info.dtype, s_info.shape, s_info.dtype
+                )));
+            }
+            let n = p_info.shape[0];
+            let groups = p_info.shape[1];
+            let k = groups
+                .checked_mul(128)
+                .ok_or_else(|| loader_err_msg(format!("5-trit K overflow on '{real_5trit}'")))?;
+            if !n.is_multiple_of(8) {
+                return Err(loader_err_msg(format!(
+                    "5-trit N={n} must be a multiple of 8 on '{real_5trit}'"
+                )));
+            }
+            let expected_scales = n
+                .checked_mul(groups)
+                .ok_or_else(|| loader_err("5-trit scale count overflow"))?;
+            let expected_bytes = expected_scales
+                .checked_mul(26)
+                .ok_or_else(|| loader_err("5-trit byte count overflow"))?;
+            let packed_bytes = archive
+                .read_bytes(&real_5trit)
+                .map_err(|e| loader_err_msg(format!("read_bytes('{real_5trit}') failed: {e}")))?;
+            if packed_bytes.len() != expected_bytes {
+                return Err(loader_err_msg(format!(
+                    "'{real_5trit}' byte length {} != expected {expected_bytes}",
+                    packed_bytes.len()
+                )));
+            }
+            let scales = archive
+                .read_f16_bits(&scale_key)
+                .map_err(|e| loader_err_msg(format!("read_f16_bits('{scale_key}') failed: {e}")))?;
+            if scales.len() != expected_scales {
+                return Err(loader_err_msg(format!(
+                    "'{scale_key}' element count {} != expected {expected_scales}",
+                    scales.len()
+                )));
+            }
+            let packed_gpu =
+                crate::loader::repack_5trit_n_major_to_gpu(&packed_bytes, &scales, n, k);
+            return Ok(Self::Ternary5Trit { packed_gpu, n, k });
+        }
+
         // 1. compressed-tensors pack-quantized (`*.weight_packed` + `*.weight_scale` [+ `*.weight_zero_point`])
         let packed_key = format!("{base_prefix}.weight_packed");
         if !has_unquantized_weight && let Some(real_packed) = archive.resolve_name(&packed_key) {
@@ -1562,10 +1880,35 @@ impl RawLinearHost {
     pub(crate) fn slice_rows(&self, row_start: usize, row_end: usize) -> Self {
         let out_n = row_end - row_start;
         match self {
-            Self::Hadamard { inner, block_size } => Self::Hadamard {
+            Self::Hadamard {
+                inner,
+                block_size,
+                pre_signs,
+            } => Self::Hadamard {
                 inner: Box::new(inner.slice_rows(row_start, row_end)),
                 block_size: *block_size,
+                pre_signs: pre_signs.clone(),
             },
+            Self::Ternary5Trit { packed_gpu, k, .. } => {
+                if row_start.is_multiple_of(8) && row_end.is_multiple_of(8) {
+                    let groups = k / 128;
+                    let words_per_blk = groups * 56;
+                    Self::Ternary5Trit {
+                        packed_gpu: packed_gpu
+                            [(row_start / 8) * words_per_blk..(row_end / 8) * words_per_blk]
+                            .to_vec(),
+                        n: out_n,
+                        k: *k,
+                    }
+                } else {
+                    let f16_all = self.to_f16_vec();
+                    Self::DenseF16 {
+                        weight: f16_all[row_start * k..row_end * k].to_vec(),
+                        n: out_n,
+                        k: *k,
+                    }
+                }
+            }
             Self::U2B2NMajor {
                 packed,
                 scales,
@@ -1676,10 +2019,47 @@ impl RawLinearHost {
     fn slice_cols_inner(&self, col_start: usize, col_end: usize) -> Self {
         let out_k = col_end - col_start;
         match self {
-            Self::Hadamard { inner, block_size } => Self::Hadamard {
+            Self::Hadamard {
+                inner,
+                block_size,
+                pre_signs,
+            } => Self::Hadamard {
                 inner: Box::new(inner.slice_cols_inner(col_start, col_end)),
                 block_size: *block_size,
+                pre_signs: pre_signs
+                    .as_ref()
+                    .map(|s| std::sync::Arc::from(&s[col_start..col_end])),
             },
+            Self::Ternary5Trit { packed_gpu, n, k } => {
+                if !col_start.is_multiple_of(128) || !out_k.is_multiple_of(128) {
+                    let dense = self.to_f16_vec();
+                    let col_major: Vec<u16> = dense
+                        .chunks_exact(*k)
+                        .flat_map(|row| row[col_start..col_end].iter().copied())
+                        .collect();
+                    return Self::DenseF16 {
+                        weight: col_major,
+                        n: *n,
+                        k: out_k,
+                    };
+                }
+                let n_blks = n / 8;
+                let in_groups = k / 128;
+                let out_groups = out_k / 128;
+                let g_start = col_start / 128;
+                let mut new_packed = vec![0u32; n_blks * out_groups * 56];
+                for blk in 0..n_blks {
+                    new_packed[blk * out_groups * 56..(blk + 1) * out_groups * 56].copy_from_slice(
+                        &packed_gpu[(blk * in_groups + g_start) * 56
+                            ..(blk * in_groups + g_start + out_groups) * 56],
+                    );
+                }
+                Self::Ternary5Trit {
+                    packed_gpu: new_packed,
+                    n: *n,
+                    k: out_k,
+                }
+            }
             Self::U2B2NMajor {
                 packed,
                 scales,
@@ -1941,6 +2321,33 @@ impl RawLinearHost {
                     p.dims().1
                 )));
             }
+        }
+        if matches!(&parts[0], Self::Ternary5Trit { .. })
+            && parts.iter().all(|p| matches!(p, Self::Ternary5Trit { .. }))
+        {
+            let cap: usize = parts
+                .iter()
+                .map(|p| match p {
+                    Self::Ternary5Trit { packed_gpu, .. } => packed_gpu.len(),
+                    _ => 0,
+                })
+                .sum();
+            let mut packed_gpu = Vec::with_capacity(cap);
+            let mut total_n = 0;
+            for p in parts {
+                if let Self::Ternary5Trit {
+                    packed_gpu: pk, n, ..
+                } = p
+                {
+                    packed_gpu.extend_from_slice(pk);
+                    total_n += n;
+                }
+            }
+            return Ok(Self::Ternary5Trit {
+                packed_gpu,
+                n: total_n,
+                k,
+            });
         }
         if let Self::U2B2NMajor {
             group_size: gs0,
@@ -2366,8 +2773,24 @@ impl RawLinearHost {
                 || (n.is_multiple_of(MARLIN_TILE_K_W4) && k.is_multiple_of(MARLIN_TILE_N))
         };
         match self {
-            Self::Hadamard { inner, block_size } => {
-                inner.upload_hadamard_with(*block_size, arena, stream, staging)
+            Self::Hadamard {
+                inner,
+                block_size,
+                pre_signs,
+            } => inner.upload_hadamard_with(
+                *block_size,
+                pre_signs.as_deref(),
+                arena,
+                stream,
+                staging,
+            ),
+            Self::Ternary5Trit { packed_gpu, n, k } => {
+                let packed_ptr = staging.upload_slice(arena, packed_gpu, stream)?;
+                Ok(LinearProj::Ternary5Trit {
+                    packed_ptr,
+                    size_n: *n,
+                    size_k: *k,
+                })
             }
             Self::U2B2NMajor {
                 packed,
@@ -2572,7 +2995,7 @@ impl RawLinearHost {
     }
 }
 
-mod hgptq;
+pub(super) mod hgptq;
 
 mod layers;
 pub use layers::*;

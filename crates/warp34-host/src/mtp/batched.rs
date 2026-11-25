@@ -943,6 +943,12 @@ impl Qwen3_5MtpRank {
                 )?;
             }
         }
+        let export_pre_norm = self.final_residual.exports_pre_norm_hidden();
+        let lm_norm_out = if export_pre_norm {
+            normed_buf
+        } else {
+            hidden_ptr
+        };
         let final_ln_ptr = self
             .final_residual
             .single_stream_norm_ptr()
@@ -954,7 +960,7 @@ impl Qwen3_5MtpRank {
                 0,
                 residual_buf,
                 final_ln_ptr,
-                hidden_ptr,
+                lm_norm_out,
                 0,
                 t.rank as i32,
                 b_reqs as i32,
@@ -965,14 +971,14 @@ impl Qwen3_5MtpRank {
             )?;
         } else {
             check_rc(
-                // SAFETY: mlp_out_buf, residual_buf, and hidden_ptr hold b_reqs * h_dim halves.
+                // SAFETY: mlp_out_buf, residual_buf, and lm_norm_out hold b_reqs * h_dim halves.
                 unsafe {
                     ffi::warp34_fused_add_gemma_rms_norm_f16(
                         ex,
                         mlp_out_buf as *const c_void,
                         residual_buf as *mut c_void,
                         final_ln_ptr as *const c_void,
-                        hidden_ptr as *mut c_void,
+                        lm_norm_out as *mut c_void,
                         core::ptr::null(),
                         b_reqs as i32,
                         h_dim as i32,
@@ -982,13 +988,32 @@ impl Qwen3_5MtpRank {
                 "MTP batched final norm",
             )?;
         }
-        if is_last_step {
+        if export_pre_norm && has_next_step {
             check_rc(
-                // SAFETY: batch_hidden and hidden_ptr hold >= b_reqs * h_dim * 2 bytes on t.stream.
+                // SAFETY: hidden_ptr and residual_buf hold >= b_reqs * h_dim * 2 bytes on t.stream.
+                unsafe {
+                    ffi::warp34_memcpy_d2d_async(
+                        hidden_ptr as *mut c_void,
+                        residual_buf as *const c_void,
+                        b_reqs * h_dim * 2,
+                        t.stream.handle,
+                    )
+                },
+                "MTP batched pre-norm hidden recurrence",
+            )?;
+        }
+        if is_last_step {
+            let tail_src = if export_pre_norm {
+                residual_buf
+            } else {
+                hidden_ptr
+            };
+            check_rc(
+                // SAFETY: batch_hidden and tail_src hold >= b_reqs * h_dim * 2 bytes on t.stream.
                 unsafe {
                     ffi::warp34_memcpy_d2d_async(
                         self.batch_hidden.addr() as *mut c_void,
-                        hidden_ptr as *const c_void,
+                        tail_src as *const c_void,
                         b_reqs * h_dim * 2,
                         t.stream.handle,
                     )
@@ -996,7 +1021,7 @@ impl Qwen3_5MtpRank {
                 "MTP batched hidden tail",
             )?;
         }
-        Self::project(self.lm_head(t)?, ex, t, hidden_ptr, logits_buf, b_reqs)?;
+        Self::project(self.lm_head(t)?, ex, t, lm_norm_out, logits_buf, b_reqs)?;
         check_rc(
             // SAFETY: logits_buf holds b_reqs * local_vocab_size halves; output holds b_reqs i32/f32s.
             unsafe {

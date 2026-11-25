@@ -195,6 +195,135 @@ class RunSwebenchTests(unittest.TestCase):
             self.assertIn("**RESOLVED**", md)
             self.assertIn("`1 / 1 (100.0%)`", md)
 
+    def test_synthesize_eval_report_from_logs_recovers_partial_runs(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            preds_path = root / "preds.json"
+            preds_path.write_text(
+                json.dumps(
+                    {
+                        "repo__ok-1": {"model_patch": "diff --git a/a.py b/a.py\n"},
+                        "repo__fail-2": {"model_patch": "diff --git a/b.py b/b.py\n"},
+                        "repo__empty-3": {"model_patch": "   "},
+                        "repo__crashed-4": {"model_patch": "diff --git a/d.py b/d.py\n"},
+                    }
+                )
+            )
+            log_dir = root / "logs" / "run_evaluation" / "run1"
+            for iid, resolved in [("repo__ok-1", True), ("repo__fail-2", False)]:
+                rdir = log_dir / "model" / iid
+                rdir.mkdir(parents=True)
+                (rdir / "report.json").write_text(json.dumps({iid: {"resolved": resolved}}))
+
+            synth = run_swebench._synthesize_eval_report_from_logs(preds_path, log_dir)
+            assert synth is not None
+            self.assertEqual(synth["submitted_instances"], 4)
+            self.assertEqual(synth["completed_instances"], 2)
+            self.assertEqual(synth["resolved_ids"], ["repo__ok-1"])
+            self.assertEqual(synth["unresolved_ids"], ["repo__fail-2"])
+            self.assertEqual(synth["empty_patch_ids"], ["repo__empty-3"])
+            self.assertEqual(synth["error_ids"], ["repo__crashed-4"])
+
+    def test_run_evaluation_harness_recovers_on_timeout_or_reraises(self) -> None:
+        from unittest import mock
+        import os
+        import subprocess
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            out_dir = root / "out"
+            out_dir.mkdir()
+            (out_dir / "preds.json").write_text(
+                json.dumps({"repo__ok-1": {"model_patch": "diff --git a/a.py b/a.py\n"}})
+            )
+            log_dir = root / "logs" / "run_evaluation" / "warp34-out" / "model" / "repo__ok-1"
+            log_dir.mkdir(parents=True)
+            (log_dir / "report.json").write_text(json.dumps({"repo__ok-1": {"resolved": True}}))
+
+            old_cwd = pathlib.Path.cwd()
+            try:
+                os.chdir(root)
+                with mock.patch.object(
+                    subprocess,
+                    "run",
+                    side_effect=subprocess.TimeoutExpired(cmd=["uvx"], timeout=1),
+                ):
+                    run_swebench.run_evaluation_harness(
+                        out_dir, max_workers=1, normalize_p1=False, timeout_s=1
+                    )
+                recovered = json.loads((out_dir / "eval_report.json").read_text())
+                self.assertEqual(recovered["resolved_ids"], ["repo__ok-1"])
+
+                # Without logs or report files, TimeoutExpired is re-raised.
+                (out_dir / "eval_report.json").unlink()
+                with mock.patch.object(
+                    subprocess,
+                    "run",
+                    side_effect=subprocess.TimeoutExpired(cmd=["uvx"], timeout=1),
+                ):
+                    with self.assertRaises(subprocess.TimeoutExpired):
+                        run_swebench.run_evaluation_harness(
+                            out_dir, max_workers=1, normalize_p1=False, timeout_s=1
+                        )
+
+                # Normalized re-check: recovers partial logs on TimeoutExpired and re-raises without logs.
+                (out_dir / "preds.json").write_text(
+                    json.dumps(
+                        {
+                            "repo__p0-1": {
+                                "model_patch": "--- pkg/a.py\n+++ pkg/a.py\n@@ -1 +1 @@\n-x\n+y\n"
+                            }
+                        }
+                    )
+                )
+                base_log_dir = (
+                    root / "logs" / "run_evaluation" / "warp34-out" / "model" / "repo__p0-1"
+                )
+                norm_log_dir = (
+                    root / "logs" / "run_evaluation" / "warp34-out-norm" / "model" / "repo__p0-1"
+                )
+                base_log_dir.mkdir(parents=True)
+                norm_log_dir.mkdir(parents=True)
+                (base_log_dir / "report.json").write_text(
+                    json.dumps({"repo__p0-1": {"resolved": False}})
+                )
+                (norm_log_dir / "report.json").write_text(
+                    json.dumps({"repo__p0-1": {"resolved": True}})
+                )
+                with mock.patch.object(
+                    subprocess,
+                    "run",
+                    side_effect=[
+                        subprocess.TimeoutExpired(cmd=["uvx"], timeout=1),
+                        subprocess.TimeoutExpired(cmd=["uvx"], timeout=1),
+                    ],
+                ):
+                    run_swebench.run_evaluation_harness(
+                        out_dir, max_workers=1, normalize_p1=True, timeout_s=1
+                    )
+                norm_recovered = json.loads((out_dir / "eval_report_normalized.json").read_text())
+                self.assertEqual(norm_recovered["resolved_ids"], ["repo__p0-1"])
+
+                # Normalized re-check without logs re-raises TimeoutExpired.
+                base_log_dir.mkdir(parents=True)
+                (base_log_dir / "report.json").write_text(
+                    json.dumps({"repo__p0-1": {"resolved": False}})
+                )
+                with mock.patch.object(
+                    subprocess,
+                    "run",
+                    side_effect=[
+                        subprocess.TimeoutExpired(cmd=["uvx"], timeout=1),
+                        subprocess.TimeoutExpired(cmd=["uvx"], timeout=1),
+                    ],
+                ):
+                    with self.assertRaises(subprocess.TimeoutExpired):
+                        run_swebench.run_evaluation_harness(
+                            out_dir, max_workers=1, normalize_p1=True, timeout_s=1
+                        )
+            finally:
+                os.chdir(old_cwd)
+
 
 if __name__ == "__main__":
     unittest.main()

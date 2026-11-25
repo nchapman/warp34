@@ -61,7 +61,7 @@ fn repack_bytes(raw: &RawLinearHost) -> Result<usize> {
             (*n, *k, 2)
         }
         RawLinearHost::U8B128NMajor { n, k, .. } => (*n, *k, 1),
-        RawLinearHost::DenseF16 { .. } => return Ok(0),
+        RawLinearHost::DenseF16 { .. } | RawLinearHost::Ternary5Trit { .. } => return Ok(0),
     };
     n.checked_add(MARLIN_TILE_N - 1)
         .map(|v| v / MARLIN_TILE_N * MARLIN_TILE_N)
@@ -155,6 +155,7 @@ pub(super) fn forward_bias_maybe_defer(
         size_n,
         size_k,
         block_size,
+        pre_signs_ptr,
     } = projection
     {
         let defer_had = allow_defer && *size_n == inner.size_n();
@@ -163,6 +164,7 @@ pub(super) fn forward_bias_maybe_defer(
             *size_n,
             *size_k,
             *block_size,
+            *pre_signs_ptr,
             ex,
             cublas,
             workspace,
@@ -219,6 +221,7 @@ mod tests {
         let transformed = RawLinearHost::Hadamard {
             inner: Box::new(raw),
             block_size: 16,
+            pre_signs: None,
         };
         assert_eq!(repack_bytes(&transformed).unwrap(), 128 * 256 / 2);
         let raw = RawLinearHost::U8B128NMajor {

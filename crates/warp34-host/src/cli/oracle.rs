@@ -1158,6 +1158,10 @@ pub(crate) fn profile_bench_args(options: &CudaCliOptions, exe: &Path) -> Vec<St
         args.push("--kv-pages".to_string());
         args.push(pages.to_string());
     }
+    if let Some(bytes) = options.max_vram_bytes {
+        args.push("--max-vram".to_string());
+        args.push(bytes.to_string());
+    }
     if !options.use_cuda_graph {
         args.push("--no-cuda-graph".to_string());
     }

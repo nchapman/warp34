@@ -53,6 +53,12 @@ impl FullAttentionLayerWeights {
             && self.qkv_proj.can_fuse_h512_from_producer()
         {
             512
+        } else if allow_h512
+            && h_dim <= PRODUCER_FUSED_H64_MAX_HIDDEN_SIZE
+            && h_dim.is_multiple_of(1024)
+            && self.qkv_proj.can_fuse_h1024_from_producer()
+        {
+            1024
         } else {
             return ([normed_buf, 0], 0);
         };
@@ -536,7 +542,9 @@ impl LayerResidual {
                 ..
             } => {
                 if layer_idx == 0 {
-                    let norm_fn = if had_block == 512 && norm_had != 0 {
+                    let norm_fn = if had_block == 1024 && norm_had != 0 {
+                        ffi::warp34_gemma_rms_norm_hadamard1024_f16
+                    } else if had_block == 512 && norm_had != 0 {
                         ffi::warp34_gemma_rms_norm_hadamard512_f16
                     } else {
                         ffi::warp34_gemma_rms_norm_hadamard_f16
@@ -647,7 +655,9 @@ impl LayerResidual {
                         0,
                     )
                 } else {
-                    let norm_fn = if had_block == 512 && norm_had64 != 0 {
+                    let norm_fn = if had_block == 1024 && norm_had64 != 0 {
+                        ffi::warp34_fused_add_gemma_rms_norm_tap_hadamard1024_f16
+                    } else if had_block == 512 && norm_had64 != 0 {
                         ffi::warp34_fused_add_gemma_rms_norm_tap_hadamard512_f16
                     } else {
                         ffi::warp34_fused_add_gemma_rms_norm_tap_hadamard_f16
@@ -785,7 +795,9 @@ impl LayerResidual {
                         tap.offset,
                     )
                 } else {
-                    let norm_fn = if next_had_block == 512 && next_norm_had64 != 0 {
+                    let norm_fn = if next_had_block == 1024 && next_norm_had64 != 0 {
+                        ffi::warp34_fused_add_gemma_rms_norm_tap_hadamard1024_f16
+                    } else if next_had_block == 512 && next_norm_had64 != 0 {
                         ffi::warp34_fused_add_gemma_rms_norm_tap_hadamard512_f16
                     } else {
                         ffi::warp34_fused_add_gemma_rms_norm_tap_hadamard_f16
@@ -847,12 +859,33 @@ impl LayerResidual {
     }
 }
 
+/// Returns `true` when a `GemmaRMSNorm` weight vector (`scale = 1 + w`) has random Hadamard
+/// pre-signs (`signs_h ∈ {-1, +1}`) folded into it (`1 + w < 0` on roughly half of channels).
+///
+/// Standard unsigned `GemmaRMSNorm` weights satisfy `1 + w >= 0` (`w >= -1`), whereas checkpoints
+/// with folded `lm_head` Hadamard pre-signs (such as Ternary Bonsai) negate ~50% of channels so
+/// speculative MTP `pre_fc_norm_hidden` must consume pre-norm residuals instead of post-norm outputs.
+#[inline]
+pub fn gemma_rms_norm_has_folded_signs(f16_bits: &[u16]) -> bool {
+    if f16_bits.is_empty() {
+        return false;
+    }
+    let neg_scale_count = f16_bits
+        .iter()
+        .filter(|&&bits| (bits & 0x8000) != 0 && (0x3C01..0x7C00).contains(&(bits & 0x7FFF)))
+        .count();
+    neg_scale_count.saturating_mul(4) >= f16_bits.len()
+}
+
 /// Final pre-LM-head residual normalization / stream mixer.
 #[cfg(feature = "cuda")]
 #[allow(clippy::large_enum_variant)]
 pub enum FinalResidual {
     /// Single-stream `GemmaRMSNorm` (`[num_tokens, h_dim] -> [num_tokens, h_dim]`).
-    SingleStream { norm_ptr: u64 },
+    SingleStream {
+        norm_ptr: u64,
+        norm_has_folded_signs: bool,
+    },
     /// Multi-stream HyperConnection mixer (`[num_tokens, hc_count * h_dim] -> [num_tokens, h_dim]`).
     HyperConnection { mixer: HcBlockWeights },
 }
@@ -861,7 +894,7 @@ pub enum FinalResidual {
 impl FinalResidual {
     pub fn single_stream_norm_ptr(&self) -> Option<u64> {
         match self {
-            Self::SingleStream { norm_ptr } => Some(*norm_ptr),
+            Self::SingleStream { norm_ptr, .. } => Some(*norm_ptr),
             Self::HyperConnection { .. } => None,
         }
     }
@@ -875,6 +908,19 @@ impl FinalResidual {
 
     pub fn is_hyper_connection(&self) -> bool {
         matches!(self, Self::HyperConnection { .. })
+    }
+
+    /// True when MTP `pre_fc_norm_hidden` consumes the pre-final-norm residual stream rather than
+    /// the post-norm `lm_head` input (HyperConnection multi-stream stacks and single-stream models
+    /// whose `model.norm` / `mtp.norm` weights have Hadamard `signs_h` folded in).
+    pub fn exports_pre_norm_hidden(&self) -> bool {
+        match self {
+            Self::SingleStream {
+                norm_has_folded_signs,
+                ..
+            } => *norm_has_folded_signs,
+            Self::HyperConnection { .. } => true,
+        }
     }
 
     /// Initializes the multi-stream residual buffer from `embed_buf` (`[num_tokens, h_dim]`)
@@ -931,7 +977,30 @@ impl FinalResidual {
         hc_pre_normed: bool,
     ) -> Result<()> {
         match self {
-            Self::SingleStream { .. } => Ok(()),
+            Self::SingleStream {
+                norm_has_folded_signs,
+                ..
+            } => {
+                if *norm_has_folded_signs
+                    && let Some(final_h_buf) = last_final_hidden_f16
+                    && ctx.num_tokens * ctx.h_dim * 2 <= final_h_buf.len_bytes
+                {
+                    check_rc(
+                        // SAFETY: `residual_buf` and `final_h_buf` hold at least
+                        // `num_tokens * h_dim * 2` bytes on `stream`.
+                        unsafe {
+                            ffi::warp34_memcpy_d2d_async(
+                                final_h_buf.addr() as *mut c_void,
+                                ctx.residual_buf as *const c_void,
+                                ctx.num_tokens * ctx.h_dim * 2,
+                                stream.handle,
+                            )
+                        },
+                        "export pre-norm last_final_hidden_f16",
+                    )?;
+                }
+                Ok(())
+            }
             Self::HyperConnection { mixer } => {
                 if let Some(final_h_buf) = last_final_hidden_f16
                     && ctx.num_tokens * ctx.hc_count * ctx.h_dim * 2 <= final_h_buf.len_bytes
@@ -1182,6 +1251,12 @@ impl LayerBlockWeights {
                     && gdn.in_proj_qkvz.can_fuse_h512_from_producer()
                 {
                     512
+                } else if allow_h512
+                    && h_dim <= PRODUCER_FUSED_H64_MAX_HIDDEN_SIZE
+                    && h_dim.is_multiple_of(1024)
+                    && gdn.in_proj_qkvz.can_fuse_h1024_from_producer()
+                {
+                    1024
                 } else {
                     0
                 };
@@ -1198,5 +1273,33 @@ impl LayerBlockWeights {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::gemma_rms_norm_has_folded_signs;
+
+    #[test]
+    fn gemma_rms_norm_folded_signs_distinguishes_unsigned_and_signed_norms() {
+        assert!(!gemma_rms_norm_has_folded_signs(&[]));
+        // Unsigned GemmaRMSNorm (`w >= -1.0`, `1 + w >= 0.0`): 0.0, -0.5, -1.0, +0.25.
+        let unsigned = [
+            0x0000u16, 0xB800, 0xBC00, 0x3400, 0x3C00, 0xB400, 0x0000, 0x3800,
+        ];
+        assert!(!gemma_rms_norm_has_folded_signs(&unsigned));
+        // Single noisy channel < -1.0 out of 8 (12.5% < 25%) does not false-trigger.
+        let one_outlier = [
+            0xBC01u16, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
+        ];
+        assert!(!gemma_rms_norm_has_folded_signs(&one_outlier));
+        // Folded Rademacher `signs_h` (`w = gamma * signs_h - 1.0`, ~50% < -1.0, e.g. -2.0 = 0xC000).
+        let signed = [
+            0xC000u16, 0x0000, 0xC100, 0x3400, 0xBC01, 0x3800, 0xC200, 0x0000,
+        ];
+        assert!(gemma_rms_norm_has_folded_signs(&signed));
+        // Non-finite negative bit patterns (`-inf` = 0xFC00, `-NaN` = 0xFE00) are ignored.
+        let non_finite = [0xFC00u16, 0xFE00, 0xFC00, 0xFE00];
+        assert!(!gemma_rms_norm_has_folded_signs(&non_finite));
     }
 }

@@ -99,6 +99,11 @@ impl FfnBlockWeights {
                     && gate_up_proj.can_fuse_h512_from_producer()
                 {
                     ([0, normed_buf], 512)
+                } else if allow_h512
+                    && h_dim.is_multiple_of(1024)
+                    && gate_up_proj.can_fuse_h1024_from_producer()
+                {
+                    ([0, normed_buf], 1024)
                 } else {
                     ([normed_buf, 0], 0)
                 }
@@ -120,6 +125,15 @@ impl FfnBlockWeights {
                         .is_none_or(LinearProj::can_fuse_h512_from_producer)
                 {
                     512
+                } else if allow_h512
+                    && moe.routed_input_hadamard == 1024
+                    && h_dim.is_multiple_of(1024)
+                    && moe
+                        .shared_gate_up_proj
+                        .as_ref()
+                        .is_none_or(LinearProj::can_fuse_h1024_from_producer)
+                {
+                    1024
                 } else {
                     return ([normed_buf, 0], 0);
                 };
@@ -139,7 +153,9 @@ impl FfnBlockWeights {
                             .shared_down_proj
                             .as_ref()
                             .filter(|p| {
-                                !p.can_fuse_h64_from_producer() && !p.can_fuse_h512_from_producer()
+                                !p.can_fuse_h64_from_producer()
+                                    && !p.can_fuse_h512_from_producer()
+                                    && !p.can_fuse_h1024_from_producer()
                             })
                             .and_then(|p| p.input_transform_workspace_bytes(rows))
                             .unwrap_or(0);
@@ -282,10 +298,14 @@ impl FfnBlockWeights {
                 }
                 let fuse_down_h64 = down_proj.can_fuse_h64_from_producer();
                 let fuse_down_h512 = !fuse_down_h64 && down_proj.can_fuse_h512_from_producer();
+                let fuse_down_h1024 =
+                    !fuse_down_h64 && !fuse_down_h512 && down_proj.can_fuse_h1024_from_producer();
                 let silu_fn = if fuse_down_h64 {
                     ffi::warp34_silu_and_mul_hadamard_f16
                 } else if fuse_down_h512 {
                     ffi::warp34_silu_and_mul_hadamard512_f16
+                } else if fuse_down_h1024 {
+                    ffi::warp34_silu_and_mul_hadamard1024_f16
                 } else {
                     ffi::warp34_silu_and_mul_f16
                 };
@@ -306,7 +326,7 @@ impl FfnBlockWeights {
                     },
                     "warp34_silu_and_mul_f16",
                 )?;
-                if fuse_down_h64 || fuse_down_h512 {
+                if fuse_down_h64 || fuse_down_h512 || fuse_down_h1024 {
                     down_proj.forward_prerotated(
                         ex,
                         cublas,
@@ -482,10 +502,15 @@ impl FfnBlockWeights {
                     let fuse_sh_down_h64 = sh_dn.can_fuse_h64_from_producer();
                     let fuse_sh_down_h512 =
                         !fuse_sh_down_h64 && sh_dn.can_fuse_h512_from_producer();
+                    let fuse_sh_down_h1024 = !fuse_sh_down_h64
+                        && !fuse_sh_down_h512
+                        && sh_dn.can_fuse_h1024_from_producer();
                     let sh_silu_fn = if fuse_sh_down_h64 {
                         ffi::warp34_silu_and_mul_hadamard_f16
                     } else if fuse_sh_down_h512 {
                         ffi::warp34_silu_and_mul_hadamard512_f16
+                    } else if fuse_sh_down_h1024 {
+                        ffi::warp34_silu_and_mul_hadamard1024_f16
                     } else {
                         ffi::warp34_silu_and_mul_f16
                     };
@@ -505,7 +530,7 @@ impl FfnBlockWeights {
                         },
                         "warp34_silu_and_mul_f16 (shared_expert)",
                     )?;
-                    if fuse_sh_down_h64 || fuse_sh_down_h512 {
+                    if fuse_sh_down_h64 || fuse_sh_down_h512 || fuse_sh_down_h1024 {
                         sh_dn.forward_prerotated(
                             ex,
                             cublas,
@@ -1052,10 +1077,14 @@ impl FfnBlockWeights {
                 }
                 let fuse_sh_down_h64 = sh_dn.can_fuse_h64_from_producer();
                 let fuse_sh_down_h512 = !fuse_sh_down_h64 && sh_dn.can_fuse_h512_from_producer();
+                let fuse_sh_down_h1024 =
+                    !fuse_sh_down_h64 && !fuse_sh_down_h512 && sh_dn.can_fuse_h1024_from_producer();
                 let sh_silu_fn = if fuse_sh_down_h64 {
                     ffi::warp34_silu_and_mul_hadamard_f16
                 } else if fuse_sh_down_h512 {
                     ffi::warp34_silu_and_mul_hadamard512_f16
+                } else if fuse_sh_down_h1024 {
+                    ffi::warp34_silu_and_mul_hadamard1024_f16
                 } else {
                     ffi::warp34_silu_and_mul_f16
                 };
@@ -1073,7 +1102,7 @@ impl FfnBlockWeights {
                     },
                     "warp34_silu_and_mul_f16 (shared_expert)",
                 )?;
-                if fuse_sh_down_h64 || fuse_sh_down_h512 {
+                if fuse_sh_down_h64 || fuse_sh_down_h512 || fuse_sh_down_h1024 {
                     sh_dn.forward_prerotated(
                         ex,
                         cublas,
@@ -1229,11 +1258,19 @@ pub(crate) fn load_moe_layer_weights(
                         .and_then(|s| s.strip_suffix(&format!(".{suffix}")).map(str::to_owned))
                 })
                 .unwrap_or(cand);
-            let b = cfg
+            let (b, signs) = match cfg
                 .quant
-                .input_hadamard(&name)
+                .input_hadamard_with_signs(&name)
                 .map_err(|e| loader_err_msg(e.to_string()))?
-                .unwrap_or(0);
+            {
+                Some((b, signs)) => (b, signs),
+                None => (0, None),
+            };
+            if signs.is_some() {
+                return Err(loader_err_msg(format!(
+                    "signed Hadamard pre-signs are not supported on routed MoE expert '{name}'"
+                )));
+            }
             if !is_valid_hadamard_block_for_dim(b, k_dim) {
                 return Err(loader_err_msg(format!(
                     "invalid MoE Hadamard block_size={b} for K={k_dim} at '{name}'"
@@ -1249,6 +1286,11 @@ pub(crate) fn load_moe_layer_weights(
             )));
         }
         let down_had = resolve_proj("down_proj", local_moe_interm)?;
+        if !matches!(down_had, 0 | 16 | 64 | 128 | 512) {
+            return Err(loader_err_msg(format!(
+                "unsupported routed MoE down_proj Hadamard block_size={down_had} at '{pfx}' (supported: 0, 16, 64, 128, 512)"
+            )));
+        }
         Ok((gate_had, down_had))
     };
 
@@ -1370,7 +1412,7 @@ pub(crate) fn load_moe_layer_weights(
             &format!("{pfx}.mlp.experts.0.gate_proj"),
             &cfg.quant,
         )?
-        .unwrap_hadamard();
+        .unwrap_hadamard()?;
         if exp0_gate.dims() != (full_interm, h) {
             return Err(loader_err_msg(format!(
                 "MoE gate_proj dims {:?} at '{pfx}.mlp.experts.0' do not match expected ({full_interm}, {h})",
@@ -1418,10 +1460,10 @@ pub(crate) fn load_moe_layer_weights(
                     rd_full.dims()
                 )));
             }
-            let (gu, gu_had) = RawLinearHost::concat_rows(&[rg, ru])?.unwrap_hadamard();
+            let (gu, gu_had) = RawLinearHost::concat_rows(&[rg, ru])?.unwrap_hadamard()?;
             let (rd, rd_had) = rd_full
                 .into_slice_cols(rank * local_moe_interm, (rank + 1) * local_moe_interm)?
-                .unwrap_hadamard();
+                .unwrap_hadamard()?;
             if gu_had != exp0_in_had || rd_had != exp0_dn_had {
                 return Err(loader_err_msg(format!(
                     "inconsistent MoE Hadamard block sizes at '{epfx}' (expected in={exp0_in_had}, down={exp0_dn_had}; got in={gu_had}, down={rd_had})"
@@ -1846,6 +1888,9 @@ pub(crate) fn load_moe_layer_weights(
                     exp0_in_had,
                     exp0_dn_had,
                 )
+            }
+            RawLinearHost::Ternary5Trit { .. } => {
+                return Err(loader_err("5-trit MoE experts are not yet supported"));
             }
         }
     };

@@ -674,3 +674,194 @@ pub fn validate_static_gptq_g_idx(
     }
     Ok(())
 }
+
+/// Repacks an N-major `[N, K/128, 26]` `PTQ1_0` 5-trit tensor and `[N, K/128]` `FP16` scales
+/// into the GPU-coalesced `[N/8, K/128, 7, 8]` `u32` layout consumed by `warp34_gemm_5trit_f16`.
+///
+/// Each `(n, g)` 28-byte block fuses 26 trit bytes (little-endian into `w[0..6]`, with bytes
+/// `24..25` in the low 16 bits of `w[6]`) and the 2-byte `FP16` scale in the high 16 bits of `w[6]`.
+pub fn repack_5trit_n_major_to_gpu(
+    packed_5trit: &[u8],
+    scales_f16: &[u16],
+    size_n: usize,
+    size_k: usize,
+) -> Vec<u32> {
+    assert!(size_n.is_multiple_of(8), "5-trit N must be a multiple of 8");
+    assert!(
+        size_k.is_multiple_of(128),
+        "5-trit K must be a multiple of 128"
+    );
+    let groups = size_k / 128;
+    let total_groups = size_n
+        .checked_mul(groups)
+        .expect("5-trit N * groups overflow");
+    let total_trit_bytes = total_groups
+        .checked_mul(26)
+        .expect("5-trit byte count overflow");
+    assert_eq!(packed_5trit.len(), total_trit_bytes);
+    assert_eq!(scales_f16.len(), total_groups);
+    if size_n == 0 || size_k == 0 {
+        return Vec::new();
+    }
+    let n_blks = size_n / 8;
+    let out_words = n_blks
+        .checked_mul(groups)
+        .and_then(|v| v.checked_mul(56))
+        .expect("5-trit packed word count overflow");
+    let mut out = vec![0u32; out_words];
+    let repack_range = |blk_start: usize, dst: &mut [u32]| {
+        for (rel_blk, blk_dst) in dst.chunks_exact_mut(groups * 56).enumerate() {
+            let n_blk = blk_start + rel_blk;
+            for g in 0..groups {
+                let g_dst = &mut blk_dst[g * 56..(g + 1) * 56];
+                for r in 0..8 {
+                    let n = n_blk * 8 + r;
+                    let src_off = (n * groups + g) * 26;
+                    let b = &packed_5trit[src_off..src_off + 26];
+                    for w in 0..6 {
+                        let o = w * 4;
+                        g_dst[w * 8 + r] = u32::from_le_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]]);
+                    }
+                    let sc = scales_f16[n * groups + g] as u32;
+                    g_dst[6 * 8 + r] = (sc << 16) | ((b[25] as u32) << 8) | (b[24] as u32);
+                }
+            }
+        }
+    };
+    let workers = std::thread::available_parallelism()
+        .map_or(1, usize::from)
+        .min(n_blks);
+    if workers <= 1 || n_blks < 16 {
+        repack_range(0, &mut out);
+    } else {
+        let blks_per_chunk = n_blks.div_ceil(workers);
+        std::thread::scope(|s| {
+            for (ci, chunk) in out.chunks_mut(blks_per_chunk * groups * 56).enumerate() {
+                let blk_start = ci * blks_per_chunk;
+                s.spawn(move || repack_range(blk_start, chunk));
+            }
+        });
+    }
+    out
+}
+
+#[inline]
+fn decode_5trit_group_into_f16(bytes26: &[u8], scale_f16: u16, dst128: &mut [u16]) {
+    const POW3: [u32; 5] = [1, 3, 9, 27, 81];
+    let s = f16_to_f32(scale_f16);
+    let vals = [f32_to_f16(-s), 0u16, f32_to_f16(s)];
+    // Segment 0: bytes 0..16 -> 16 x 5 = 80 trits @ stride 16
+    for i in 0..16 {
+        let q = bytes26[i] as u32;
+        for (n, &p3) in POW3.iter().enumerate() {
+            let u = (((q * p3) & 0xFF) * 3) >> 8;
+            dst128[n * 16 + i] = vals[u as usize];
+        }
+    }
+    // Segment 1: bytes 16..24 -> 8 x 5 = 40 trits @ stride 8
+    for i in 0..8 {
+        let q = bytes26[16 + i] as u32;
+        for (n, &p3) in POW3.iter().enumerate() {
+            let u = (((q * p3) & 0xFF) * 3) >> 8;
+            dst128[80 + n * 8 + i] = vals[u as usize];
+        }
+    }
+    // Segment 2: bytes 24..26 -> 2 x 4 = 8 trits @ stride 2
+    for i in 0..2 {
+        let q = bytes26[24 + i] as u32;
+        for (n, &p3) in POW3[..4].iter().enumerate() {
+            let u = (((q * p3) & 0xFF) * 3) >> 8;
+            dst128[120 + n * 2 + i] = vals[u as usize];
+        }
+    }
+}
+
+/// Dequantizes an N-major `[N, K/128, 26]` `PTQ1_0` 5-trit tensor + `[N, K/128]` `FP16` scales
+/// into an N-major `[N, K]` `FP16` matrix.
+pub fn dequant_5trit_n_major_to_f16(
+    packed_5trit: &[u8],
+    scales_f16: &[u16],
+    size_n: usize,
+    size_k: usize,
+) -> Vec<u16> {
+    assert!(size_k.is_multiple_of(128));
+    let groups = size_k / 128;
+    let total_groups = size_n
+        .checked_mul(groups)
+        .expect("5-trit N * groups overflow");
+    let total_trit_bytes = total_groups
+        .checked_mul(26)
+        .expect("5-trit byte count overflow");
+    assert_eq!(packed_5trit.len(), total_trit_bytes);
+    assert_eq!(scales_f16.len(), total_groups);
+    if size_n == 0 || size_k == 0 {
+        return Vec::new();
+    }
+    let out_elems = size_n
+        .checked_mul(size_k)
+        .expect("5-trit N * K element overflow");
+    let mut out = vec![0u16; out_elems];
+    let dequant_rows = |row_start: usize, dst_rows: &mut [u16]| {
+        for (rel_n, dst_row) in dst_rows.chunks_exact_mut(size_k).enumerate() {
+            let n = row_start + rel_n;
+            for g in 0..groups {
+                let off = (n * groups + g) * 26;
+                decode_5trit_group_into_f16(
+                    &packed_5trit[off..off + 26],
+                    scales_f16[n * groups + g],
+                    &mut dst_row[g * 128..(g + 1) * 128],
+                );
+            }
+        }
+    };
+    let workers = std::thread::available_parallelism()
+        .map_or(1, usize::from)
+        .min(size_n);
+    if workers <= 1 || size_n < 128 {
+        dequant_rows(0, &mut out);
+    } else {
+        let rows_per_chunk = size_n.div_ceil(workers);
+        std::thread::scope(|s| {
+            for (ci, chunk) in out.chunks_mut(rows_per_chunk * size_k).enumerate() {
+                let row_start = ci * rows_per_chunk;
+                s.spawn(move || dequant_rows(row_start, chunk));
+            }
+        });
+    }
+    out
+}
+
+/// Dequantizes a GPU-repacked `[N/8, K/128, 7, 8]` `PTQ1_0` 5-trit matrix back to N-major `[N, K]` `FP16`.
+pub fn dequant_5trit_gpu_to_f16(packed_gpu: &[u32], size_n: usize, size_k: usize) -> Vec<u16> {
+    assert!(size_n.is_multiple_of(8) && size_k.is_multiple_of(128));
+    let groups = size_k / 128;
+    let n_blks = size_n / 8;
+    let expected_words = n_blks
+        .checked_mul(groups)
+        .and_then(|v| v.checked_mul(56))
+        .expect("5-trit GPU word count overflow");
+    assert_eq!(packed_gpu.len(), expected_words);
+    let out_elems = size_n
+        .checked_mul(size_k)
+        .expect("5-trit N * K element overflow");
+    let mut out = vec![0u16; out_elems];
+    for n_blk in 0..n_blks {
+        for g in 0..groups {
+            let g_src = &packed_gpu[(n_blk * groups + g) * 56..][..56];
+            for r in 0..8 {
+                let n = n_blk * 8 + r;
+                let mut b = [0u8; 26];
+                for w in 0..6 {
+                    let bytes = g_src[w * 8 + r].to_le_bytes();
+                    b[w * 4..w * 4 + 4].copy_from_slice(&bytes);
+                }
+                let w6 = g_src[6 * 8 + r];
+                b[24] = (w6 & 0xFF) as u8;
+                b[25] = ((w6 >> 8) & 0xFF) as u8;
+                let sc = (w6 >> 16) as u16;
+                decode_5trit_group_into_f16(&b, sc, &mut out[n * size_k + g * 128..][..128]);
+            }
+        }
+    }
+    out
+}

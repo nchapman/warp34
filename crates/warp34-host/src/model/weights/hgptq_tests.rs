@@ -49,6 +49,7 @@ fn shards_and_fused_rows_preserve_transform_contract() {
     let w = RawLinearHost::Hadamard {
         inner: Box::new(raw(128, 256, 64)),
         block_size: 64,
+        pre_signs: None,
     };
     assert!(w.slice_cols(16, 144).is_err());
     assert!(w.slice_cols(0, 0).is_err());
@@ -68,6 +69,7 @@ fn shards_and_fused_rows_preserve_transform_contract() {
     let channel = RawLinearHost::Hadamard {
         inner: Box::new(raw(128, 512, 512)),
         block_size: 16,
+        pre_signs: None,
     };
     let shard = channel.slice_cols(256, 512).unwrap();
     let RawLinearHost::Hadamard { inner, .. } = shard else {
@@ -81,6 +83,78 @@ fn shards_and_fused_rows_preserve_transform_contract() {
             ..
         }
     ));
+
+    // Signed multi-block Hadamard column sharding (TP=2/TP=4 on o_proj / out_proj):
+    // Rank 1's K-shard must slice `pre_signs[col_start..col_end]` rather than reusing `[0..out_k]`.
+    let mut signs = vec![1i8; 1024];
+    for s in &mut signs[512..1024] {
+        *s = -1;
+    }
+    let signed_w = RawLinearHost::Hadamard {
+        inner: Box::new(raw(64, 1024, 128)),
+        block_size: 512,
+        pre_signs: Some(std::sync::Arc::from(signs)),
+    };
+    let full_f16 = signed_w.to_f16_vec();
+    let shard0 = signed_w.slice_cols(0, 512).unwrap();
+    let shard1 = signed_w.slice_cols(512, 1024).unwrap();
+    let s0_f16 = shard0.to_f16_vec();
+    let s1_f16 = shard1.to_f16_vec();
+    for r in 0..64 {
+        assert_eq!(
+            &s0_f16[r * 512..(r + 1) * 512],
+            &full_f16[r * 1024..r * 1024 + 512]
+        );
+        assert_eq!(
+            &s1_f16[r * 512..(r + 1) * 512],
+            &full_f16[r * 1024 + 512..(r + 1) * 1024]
+        );
+    }
+
+    // Non-8-aligned `slice_rows` on `Ternary5Trit` must fall back to `DenseF16` without panicking.
+    let packed_5trit: Vec<u8> = (0..16 * 26).map(|i| ((i * 37 + 13) & 0xFF) as u8).collect();
+    let scales_5trit: Vec<u16> = (0..16)
+        .map(|i| f32_to_f16(0.25 + i as f32 * 0.05))
+        .collect();
+    let trit_raw = RawLinearHost::Ternary5Trit {
+        packed_gpu: crate::loader::repack_5trit_n_major_to_gpu(
+            &packed_5trit,
+            &scales_5trit,
+            16,
+            128,
+        ),
+        n: 16,
+        k: 128,
+    };
+    let trit_full = trit_raw.to_f16_vec();
+    let trit_unaligned = trit_raw.slice_rows(2, 14);
+    assert_eq!(trit_unaligned.dims(), (12, 128));
+    assert_eq!(trit_unaligned.to_f16_vec(), &trit_full[2 * 128..14 * 128]);
+
+    // `unwrap_hadamard` preserves unsigned block sizes and rejects signed Hadamard transforms.
+    let unsigned_had = RawLinearHost::Hadamard {
+        inner: Box::new(RawLinearHost::DenseF16 {
+            weight: vec![0u16; 16 * 64],
+            n: 16,
+            k: 64,
+        }),
+        block_size: 64,
+        pre_signs: None,
+    };
+    let (unwrapped, bs) = unsigned_had.unwrap_hadamard().unwrap();
+    assert_eq!(bs, 64);
+    assert_eq!(unwrapped.dims(), (16, 64));
+
+    let signed_had = RawLinearHost::Hadamard {
+        inner: Box::new(RawLinearHost::DenseF16 {
+            weight: vec![0u16; 16 * 64],
+            n: 16,
+            k: 64,
+        }),
+        block_size: 64,
+        pre_signs: Some(std::sync::Arc::from(vec![1i8; 64])),
+    };
+    assert!(signed_had.unwrap_hadamard().is_err());
 }
 
 #[test]
@@ -238,6 +312,7 @@ fn transformed_projection_matches_independent_reference_and_graph() {
         let rotated = RawLinearHost::Hadamard {
             inner: Box::new(raw),
             block_size: block,
+            pre_signs: None,
         };
         let mut arena = DeviceArena::new(0, 16 * 1024 * 1024).unwrap();
         let proj = rotated.upload(&mut arena, &stream, &staging).unwrap();
@@ -330,6 +405,7 @@ fn channelwise_hadamard_k4304_does_not_overflow_fp16_before_scale() {
     let rotated = RawLinearHost::Hadamard {
         inner: Box::new(raw),
         block_size: block,
+        pre_signs: None,
     };
     let mut arena = DeviceArena::new(0, 16 * 1024 * 1024).unwrap();
     let proj = rotated.upload(&mut arena, &stream, &staging).unwrap();
@@ -395,12 +471,14 @@ fn h64_moe_ffn_block_shares_input_rotation_and_matches_reference() {
     let sh_gu_had = RawLinearHost::Hadamard {
         inner: Box::new(raw(2 * sh_interm, h_dim, group_size)),
         block_size: 64,
+        pre_signs: None,
     }
     .upload(&mut arena, &stream, &staging)
     .unwrap();
     let sh_dn_had = RawLinearHost::Hadamard {
         inner: Box::new(raw(h_dim, sh_interm, group_size)),
         block_size: 64,
+        pre_signs: None,
     }
     .upload(&mut arena, &stream, &staging)
     .unwrap();
@@ -815,10 +893,12 @@ fn marlin_w2a16_and_hadamard_w2a16_match_dilated_w4a16_zero_ulp() {
     let had_u2 = RawLinearHost::Hadamard {
         inner: Box::new(raw_u2.slice_rows(0, n)),
         block_size: block,
+        pre_signs: None,
     };
     let had_u4 = RawLinearHost::Hadamard {
         inner: Box::new(raw_u4.slice_rows(0, n)),
         block_size: block,
+        pre_signs: None,
     };
     let mut arena = DeviceArena::new(0, 16 * 1024 * 1024).unwrap();
     let proj_had_u2 = had_u2.upload(&mut arena, &stream, &staging).unwrap();
@@ -1075,6 +1155,8 @@ fn block_hadamard_f16_128_and_512_match_cpu_reference() {
         (512, 512, 1),
         (512, 1536, 4),
         (512, 5120, 3),
+        (4096, 4096, 1),
+        (4096, 12288, 3),
     ] {
         let input: Vec<u16> = (0..rows * dim)
             .map(|i| f32_to_f16((((i * 37 + 13) % 97) as f32 - 48.0) / 32.0))
@@ -1149,6 +1231,316 @@ fn block_hadamard_f16_128_and_512_match_cpu_reference() {
         assert_ne!(
             rc_overlap, 0,
             "overlapping src == dst must be rejected for B={block_size}"
+        );
+    }
+}
+
+#[cfg(feature = "cuda")]
+#[test]
+fn block_hadamard_4096_signed_f16_matches_cpu_reference() {
+    let stream = CudaStream::new(0).unwrap();
+    let rows = 3usize;
+    for (block_size, dim) in [(512usize, 2048usize), (1024, 6144), (4096, 4096)] {
+        let input: Vec<u16> = (0..rows * dim)
+            .map(|i| f32_to_f16((((i * 41 + 7) % 89) as f32 - 44.0) / 32.0))
+            .collect();
+        let signs: Vec<i8> = (0..dim)
+            .map(|i| {
+                if (i.wrapping_mul(2654435761) >> 31) == 0 {
+                    1
+                } else {
+                    -1
+                }
+            })
+            .collect();
+        let mut expected = vec![0u16; rows * dim];
+        let inv_sqrt = 1.0f32 / (block_size as f32).sqrt();
+        for r in 0..rows {
+            for blk_off in (0..dim).step_by(block_size) {
+                let base = r * dim + blk_off;
+                let mut v: Vec<f32> = input[base..base + block_size]
+                    .iter()
+                    .zip(&signs[blk_off..blk_off + block_size])
+                    .map(|(&b, &s)| f16_to_f32(b) * (s as f32))
+                    .collect();
+                let mut step = 1usize;
+                while step < block_size {
+                    for off in (0..block_size).step_by(2 * step) {
+                        for j in 0..step {
+                            let a = v[off + j];
+                            let b = v[off + j + step];
+                            v[off + j] = a + b;
+                            v[off + j + step] = a - b;
+                        }
+                    }
+                    step *= 2;
+                }
+                for j in 0..block_size {
+                    expected[base + j] = f32_to_f16(v[j] * inv_sqrt);
+                }
+            }
+        }
+
+        let d_in = DeviceBuffer::alloc(0, input.len() * 2).unwrap();
+        let d_signs = DeviceBuffer::alloc(0, signs.len()).unwrap();
+        let d_out = DeviceBuffer::alloc(0, input.len() * 2).unwrap();
+        d_in.copy_from_host(&input, &stream).unwrap();
+        d_signs.copy_from_host(&signs, &stream).unwrap();
+        let ex = stream.exec(0, 0);
+        check_rc(
+            // SAFETY: `d_in`, `d_signs`, and `d_out` are disjoint live device buffers sized for this launch.
+            unsafe {
+                ffi::warp34_block_hadamard_signed_f16(
+                    &ex,
+                    d_in.addr() as *const _,
+                    d_signs.addr() as *const i8,
+                    d_out.addr() as *mut _,
+                    rows as i32,
+                    dim as i32,
+                    dim as i32,
+                    block_size as i32,
+                )
+            },
+            "warp34_block_hadamard_signed_f16",
+        )
+        .unwrap();
+        let mut got = vec![0u16; rows * dim];
+        d_out.copy_to_host(&mut got, &stream).unwrap();
+        assert_eq!(
+            got, expected,
+            "0-ULP mismatch for signed H_{block_size} (dim={dim})"
+        );
+    }
+}
+
+#[cfg(feature = "cuda")]
+#[test]
+fn gemm_5trit_f16_matches_cpu_reference() {
+    let stream = CudaStream::new(0).unwrap();
+    for (m, n, k) in [
+        (1usize, 8usize, 128usize),
+        (1, 40, 512),
+        (1, 24, 1024),
+        (1, 16, 6144),
+        (2, 64, 512),
+        (2, 24, 1152),
+        (3, 40, 256),
+        (4, 24, 4096),
+        (4, 128, 1024),
+        (8, 128, 512),
+        (13, 96, 640),
+        (16, 128, 1024),
+        (19, 5504, 256),
+    ] {
+        let groups = k / 128;
+        let packed_bytes: Vec<u8> = (0..n * groups * 26)
+            .map(|i| ((i * 73 + 19) & 0xFF) as u8)
+            .collect();
+        let scales: Vec<u16> = (0..n * groups)
+            .map(|i| f32_to_f16((((i * 29 + 5) % 41) as f32 + 1.0) / 64.0))
+            .collect();
+        let a_f16: Vec<u16> = (0..m * k)
+            .map(|i| f32_to_f16((((i * 37 + 11) % 79) as f32 - 39.0) / 32.0))
+            .collect();
+
+        let packed_gpu = crate::loader::repack_5trit_n_major_to_gpu(&packed_bytes, &scales, n, k);
+        let w_f16 = crate::loader::dequant_5trit_n_major_to_f16(&packed_bytes, &scales, n, k);
+        assert_eq!(
+            w_f16,
+            crate::loader::dequant_5trit_gpu_to_f16(&packed_gpu, n, k),
+            "repack round-trip mismatch for M={m} N={n} K={k}"
+        );
+
+        let mut expected = vec![0u16; m * n];
+        for r in 0..m {
+            for col in 0..n {
+                let mut acc = 0.0f32;
+                for kk in 0..k {
+                    acc += f16_to_f32(a_f16[r * k + kk]) * f16_to_f32(w_f16[col * k + kk]);
+                }
+                expected[r * n + col] = f32_to_f16(acc);
+            }
+        }
+
+        let d_a = DeviceBuffer::alloc(0, a_f16.len() * 2).unwrap();
+        let d_w = DeviceBuffer::alloc(0, packed_gpu.len() * 4).unwrap();
+        let d_out = DeviceBuffer::alloc(0, m * n * 2).unwrap();
+        d_a.copy_from_host(&a_f16, &stream).unwrap();
+        d_w.copy_from_host(&packed_gpu, &stream).unwrap();
+        let ex = stream.exec(0, 0);
+        check_rc(
+            // SAFETY: `d_a`, `d_w`, and `d_out` are disjoint live device buffers sized for this launch.
+            unsafe {
+                ffi::warp34_gemm_5trit_f16(
+                    &ex,
+                    d_a.addr() as *const _,
+                    d_w.addr() as *const u32,
+                    d_out.addr() as *mut _,
+                    m as i32,
+                    n as i32,
+                    k as i32,
+                )
+            },
+            "warp34_gemm_5trit_f16",
+        )
+        .unwrap();
+        let mut got = vec![0u16; m * n];
+        d_out.copy_to_host(&mut got, &stream).unwrap();
+        let mut max_abs = 0.0f32;
+        for (idx, (&g, &e)) in got.iter().zip(&expected).enumerate() {
+            let diff = (f16_to_f32(g) - f16_to_f32(e)).abs();
+            max_abs = max_abs.max(diff);
+            assert!(
+                diff <= 1e-2,
+                "5-trit GEMM mismatch at M={m} N={n} K={k} idx={idx}: got={} exp={} diff={diff}",
+                f16_to_f32(g),
+                f16_to_f32(e),
+            );
+        }
+        assert!(max_abs <= 1e-2, "max_abs={max_abs}");
+    }
+}
+
+#[cfg(feature = "cuda")]
+#[test]
+fn dequant_5trit_to_f16_matches_cpu_reference() {
+    let stream = CudaStream::new(0).unwrap();
+    let n = 64usize;
+    let k = 512usize;
+    let groups = k / 128;
+    let packed_bytes: Vec<u8> = (0..n * groups * 26)
+        .map(|i| ((i * 89 + 13) & 0xFF) as u8)
+        .collect();
+    let scales: Vec<u16> = (0..n * groups)
+        .map(|i| f32_to_f16((((i * 17 + 3) % 37) as f32 + 1.0) / 64.0))
+        .collect();
+    let packed_gpu = crate::loader::repack_5trit_n_major_to_gpu(&packed_bytes, &scales, n, k);
+    let expected = crate::loader::dequant_5trit_gpu_to_f16(&packed_gpu, n, k);
+
+    let d_w = DeviceBuffer::alloc(0, packed_gpu.len() * 4).unwrap();
+    d_w.copy_from_host(&packed_gpu, &stream).unwrap();
+    let ex = stream.exec(0, 0);
+
+    for (n_start, n_chunk) in [(0usize, n), (0, 24), (24, 40)] {
+        let d_dst = DeviceBuffer::alloc(0, n_chunk * k * 2).unwrap();
+        check_rc(
+            // SAFETY: `d_w` and `d_dst` are disjoint live device buffers sized for this launch.
+            unsafe {
+                ffi::warp34_dequant_5trit_to_f16(
+                    &ex,
+                    d_w.addr() as *const u32,
+                    d_dst.addr() as *mut _,
+                    n_start as i32,
+                    n_chunk as i32,
+                    k as i32,
+                )
+            },
+            "warp34_dequant_5trit_to_f16",
+        )
+        .unwrap();
+        let mut got = vec![0u16; n_chunk * k];
+        d_dst.copy_to_host(&mut got, &stream).unwrap();
+        stream.synchronize().unwrap();
+        let exp_slice = &expected[n_start * k..(n_start + n_chunk) * k];
+        assert_eq!(
+            got, exp_slice,
+            "0-ULP mismatch for warp34_dequant_5trit_to_f16 n_start={n_start} n_chunk={n_chunk}"
+        );
+    }
+}
+
+#[cfg(feature = "cuda")]
+#[test]
+fn repack_5trit_to_marlin_u2_matches_cpu_reference() {
+    let stream = CudaStream::new(0).unwrap();
+    let dev_props = CudaDevice::set_current(0).unwrap().props().unwrap();
+    let ws_bytes = dev_props.marlin_workspace_bytes();
+    let ws_ints = ws_bytes / 4;
+    let d_ws = DeviceBuffer::alloc(0, ws_bytes).unwrap();
+    let scratch_bytes = 4 * 1024 * 1024;
+    let d_scratch = DeviceBuffer::alloc(0, scratch_bytes).unwrap();
+
+    for (m, n, k) in [(16usize, 64usize, 128usize), (128, 128, 512)] {
+        let groups = k / 128;
+        let packed_bytes: Vec<u8> = (0..n * groups * 26)
+            .map(|i| ((i * 67 + 23) & 0xFF) as u8)
+            .collect();
+        let scales: Vec<u16> = (0..n * groups)
+            .map(|i| f32_to_f16((((i * 31 + 7) % 39) as f32 + 1.0) / 64.0))
+            .collect();
+        let a_f16: Vec<u16> = (0..m * k)
+            .map(|i| f32_to_f16((((i * 43 + 5) % 73) as f32 - 36.0) / 32.0))
+            .collect();
+
+        let packed_gpu = crate::loader::repack_5trit_n_major_to_gpu(&packed_bytes, &scales, n, k);
+        let w_f16 = crate::loader::dequant_5trit_gpu_to_f16(&packed_gpu, n, k);
+
+        let d_a = DeviceBuffer::alloc(0, a_f16.len() * 2).unwrap();
+        let d_w = DeviceBuffer::alloc(0, packed_gpu.len() * 4).unwrap();
+        let d_marlin = DeviceBuffer::alloc(0, k * n / 4).unwrap();
+        let d_scales = DeviceBuffer::alloc(0, groups * n * 2).unwrap();
+        let d_out = DeviceBuffer::alloc(0, m * n * 2).unwrap();
+        d_a.copy_from_host(&a_f16, &stream).unwrap();
+        d_w.copy_from_host(&packed_gpu, &stream).unwrap();
+
+        let ex = stream.exec(d_scratch.addr(), scratch_bytes);
+        check_rc(
+            // SAFETY: all device buffers are disjoint and sized for `(m, n, k)`.
+            unsafe {
+                ffi::warp34_repack_5trit_to_marlin_u2(
+                    &ex,
+                    d_w.addr() as *const u32,
+                    d_marlin.addr() as *mut u32,
+                    d_scales.addr() as *mut u16,
+                    n as i32,
+                    k as i32,
+                )
+            },
+            "warp34_repack_5trit_to_marlin_u2",
+        )
+        .unwrap();
+        check_rc(
+            // SAFETY: `d_marlin` and `d_scales` hold repacked Marlin U2B2 weights & scales;
+            // `d_ws` and `ex.scratch_ptr` are disjoint workspaces.
+            unsafe {
+                ffi::warp34_marlin_gemm_f16u2(
+                    &ex,
+                    d_a.addr() as *const _,
+                    d_marlin.addr() as *const _,
+                    d_scales.addr() as *const _,
+                    d_out.addr() as *mut _,
+                    d_ws.addr() as *mut i32,
+                    m as i64,
+                    n as i64,
+                    k as i64,
+                    ws_ints as i64,
+                    8,
+                )
+            },
+            "warp34_marlin_gemm_f16u2(5trit)",
+        )
+        .unwrap();
+
+        let mut got = vec![0u16; m * n];
+        d_out.copy_to_host(&mut got, &stream).unwrap();
+        stream.synchronize().unwrap();
+
+        // Check against CPU FP32 reference (allow W2A8 INT8 dynamic quantization tolerance at M=128).
+        let tol = if m >= 128 { 0.15f32 } else { 2e-2f32 };
+        let mut max_abs = 0.0f32;
+        for r in 0..m {
+            for col in 0..n {
+                let mut acc = 0.0f32;
+                for kk in 0..k {
+                    acc += f16_to_f32(a_f16[r * k + kk]) * f16_to_f32(w_f16[col * k + kk]);
+                }
+                let diff = (f16_to_f32(got[r * n + col]) - acc).abs();
+                max_abs = max_abs.max(diff);
+            }
+        }
+        assert!(
+            max_abs <= tol,
+            "repack_5trit_to_marlin_u2 GEMM mismatch M={m} N={n} K={k}: max_abs={max_abs} > tol={tol}"
         );
     }
 }
@@ -1683,6 +2075,284 @@ fn producer_fused_hadamard512_matches_standalone_zero_ulp() {
         assert_eq!(
             got_h, ref_h,
             "fused_add_gemma_rms_norm_tap_hadamard512 rows={rows} dim={dim}"
+        );
+    }
+}
+
+#[cfg(feature = "cuda")]
+#[test]
+fn producer_fused_hadamard1024_matches_standalone_zero_ulp() {
+    let _device = CudaDevice::set_current(0).unwrap();
+    let stream = CudaStream::new(0).unwrap();
+    let ex = stream.exec(0, 0);
+    let upload = |src: &[u16]| {
+        let buf = DeviceBuffer::alloc(0, src.len() * 2).unwrap();
+        buf.copy_from_host(src, &stream).unwrap();
+        buf
+    };
+
+    for &(rows, dim) in &[
+        (1usize, 1024usize),
+        (3, 2048),
+        (2, 4096),
+        (2, 5120),
+        (1, 6144),
+        (1, 9216),
+    ] {
+        let a_h: Vec<u16> = (0..rows * 2 * dim)
+            .map(|i| f32_to_f16((((i * 37 + 13) % 101) as f32 / 50.0) - 1.0))
+            .collect();
+        let b_h: Vec<u16> = (0..rows * dim)
+            .map(|i| f32_to_f16((((i * 23 + 7) % 89) as f32 / 44.0) - 1.0))
+            .collect();
+        let w_h: Vec<u16> = (0..dim)
+            .map(|i| f32_to_f16((((i * 17 + 3) % 53) as f32 / 100.0) - 0.25))
+            .collect();
+        let d_a = upload(&a_h);
+        let d_b = upload(&b_h);
+        let d_w = upload(&w_h);
+        let d_res_ref = upload(&b_h);
+        let d_res_got = upload(&b_h);
+        let d_tmp = DeviceBuffer::alloc(0, rows * dim * 2).unwrap();
+        let d_ref = DeviceBuffer::alloc(0, rows * dim * 2).unwrap();
+        let d_got = DeviceBuffer::alloc(0, rows * dim * 2).unwrap();
+        let d_unrot_got = DeviceBuffer::alloc(0, rows * dim * 2).unwrap();
+        let mut ref_h = vec![0u16; rows * dim];
+        let mut got_h = vec![0u16; rows * dim];
+
+        // 1. silu_and_mul_hadamard1024_f16
+        // SAFETY: all device buffers are allocated and sized for `rows * dim` (or `rows * 2 * dim`) FP16 elements.
+        unsafe {
+            assert_eq!(
+                ffi::warp34_silu_and_mul_f16(
+                    &ex,
+                    d_a.addr() as *const _,
+                    d_tmp.addr() as *mut _,
+                    core::ptr::null(),
+                    rows as i32,
+                    dim as i32,
+                ),
+                0
+            );
+            assert_eq!(
+                ffi::warp34_block_hadamard_f16(
+                    &ex,
+                    d_tmp.addr() as *const _,
+                    d_ref.addr() as *mut _,
+                    rows as i32,
+                    dim as i32,
+                    dim as i32,
+                    1024,
+                ),
+                0
+            );
+            assert_eq!(
+                ffi::warp34_silu_and_mul_hadamard1024_f16(
+                    &ex,
+                    d_a.addr() as *const _,
+                    d_got.addr() as *mut _,
+                    core::ptr::null(),
+                    rows as i32,
+                    dim as i32,
+                ),
+                0
+            );
+        }
+        d_ref.copy_to_host(&mut ref_h, &stream).unwrap();
+        d_got.copy_to_host(&mut got_h, &stream).unwrap();
+        stream.synchronize().unwrap();
+        assert_eq!(
+            got_h, ref_h,
+            "silu_and_mul_hadamard1024 rows={rows} dim={dim}"
+        );
+
+        // 2. apply_attn_output_gate_hadamard1024_f16
+        // SAFETY: all device buffers are allocated and sized for `rows * dim` FP16 elements.
+        unsafe {
+            assert_eq!(
+                ffi::warp34_apply_attn_output_gate_f16(
+                    &ex,
+                    d_a.addr() as *const _,
+                    d_b.addr() as *const _,
+                    d_tmp.addr() as *mut _,
+                    core::ptr::null(),
+                    rows as i32,
+                    dim as i32,
+                ),
+                0
+            );
+            assert_eq!(
+                ffi::warp34_block_hadamard_f16(
+                    &ex,
+                    d_tmp.addr() as *const _,
+                    d_ref.addr() as *mut _,
+                    rows as i32,
+                    dim as i32,
+                    dim as i32,
+                    1024,
+                ),
+                0
+            );
+            assert_eq!(
+                ffi::warp34_apply_attn_output_gate_hadamard1024_f16(
+                    &ex,
+                    d_a.addr() as *const _,
+                    d_b.addr() as *const _,
+                    d_got.addr() as *mut _,
+                    core::ptr::null(),
+                    rows as i32,
+                    dim as i32,
+                ),
+                0
+            );
+        }
+        d_ref.copy_to_host(&mut ref_h, &stream).unwrap();
+        d_got.copy_to_host(&mut got_h, &stream).unwrap();
+        stream.synchronize().unwrap();
+        assert_eq!(
+            got_h, ref_h,
+            "apply_attn_output_gate_hadamard1024 rows={rows} dim={dim}"
+        );
+
+        // 3. gemma_rms_norm_hadamard1024_f16
+        // SAFETY: all device buffers are allocated and sized for `rows * dim` / `dim` FP16 elements.
+        unsafe {
+            assert_eq!(
+                ffi::warp34_gemma_rms_norm_f16(
+                    &ex,
+                    d_a.addr() as *const _,
+                    d_w.addr() as *const _,
+                    d_tmp.addr() as *mut _,
+                    core::ptr::null(),
+                    rows as i32,
+                    dim as i32,
+                    1e-6,
+                ),
+                0
+            );
+            assert_eq!(
+                ffi::warp34_block_hadamard_f16(
+                    &ex,
+                    d_tmp.addr() as *const _,
+                    d_ref.addr() as *mut _,
+                    rows as i32,
+                    dim as i32,
+                    dim as i32,
+                    1024,
+                ),
+                0
+            );
+            assert_eq!(
+                ffi::warp34_gemma_rms_norm_hadamard1024_f16(
+                    &ex,
+                    d_a.addr() as *const _,
+                    d_w.addr() as *const _,
+                    d_unrot_got.addr() as *mut _,
+                    d_got.addr() as *mut _,
+                    core::ptr::null(),
+                    rows as i32,
+                    dim as i32,
+                    1e-6,
+                ),
+                0
+            );
+        }
+        d_ref.copy_to_host(&mut ref_h, &stream).unwrap();
+        d_got.copy_to_host(&mut got_h, &stream).unwrap();
+        stream.synchronize().unwrap();
+        assert_eq!(
+            got_h, ref_h,
+            "gemma_rms_norm_hadamard1024 rows={rows} dim={dim}"
+        );
+
+        if dim <= 6144 {
+            // 4. fused_add_gemma_rms_norm_tap_hadamard1024_f16
+            // SAFETY: all device buffers are allocated and sized for `rows * dim` / `dim` FP16 elements.
+            unsafe {
+                assert_eq!(
+                    ffi::warp34_fused_add_gemma_rms_norm_f16(
+                        &ex,
+                        d_a.addr() as *const _,
+                        d_res_ref.addr() as *mut _,
+                        d_w.addr() as *const _,
+                        d_tmp.addr() as *mut _,
+                        core::ptr::null(),
+                        rows as i32,
+                        dim as i32,
+                        1e-6,
+                    ),
+                    0
+                );
+                assert_eq!(
+                    ffi::warp34_block_hadamard_f16(
+                        &ex,
+                        d_tmp.addr() as *const _,
+                        d_ref.addr() as *mut _,
+                        rows as i32,
+                        dim as i32,
+                        dim as i32,
+                        1024,
+                    ),
+                    0
+                );
+                assert_eq!(
+                    ffi::warp34_fused_add_gemma_rms_norm_tap_hadamard1024_f16(
+                        &ex,
+                        d_a.addr() as *const _,
+                        d_res_got.addr() as *mut _,
+                        d_w.addr() as *const _,
+                        d_unrot_got.addr() as *mut _,
+                        d_got.addr() as *mut _,
+                        core::ptr::null_mut(),
+                        core::ptr::null(),
+                        rows as i32,
+                        dim as i32,
+                        1e-6,
+                        0,
+                        0,
+                    ),
+                    0
+                );
+            }
+            d_ref.copy_to_host(&mut ref_h, &stream).unwrap();
+            d_got.copy_to_host(&mut got_h, &stream).unwrap();
+            stream.synchronize().unwrap();
+            assert_eq!(
+                got_h, ref_h,
+                "fused_add_gemma_rms_norm_tap_hadamard1024 rows={rows} dim={dim}"
+            );
+        }
+    }
+
+    // Reject non-1024-multiple dims and overlapping `pre_signs` / `dst`.
+    let d_src = DeviceBuffer::alloc(0, 1024 * 2).unwrap();
+    let d_dst = DeviceBuffer::alloc(0, 1024 * 2).unwrap();
+    // SAFETY: valid device pointers used to test host-side boundary validation.
+    unsafe {
+        assert_ne!(
+            ffi::warp34_silu_and_mul_hadamard1024_f16(
+                &ex,
+                d_src.addr() as *const _,
+                d_dst.addr() as *mut _,
+                core::ptr::null(),
+                1,
+                512,
+            ),
+            0
+        );
+        assert_ne!(
+            ffi::warp34_block_hadamard_signed_f16(
+                &ex,
+                d_src.addr() as *const _,
+                d_dst.addr() as *const i8,
+                d_dst.addr() as *mut _,
+                1,
+                512,
+                512,
+                512,
+            ),
+            0,
+            "overlapping pre_signs and dst must be rejected"
         );
     }
 }

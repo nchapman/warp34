@@ -469,6 +469,12 @@ impl Qwen3_5MtpRank {
                     )?;
                 }
             }
+            let export_pre_norm = self.final_residual.exports_pre_norm_hidden();
+            let lm_norm_out = if export_pre_norm {
+                normed_buf
+            } else {
+                self.hidden.addr()
+            };
             if let Some(comm) = tp2 {
                 comm.all_reduce_residual_gemma_rms_norm_f16(
                     &ex,
@@ -478,7 +484,7 @@ impl Qwen3_5MtpRank {
                     self.final_residual
                         .single_stream_norm_ptr()
                         .ok_or_else(|| loader_err("MTP graph requires single-stream final norm"))?,
-                    self.hidden.addr(),
+                    lm_norm_out,
                     0,
                     t.rank as i32,
                     1,
@@ -489,7 +495,7 @@ impl Qwen3_5MtpRank {
                 )?;
             } else {
                 check_rc(
-                    // SAFETY: mlp_out_buf and residual_buf are valid device buffers for h_dim half elements, final norm weight is valid, hidden buffer has capacity for h_dim half elements.
+                    // SAFETY: mlp_out_buf, residual_buf, and lm_norm_out are valid device buffers for h_dim half elements, and final norm weight is valid.
                     unsafe {
                         ffi::warp34_fused_add_gemma_rms_norm_f16(
                             &ex,
@@ -500,7 +506,7 @@ impl Qwen3_5MtpRank {
                                 .ok_or_else(|| {
                                     loader_err("MTP graph requires single-stream final norm")
                                 })? as *const c_void,
-                            self.hidden.addr() as *mut c_void,
+                            lm_norm_out as *mut c_void,
                             core::ptr::null(),
                             1,
                             h_dim as i32,
@@ -508,6 +514,20 @@ impl Qwen3_5MtpRank {
                         )
                     },
                     "MTP final norm",
+                )?;
+            }
+            if export_pre_norm {
+                check_rc(
+                    // SAFETY: hidden and residual_buf hold at least h_dim * 2 bytes on t.stream.
+                    unsafe {
+                        ffi::warp34_memcpy_d2d_async(
+                            self.hidden.addr() as *mut c_void,
+                            residual_buf as *const c_void,
+                            h_dim * 2,
+                            t.stream.handle,
+                        )
+                    },
+                    "MTP pre-norm hidden recurrence",
                 )?;
             }
             if step + 1 == k {
@@ -524,7 +544,7 @@ impl Qwen3_5MtpRank {
                     "MTP batch hidden tail",
                 )?;
             }
-            Self::project(self.lm_head(t)?, &ex, t, self.hidden.addr(), logits_buf, 1)?;
+            Self::project(self.lm_head(t)?, &ex, t, lm_norm_out, logits_buf, 1)?;
             check_rc(
                 // SAFETY: logits_buf contains local_vocab_size valid half logits, output pointers have capacity for argmax results.
                 unsafe {
@@ -772,7 +792,8 @@ impl Qwen3_5MtpRank {
             | LinearProj::MarlinW2A16 { .. }
             | LinearProj::MarlinW4A16 { .. }
             | LinearProj::MarlinW4A16Zp { .. }
-            | LinearProj::MarlinW8A16 { .. } => proj.forward(
+            | LinearProj::MarlinW8A16 { .. }
+            | LinearProj::Ternary5Trit { .. } => proj.forward(
                 ex,
                 &t.cublas,
                 t.marlin_ws.addr(),
@@ -803,7 +824,8 @@ impl Qwen3_5MtpRank {
             | LinearProj::MarlinW2A16 { .. }
             | LinearProj::MarlinW4A16 { .. }
             | LinearProj::MarlinW4A16Zp { .. }
-            | LinearProj::MarlinW8A16 { .. } => proj.forward_prerotated(
+            | LinearProj::MarlinW8A16 { .. }
+            | LinearProj::Ternary5Trit { .. } => proj.forward_prerotated(
                 ex,
                 &t.cublas,
                 t.marlin_ws.addr(),
@@ -1579,6 +1601,12 @@ impl Qwen3_5MtpRank {
                 top_k,
             )?;
         }
+        let export_pre_norm = self.final_residual.exports_pre_norm_hidden();
+        let post_mlp_norm_out = if export_pre_norm {
+            normed_buf
+        } else {
+            self.batch_hidden.addr()
+        };
         self.residual.post_mlp(
             &hc_ctx,
             tp2,
@@ -1586,18 +1614,23 @@ impl Qwen3_5MtpRank {
             mlp_out_buf,
             [
                 self.final_residual.single_stream_norm_ptr().unwrap_or(0),
-                self.batch_hidden.addr(),
+                post_mlp_norm_out,
             ],
             TapExport::default(),
         )?;
         let multi_row_bytes = hc_count * h_dim * 2;
-        if self.final_residual.is_hyper_connection() {
+        if export_pre_norm {
+            let pre_norm_src = if self.final_residual.is_hyper_connection() {
+                hc_residual_buf
+            } else {
+                hc_ctx.residual_buf
+            };
             check_rc(
-                // SAFETY: batch_hidden and hc_residual_buf hold num_tokens * multi_row_bytes.
+                // SAFETY: batch_hidden and pre_norm_src hold num_tokens * multi_row_bytes.
                 unsafe {
                     ffi::warp34_memcpy_d2d_async(
                         self.batch_hidden.addr() as *mut c_void,
-                        hc_residual_buf as *const c_void,
+                        pre_norm_src as *const c_void,
                         num_tokens * multi_row_bytes,
                         t.stream.handle,
                     )
@@ -1620,16 +1653,18 @@ impl Qwen3_5MtpRank {
         )?;
 
         // Collapse multi-stream residuals only for the LM head. Single-stream
-        // post_mlp has already written the final-normalized recurrent hidden.
+        // post_mlp has already written the final-normalized output.
         let sampled_id = if sample_last {
-            let mut final_hc_ctx = hc_ctx;
-            final_hc_ctx.residual_buf = last_multi_ptr;
-            final_hc_ctx.hc_residual_buf = last_multi_ptr;
-            final_hc_ctx.num_tokens = 1;
-            self.final_residual
-                .finish_stack(&final_hc_ctx, &t.stream, normed_buf, None)?;
             let lm_input = if self.final_residual.is_hyper_connection() {
+                let mut final_hc_ctx = hc_ctx;
+                final_hc_ctx.residual_buf = last_multi_ptr;
+                final_hc_ctx.hc_residual_buf = last_multi_ptr;
+                final_hc_ctx.num_tokens = 1;
+                self.final_residual
+                    .finish_stack(&final_hc_ctx, &t.stream, normed_buf, None)?;
                 normed_buf
+            } else if export_pre_norm {
+                normed_buf + ((num_tokens - 1) * h_dim * 2) as u64
             } else {
                 last_multi_ptr
             };

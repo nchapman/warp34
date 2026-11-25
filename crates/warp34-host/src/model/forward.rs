@@ -283,7 +283,7 @@ impl Qwen3_5ModelRank {
     }
 
     fn final_norm_target(&self, rows: usize, fallback: u64) -> u64 {
-        if !self.final_residual.is_hyper_connection()
+        if !self.final_residual.exports_pre_norm_hidden()
             && rows <= self.max_tap_rows
             && let Some(buf) = &self.last_final_hidden_f16
         {
@@ -1181,7 +1181,13 @@ impl Qwen3_5ModelRank {
                     "warp34_kv_cache_write_strided",
                 )?;
                 let fuse_o_h64 = fa.o_proj.can_fuse_h64_from_producer();
-                let fuse_o_h512 = !fuse_o_h64 && fa.o_proj.can_fuse_h512_from_producer();
+                let fuse_o_h512 = !fuse_o_h64
+                    && fa.qsa_indexer.is_none()
+                    && fa.o_proj.can_fuse_h512_from_producer();
+                let fuse_o_h1024 = !fuse_o_h64
+                    && !fuse_o_h512
+                    && fa.qsa_indexer.is_none()
+                    && fa.o_proj.can_fuse_h1024_from_producer();
                 if let Some(indexer) = &fa.qsa_indexer {
                     fa.forward_qsa_attention(
                         indexer,
@@ -1224,6 +1230,8 @@ impl Qwen3_5ModelRank {
                         ffi::warp34_apply_attn_output_gate_hadamard_f16
                     } else if fuse_o_h512 {
                         ffi::warp34_apply_attn_output_gate_hadamard512_f16
+                    } else if fuse_o_h1024 {
+                        ffi::warp34_apply_attn_output_gate_hadamard1024_f16
                     } else {
                         ffi::warp34_apply_attn_output_gate_f16
                     };
@@ -1243,7 +1251,7 @@ impl Qwen3_5ModelRank {
                         "warp34_apply_attn_output_gate_f16",
                     )?;
                 }
-                if fuse_o_h64 || fuse_o_h512 {
+                if fuse_o_h64 || fuse_o_h512 || fuse_o_h1024 {
                     fa.o_proj
                         .forward_prerotated(ex, &self.cublas, mw, mi, gated, s.block, rows)?;
                 } else {

@@ -529,6 +529,45 @@ impl SafetensorsArchive {
         Ok(buf)
     }
 
+    pub fn read_u8_subslice(
+        &self,
+        name: &str,
+        elem_offset: usize,
+        elem_len: usize,
+    ) -> io::Result<Vec<u8>> {
+        let info = self.tensor_info(name)?;
+        if info.dtype != "U8" {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("tensor '{}' has dtype {}, expected U8", name, info.dtype),
+            ));
+        }
+        let end = elem_offset
+            .checked_add(elem_len)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "u8 subslice overflow"))?;
+        if end as u64 > info.len_bytes {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "tensor '{}' u8 subslice [{elem_offset}..{end}) exceeds {} bytes",
+                    name, info.len_bytes
+                ),
+            ));
+        }
+        let f = self.files.get(&info.shard_file).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("shard '{}' not open", info.shard_file),
+            )
+        })?;
+        let file_off = info.offset.checked_add(elem_offset as u64).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "u8 file offset overflow")
+        })?;
+        let mut buf = vec![0u8; elem_len];
+        f.read_exact_at(&mut buf, file_off)?;
+        Ok(buf)
+    }
+
     fn read_le_u16_subslice_conv(
         &self,
         name: &str,

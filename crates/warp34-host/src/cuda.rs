@@ -406,8 +406,41 @@ impl CudaDevice {
             unsafe { ffi::warp34_get_mem_info(&raw mut free, &raw mut total) },
             "warp34_get_mem_info",
         )?;
-        Ok((free, total))
+        Ok(apply_vram_cap(free, total, max_vram_bytes()))
     }
+}
+
+/// Optional process-wide per-GPU VRAM ceiling (`--max-vram`). `0` means uncapped.
+#[cfg(feature = "cuda")]
+static MAX_VRAM_BYTES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Configures a per-GPU VRAM ceiling honored by [`CudaDevice::mem_info`] so all capacity planners
+/// (host-embed offload, KV pool, scratch arena, MTP hot experts, graph capture) target the cap.
+#[cfg(feature = "cuda")]
+pub fn set_max_vram_bytes(bytes: Option<usize>) {
+    MAX_VRAM_BYTES.store(bytes.unwrap_or(0), std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Returns the active `--max-vram` per-GPU ceiling, if set.
+#[cfg(feature = "cuda")]
+pub fn max_vram_bytes() -> Option<usize> {
+    match MAX_VRAM_BYTES.load(std::sync::atomic::Ordering::Relaxed) {
+        0 => None,
+        n => Some(n),
+    }
+}
+
+/// Pure helper applying an optional per-GPU VRAM ceiling to raw `(free, total)` byte counts.
+#[cfg(feature = "cuda")]
+#[inline]
+pub(crate) fn apply_vram_cap(free: usize, total: usize, cap: Option<usize>) -> (usize, usize) {
+    let Some(cap) = cap.filter(|&c| c > 0) else {
+        return (free, total);
+    };
+    let used = total.saturating_sub(free);
+    let capped_total = total.min(cap);
+    let capped_free = capped_total.saturating_sub(used).min(free);
+    (capped_free, capped_total)
 }
 
 /// Sticky host failures shared by streams and events through flat slot snapshots.
@@ -748,6 +781,7 @@ impl Drop for CudaEvent {
 pub struct CublasHandle {
     pub device_id: i32,
     pub handle: usize,
+    pub stream_handle: usize,
 }
 
 #[cfg(feature = "cuda")]
@@ -767,6 +801,7 @@ impl CublasHandle {
         Ok(Self {
             device_id: stream.device_id,
             handle,
+            stream_handle: stream.handle,
         })
     }
 
@@ -794,6 +829,36 @@ impl CublasHandle {
                 )
             },
             "warp34_cublas_gemm_f16",
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_f16_ldc(
+        &self,
+        a_ptr: u64,
+        b_ptr: u64,
+        c_ptr: u64,
+        m: i32,
+        n: i32,
+        k: i32,
+        ldc: i32,
+    ) -> Result<()> {
+        check_rc(
+            // SAFETY: `self.handle` is a live `Warp34Blas` handle; caller guarantees `a_ptr`, `b_ptr`,
+            // and `c_ptr` reference valid FP16 device buffers sized for `[m, k]`, `[n, k]`, and `[m, ldc]`.
+            unsafe {
+                ffi::warp34_cublas_gemm_f16_ldc(
+                    self.handle,
+                    a_ptr as *const c_void,
+                    b_ptr as *const c_void,
+                    c_ptr as *mut c_void,
+                    m,
+                    n,
+                    k,
+                    ldc,
+                )
+            },
+            "warp34_cublas_gemm_f16_ldc",
         )
     }
 

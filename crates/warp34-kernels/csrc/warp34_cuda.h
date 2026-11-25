@@ -176,6 +176,8 @@ int warp34_cublas_gemm_f16_bias(uintptr_t handle, const void* a, const void* b,
                             const void* bias, void* c, int m, int n, int k);
 int warp34_cublas_gemm_f16(uintptr_t handle, const void* a, const void* b, void* c,
                         int m, int n, int k);
+int warp34_cublas_gemm_f16_ldc(uintptr_t handle, const void* a, const void* b, void* c,
+                            int m, int n, int k, int ldc);
 int warp34_cublas_lora_shrink_expand_f16(
     uintptr_t handle, const void* x, void* y_inout, const void* lora_a, const void* lora_b,
     void* lowrank_ws, int adapter_id, int m, int size_n, int size_k, int rank_pad,
@@ -199,6 +201,16 @@ int warp34_linear_epilogue_f16(const warp34_exec* ex, const void* src,
 
 int warp34_block_hadamard_f16(const warp34_exec* ex, const void* src, void* dst,
                            int rows, int k, int padded_k, int block_size);
+int warp34_block_hadamard_signed_f16(const warp34_exec* ex, const void* src,
+                                     const int8_t* pre_signs, void* dst,
+                                     int rows, int k, int padded_k, int block_size);
+int warp34_gemm_5trit_f16(const warp34_exec* ex, const void* a,
+                          const uint32_t* packed_w, void* out,
+                          int m, int n, int k);
+int warp34_dequant_5trit_to_f16(const warp34_exec* ex, const uint32_t* packed_w,
+                                void* dst_f16, int n_start, int n_chunk, int k);
+int warp34_repack_5trit_to_marlin_u2(const warp34_exec* ex, const uint32_t* packed_w,
+                                     uint32_t* dst_marlin, uint16_t* dst_scales, int n, int k);
 int warp34_block_hadamard_inplace_f16(const warp34_exec* ex, void* buf,
                                    int rows, int k, int block_size);
 int warp34_block_hadamard_bf16(const warp34_exec* ex, const void* src, void* dst,
@@ -1008,6 +1020,9 @@ int warp34_gemma_rms_norm_hadamard_f16(
 int warp34_gemma_rms_norm_hadamard512_f16(
     const warp34_exec* ex, const void* x, const void* weight, void* out, void* out_had512,
     const uint8_t* valid_token_mask, int num_tokens, int hidden_size, float eps);
+int warp34_gemma_rms_norm_hadamard1024_f16(
+    const warp34_exec* ex, const void* x, const void* weight, void* out, void* out_had1024,
+    const uint8_t* valid_token_mask, int num_tokens, int hidden_size, float eps);
 int warp34_fused_add_gemma_rms_norm_tap_hadamard_f16(
     const warp34_exec* ex, const void* x, void* residual, const void* weight, void* out,
     void* out_had64, void* tap_dst_bf16, const uint8_t* valid_token_mask,
@@ -1015,6 +1030,10 @@ int warp34_fused_add_gemma_rms_norm_tap_hadamard_f16(
 int warp34_fused_add_gemma_rms_norm_tap_hadamard512_f16(
     const warp34_exec* ex, const void* x, void* residual, const void* weight, void* out,
     void* out_had512, void* tap_dst_bf16, const uint8_t* valid_token_mask,
+    int num_tokens, int hidden_size, float eps, int tap_row_stride, int tap_col_offset);
+int warp34_fused_add_gemma_rms_norm_tap_hadamard1024_f16(
+    const warp34_exec* ex, const void* x, void* residual, const void* weight, void* out,
+    void* out_had1024, void* tap_dst_bf16, const uint8_t* valid_token_mask,
     int num_tokens, int hidden_size, float eps, int tap_row_stride, int tap_col_offset);
 int warp34_tp2_all_reduce_residual_gemma_rms_norm_hadamard_f16(
     const warp34_exec* ex, const void* local_in, void* ar_out, void* residual,
@@ -1047,10 +1066,16 @@ int warp34_silu_and_mul_hadamard_f16(
 int warp34_silu_and_mul_hadamard512_f16(
     const warp34_exec* ex, const void* gate_up, void* out, const uint8_t* valid_token_mask,
     int num_tokens, int intermediate_size);
+int warp34_silu_and_mul_hadamard1024_f16(
+    const warp34_exec* ex, const void* gate_up, void* out, const uint8_t* valid_token_mask,
+    int num_tokens, int intermediate_size);
 int warp34_apply_attn_output_gate_hadamard_f16(
     const warp34_exec* ex, const void* attn_out, const void* gate, void* out,
     const uint8_t* valid_token_mask, int num_tokens, int total_dim);
 int warp34_apply_attn_output_gate_hadamard512_f16(
+    const warp34_exec* ex, const void* attn_out, const void* gate, void* out,
+    const uint8_t* valid_token_mask, int num_tokens, int total_dim);
+int warp34_apply_attn_output_gate_hadamard1024_f16(
     const warp34_exec* ex, const void* attn_out, const void* gate, void* out,
     const uint8_t* valid_token_mask, int num_tokens, int total_dim);
 int warp34_tp2_all_gather_topk_f32_i32(
