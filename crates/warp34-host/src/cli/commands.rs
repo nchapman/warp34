@@ -49,6 +49,7 @@ pub fn run_cuda_cli(args: &[String]) -> Result<ExitCode, String> {
     else {
         return Ok(ExitCode::SUCCESS);
     };
+    crate::cuda::set_max_vram_bytes(options.max_vram_bytes);
     match args[0].as_str() {
         "generate" => run_generate(options, policy, spec_config),
         "bench" => run_bench(options, policy, spec_config),

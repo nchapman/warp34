@@ -884,6 +884,42 @@ fn lora_cli_flags_resolve_and_validate() {
 
 #[cfg(feature = "cuda")]
 #[test]
+fn max_vram_parsing_and_cap_math() {
+    let mib = 1024 * 1024usize;
+    let gib = 1024 * mib;
+    assert_eq!(parse_byte_size("8g", "--max-vram").unwrap(), 8 * gib);
+    assert_eq!(parse_byte_size("7.5GiB", "--max-vram").unwrap(), 7680 * mib);
+    assert_eq!(parse_byte_size("7600m", "--max-vram").unwrap(), 7600 * mib);
+    assert_eq!(
+        parse_byte_size("8192MiB", "--max-vram").unwrap(),
+        8192 * mib
+    );
+    for bad in ["", "0", "-8g", "100m", "abc", "NaN"] {
+        assert!(parse_byte_size(bad, "--max-vram").is_err(), "{bad}");
+    }
+    for flag in ["--max-vram", "--vram-limit"] {
+        let opts = parse(&["generate", flag, "8g"]);
+        assert_eq!(opts.max_vram_bytes, Some(8 * gib));
+    }
+    // apply_vram_cap preserves already-used driver/allocation bytes under the cap.
+    assert_eq!(
+        crate::cuda::apply_vram_cap(23_500 * mib, 24_576 * mib, Some(8 * gib)),
+        (7_116 * mib, 8 * gib)
+    );
+    // Cap larger than physical VRAM is a no-op.
+    assert_eq!(
+        crate::cuda::apply_vram_cap(7_500 * mib, 8 * gib, Some(24 * gib)),
+        (7_500 * mib, 8 * gib)
+    );
+    // Uncapped returns raw values.
+    assert_eq!(
+        crate::cuda::apply_vram_cap(23_500 * mib, 24_576 * mib, None),
+        (23_500 * mib, 24_576 * mib)
+    );
+}
+
+#[cfg(feature = "cuda")]
+#[test]
 fn token_counts_ctx_size_and_serve_effective_kv_pages() {
     assert_eq!(parse_token_count("4096", "--ctx-size").unwrap(), 4096);
     assert_eq!(parse_token_count("32_768", "--ctx-size").unwrap(), 32_768);

@@ -19,6 +19,45 @@ pub(crate) fn parse_kv_policy(s: &str) -> Result<KvFormatPolicy, String> {
 /// Parses a token count or page count, accepting plain integers (`4096`), underscore
 /// separators (`32_768`), or binary `k`/`K` (`× 1024`) and `m`/`M` (`× 1_048_576`) suffixes
 /// (`4k` -> `4096`, `32k` -> `32768`, `128k` -> `131072`).
+/// Parses a byte-size argument like `8g`, `7.5GiB`, `7600m`, `8192MiB`, or raw bytes.
+#[cfg(feature = "cuda")]
+pub(crate) fn parse_byte_size(raw: &str, flag: &str) -> Result<usize, String> {
+    let s = raw.trim().replace('_', "");
+    if s.is_empty() {
+        return Err(format!("invalid {flag} value '{raw}'"));
+    }
+    let lower = s.to_ascii_lowercase();
+    let (num_str, mult): (&str, f64) = if let Some(n) = lower.strip_suffix("gib") {
+        (n, (1024.0f64).powi(3))
+    } else if let Some(n) = lower.strip_suffix("gb") {
+        (n, (1024.0f64).powi(3))
+    } else if let Some(n) = lower.strip_suffix('g') {
+        (n, (1024.0f64).powi(3))
+    } else if let Some(n) = lower.strip_suffix("mib") {
+        (n, (1024.0f64).powi(2))
+    } else if let Some(n) = lower.strip_suffix("mb") {
+        (n, (1024.0f64).powi(2))
+    } else if let Some(n) = lower.strip_suffix('m') {
+        (n, (1024.0f64).powi(2))
+    } else if let Some(n) = lower.strip_suffix('b') {
+        (n, 1.0)
+    } else {
+        (lower.as_str(), 1.0)
+    };
+    let val: f64 = num_str
+        .trim()
+        .parse()
+        .map_err(|_| format!("invalid {flag} value '{raw}' (expected e.g. 8g, 7600m, 12GiB)"))?;
+    if !val.is_finite() || val <= 0.0 {
+        return Err(format!("{flag} must be positive (got '{raw}')"));
+    }
+    let bytes = (val * mult).round();
+    if !bytes.is_finite() || bytes < (256.0 * 1024.0 * 1024.0) || bytes > (usize::MAX as f64) {
+        return Err(format!("{flag} must be at least 256m (got '{raw}')"));
+    }
+    Ok(bytes as usize)
+}
+
 #[cfg(feature = "cuda")]
 pub(crate) fn parse_token_count(raw: &str, flag: &str) -> Result<usize, String> {
     let trimmed = raw.trim();
@@ -103,6 +142,7 @@ Context & KV Cache Options:
                                       tq4, tq4_all (3.88x), fp8, q8_0, fp16, bf16
                                       (aliases: --kv-cache-dtype, --cache-type-k)
   --kv-pages <n>                      Target KV pool in 16-token pages (low-level alternative to --ctx-size)
+  --max-vram <size>                   Cap per-GPU VRAM budget (e.g. 8g, 7600m, 12GiB; alias: --vram-limit)
 
 Parallelism & Speculative Decoding:
   --tp, --tp-size <1|2|4|auto>        Tensor parallelism degree (default: 1; alias: --tensor-parallel-size)
@@ -569,6 +609,7 @@ pub(crate) struct CudaCliOptions {
     pub(crate) kv_pages: Option<usize>,
     pub(crate) ctx_tokens: Option<usize>,
     pub(crate) explicit_kv_pages: bool,
+    pub(crate) max_vram_bytes: Option<usize>,
     pub(crate) bench_stage: String,
     pub(crate) batch_size: usize,
     pub(crate) verify_lossless: bool,
@@ -664,6 +705,7 @@ pub(crate) fn parse_cuda_options(args: &[String]) -> Result<Option<CudaCliOption
     let mut kv_pages = None;
     let mut ctx_tokens = None;
     let mut explicit_kv_pages = false;
+    let mut max_vram_bytes = None;
     let mut bench_stage = "decode".to_string();
     let mut batch_size = 8usize;
     let mut verify_lossless = false;
@@ -739,6 +781,11 @@ pub(crate) fn parse_cuda_options(args: &[String]) -> Result<Option<CudaCliOption
                 let raw = args.get(i).ok_or("missing --kv-pages")?;
                 kv_pages = Some(parse_token_count(raw, "--kv-pages")?);
                 explicit_kv_pages = true;
+            }
+            "--max-vram" | "--vram-limit" => {
+                i += 1;
+                let raw = args.get(i).ok_or("missing --max-vram value")?;
+                max_vram_bytes = Some(parse_byte_size(raw, "--max-vram")?);
             }
             "--model" | "-m" | "--model-path" | "--hf-repo" | "-hf" => {
                 i += 1;
@@ -1140,6 +1187,7 @@ pub(crate) fn parse_cuda_options(args: &[String]) -> Result<Option<CudaCliOption
         kv_pages,
         ctx_tokens,
         explicit_kv_pages,
+        max_vram_bytes,
         bench_stage,
         batch_size,
         verify_lossless,

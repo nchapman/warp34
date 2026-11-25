@@ -406,8 +406,41 @@ impl CudaDevice {
             unsafe { ffi::warp34_get_mem_info(&raw mut free, &raw mut total) },
             "warp34_get_mem_info",
         )?;
-        Ok((free, total))
+        Ok(apply_vram_cap(free, total, max_vram_bytes()))
     }
+}
+
+/// Optional process-wide per-GPU VRAM ceiling (`--max-vram`). `0` means uncapped.
+#[cfg(feature = "cuda")]
+static MAX_VRAM_BYTES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Configures a per-GPU VRAM ceiling honored by [`CudaDevice::mem_info`] so all capacity planners
+/// (host-embed offload, KV pool, scratch arena, MTP hot experts, graph capture) target the cap.
+#[cfg(feature = "cuda")]
+pub fn set_max_vram_bytes(bytes: Option<usize>) {
+    MAX_VRAM_BYTES.store(bytes.unwrap_or(0), std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Returns the active `--max-vram` per-GPU ceiling, if set.
+#[cfg(feature = "cuda")]
+pub fn max_vram_bytes() -> Option<usize> {
+    match MAX_VRAM_BYTES.load(std::sync::atomic::Ordering::Relaxed) {
+        0 => None,
+        n => Some(n),
+    }
+}
+
+/// Pure helper applying an optional per-GPU VRAM ceiling to raw `(free, total)` byte counts.
+#[cfg(feature = "cuda")]
+#[inline]
+pub(crate) fn apply_vram_cap(free: usize, total: usize, cap: Option<usize>) -> (usize, usize) {
+    let Some(cap) = cap.filter(|&c| c > 0) else {
+        return (free, total);
+    };
+    let used = total.saturating_sub(free);
+    let capped_total = total.min(cap);
+    let capped_free = capped_total.saturating_sub(used).min(free);
+    (capped_free, capped_total)
 }
 
 /// Sticky host failures shared by streams and events through flat slot snapshots.
