@@ -130,6 +130,31 @@ fn shards_and_fused_rows_preserve_transform_contract() {
     let trit_unaligned = trit_raw.slice_rows(2, 14);
     assert_eq!(trit_unaligned.dims(), (12, 128));
     assert_eq!(trit_unaligned.to_f16_vec(), &trit_full[2 * 128..14 * 128]);
+
+    // `unwrap_hadamard` preserves unsigned block sizes and rejects signed Hadamard transforms.
+    let unsigned_had = RawLinearHost::Hadamard {
+        inner: Box::new(RawLinearHost::DenseF16 {
+            weight: vec![0u16; 16 * 64],
+            n: 16,
+            k: 64,
+        }),
+        block_size: 64,
+        pre_signs: None,
+    };
+    let (unwrapped, bs) = unsigned_had.unwrap_hadamard().unwrap();
+    assert_eq!(bs, 64);
+    assert_eq!(unwrapped.dims(), (16, 64));
+
+    let signed_had = RawLinearHost::Hadamard {
+        inner: Box::new(RawLinearHost::DenseF16 {
+            weight: vec![0u16; 16 * 64],
+            n: 16,
+            k: 64,
+        }),
+        block_size: 64,
+        pre_signs: Some(std::sync::Arc::from(vec![1i8; 64])),
+    };
+    assert!(signed_had.unwrap_hadamard().is_err());
 }
 
 #[test]

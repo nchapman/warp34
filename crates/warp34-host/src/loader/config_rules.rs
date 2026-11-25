@@ -216,109 +216,6 @@ fn matches(patterns: &[CompiledPattern], name: &str) -> io::Result<bool> {
 
 impl CompressedTensorRules {
     pub(super) fn parse(q: &Json) -> io::Result<Option<Self>> {
-        let Some(config) = q.get("transform_config").filter(|v| !v.is_null()) else {
-            return Ok(None);
-        };
-        let obj = config
-            .as_object()
-            .ok_or_else(|| invalid("transform_config must be an object"))?;
-        if obj.is_empty() {
-            return Ok(None);
-        }
-        if obj.keys().any(|k| k != "config_groups") {
-            return Err(invalid("unsupported transform_config metadata"));
-        }
-        let groups = config
-            .get("config_groups")
-            .and_then(Json::as_object)
-            .ok_or_else(|| invalid("missing transform config_groups"))?;
-        if groups.is_empty() {
-            return Ok(None);
-        }
-        if groups.len() > MAX_COMPRESSED_TENSORS_GROUPS {
-            return Err(invalid("transform config_groups exceeds group count limit"));
-        }
-        let ignore = patterns(q.get("ignore"), false)?;
-        let input_signs_map = match q.get("warp_quant_input_signs").filter(|v| !v.is_null()) {
-            Some(v) => Some(
-                v.as_object()
-                    .ok_or_else(|| invalid("warp_quant_input_signs must be an object"))?,
-            ),
-            None => None,
-        };
-        let mut transforms = vec![];
-        for (group_name, group) in groups {
-            let obj = group
-                .as_object()
-                .ok_or_else(|| invalid("invalid transform group"))?;
-            if obj.keys().any(|k| {
-                !matches!(
-                    k.as_str(),
-                    "type" | "head_dim" | "randomize" | "requires_grad" | "precision" | "apply"
-                )
-            }) || group.get("type").and_then(Json::as_str) != Some("hadamard")
-                || group.get("randomize").and_then(Json::as_bool) != Some(false)
-                || group.get("requires_grad").is_some_and(|v| v != false)
-                || group
-                    .get("precision")
-                    .is_some_and(|v| v != "torch.float32" && v != "float32")
-            {
-                return Err(invalid(
-                    "unsupported non-deterministic HGPTQ transform metadata",
-                ));
-            }
-            let head_dim = group
-                .get("head_dim")
-                .and_then(Json::as_u64)
-                .ok_or_else(|| invalid("missing Hadamard head_dim"))?
-                as usize;
-            if !SUPPORTED_HADAMARD_BLOCKS.contains(&head_dim) {
-                return Err(invalid("unsupported Hadamard head_dim"));
-            }
-            let group_signs = match input_signs_map.and_then(|m| m.get(group_name)) {
-                Some(v) => Some(parse_sign_array(
-                    v,
-                    head_dim,
-                    &format!("warp_quant_input_signs.{group_name}"),
-                )?),
-                None => None,
-            };
-            let apply = group
-                .get("apply")
-                .and_then(Json::as_array)
-                .filter(|a| !a.is_empty())
-                .ok_or_else(|| invalid("missing transform apply rules"))?;
-            for rule in apply {
-                let obj = rule
-                    .as_object()
-                    .ok_or_else(|| invalid("invalid transform apply rule"))?;
-                if obj
-                    .keys()
-                    .any(|k| !matches!(k.as_str(), "targets" | "ignore" | "location" | "inverse"))
-                {
-                    return Err(invalid("unsupported transform apply metadata"));
-                }
-                let offline = match (
-                    rule.get("location").and_then(Json::as_str),
-                    rule.get("inverse").and_then(Json::as_bool),
-                ) {
-                    (Some("input"), Some(false)) => false,
-                    (Some("weight_input"), Some(true)) => true,
-                    _ => {
-                        return Err(invalid(
-                            "unsupported transform location/inverse (only input and offline inverse weight_input supported)",
-                        ));
-                    }
-                };
-                transforms.push(TransformRule {
-                    targets: patterns(rule.get("targets"), true)?,
-                    ignore: patterns(rule.get("ignore"), false)?,
-                    head_dim,
-                    offline,
-                    input_signs: if offline { None } else { group_signs.clone() },
-                });
-            }
-        }
         let embed_quant = match q.get("warp_quant_embed_w2").filter(|v| !v.is_null()) {
             Some(v) => {
                 let obj = v
@@ -358,6 +255,113 @@ impl CompressedTensorRules {
             }
             None => None,
         };
+
+        let mut transforms = vec![];
+        if let Some(config) = q.get("transform_config").filter(|v| !v.is_null()) {
+            let obj = config
+                .as_object()
+                .ok_or_else(|| invalid("transform_config must be an object"))?;
+            if !obj.is_empty() {
+                if obj.keys().any(|k| k != "config_groups") {
+                    return Err(invalid("unsupported transform_config metadata"));
+                }
+                let groups = config
+                    .get("config_groups")
+                    .and_then(Json::as_object)
+                    .ok_or_else(|| invalid("missing transform config_groups"))?;
+                if groups.len() > MAX_COMPRESSED_TENSORS_GROUPS {
+                    return Err(invalid("transform config_groups exceeds group count limit"));
+                }
+                let input_signs_map = match q.get("warp_quant_input_signs").filter(|v| !v.is_null())
+                {
+                    Some(v) => Some(
+                        v.as_object()
+                            .ok_or_else(|| invalid("warp_quant_input_signs must be an object"))?,
+                    ),
+                    None => None,
+                };
+                for (group_name, group) in groups {
+                    let obj = group
+                        .as_object()
+                        .ok_or_else(|| invalid("invalid transform group"))?;
+                    if obj.keys().any(|k| {
+                        !matches!(
+                            k.as_str(),
+                            "type"
+                                | "head_dim"
+                                | "randomize"
+                                | "requires_grad"
+                                | "precision"
+                                | "apply"
+                        )
+                    }) || group.get("type").and_then(Json::as_str) != Some("hadamard")
+                        || group.get("randomize").and_then(Json::as_bool) != Some(false)
+                        || group.get("requires_grad").is_some_and(|v| v != false)
+                        || group
+                            .get("precision")
+                            .is_some_and(|v| v != "torch.float32" && v != "float32")
+                    {
+                        return Err(invalid(
+                            "unsupported non-deterministic HGPTQ transform metadata",
+                        ));
+                    }
+                    let head_dim = group
+                        .get("head_dim")
+                        .and_then(Json::as_u64)
+                        .ok_or_else(|| invalid("missing Hadamard head_dim"))?
+                        as usize;
+                    if !SUPPORTED_HADAMARD_BLOCKS.contains(&head_dim) {
+                        return Err(invalid("unsupported Hadamard head_dim"));
+                    }
+                    let group_signs = match input_signs_map.and_then(|m| m.get(group_name)) {
+                        Some(v) => Some(parse_sign_array(
+                            v,
+                            head_dim,
+                            &format!("warp_quant_input_signs.{group_name}"),
+                        )?),
+                        None => None,
+                    };
+                    let apply = group
+                        .get("apply")
+                        .and_then(Json::as_array)
+                        .filter(|a| !a.is_empty())
+                        .ok_or_else(|| invalid("missing transform apply rules"))?;
+                    for rule in apply {
+                        let obj = rule
+                            .as_object()
+                            .ok_or_else(|| invalid("invalid transform apply rule"))?;
+                        if obj.keys().any(|k| {
+                            !matches!(k.as_str(), "targets" | "ignore" | "location" | "inverse")
+                        }) {
+                            return Err(invalid("unsupported transform apply metadata"));
+                        }
+                        let offline = match (
+                            rule.get("location").and_then(Json::as_str),
+                            rule.get("inverse").and_then(Json::as_bool),
+                        ) {
+                            (Some("input"), Some(false)) => false,
+                            (Some("weight_input"), Some(true)) => true,
+                            _ => {
+                                return Err(invalid(
+                                    "unsupported transform location/inverse (only input and offline inverse weight_input supported)",
+                                ));
+                            }
+                        };
+                        transforms.push(TransformRule {
+                            targets: patterns(rule.get("targets"), true)?,
+                            ignore: patterns(rule.get("ignore"), false)?,
+                            head_dim,
+                            offline,
+                            input_signs: if offline { None } else { group_signs.clone() },
+                        });
+                    }
+                }
+            }
+        }
+        if transforms.is_empty() && embed_quant.is_none() {
+            return Ok(None);
+        }
+        let ignore = patterns(q.get("ignore"), false)?;
         let mut quant_groups = vec![];
         let quant_map = q
             .get("config_groups")

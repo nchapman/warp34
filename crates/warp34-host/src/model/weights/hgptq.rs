@@ -235,12 +235,21 @@ impl RawLinearHost {
         }
     }
 
-    pub(crate) fn unwrap_hadamard(self) -> (Self, usize) {
+    pub(crate) fn unwrap_hadamard(self) -> Result<(Self, usize)> {
         match self {
             Self::Hadamard {
-                inner, block_size, ..
-            } => (*inner, block_size),
-            other => (other, 0),
+                inner,
+                block_size,
+                pre_signs,
+            } => {
+                if pre_signs.is_some() {
+                    return Err(loader_err(
+                        "signed Hadamard pre-signs are not supported on routed MoE expert projections",
+                    ));
+                }
+                Ok((*inner, block_size))
+            }
+            other => Ok((other, 0)),
         }
     }
 }

@@ -1552,3 +1552,55 @@ fn compressed_tensors_bonsai_h4096_signs_and_embed_w2_rules() {
     assert_eq!(embed.hadamard_block_size, 4096);
     assert_eq!(embed.signs.as_ref(), signs.as_slice());
 }
+
+#[test]
+fn compressed_tensors_parses_embed_w2_without_linear_transform_groups() {
+    let signs: Vec<i8> = (0..1024)
+        .map(|i| if (i % 2) == 0 { 1 } else { -1 })
+        .collect();
+    for transform_config in [
+        None,
+        Some(serde_json::json!({})),
+        Some(serde_json::json!({ "config_groups": {} })),
+    ] {
+        let mut q = serde_json::json!({
+            "quant_method": "compressed-tensors",
+            "format": "pack-quantized",
+            "ignore": ["lm_head"],
+            "config_groups": {
+                "group_0": {
+                    "targets": ["Linear"],
+                    "weights": {
+                        "num_bits": 4,
+                        "type": "int",
+                        "symmetric": true,
+                        "strategy": "group",
+                        "group_size": 128,
+                        "dynamic": false
+                    }
+                }
+            },
+            "warp_quant_embed_w2": {
+                "group_size": 128,
+                "hadamard_block_size": 1024,
+                "signs": signs
+            }
+        });
+        if let Some(tc) = transform_config {
+            q["transform_config"] = tc;
+        }
+        let parsed = ModelConfig::parse_quant(Some(&q)).unwrap();
+        let embed = parsed
+            .embed_quant()
+            .expect("warp_quant_embed_w2 must parse even without linear transform groups");
+        assert_eq!(embed.group_size, 128);
+        assert_eq!(embed.hadamard_block_size, 1024);
+        assert_eq!(embed.signs.as_ref(), signs.as_slice());
+        assert_eq!(
+            parsed
+                .input_hadamard("model.layers.0.mlp.down_proj")
+                .unwrap(),
+            None
+        );
+    }
+}

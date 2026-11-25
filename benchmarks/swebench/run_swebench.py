@@ -600,10 +600,10 @@ def run_evaluation_harness(
     )
     cwd = pathlib.Path.cwd()
     run_log_dir = cwd / "logs" / "run_evaluation" / run_id
-    eval_exc: subprocess.CalledProcessError | None = None
+    eval_exc: subprocess.SubprocessError | None = None
     try:
         subprocess.run(cmd, check=True, timeout=timeout_s)
-    except subprocess.CalledProcessError as exc:
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
         eval_exc = exc
 
     reports = sorted(cwd.glob(f"*.{run_id}.json"), key=lambda p: p.stat().st_mtime)
@@ -655,7 +655,7 @@ def run_evaluation_harness(
     norm_log_dir = cwd / "logs" / "run_evaluation" / norm_run_id
     try:
         subprocess.run(norm_cmd, check=True, timeout=timeout_s)
-    except subprocess.CalledProcessError:
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
         pass
     norm_reports = sorted(cwd.glob(f"*.{norm_run_id}.json"), key=lambda p: p.stat().st_mtime)
     recheck_eval = (

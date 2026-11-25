@@ -224,6 +224,50 @@ class RunSwebenchTests(unittest.TestCase):
             self.assertEqual(synth["empty_patch_ids"], ["repo__empty-3"])
             self.assertEqual(synth["error_ids"], ["repo__crashed-4"])
 
+    def test_run_evaluation_harness_recovers_on_timeout_or_reraises(self) -> None:
+        from unittest import mock
+        import os
+        import subprocess
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            out_dir = root / "out"
+            out_dir.mkdir()
+            (out_dir / "preds.json").write_text(
+                json.dumps({"repo__ok-1": {"model_patch": "diff --git a/a.py b/a.py\n"}})
+            )
+            log_dir = root / "logs" / "run_evaluation" / "warp34-out" / "model" / "repo__ok-1"
+            log_dir.mkdir(parents=True)
+            (log_dir / "report.json").write_text(json.dumps({"repo__ok-1": {"resolved": True}}))
+
+            old_cwd = pathlib.Path.cwd()
+            try:
+                os.chdir(root)
+                with mock.patch.object(
+                    subprocess,
+                    "run",
+                    side_effect=subprocess.TimeoutExpired(cmd=["uvx"], timeout=1),
+                ):
+                    run_swebench.run_evaluation_harness(
+                        out_dir, max_workers=1, normalize_p1=False, timeout_s=1
+                    )
+                recovered = json.loads((out_dir / "eval_report.json").read_text())
+                self.assertEqual(recovered["resolved_ids"], ["repo__ok-1"])
+
+                # Without logs or report files, TimeoutExpired is re-raised.
+                (out_dir / "eval_report.json").unlink()
+                with mock.patch.object(
+                    subprocess,
+                    "run",
+                    side_effect=subprocess.TimeoutExpired(cmd=["uvx"], timeout=1),
+                ):
+                    with self.assertRaises(subprocess.TimeoutExpired):
+                        run_swebench.run_evaluation_harness(
+                            out_dir, max_workers=1, normalize_p1=False, timeout_s=1
+                        )
+            finally:
+                os.chdir(old_cwd)
+
 
 if __name__ == "__main__":
     unittest.main()
