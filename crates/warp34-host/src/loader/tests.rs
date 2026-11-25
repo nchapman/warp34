@@ -1450,3 +1450,105 @@ fn compressed_tensors_hgptq_code_offset_half_and_h128_h512_rules() {
     }));
     assert!(bad_val.is_err());
 }
+
+#[test]
+fn compressed_tensors_bonsai_h4096_signs_and_embed_w2_rules() {
+    let signs: Vec<i8> = (0..4096).map(|i| if i % 2 == 0 { 1 } else { -1 }).collect();
+    let q = cfg_with_quant(serde_json::json!({
+        "quant_method": "compressed-tensors",
+        "format": "pack-quantized",
+        "config_groups": {
+            "w2_ternary": {
+                "targets": [
+                    "re:.*(?<!mtp\\.)layers\\.\\d+\\.(self_attn|linear_attn|mlp)\\.(q_proj|o_proj|out_proj|gate_proj)$",
+                    "re:(?:^|.*\\.)lm_head$"
+                ],
+                "weights": {
+                    "num_bits": 2,
+                    "type": "int",
+                    "symmetric": true,
+                    "strategy": "group",
+                    "group_size": 128,
+                    "dynamic": false
+                }
+            }
+        },
+        "transform_config": {
+            "config_groups": {
+                "v": {
+                    "type": "hadamard",
+                    "head_dim": 4096,
+                    "randomize": false,
+                    "requires_grad": false,
+                    "apply": [
+                        { "location": "weight_input", "inverse": true, "targets": [
+                            "re:.*(?<!mtp\\.)layers\\.\\d+\\.(self_attn|linear_attn|mlp)\\.(q_proj|gate_proj)$",
+                            "re:(?:^|.*\\.)lm_head$"
+                        ], "ignore": [] },
+                        { "location": "input", "inverse": false, "targets": [
+                            "re:.*(?<!mtp\\.)layers\\.\\d+\\.(self_attn|linear_attn|mlp)\\.(q_proj|gate_proj)$",
+                            "re:(?:^|.*\\.)lm_head$"
+                        ], "ignore": [] }
+                    ]
+                },
+                "v_o_proj": {
+                    "type": "hadamard",
+                    "head_dim": 4096,
+                    "randomize": false,
+                    "requires_grad": false,
+                    "apply": [
+                        { "location": "weight_input", "inverse": true, "targets": [
+                            "re:.*(?<!mtp\\.)layers\\.\\d+\\.(self_attn\\.o_proj|linear_attn\\.out_proj)$"
+                        ], "ignore": [] },
+                        { "location": "input", "inverse": false, "targets": [
+                            "re:.*(?<!mtp\\.)layers\\.\\d+\\.(self_attn\\.o_proj|linear_attn\\.out_proj)$"
+                        ], "ignore": [] }
+                    ]
+                }
+            }
+        },
+        "warp_quant_input_signs": {
+            "v_o_proj": signs
+        },
+        "warp_quant_embed_w2": {
+            "group_size": 128,
+            "hadamard_block_size": 4096,
+            "signs": signs
+        },
+        "warp_quant_lm_head_hadamard": {
+            "block_size": 4096,
+            "signs": signs
+        }
+    }))
+    .unwrap();
+
+    let (hd_q, signs_q) = q
+        .input_hadamard_with_signs("model.language_model.layers.0.self_attn.q_proj")
+        .unwrap()
+        .unwrap();
+    assert_eq!(hd_q, 4096);
+    assert!(signs_q.is_none());
+
+    let (hd_lm, signs_lm) = q.input_hadamard_with_signs("lm_head").unwrap().unwrap();
+    assert_eq!(hd_lm, 4096);
+    assert!(signs_lm.is_none());
+
+    let (hd_o, signs_o) = q
+        .input_hadamard_with_signs("model.language_model.layers.3.self_attn.o_proj")
+        .unwrap()
+        .unwrap();
+    assert_eq!(hd_o, 4096);
+    assert_eq!(signs_o.as_deref(), Some(signs.as_slice()));
+
+    let (hd_out, signs_out) = q
+        .input_hadamard_with_signs("model.language_model.layers.0.linear_attn.out_proj")
+        .unwrap()
+        .unwrap();
+    assert_eq!(hd_out, 4096);
+    assert_eq!(signs_out.as_deref(), Some(signs.as_slice()));
+
+    let embed = q.embed_quant().unwrap();
+    assert_eq!(embed.group_size, 128);
+    assert_eq!(embed.hadamard_block_size, 4096);
+    assert_eq!(embed.signs.as_ref(), signs.as_slice());
+}

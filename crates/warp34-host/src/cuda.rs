@@ -797,6 +797,36 @@ impl CublasHandle {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_f16_ldc(
+        &self,
+        a_ptr: u64,
+        b_ptr: u64,
+        c_ptr: u64,
+        m: i32,
+        n: i32,
+        k: i32,
+        ldc: i32,
+    ) -> Result<()> {
+        check_rc(
+            // SAFETY: `self.handle` is a live `Warp34Blas` handle; caller guarantees `a_ptr`, `b_ptr`,
+            // and `c_ptr` reference valid FP16 device buffers sized for `[m, k]`, `[n, k]`, and `[m, ldc]`.
+            unsafe {
+                ffi::warp34_cublas_gemm_f16_ldc(
+                    self.handle,
+                    a_ptr as *const c_void,
+                    b_ptr as *const c_void,
+                    c_ptr as *mut c_void,
+                    m,
+                    n,
+                    k,
+                    ldc,
+                )
+            },
+            "warp34_cublas_gemm_f16_ldc",
+        )
+    }
+
     /// Row-major native FP16 Linear using the cuBLASLt BIAS epilogue.
     ///
     /// Warm each shape, bias address and pointer-alignment combination immediately

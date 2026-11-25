@@ -862,11 +862,74 @@ impl Qwen3_5ModelRank {
             }
             return Ok(embed_f16);
         }
+        if let Some(trit5_key) = archive.resolve_name("model.embed_tokens.weight_5trit") {
+            let scale_key = archive
+                .resolve_name("model.embed_tokens.weight_scale")
+                .ok_or_else(|| {
+                    loader_err_msg(format!(
+                        "missing 'model.embed_tokens.weight_scale' for '{trit5_key}'"
+                    ))
+                })?;
+            let packed_bytes = archive
+                .read_bytes(&trit5_key)
+                .map_err(|e| loader_err_msg(format!("read_bytes('{trit5_key}') failed: {e}")))?;
+            let scales = archive
+                .read_f16_bits(&scale_key)
+                .map_err(|e| loader_err_msg(format!("read_f16_bits('{scale_key}') failed: {e}")))?;
+            if cfg.hidden_size == 0 || !cfg.hidden_size.is_multiple_of(128) {
+                return Err(loader_err_msg(format!(
+                    "5-trit embed_tokens requires hidden_size divisible by 128, got {}",
+                    cfg.hidden_size
+                )));
+            }
+            let groups = cfg.hidden_size / 128;
+            let expected_packed = cfg.vocab_size.saturating_mul(groups).saturating_mul(26);
+            if packed_bytes.len() != expected_packed {
+                return Err(loader_err_msg(format!(
+                    "'{trit5_key}' byte length {} != expected {expected_packed} for [{}, {}]",
+                    packed_bytes.len(),
+                    cfg.vocab_size,
+                    cfg.hidden_size
+                )));
+            }
+            let expected_scales = cfg.vocab_size.saturating_mul(groups);
+            if scales.len() != expected_scales {
+                return Err(loader_err_msg(format!(
+                    "'{scale_key}' element count {} != expected {expected_scales} for [{}, {}]",
+                    scales.len(),
+                    cfg.vocab_size,
+                    cfg.hidden_size
+                )));
+            }
+            let mut embed_f16 = crate::loader::dequant_5trit_n_major_to_f16(
+                &packed_bytes,
+                &scales,
+                cfg.vocab_size,
+                cfg.hidden_size,
+            );
+            if let Some(spec) = cfg.quant.embed_quant() {
+                if spec.signs.len() != cfg.hidden_size {
+                    return Err(loader_err_msg(format!(
+                        "warp_quant_embed_w2 signs len {} != hidden_size {}",
+                        spec.signs.len(),
+                        cfg.hidden_size
+                    )));
+                }
+                crate::model::weights::hgptq::hadamard_f16_rows_with_post_signs(
+                    &mut embed_f16,
+                    cfg.hidden_size,
+                    Some(&spec.signs),
+                );
+            }
+            return Ok(embed_f16);
+        }
         if archive
             .resolve_name("model.embed_tokens.weight_packed")
             .is_some()
             || archive.resolve_name("model.embed_tokens.qweight").is_some()
         {
+            let embed_spec = cfg.quant.embed_quant();
+            let embed_group_size = embed_spec.map_or(cfg.quant.raw_group_size(), |s| s.group_size);
             let mut embed_quant = cfg.quant.clone();
             if let Some(pk) = archive.resolve_name("model.embed_tokens.weight_packed")
                 && let Ok(p_info) = archive.tensor_info(&pk)
@@ -879,7 +942,7 @@ impl Qwen3_5ModelRank {
                 if p_info.shape[1].saturating_mul(4) == cfg.hidden_size {
                     embed_quant = crate::loader::QuantScheme::CompressedTensors {
                         num_bits: 8,
-                        group_size: cfg.quant.raw_group_size(),
+                        group_size: embed_group_size,
                         symmetric: true,
                         code_offset_half: false,
                         ignore: Vec::new(),
@@ -888,7 +951,16 @@ impl Qwen3_5ModelRank {
                 } else if p_info.shape[1].saturating_mul(8) == cfg.hidden_size {
                     embed_quant = crate::loader::QuantScheme::CompressedTensors {
                         num_bits: 4,
-                        group_size: cfg.quant.raw_group_size(),
+                        group_size: embed_group_size,
+                        symmetric: !has_zp,
+                        code_offset_half: false,
+                        ignore: Vec::new(),
+                        rules: None,
+                    };
+                } else if p_info.shape[1].saturating_mul(16) == cfg.hidden_size {
+                    embed_quant = crate::loader::QuantScheme::CompressedTensors {
+                        num_bits: 2,
+                        group_size: embed_group_size,
                         symmetric: !has_zp,
                         code_offset_half: false,
                         ignore: Vec::new(),
@@ -905,7 +977,21 @@ impl Qwen3_5ModelRank {
                     cfg.hidden_size
                 )));
             }
-            return Ok(raw_embed.to_f16_vec());
+            let mut embed_f16 = raw_embed.to_f16_vec();
+            if let Some(spec) = embed_spec {
+                if !cfg.hidden_size.is_multiple_of(spec.hadamard_block_size) {
+                    return Err(loader_err_msg(format!(
+                        "embed_tokens hidden_size {} is not divisible by warp_quant_embed_w2 hadamard_block_size {}",
+                        cfg.hidden_size, spec.hadamard_block_size
+                    )));
+                }
+                super::weights::hgptq::hadamard_f16_rows_with_post_signs(
+                    &mut embed_f16,
+                    spec.hadamard_block_size,
+                    Some(&spec.signs),
+                );
+            }
+            return Ok(embed_f16);
         }
         Err(loader_err_msg("missing model.embed_tokens.weight"))
     }
@@ -1376,9 +1462,14 @@ impl Qwen3_5ModelRank {
         // 1. embed_tokens (replicated in FP16; dequantized on host when packed, and optionally
         //    preloaded in parallel with GPU warmup via `shared_vocab`).
         let has_untied_lm_head = !cfg.tie_word_embeddings
-            && ["lm_head.weight", "lm_head.weight_packed", "lm_head.qweight"]
-                .iter()
-                .any(|k| archive.resolve_name(k).is_some());
+            && [
+                "lm_head.weight",
+                "lm_head.weight_packed",
+                "lm_head.weight_5trit",
+                "lm_head.qweight",
+            ]
+            .iter()
+            .any(|k| archive.resolve_name(k).is_some());
         let owned_vocab;
         let embed_f16: &[u16] = if let Some(cell) = shared_vocab {
             let res = cell.get_or_init(|| Self::load_embed_tokens_f16(archive, cfg));

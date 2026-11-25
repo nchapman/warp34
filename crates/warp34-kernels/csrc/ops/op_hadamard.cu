@@ -247,12 +247,157 @@ __global__ void block_hadamard_512_16bit(const T* src, T* dst,
     }
 }
 
+// H_4096 factored as H_64 ⊗ H_64 in shared memory (`64 × 65` float = 16.25 KiB, zero bank
+// conflicts on transpose). Supports optional per-channel `pre_signs` (`{-1, +1}` in `int8_t`,
+// length 4096) fused into the load so `v_o_proj` (`H_4096(x * signs)`) takes a single pass.
+// One CTA (256 threads = 16 half-warps × 16 lanes) handles one 4096-element block per iteration.
+template <typename T>
+__global__ void block_hadamard_4096_16bit(const T* src, const int8_t* pre_signs, T* dst,
+                                          int k, int padded_k, int64_t groups) {
+    using S = HadScalar<T>;
+    constexpr float scale = 0.015625f; // 1 / sqrt(4096) = 1 / 64
+    __shared__ float smem[64][65];
+
+    const int hw = threadIdx.x >> 4;   // 0..15 half-warp index
+    const int lane = threadIdx.x & 15; // 0..15 lane within half-warp
+    const int blocks_per_row = padded_k / 4096;
+    const bool vec_aligned =
+        ((reinterpret_cast<uintptr_t>(src) | reinterpret_cast<uintptr_t>(dst)) & 7u) == 0u;
+
+    for (int64_t group = blockIdx.x; group < groups; group += gridDim.x) {
+        const int64_t row = group / blocks_per_row;
+        const int base_col = int(group % blocks_per_row) * 4096;
+
+        // Pass 1: H_64 along each of the 64 rows (low 6 bits: h = 1..32).
+        #pragma unroll
+        for (int p = 0; p < 4; ++p) {
+            const int r = hw + p * 16;
+            const int c = lane * 4;
+            const int in_blk = r * 64 + c;
+            const int col = base_col + in_blk;
+            float v0 = 0.0f, v1 = 0.0f, v2 = 0.0f, v3 = 0.0f;
+            if (col < k) {
+                const T* sp = src + row * k + col;
+                if (vec_aligned) {
+                    const uint2 raw = *reinterpret_cast<const uint2*>(sp);
+                    const float2 f01 = S::to_float2(raw.x);
+                    const float2 f23 = S::to_float2(raw.y);
+                    v0 = f01.x;
+                    v1 = f01.y;
+                    v2 = f23.x;
+                    v3 = f23.y;
+                } else {
+                    v0 = S::to_float(sp[0]);
+                    v1 = S::to_float(sp[1]);
+                    v2 = S::to_float(sp[2]);
+                    v3 = S::to_float(sp[3]);
+                }
+                if (pre_signs) {
+                    v0 *= float(pre_signs[in_blk + 0]);
+                    v1 *= float(pre_signs[in_blk + 1]);
+                    v2 *= float(pre_signs[in_blk + 2]);
+                    v3 *= float(pre_signs[in_blk + 3]);
+                }
+            }
+            {
+                const float a0 = v0 + v1;
+                const float a1 = v0 - v1;
+                const float a2 = v2 + v3;
+                const float a3 = v2 - v3;
+                v0 = a0 + a2;
+                v1 = a1 + a3;
+                v2 = a0 - a2;
+                v3 = a1 - a3;
+            }
+            #pragma unroll
+            for (int h = 1; h < 16; h *= 2) {
+                const float o0 = __shfl_xor_sync(0xffffffffu, v0, h, 16);
+                const float o1 = __shfl_xor_sync(0xffffffffu, v1, h, 16);
+                const float o2 = __shfl_xor_sync(0xffffffffu, v2, h, 16);
+                const float o3 = __shfl_xor_sync(0xffffffffu, v3, h, 16);
+                const bool sub = (lane & h) != 0;
+                v0 = sub ? (o0 - v0) : (v0 + o0);
+                v1 = sub ? (o1 - v1) : (v1 + o1);
+                v2 = sub ? (o2 - v2) : (v2 + o2);
+                v3 = sub ? (o3 - v3) : (v3 + o3);
+            }
+            smem[r][c + 0] = v0;
+            smem[r][c + 1] = v1;
+            smem[r][c + 2] = v2;
+            smem[r][c + 3] = v3;
+        }
+        __syncthreads();
+
+        // Pass 2: H_64 along each of the 64 columns (high 6 bits: h = 64..2048), scaled by 1/64.
+        #pragma unroll
+        for (int p = 0; p < 4; ++p) {
+            const int c = hw + p * 16;
+            const int r = lane * 4;
+            float v0 = smem[r + 0][c];
+            float v1 = smem[r + 1][c];
+            float v2 = smem[r + 2][c];
+            float v3 = smem[r + 3][c];
+            {
+                const float a0 = v0 + v1;
+                const float a1 = v0 - v1;
+                const float a2 = v2 + v3;
+                const float a3 = v2 - v3;
+                v0 = a0 + a2;
+                v1 = a1 + a3;
+                v2 = a0 - a2;
+                v3 = a1 - a3;
+            }
+            #pragma unroll
+            for (int h = 1; h < 16; h *= 2) {
+                const float o0 = __shfl_xor_sync(0xffffffffu, v0, h, 16);
+                const float o1 = __shfl_xor_sync(0xffffffffu, v1, h, 16);
+                const float o2 = __shfl_xor_sync(0xffffffffu, v2, h, 16);
+                const float o3 = __shfl_xor_sync(0xffffffffu, v3, h, 16);
+                const bool sub = (lane & h) != 0;
+                v0 = sub ? (o0 - v0) : (v0 + o0);
+                v1 = sub ? (o1 - v1) : (v1 + o1);
+                v2 = sub ? (o2 - v2) : (v2 + o2);
+                v3 = sub ? (o3 - v3) : (v3 + o3);
+            }
+            smem[r + 0][c] = v0 * scale;
+            smem[r + 1][c] = v1 * scale;
+            smem[r + 2][c] = v2 * scale;
+            smem[r + 3][c] = v3 * scale;
+        }
+        __syncthreads();
+
+        // Pass 3: coalesced row-major stores back to global memory.
+        #pragma unroll
+        for (int p = 0; p < 4; ++p) {
+            const int r = hw + p * 16;
+            const int c = lane * 4;
+            T* dp = dst + row * padded_k + base_col + r * 64 + c;
+            const typename S::Vec2 out01 = S::from_floats2(smem[r][c + 0], smem[r][c + 1]);
+            const typename S::Vec2 out23 = S::from_floats2(smem[r][c + 2], smem[r][c + 3]);
+            if (vec_aligned) {
+                uint2 packed_out;
+                packed_out.x = *reinterpret_cast<const uint32_t*>(&out01);
+                packed_out.y = *reinterpret_cast<const uint32_t*>(&out23);
+                *reinterpret_cast<uint2*>(dp) = packed_out;
+            } else {
+                dp[0] = S::low(out01);
+                dp[1] = S::high(out01);
+                dp[2] = S::low(out23);
+                dp[3] = S::high(out23);
+            }
+        }
+        __syncthreads();
+    }
+}
+
 template <typename T>
 int launch_block_hadamard(const warp34_exec* ex, const void* src,
-                          void* dst, int rows, int k, int padded_k,
-                          int block_size) {
+                          const int8_t* pre_signs, void* dst, int rows, int k,
+                          int padded_k, int block_size) {
     if (!ex || rows < 0 || k <= 0 || padded_k < k ||
-        (block_size != 16 && block_size != 64 && block_size != 128 && block_size != 512) ||
+        (block_size != 16 && block_size != 64 && block_size != 128 &&
+         block_size != 512 && block_size != 4096) ||
+        (pre_signs != nullptr && block_size != 4096) ||
         k % block_size != 0 || padded_k % block_size != 0) {
         return int(cudaErrorInvalidValue);
     }
@@ -269,8 +414,9 @@ int launch_block_hadamard(const warp34_exec* ex, const void* src,
         return int(cudaErrorInvalidValue);
     }
     const int64_t groups = int64_t(rows) * (padded_k / block_size);
-    const int groups_per_cta = 256 / (block_size / 4);
-    const int64_t needed = (groups + groups_per_cta - 1) / groups_per_cta;
+    const int64_t needed = (block_size == 4096)
+        ? groups
+        : ((groups + (256 / (block_size / 4)) - 1) / (256 / (block_size / 4)));
     const int grid = int(needed < 65535 ? needed : 65535);
     const auto stream = reinterpret_cast<cudaStream_t>(ex->stream);
     if (block_size == 16) {
@@ -282,9 +428,12 @@ int launch_block_hadamard(const warp34_exec* ex, const void* src,
     } else if (block_size == 128) {
         block_hadamard_16bit<T, 128><<<grid, 256, 0, stream>>>(
             static_cast<const T*>(src), static_cast<T*>(dst), k, padded_k, groups);
-    } else {
+    } else if (block_size == 512) {
         block_hadamard_512_16bit<T><<<grid, 256, 0, stream>>>(
             static_cast<const T*>(src), static_cast<T*>(dst), k, padded_k, groups);
+    } else {
+        block_hadamard_4096_16bit<T><<<grid, 256, 0, stream>>>(
+            static_cast<const T*>(src), pre_signs, static_cast<T*>(dst), k, padded_k, groups);
     }
     return int(cudaGetLastError());
 }
@@ -294,13 +443,21 @@ int launch_block_hadamard(const warp34_exec* ex, const void* src,
 extern "C" int warp34_block_hadamard_f16(const warp34_exec* ex, const void* src,
                                       void* dst, int rows, int k, int padded_k,
                                       int block_size) {
-    return launch_block_hadamard<__half>(ex, src, dst, rows, k, padded_k, block_size);
+    return launch_block_hadamard<__half>(ex, src, nullptr, dst, rows, k, padded_k, block_size);
+}
+
+extern "C" int warp34_block_hadamard_signed_f16(const warp34_exec* ex, const void* src,
+                                             const int8_t* pre_signs, void* dst,
+                                             int rows, int k, int padded_k,
+                                             int block_size) {
+    return launch_block_hadamard<__half>(ex, src, pre_signs, dst, rows, k, padded_k, block_size);
 }
 
 extern "C" int warp34_block_hadamard_inplace_f16(const warp34_exec* ex, void* buf,
                                               int rows, int k, int block_size) {
     if (!ex || rows < 0 || k <= 0 ||
-        (block_size != 16 && block_size != 64 && block_size != 128 && block_size != 512) ||
+        (block_size != 16 && block_size != 64 && block_size != 128 &&
+         block_size != 512 && block_size != 4096) ||
         k % block_size != 0) {
         return int(cudaErrorInvalidValue);
     }
@@ -311,8 +468,9 @@ extern "C" int warp34_block_hadamard_inplace_f16(const warp34_exec* ex, void* bu
         return int(cudaErrorInvalidValue);
     }
     const int64_t groups = int64_t(rows) * (k / block_size);
-    const int groups_per_cta = 256 / (block_size / 4);
-    const int64_t needed = (groups + groups_per_cta - 1) / groups_per_cta;
+    const int64_t needed = (block_size == 4096)
+        ? groups
+        : ((groups + (256 / (block_size / 4)) - 1) / (256 / (block_size / 4)));
     const int grid = int(needed < 65535 ? needed : 65535);
     const auto stream = reinterpret_cast<cudaStream_t>(ex->stream);
     if (block_size == 16) {
@@ -324,9 +482,12 @@ extern "C" int warp34_block_hadamard_inplace_f16(const warp34_exec* ex, void* bu
     } else if (block_size == 128) {
         block_hadamard_16bit<__half, 128><<<grid, 256, 0, stream>>>(
             static_cast<const __half*>(buf), static_cast<__half*>(buf), k, k, groups);
-    } else {
+    } else if (block_size == 512) {
         block_hadamard_512_16bit<__half><<<grid, 256, 0, stream>>>(
             static_cast<const __half*>(buf), static_cast<__half*>(buf), k, k, groups);
+    } else {
+        block_hadamard_4096_16bit<__half><<<grid, 256, 0, stream>>>(
+            static_cast<const __half*>(buf), nullptr, static_cast<__half*>(buf), k, k, groups);
     }
     return int(cudaGetLastError());
 }
@@ -334,7 +495,8 @@ extern "C" int warp34_block_hadamard_inplace_f16(const warp34_exec* ex, void* bu
 extern "C" int warp34_block_hadamard_bf16(const warp34_exec* ex, const void* src,
                                        void* dst, int rows, int k, int padded_k,
                                        int block_size) {
-    return launch_block_hadamard<__nv_bfloat16>(ex, src, dst, rows, k, padded_k, block_size);
+    return launch_block_hadamard<__nv_bfloat16>(
+        ex, src, nullptr, dst, rows, k, padded_k, block_size);
 }
 
 namespace {

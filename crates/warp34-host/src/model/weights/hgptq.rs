@@ -34,12 +34,12 @@ impl RawLinearHost {
         let resolved = quant
             .for_linear(&name)
             .map_err(|e| loader_err_msg(e.to_string()))?;
-        let block = quant
-            .input_hadamard(&name)
+        let block_and_signs = quant
+            .input_hadamard_with_signs(&name)
             .map_err(|e| loader_err_msg(e.to_string()))?;
         let (raw, full_n) =
             Self::load_untransformed_row_range(archive, prefix, &resolved, row_range)?;
-        let Some(block_size) = block else {
+        let Some((block_size, pre_signs)) = block_and_signs else {
             return Ok((raw, full_n));
         };
         let (n, k, group_size) = match &raw {
@@ -49,9 +49,10 @@ impl RawLinearHost {
             | Self::U4B8NMajor {
                 n, k, group_size, ..
             } => (*n, *k, *group_size),
+            Self::Ternary5Trit { n, k, .. } => (*n, *k, 128),
             _ => {
                 return Err(loader_err_msg(format!(
-                    "HGPTQ requires symmetric packed W2/W4 weights: {name}"
+                    "HGPTQ requires symmetric packed W2/W4/5-Trit weights: {name}"
                 )));
             }
         };
@@ -70,13 +71,19 @@ impl RawLinearHost {
             Self::Hadamard {
                 inner: Box::new(raw),
                 block_size,
+                pre_signs,
             },
             full_n,
         ))
     }
 
     pub(super) fn concat_transformed_rows(parts: &[&Self]) -> Result<Self> {
-        let Some(Self::Hadamard { block_size, .. }) = parts.first().copied() else {
+        let Some(Self::Hadamard {
+            block_size,
+            pre_signs,
+            ..
+        }) = parts.first().copied()
+        else {
             return Err(loader_err(
                 "cannot fuse transformed and untransformed projections",
             ));
@@ -87,7 +94,8 @@ impl RawLinearHost {
                 Self::Hadamard {
                     inner,
                     block_size: b,
-                } if b == block_size => Ok(inner.as_ref()),
+                    pre_signs: ps,
+                } if b == block_size && ps == pre_signs => Ok(inner.as_ref()),
                 _ => Err(loader_err(
                     "cannot fuse projections with different input transforms",
                 )),
@@ -96,6 +104,7 @@ impl RawLinearHost {
         Ok(Self::Hadamard {
             inner: Box::new(Self::concat_row_refs(&inner?)?),
             block_size: *block_size,
+            pre_signs: pre_signs.clone(),
         })
     }
 
@@ -103,13 +112,16 @@ impl RawLinearHost {
     pub(super) fn upload_hadamard_with(
         &self,
         block_size: usize,
+        pre_signs: Option<&[i8]>,
         arena: &mut DeviceArena,
         stream: &CudaStream,
         staging: &mut UploadStaging<'_>,
     ) -> Result<LinearProj> {
         let (n, k) = self.dims();
         let padded;
-        let storage = if n.is_multiple_of(MARLIN_TILE_N) && k.is_multiple_of(MARLIN_TILE_K_W4) {
+        let storage = if matches!(self, Self::Ternary5Trit { .. })
+            || (n.is_multiple_of(MARLIN_TILE_N) && k.is_multiple_of(MARLIN_TILE_K_W4))
+        {
             self
         } else {
             padded = self.pad_hadamard_weight()?;
@@ -118,15 +130,24 @@ impl RawLinearHost {
         let inner = storage.upload_with(arena, stream, staging)?;
         if !matches!(
             inner,
-            LinearProj::MarlinW2A16 { .. } | LinearProj::MarlinW4A16 { .. }
+            LinearProj::MarlinW2A16 { .. }
+                | LinearProj::MarlinW4A16 { .. }
+                | LinearProj::Ternary5Trit { .. }
         ) {
-            return Err(loader_err("HGPTQ must remain native W2/W4 after upload"));
+            return Err(loader_err(
+                "HGPTQ must remain native W2/W4/5-Trit after upload",
+            ));
         }
+        let pre_signs_ptr = match pre_signs {
+            Some(signs) => arena.upload_slice(signs, stream)?,
+            None => 0,
+        };
         Ok(LinearProj::Hadamard {
             inner: Box::new(inner),
             size_n: n,
             size_k: k,
             block_size,
+            pre_signs_ptr,
         })
     }
 
@@ -214,16 +235,22 @@ impl RawLinearHost {
 
     pub(crate) fn unwrap_hadamard(self) -> (Self, usize) {
         match self {
-            Self::Hadamard { inner, block_size } => (*inner, block_size),
+            Self::Hadamard {
+                inner, block_size, ..
+            } => (*inner, block_size),
             other => (other, 0),
         }
     }
 }
 
-/// Materializing a logical weight must undo its offline basis change too.
-/// This path is for host diagnostics; GPU upload never dequantizes HGPTQ.
-pub(super) fn unrotate_weights(inner: &RawLinearHost, block: usize) -> Vec<u16> {
-    let mut dense = inner.to_f16_vec();
+/// Applies `row -> H_{block}(row) * post_signs` in FP32 and converts back to FP16.
+/// Used for both host-side HGPTQ unrotation and `warp_quant_embed_w2` post-dequantization.
+pub(crate) fn hadamard_f16_rows_with_post_signs(
+    dense: &mut [u16],
+    block: usize,
+    post_signs: Option<&[i8]>,
+) {
+    let inv_sqrt = 1.0f32 / (block as f32).sqrt();
     let mut values = vec![0.0f32; block];
     for chunk in dense.chunks_exact_mut(block) {
         for (v, &bits) in values.iter_mut().zip(chunk.iter()) {
@@ -241,10 +268,27 @@ pub(super) fn unrotate_weights(inner: &RawLinearHost, block: usize) -> Vec<u16> 
             }
             step *= 2;
         }
-        for (bits, v) in chunk.iter_mut().zip(&values) {
-            *bits = f32_to_f16(*v / (block as f32).sqrt());
+        if let Some(signs) = post_signs {
+            for ((bits, &v), &s) in chunk.iter_mut().zip(&values).zip(signs.iter()) {
+                *bits = f32_to_f16(v * inv_sqrt * (s as f32));
+            }
+        } else {
+            for (bits, &v) in chunk.iter_mut().zip(&values) {
+                *bits = f32_to_f16(v * inv_sqrt);
+            }
         }
     }
+}
+
+/// Materializing a logical weight must undo its offline basis change too.
+/// This path is for host diagnostics; GPU upload never dequantizes HGPTQ.
+pub(super) fn unrotate_weights(
+    inner: &RawLinearHost,
+    block: usize,
+    pre_signs: Option<&[i8]>,
+) -> Vec<u16> {
+    let mut dense = inner.to_f16_vec();
+    hadamard_f16_rows_with_post_signs(&mut dense, block, pre_signs);
     dense
 }
 
@@ -252,6 +296,20 @@ pub(super) fn unrotate_weights(inner: &RawLinearHost, block: usize) -> Vec<u16> 
 impl LinearProj {
     /// Extra workspace beyond existing GEMM workspace, for this projection.
     pub fn input_transform_workspace_bytes(&self, rows: usize) -> Option<usize> {
+        let trit5_prefill_bytes = |proj: &Self| -> Option<usize> {
+            if rows <= 8 {
+                return Some(0);
+            }
+            if let Self::Ternary5Trit { size_n, size_k, .. } = proj {
+                const MAX_STRIP_BYTES: usize = 16 * 1024 * 1024;
+                let row_bytes = size_k.checked_mul(2)?;
+                let max_rows = (MAX_STRIP_BYTES / row_bytes).max(8) & !7;
+                let strip_rows = (*size_n).min(max_rows);
+                align_up_scratch(strip_rows.checked_mul(row_bytes)?)
+            } else {
+                Some(0)
+            }
+        };
         match self {
             Self::Hadamard { inner, size_n, .. } => {
                 let input = align_up_scratch(rows.checked_mul(inner.size_k())?.checked_mul(2)?)?;
@@ -260,8 +318,11 @@ impl LinearProj {
                 } else {
                     0
                 };
-                input.checked_add(output)
+                input
+                    .checked_add(output)?
+                    .checked_add(trit5_prefill_bytes(inner)?)
             }
+            Self::Ternary5Trit { .. } => trit5_prefill_bytes(self),
             _ => Some(0),
         }
     }
@@ -278,7 +339,9 @@ impl LinearProj {
                     size_n,
                     size_k,
                     block_size,
+                    pre_signs_ptr,
                 } if *block_size == target_block_size
+                    && *pre_signs_ptr == 0
                     && *size_k == inner.size_k()
                     && *size_n == inner.size_n()
                     && size_k.is_multiple_of(target_block_size)
@@ -319,7 +382,9 @@ impl LinearProj {
                 size_n,
                 size_k,
                 block_size,
+                pre_signs_ptr,
             } if *block_size > 0
+                && *pre_signs_ptr == 0
                 && *size_k == inner.size_k()
                 && *size_n == inner.size_n()
                 && size_k.is_multiple_of(*block_size) =>
@@ -366,6 +431,7 @@ impl LinearProj {
         n: usize,
         k: usize,
         block: usize,
+        pre_signs_ptr: u64,
         ex: &Warp34Exec,
         cublas: &CublasHandle,
         locks: u64,
@@ -375,7 +441,19 @@ impl LinearProj {
         rows: usize,
     ) -> Result<()> {
         Self::forward_hadamard_with_bias(
-            inner, n, k, block, ex, cublas, locks, lock_count, input, None, output, rows,
+            inner,
+            n,
+            k,
+            block,
+            pre_signs_ptr,
+            ex,
+            cublas,
+            locks,
+            lock_count,
+            input,
+            None,
+            output,
+            rows,
         )
     }
 
@@ -385,6 +463,7 @@ impl LinearProj {
         n: usize,
         k: usize,
         block: usize,
+        pre_signs_ptr: u64,
         ex: &Warp34Exec,
         cublas: &CublasHandle,
         locks: u64,
@@ -425,22 +504,42 @@ impl LinearProj {
         } else {
             ex.scratch_ptr + input_bytes as u64
         };
-        check_rc(
-            // SAFETY: caller supplies disjoint live activation/output/workspace buffers;
-            // capacity is checked above. Loader validates block-aligned logical K.
-            unsafe {
-                ffi::warp34_block_hadamard_f16(
-                    ex,
-                    input as *const c_void,
-                    ex.scratch_ptr as *mut c_void,
-                    m,
-                    k as i32,
-                    inner.size_k() as i32,
-                    block as i32,
-                )
-            },
-            "HGPTQ block Hadamard",
-        )?;
+        if pre_signs_ptr != 0 {
+            check_rc(
+                // SAFETY: caller supplies disjoint live activation/output/workspace buffers and
+                // a live `block`-element `int8` sign vector; capacity is checked above.
+                unsafe {
+                    ffi::warp34_block_hadamard_signed_f16(
+                        ex,
+                        input as *const c_void,
+                        pre_signs_ptr as *const i8,
+                        ex.scratch_ptr as *mut c_void,
+                        m,
+                        k as i32,
+                        inner.size_k() as i32,
+                        block as i32,
+                    )
+                },
+                "HGPTQ signed block Hadamard",
+            )?;
+        } else {
+            check_rc(
+                // SAFETY: caller supplies disjoint live activation/output/workspace buffers;
+                // capacity is checked above. Loader validates block-aligned logical K.
+                unsafe {
+                    ffi::warp34_block_hadamard_f16(
+                        ex,
+                        input as *const c_void,
+                        ex.scratch_ptr as *mut c_void,
+                        m,
+                        k as i32,
+                        inner.size_k() as i32,
+                        block as i32,
+                    )
+                },
+                "HGPTQ block Hadamard",
+            )?;
+        }
         let inner_ex = Warp34Exec {
             stream: ex.stream,
             scratch_ptr: ex.scratch_ptr + bytes as u64,

@@ -558,6 +558,26 @@ extern "C" int warp34_cublas_gemm_f16(uintptr_t handle, const void* a, const voi
     return (int)st;
 }
 
+extern "C" int warp34_cublas_gemm_f16_ldc(uintptr_t handle, const void* a, const void* b, void* c,
+                                       int m, int n, int k, int ldc) {
+    if (handle == 0 || a == nullptr || b == nullptr || c == nullptr || ldc < n) return (int)cudaErrorInvalidValue;
+    std::lock_guard<std::mutex> lock(((Warp34Blas*)handle)->mutex);
+    const float alpha = 1.0f;
+    const float beta = 0.0f;
+    cublasStatus_t st = cublasGemmEx(
+        ((Warp34Blas*)handle)->blas,
+        CUBLAS_OP_T, CUBLAS_OP_N,
+        n, m, k,
+        &alpha,
+        b, CUDA_R_16F, k,
+        a, CUDA_R_16F, k,
+        &beta,
+        c, CUDA_R_16F, ldc,
+        CUBLAS_COMPUTE_32F,
+        CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+    return (int)st;
+}
+
 // Homogeneous-batch Tensor Core LoRA shrink + expand:
 //   1. U [m, rank_pad] = X [m, size_k] @ A[adapter_id]^T [rank_pad, size_k]   (beta = 0)
 //   2. For each non-zero slice s in 0..num_b_slices:

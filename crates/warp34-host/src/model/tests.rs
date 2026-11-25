@@ -1828,6 +1828,7 @@ mod serving_capacity_tests {
                     size_n: 2 * sh_interm,
                     size_k: h_dim,
                     block_size: 64,
+                    pre_signs_ptr: 0,
                 }),
                 shared_down_proj: Some(LinearProj::Hadamard {
                     inner: Box::new(LinearProj::MarlinW4A16 {
@@ -1840,6 +1841,7 @@ mod serving_capacity_tests {
                     size_n: h_dim,
                     size_k: sh_interm,
                     block_size: 64,
+                    pre_signs_ptr: 0,
                 }),
                 shared_expert_gate: Some(LinearProj::DenseF16 {
                     weight_ptr: d_sh_gate_w.addr(),

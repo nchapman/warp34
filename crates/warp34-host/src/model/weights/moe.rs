@@ -1847,6 +1847,9 @@ pub(crate) fn load_moe_layer_weights(
                     exp0_dn_had,
                 )
             }
+            RawLinearHost::Ternary5Trit { .. } => {
+                return Err(loader_err("5-trit MoE experts are not yet supported"));
+            }
         }
     };
 

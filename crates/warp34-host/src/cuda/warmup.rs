@@ -132,6 +132,100 @@ static WARMED_QWEN_IMAGE_BITS: std::sync::atomic::AtomicU64 = std::sync::atomic:
 static WARMED_QWEN_IMAGE_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 #[cfg(feature = "cuda")]
+fn warmup_hadamard_and_bonsai_kernels(
+    ex: &ffi::Warp34Exec,
+    buf_a: u64,
+    buf_b: u64,
+    buf_c: u64,
+) -> Result<()> {
+    for block_size in [16, 64, 128, 512, 4096] {
+        let k_warm = block_size.max(512);
+        let padded_k_warm = if block_size == 4096 { 4096 } else { 1024 };
+        for had_fn in [
+            ffi::warp34_block_hadamard_f16,
+            ffi::warp34_block_hadamard_bf16,
+        ] {
+            check_rc(
+                // SAFETY: warmup buffers `buf_a` and `buf_b` are live device allocations sized for this launch.
+                unsafe {
+                    had_fn(
+                        ex,
+                        buf_a as *const c_void,
+                        buf_b as *mut c_void,
+                        2,
+                        k_warm,
+                        padded_k_warm,
+                        block_size,
+                    )
+                },
+                "warmup warp34_block_hadamard",
+            )?;
+        }
+        check_rc(
+            // SAFETY: warmup buffer `buf_b` is a live device allocation sized for this launch.
+            unsafe {
+                ffi::warp34_block_hadamard_inplace_f16(
+                    ex,
+                    buf_b as *mut c_void,
+                    2,
+                    k_warm,
+                    block_size,
+                )
+            },
+            "warmup warp34_block_hadamard_inplace_f16",
+        )?;
+    }
+    check_rc(
+        // SAFETY: warmup buffers `buf_a`, `buf_b`, and `buf_c` are live device allocations sized for this launch.
+        unsafe {
+            ffi::warp34_block_hadamard_signed_f16(
+                ex,
+                buf_a as *const c_void,
+                buf_c as *const i8,
+                buf_b as *mut c_void,
+                2,
+                4096,
+                4096,
+                4096,
+            )
+        },
+        "warmup warp34_block_hadamard_signed_f16",
+    )?;
+    for m in [1i32, 2, 4, 8] {
+        check_rc(
+            // SAFETY: warmup buffers `buf_a`, `buf_b`, and `buf_c` are live device allocations sized for this launch.
+            unsafe {
+                ffi::warp34_gemm_5trit_f16(
+                    ex,
+                    buf_a as *const c_void,
+                    buf_c as *const u32,
+                    buf_b as *mut c_void,
+                    m,
+                    32,
+                    128,
+                )
+            },
+            "warmup warp34_gemm_5trit_f16",
+        )?;
+    }
+    check_rc(
+        // SAFETY: warmup buffers `buf_b` and `buf_c` are live device allocations sized for this launch.
+        unsafe {
+            ffi::warp34_dequant_5trit_to_f16(
+                ex,
+                buf_c as *const u32,
+                buf_b as *mut c_void,
+                0,
+                32,
+                128,
+            )
+        },
+        "warmup warp34_dequant_5trit_to_f16",
+    )?;
+    Ok(())
+}
+
+#[cfg(feature = "cuda")]
 pub fn prepare_execution_plan(device_id: i32) -> Result<()> {
     let dev = CudaDevice::set_current(device_id)?;
     let dev_props = dev.props()?;
@@ -169,37 +263,7 @@ pub fn prepare_execution_plan(device_id: i32) -> Result<()> {
 
     // HGPTQ input transforms are independent of GEMM and must be resident before
     // any rank enters graph capture or a collective warmup barrier.
-    for block_size in [16, 64, 128, 512] {
-        let k_warm = 512;
-        let padded_k_warm = 1024;
-        for had_fn in [
-            ffi::warp34_block_hadamard_f16,
-            ffi::warp34_block_hadamard_bf16,
-        ] {
-            warmup_ffi!(
-                had_fn(
-                    &ex,
-                    buf_a as *const c_void,
-                    buf_b as *mut c_void,
-                    2,
-                    k_warm,
-                    padded_k_warm,
-                    block_size,
-                ),
-                "warmup warp34_block_hadamard"
-            )?;
-        }
-        warmup_ffi!(
-            ffi::warp34_block_hadamard_inplace_f16(
-                &ex,
-                buf_b as *mut c_void,
-                2,
-                k_warm,
-                block_size
-            ),
-            "warmup warp34_block_hadamard_inplace_f16"
-        )?;
-    }
+    warmup_hadamard_and_bonsai_kernels(&ex, buf_a, buf_b, buf_c)?;
 
     warmup_ffi!(
         ffi::warp34_linear_epilogue_f16(

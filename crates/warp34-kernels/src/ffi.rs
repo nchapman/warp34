@@ -331,6 +331,16 @@ unsafe extern "C" {
         n: i32,
         k: i32,
     ) -> i32;
+    pub fn warp34_cublas_gemm_f16_ldc(
+        handle: usize,
+        a: *const c_void,
+        b: *const c_void,
+        c: *mut c_void,
+        m: i32,
+        n: i32,
+        k: i32,
+        ldc: i32,
+    ) -> i32;
     pub fn warp34_cublas_lora_shrink_expand_f16(
         handle: usize,
         x: *const c_void,
@@ -390,6 +400,33 @@ unsafe extern "C" {
         k: i32,
         padded_k: i32,
         block_size: i32,
+    ) -> i32;
+    pub fn warp34_block_hadamard_signed_f16(
+        ex: *const Warp34Exec,
+        src: *const c_void,
+        pre_signs: *const i8,
+        dst: *mut c_void,
+        rows: i32,
+        k: i32,
+        padded_k: i32,
+        block_size: i32,
+    ) -> i32;
+    pub fn warp34_gemm_5trit_f16(
+        ex: *const Warp34Exec,
+        a: *const c_void,
+        packed_w: *const u32,
+        out: *mut c_void,
+        m: i32,
+        n: i32,
+        k: i32,
+    ) -> i32;
+    pub fn warp34_dequant_5trit_to_f16(
+        ex: *const Warp34Exec,
+        packed_w: *const u32,
+        dst_f16: *mut c_void,
+        n_start: i32,
+        n_chunk: i32,
+        k: i32,
     ) -> i32;
     pub fn warp34_block_hadamard_bf16(
         ex: *const Warp34Exec,

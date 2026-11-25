@@ -772,7 +772,8 @@ impl Qwen3_5MtpRank {
             | LinearProj::MarlinW2A16 { .. }
             | LinearProj::MarlinW4A16 { .. }
             | LinearProj::MarlinW4A16Zp { .. }
-            | LinearProj::MarlinW8A16 { .. } => proj.forward(
+            | LinearProj::MarlinW8A16 { .. }
+            | LinearProj::Ternary5Trit { .. } => proj.forward(
                 ex,
                 &t.cublas,
                 t.marlin_ws.addr(),
@@ -803,7 +804,8 @@ impl Qwen3_5MtpRank {
             | LinearProj::MarlinW2A16 { .. }
             | LinearProj::MarlinW4A16 { .. }
             | LinearProj::MarlinW4A16Zp { .. }
-            | LinearProj::MarlinW8A16 { .. } => proj.forward_prerotated(
+            | LinearProj::MarlinW8A16 { .. }
+            | LinearProj::Ternary5Trit { .. } => proj.forward_prerotated(
                 ex,
                 &t.cublas,
                 t.marlin_ws.addr(),

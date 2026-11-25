@@ -176,6 +176,8 @@ int warp34_cublas_gemm_f16_bias(uintptr_t handle, const void* a, const void* b,
                             const void* bias, void* c, int m, int n, int k);
 int warp34_cublas_gemm_f16(uintptr_t handle, const void* a, const void* b, void* c,
                         int m, int n, int k);
+int warp34_cublas_gemm_f16_ldc(uintptr_t handle, const void* a, const void* b, void* c,
+                            int m, int n, int k, int ldc);
 int warp34_cublas_lora_shrink_expand_f16(
     uintptr_t handle, const void* x, void* y_inout, const void* lora_a, const void* lora_b,
     void* lowrank_ws, int adapter_id, int m, int size_n, int size_k, int rank_pad,
@@ -199,6 +201,14 @@ int warp34_linear_epilogue_f16(const warp34_exec* ex, const void* src,
 
 int warp34_block_hadamard_f16(const warp34_exec* ex, const void* src, void* dst,
                            int rows, int k, int padded_k, int block_size);
+int warp34_block_hadamard_signed_f16(const warp34_exec* ex, const void* src,
+                                     const int8_t* pre_signs, void* dst,
+                                     int rows, int k, int padded_k, int block_size);
+int warp34_gemm_5trit_f16(const warp34_exec* ex, const void* a,
+                          const uint32_t* packed_w, void* out,
+                          int m, int n, int k);
+int warp34_dequant_5trit_to_f16(const warp34_exec* ex, const uint32_t* packed_w,
+                                void* dst_f16, int n_start, int n_chunk, int k);
 int warp34_block_hadamard_inplace_f16(const warp34_exec* ex, void* buf,
                                    int rows, int k, int block_size);
 int warp34_block_hadamard_bf16(const warp34_exec* ex, const void* src, void* dst,
