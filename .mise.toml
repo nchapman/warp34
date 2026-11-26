@@ -72,9 +72,9 @@ description = "Format check, clippy (both feature states), rustdoc check, CPU SI
 depends = ["fmt-check", "clippy", "clippy-cpu", "doc-check", "simd-check", "cuda-bin-check"]
 
 [tasks."test-quick"]
-description = "Unit tests only (lib target with CUDA)"
+description = "Unit tests only (lib target with CUDA, serialized for GPU safety)"
 depends = ["dashboard-build"]
-run = "cargo test --release --features cuda --lib"
+run = "cargo test --release --features cuda --lib -- --test-threads=1"
 
 [tasks."test-cpu"]
 description = "Fast CPU-only suite: unit tests plus CPU-runnable integration tests"
@@ -109,24 +109,44 @@ description = "Verify and download all pinned test and qualification checkpoints
 run = "python3 tools/prep_test_models.py --all"
 
 [tasks.test]
-description = "Full release test suite with CUDA"
+description = "Full release test suite with CUDA (serialized for GPU safety)"
 depends = ["dashboard-build"]
-run = "cargo test --release --features cuda"
+run = "cargo test --release --features cuda -- --test-threads=1"
+
+[tasks.smoke]
+description = "Fast inner-loop verification (~1–2 min, 1 GPU): fmt, clippy-cuda, simd/cuda-bin audits, harness tests, doctests, and GPU unit tests"
+run = "python3 tools/run_suite.py smoke"
+
+[tasks.gate]
+description = "Pre-merge verification suite (~10–15 min, 2 GPUs): full static/dashboard checks, release build, full GPU unit+integration tests, multi-GPU compute-sanitizer, 4B bench-gate, and lossless greedy oracle"
+run = "python3 tools/run_suite.py gate"
+
+[tasks.qualify]
+description = "Pre-release qualification suite (~35–50 min, 2 GPUs): deduplicated gate + full-fleet bench-gate, TP=1 vs TP=2 oracle-dump, 27B 32K–262K needle-gates, live multi-agent/DP=2/image soak, and 5-task SWE-bench Verified slice"
+run = "python3 tools/run_suite.py qualify"
+
+[tasks.soak]
+description = "Standalone managed live-server release soak (27B DFlash2 SWE, 4B DP=2, Qwen-Image-2.1, Bonsai 5-Trit)"
+run = "python3 tools/run_suite.py soak"
 
 [tasks.check]
-description = "Format check, clippy (both states), rustdoc check, CUDA binary audit, full release test suite, and CUDA compute-sanitizer gate"
-depends = ["fmt-check", "clippy", "clippy-cpu", "doc-check", "simd-check", "cuda-bin-check", "test", "oracle-check", "perf-check", "dashboard-check"]
+description = "Alias for full static + test + compute-sanitizer check (prefer `mise run smoke`, `mise run gate`, or `mise run qualify`)"
+depends = ["fmt-check", "clippy", "clippy-cpu", "doc-check", "simd-check", "cuda-bin-check", "test", "oracle-check", "perf-check", "swebench-check", "dashboard-check"]
 # Runs AFTER `depends` (`test`) finishes so `compute-sanitizer` reuses compiled
 # release test binaries and never contends with `worker_capacity` for GPU VRAM.
 run = "python3 tools/check_cuda_sanitizer.py"
 
 [tasks."perf-check"]
-description = "CPU-only tests and manifest validation for the independent performance suite"
-run = "cd benchmarks/perf && python3 -m unittest discover -s tests -v && python3 -m warp34perf validate suite.toml && python3 -m warp34perf validate campaigns/27b-swe-multiclient.toml && python3 -m warp34perf validate campaigns/35b-swe-multiclient.toml && python3 -m warp34perf validate campaigns/flash-next-swe-multiclient.toml"
+description = "CPU-only tests and manifest validation for the independent performance suite (suite.toml + all campaigns/*.toml)"
+run = "cd benchmarks/perf && python3 -m unittest discover -s tests -v && python3 -m warp34perf validate suite.toml && for f in campaigns/*.toml; do python3 -m warp34perf validate \"$f\" || exit 1; done"
+
+[tasks."swebench-check"]
+description = "CPU-only unit tests for the SWE-bench runner, evaluator, and telemetry analyzer"
+run = "python3 -m unittest discover -s benchmarks/swebench/tests -v"
 
 [tasks."quality-run"]
 description = "Run the sequential four-engine FP16-KV quality suite (defaults to 10 examples/task)"
-run = "python3 benchmarks/quality/run_suite.py"
+run = "python3 benchmarks/quality/run_suite.py --output-dir outputs/quality-$(date +%Y%m%d-%H%M%S)"
 
 [tasks."quality-check"]
 description = "CPU-only quality runner and upstream lm-eval configuration tests (install quality environment first)"
@@ -184,12 +204,12 @@ run = """
 [tasks."bench-gate"]
 description = "Run 4B benchmark regression gate (Plain vs MTP-3 vs DFlash2, synthetic vs realistic prompts) and render Markdown comparison table"
 depends = ["build"]
-run = "python3 tools/check_bench_regressions.py --live --suite quick"
+run = "python3 tools/check_bench_regressions.py --live --suite quick --strict"
 
 [tasks."bench-gate-full"]
 description = "Run full benchmark regression gate across 4B, 9B+LoRA, 27B, 35B-A3B MoE, and Qwen3.8-Flash-Next"
 depends = ["build"]
-run = "python3 tools/check_bench_regressions.py --live --suite full"
+run = "python3 tools/check_bench_regressions.py --live --suite full --strict"
 
 [tasks."profile-live"]
 description = "Capture live nsys SQLite profiles and render category scoreboards vs vLLM/SGLang"

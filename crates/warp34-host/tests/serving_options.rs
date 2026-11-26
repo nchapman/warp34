@@ -2,13 +2,18 @@
 mod common;
 
 use serde_json::{Value, json};
-use std::{sync::atomic::Ordering, time::Duration};
+use std::{
+    sync::{Mutex, atomic::Ordering},
+    time::Duration,
+};
 use warp34_host::{
     api_auth::ApiKey,
     cache::KvFormatPolicy,
     model::Qwen3_5Engine,
     server::{OpenAiServerState, ServeOptions, serve},
 };
+
+static GPU_LOCK: Mutex<()> = Mutex::new(());
 
 #[test]
 fn invalid_options_do_not_load_model() {
@@ -37,6 +42,7 @@ fn invalid_options_do_not_load_model() {
 
 #[test]
 fn authenticated_serving_alias_context_and_concurrency() {
+    let _gpu = GPU_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     if common::require_or_skip_cached_model(
         "Qwen/Qwen3.5-4B",
         "authenticated_serving_alias_context_and_concurrency",
@@ -143,6 +149,7 @@ fn authenticated_serving_alias_context_and_concurrency() {
 
 #[test]
 fn disabled_webui_preserves_public_metrics_and_protected_apis() {
+    let _gpu = GPU_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     if common::require_or_skip_cached_model(
         "Qwen/Qwen3.5-4B",
         "disabled_webui_preserves_public_metrics_and_protected_apis",

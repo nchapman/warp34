@@ -269,6 +269,26 @@ SANITIZER_MATRIX: tuple[SanitizerCase, ...] = (
         min_gpus=2,
     ),
     SanitizerCase(
+        subsystem="linear",
+        target="lib",
+        test_name="model::weights::hgptq::tests::gemm_5trit_f16_matches_cpu_reference",
+    ),
+    SanitizerCase(
+        subsystem="linear",
+        target="lib",
+        test_name="model::weights::hgptq::tests::repack_5trit_to_marlin_u2_matches_cpu_reference",
+    ),
+    SanitizerCase(
+        subsystem="linear",
+        target="quant_formats",
+        test_name="marlin_w2a8_prefill_matches_w2a16_for_u2b2_and_u2b2sym",
+    ),
+    SanitizerCase(
+        subsystem="qwen_image",
+        target="lib",
+        test_name="qwen_image::tests::gpu_qwen3_vl_mrope_and_conditioning_encoder_match_oracle",
+    ),
+    SanitizerCase(
         subsystem="qwen_image_tp2",
         target="lib",
         test_name="qwen_image::tests::gpu_qwen_image_transformer_extract_cached_graph_and_tp2_match_oracle",

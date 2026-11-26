@@ -26,6 +26,7 @@ from typing import Any
 
 DEFAULT_DATASET = "princeton-nlp/SWE-Bench_Verified"
 DEFAULT_SWEBENCH_VERSION = "3.0.17"
+DEFAULT_MINISWEAGENT_VERSION = "2.4.6"
 DEFAULT_SUBSET = "verified"
 DEFAULT_SPLIT = "test"
 DEFAULT_SLICE = "0:10"
@@ -109,6 +110,7 @@ def build_warp34_serve_cmd(
     ctx_size: str | None,
     reasoning_effort: str | None,
     reasoning_budget: str | None,
+    draft_model: str | None = None,
     offline: bool = True,
 ) -> list[str]:
     cmd = [
@@ -130,6 +132,8 @@ def build_warp34_serve_cmd(
         cmd.append("--offline")
     if speculative == "mtp":
         cmd.extend(["--mtp-k", str(mtp_k)])
+    if draft_model:
+        cmd.extend(["--draft-model", draft_model])
     if ctx_size:
         cmd.extend(["--ctx-size", ctx_size])
     if reasoning_effort:
@@ -158,7 +162,7 @@ def build_minisweagent_cmd(
     cmd = [
         "uvx",
         "--from",
-        "mini-swe-agent",
+        f"mini-swe-agent=={DEFAULT_MINISWEAGENT_VERSION}",
         "mini-extra",
         "swebench",
         "--subset",
@@ -523,15 +527,100 @@ def wait_for_server_health(host: str, port: int, timeout_s: float = 120.0) -> No
 def stop_process_cleanly(proc: subprocess.Popen[Any] | None) -> None:
     if proc is None or proc.poll() is not None:
         return
-    proc.send_signal(signal.SIGTERM)
+    try:
+        pgid = os.getpgid(proc.pid)
+        if pgid == proc.pid:
+            os.killpg(pgid, signal.SIGTERM)
+        else:
+            proc.send_signal(signal.SIGTERM)
+    except OSError:
+        proc.send_signal(signal.SIGTERM)
     try:
         proc.wait(timeout=15.0)
     except subprocess.TimeoutExpired:
-        proc.kill()
+        try:
+            pgid = os.getpgid(proc.pid)
+            if pgid == proc.pid:
+                os.killpg(pgid, signal.SIGKILL)
+            else:
+                proc.kill()
+        except OSError:
+            proc.kill()
         try:
             proc.wait(timeout=5.0)
         except subprocess.TimeoutExpired:
             pass
+
+
+def evaluate_gates(
+    report: RunReport,
+    *,
+    min_submitted: int | None = None,
+    min_resolved: int | None = None,
+    max_server_errors: int | None = None,
+    max_budget_exhausted: int | None = None,
+    max_format_errors: int | None = None,
+    min_prefix_cache_hit_pct: float | None = None,
+    min_stream_tps_p50: float | None = None,
+) -> list[str]:
+    """Return a list of threshold/invariant gate failures (empty means PASS)."""
+    failures: list[str] = []
+    if min_submitted is not None and report.submitted_count < min_submitted:
+        failures.append(
+            f"submitted_count {report.submitted_count} < min_submitted {min_submitted}"
+        )
+    if min_resolved is not None:
+        resolved = (
+            report.resolved_normalized_count
+            if report.resolved_normalized_count is not None
+            else report.resolved_count
+        )
+        if resolved is None:
+            failures.append(
+                f"min_resolved={min_resolved} requested but no evaluation report was found"
+            )
+        elif resolved < min_resolved:
+            failures.append(f"resolved {resolved} < min_resolved {min_resolved}")
+    if max_format_errors is not None and report.total_format_errors > max_format_errors:
+        failures.append(
+            f"total_format_errors {report.total_format_errors} > max_format_errors {max_format_errors}"
+        )
+    if any(
+        x is not None
+        for x in (
+            max_server_errors,
+            max_budget_exhausted,
+            min_prefix_cache_hit_pct,
+            min_stream_tps_p50,
+        )
+    ):
+        if report.server is None:
+            failures.append("server log telemetry missing (cannot verify server gates)")
+        else:
+            s = report.server
+            if max_server_errors is not None and s.error_events > max_server_errors:
+                failures.append(
+                    f"server.error_events {s.error_events} > max_server_errors {max_server_errors}"
+                )
+            if (
+                max_budget_exhausted is not None
+                and s.thinking_budget_exhausted_events > max_budget_exhausted
+            ):
+                failures.append(
+                    f"server.thinking_budget_exhausted_events {s.thinking_budget_exhausted_events} > max_budget_exhausted {max_budget_exhausted}"
+                )
+            if (
+                min_prefix_cache_hit_pct is not None
+                and s.prefix_cache_hit_pct < min_prefix_cache_hit_pct
+            ):
+                failures.append(
+                    f"server.prefix_cache_hit_pct {s.prefix_cache_hit_pct:.2f}% < {min_prefix_cache_hit_pct:.2f}%"
+                )
+            if min_stream_tps_p50 is not None and s.stream_tps_p50 < min_stream_tps_p50:
+                failures.append(
+                    f"server.stream_tps_p50 {s.stream_tps_p50:.2f} < {min_stream_tps_p50:.2f}"
+                )
+    return failures
 
 
 def _synthesize_eval_report_from_logs(
@@ -704,6 +793,7 @@ def main(argv: list[str] | None = None) -> int:
     p_run.add_argument("--tp", type=int, default=2)
     p_run.add_argument("--speculative", default="mtp")
     p_run.add_argument("--mtp-k", type=int, default=3)
+    p_run.add_argument("--draft-model", default=None, help="Optional DFlash2 draft model ID")
     p_run.add_argument("--ctx-size", default=None, help="Optional KV pool capacity (e.g. 384k)")
     p_run.add_argument("--reasoning-effort", default=None, help="Server --reasoning-effort level")
     p_run.add_argument("--reasoning-budget", default=None, help="Server --reasoning-budget value")
@@ -714,6 +804,13 @@ def main(argv: list[str] | None = None) -> int:
     p_run.add_argument("--max-tokens", type=int, default=None, help="Client max_tokens (omitted by default)")
     p_run.add_argument("--timeout", type=float, default=None, help="Optional subprocess timeout in seconds")
     p_run.add_argument("--evaluate", action="store_true", help="Run swebench Docker test evaluation after generation")
+    p_run.add_argument("--min-submitted", type=int, default=None, help="Fail non-zero if submitted_count < N")
+    p_run.add_argument("--min-resolved", type=int, default=None, help="Fail non-zero if resolved < N")
+    p_run.add_argument("--max-server-errors", type=int, default=None, help="Fail non-zero if server error_events > N")
+    p_run.add_argument("--max-budget-exhausted", type=int, default=None, help="Fail non-zero if thinking_budget_exhausted > N")
+    p_run.add_argument("--max-format-errors", type=int, default=None, help="Fail non-zero if total_format_errors > N")
+    p_run.add_argument("--min-prefix-cache-hit-pct", type=float, default=None, help="Fail non-zero if prefix_cache_hit_pct < X")
+    p_run.add_argument("--min-stream-tps-p50", type=float, default=None, help="Fail non-zero if stream_tps_p50 < X")
 
     # 2. `eval` subcommand
     p_eval = sub.add_parser("eval", help="Run official swebench==3.0.17 Docker test evaluation on preds.json")
@@ -755,12 +852,14 @@ def main(argv: list[str] | None = None) -> int:
                     ctx_size=args.ctx_size,
                     reasoning_effort=args.reasoning_effort,
                     reasoning_budget=args.reasoning_budget,
+                    draft_model=args.draft_model,
                 )
-                server_log_file = server_log_path.open("a", encoding="utf-8")
+                server_log_file = server_log_path.open("w", encoding="utf-8")
                 server_proc = subprocess.Popen(
                     serve_cmd,
                     stdout=server_log_file,
                     stderr=subprocess.STDOUT,
+                    start_new_session=True,
                 )
                 wait_for_server_health(args.host, args.port)
 
@@ -794,6 +893,21 @@ def main(argv: list[str] | None = None) -> int:
         report = analyze_output_dir(args.output)
         (args.output / "summary.json").write_text(json.dumps(asdict(report), indent=2))
         sys.stdout.write(format_markdown_report(report))
+        gate_failures = evaluate_gates(
+            report,
+            min_submitted=args.min_submitted,
+            min_resolved=args.min_resolved,
+            max_server_errors=args.max_server_errors,
+            max_budget_exhausted=args.max_budget_exhausted,
+            max_format_errors=args.max_format_errors,
+            min_prefix_cache_hit_pct=args.min_prefix_cache_hit_pct,
+            min_stream_tps_p50=args.min_stream_tps_p50,
+        )
+        if gate_failures:
+            sys.stderr.write("\nSWE-bench gate failures:\n")
+            for f in gate_failures:
+                sys.stderr.write(f"  - {f}\n")
+            return 1
         return 0
 
     if args.subcommand == "eval":

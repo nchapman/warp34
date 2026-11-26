@@ -34,6 +34,12 @@ CORE_TEST_MODELS: tuple[ModelSpec, ...] = (
         revision="851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a",
         required_files=("config.json", "model.safetensors.index.json", "tokenizer.json"),
     ),
+    # Core 4B quantized checkpoint required by `bench-gate` (Plain/MTP-3/DFlash2).
+    ModelSpec(
+        repo_id="nchapman/Qwen3.5-4B-W4A16-HGPTQ",
+        revision="493bf19cf3b9947d55320c93cb0f8d4c187a9083",
+        required_files=("config.json", "model.safetensors.index.json", "tokenizer.json"),
+    ),
     # Core 4B DFlash2 drafter checkpoint.
     ModelSpec(
         repo_id="nchapman/Qwen3.5-4B-DFlash2",
@@ -54,11 +60,6 @@ FULL_SUITE_MODELS: tuple[ModelSpec, ...] = (
         repo_id="nchapman/Qwen3.5-2B-W4A16-HGPTQ",
         revision="0fbb9a38f631ea63678f4b51a491e7ecb26c681c",
         required_files=("config.json", "model.safetensors", "tokenizer.json"),
-    ),
-    ModelSpec(
-        repo_id="nchapman/Qwen3.5-4B-W4A16-HGPTQ",
-        revision="493bf19cf3b9947d55320c93cb0f8d4c187a9083",
-        required_files=("config.json", "model.safetensors.index.json", "tokenizer.json"),
     ),
     ModelSpec(
         repo_id="nchapman/Qwen3.5-9B-W4A16-HGPTQ",
@@ -99,6 +100,11 @@ FULL_SUITE_MODELS: tuple[ModelSpec, ...] = (
         repo_id="nchapman/Qwen3.8-Flash-Next-DFlash2-W4A16-HGPTQ",
         revision="24a62babba3b54387b3ea73f5599e5de83029dd8",
         required_files=("config.json", "model.safetensors"),
+    ),
+    ModelSpec(
+        repo_id="nchapman/Qwen-Image-2.1-Turbo-W4A16-HGPTQ",
+        revision="2da8ee5f4fb361dd3acd87ee441289a713dbd85c",
+        required_files=("model_index.json", "transformer/config.json", "vae/config.json"),
     ),
 )
 

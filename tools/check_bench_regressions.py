@@ -25,6 +25,7 @@ from __future__ import annotations
 import argparse
 import dataclasses
 import json
+import os
 import pathlib
 import subprocess
 import sys
@@ -108,18 +109,40 @@ def normalize_arch(raw: str) -> str:
     raise ValueError(f"unsupported or unrecognized CUDA architecture {raw!r} (expected sm_80, sm_86, or sm_89)")
 
 
-def detect_host_arch(env_override: str | None = None) -> tuple[str, int]:
-    """Detect `(sm_arch, gpu_count)` from `nvidia-smi` or an explicit override."""
-    try:
-        proc = subprocess.run(
-            ["nvidia-smi", "--query-gpu=compute_cap", "--format=csv,noheader"],
-            check=True,
-            capture_output=True,
-            text=True,
-        )
-        caps = [line.strip() for line in proc.stdout.splitlines() if line.strip()]
-    except (FileNotFoundError, subprocess.SubprocessError):
-        caps = []
+def detect_host_arch(
+    env_override: str | None = None,
+    cuda_visible_devices: str | None = None,
+) -> tuple[str, int]:
+    """Detect `(sm_arch, gpu_count)` from `nvidia-smi` (respecting `CUDA_VISIBLE_DEVICES`) or an explicit override."""
+    cvd = (
+        cuda_visible_devices
+        if cuda_visible_devices is not None
+        else os.environ.get("CUDA_VISIBLE_DEVICES")
+    )
+    cmd = ["nvidia-smi", "--query-gpu=compute_cap", "--format=csv,noheader"]
+    if cvd is not None:
+        cvd_clean = cvd.strip()
+        if cvd_clean in ("-1", "none", "NoDevFiles"):
+            caps: list[str] = []
+        elif cvd_clean:
+            cmd.extend(["-i", cvd_clean])
+            try:
+                proc = subprocess.run(cmd, check=True, capture_output=True, text=True)
+                caps = [line.strip() for line in proc.stdout.splitlines() if line.strip()]
+            except (FileNotFoundError, subprocess.SubprocessError):
+                caps = []
+        else:
+            try:
+                proc = subprocess.run(cmd, check=True, capture_output=True, text=True)
+                caps = [line.strip() for line in proc.stdout.splitlines() if line.strip()]
+            except (FileNotFoundError, subprocess.SubprocessError):
+                caps = []
+    else:
+        try:
+            proc = subprocess.run(cmd, check=True, capture_output=True, text=True)
+            caps = [line.strip() for line in proc.stdout.splitlines() if line.strip()]
+        except (FileNotFoundError, subprocess.SubprocessError):
+            caps = []
 
     gpu_count = len(caps)
     if env_override:
@@ -521,6 +544,11 @@ def main(argv: list[str] | None = None) -> int:
         default=None,
         help="Optional path to write the rendered Markdown report",
     )
+    parser.add_argument(
+        "--strict",
+        action="store_true",
+        help="Fail non-zero if any selected live case is skipped due to GPU count or missing arch baseline",
+    )
     args = parser.parse_args(argv)
 
     baselines_doc = load_baselines(args.baselines)
@@ -571,6 +599,7 @@ def main(argv: list[str] | None = None) -> int:
             )
             assert out_dir is not None
             out_dir.mkdir(parents=True, exist_ok=True)
+            skipped_cases: list[str] = []
             for case_id in selected:
                 if case_id not in all_cases:
                     print(f"error: unknown case {case_id!r}", file=sys.stderr)
@@ -578,27 +607,45 @@ def main(argv: list[str] | None = None) -> int:
                 case_spec = all_cases[case_id]
                 req_tp = int(case_spec.get("tp", 1))
                 if req_tp > gpu_count:
-                    print(
-                        f"[bench-gate] skipping {case_id} (requires TP={req_tp}, found {gpu_count} visible GPU(s))",
-                        file=sys.stderr,
-                    )
+                    msg = f"{case_id}: requires TP={req_tp}, found {gpu_count} visible GPU(s)"
+                    print(f"[bench-gate] skipping {msg}", file=sys.stderr)
+                    skipped_cases.append(msg)
                     continue
                 if arch not in case_spec.get("hardware", {}):
-                    print(
-                        f"[bench-gate] skipping {case_id} (no baseline for {arch})",
-                        file=sys.stderr,
-                    )
+                    msg = f"{case_id}: no baseline for {arch}"
+                    print(f"[bench-gate] skipping {msg}", file=sys.stderr)
+                    skipped_cases.append(msg)
                     continue
                 out_json = out_dir / f"{case_id}.json"
                 cmd = build_bench_command(args.warp34_bin, case_spec, out_json)
                 print(f"[bench-gate] running {case_id}: {' '.join(cmd)}", file=sys.stderr)
                 proc = subprocess.run(cmd, check=False, capture_output=True, text=True)
                 if proc.returncode != 0:
+                    tail = (proc.stderr or proc.stdout or "").strip().splitlines()[-8:]
+                    summary_err = " | ".join(tail) if tail else f"exit code {proc.returncode}"
                     print(
                         f"[bench-gate] {case_id} command failed (exit {proc.returncode}):\n{proc.stderr}",
                         file=sys.stderr,
                     )
-                    return 1
+                    evaluations.append(
+                        CaseEvaluation(
+                            case_id=case_id,
+                            model=str(case_spec["model"]),
+                            mode_label=format_mode_label(case_spec.get("speculative"), case_spec),
+                            prompt_source=str(case_spec.get("prompt_source", "synthetic")),
+                            tp=req_tp,
+                            decode_tok_per_s=None,
+                            sched_tok_per_s=None,
+                            mean_accepted=None,
+                            radix_speedup=None,
+                            baseline_decode_tok_per_s=None,
+                            decode_delta_pct=None,
+                            competitor_summary="—",
+                            metrics=(),
+                            invariant_failures=(f"{case_id}: command failed (exit {proc.returncode}): {summary_err}",),
+                        )
+                    )
+                    continue
                 with out_json.open("r", encoding="utf-8") as f:
                     payload = json.load(f)
                 evaluations.append(
@@ -610,6 +657,26 @@ def main(argv: list[str] | None = None) -> int:
                         max_regression_pct=args.max_regression_pct,
                     )
                 )
+            if args.strict and skipped_cases:
+                for msg in skipped_cases:
+                    evaluations.append(
+                        CaseEvaluation(
+                            case_id=msg.split(":", 1)[0],
+                            model="—",
+                            mode_label="—",
+                            prompt_source="—",
+                            tp=0,
+                            decode_tok_per_s=None,
+                            sched_tok_per_s=None,
+                            mean_accepted=None,
+                            radix_speedup=None,
+                            baseline_decode_tok_per_s=None,
+                            decode_delta_pct=None,
+                            competitor_summary="—",
+                            metrics=(),
+                            invariant_failures=(f"strict mode: skipped {msg}",),
+                        )
+                    )
         finally:
             if out_root_ctx is not None:
                 out_root_ctx.cleanup()

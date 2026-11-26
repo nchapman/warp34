@@ -18,10 +18,14 @@ Prefix GPU commands with `export PATH="/opt/cuda/bin:$PATH"` and select free car
 
 ```sh
 nvidia-smi --query-compute-apps=pid,used_memory --format=csv              # check GPU squatters first
-mise run test-prep                                                        # verify/download pinned 4B test checkpoints (use test-prep-all for 2B–Flash-Next)
+mise run smoke                                                            # Tier 1 (~1–2m, 1 GPU): fast inner-loop lint, static audits, harness/doc tests, GPU unit tests
+mise run gate                                                             # Tier 2 (~10–15m, 2 GPUs): pre-merge suite (all checks + full tests + multi-GPU sanitizer + 4B bench-gate + oracle-greedy)
+mise run qualify                                                          # Tier 3 (~35–50m, 2 GPUs): pre-release suite (deduped gate + full-fleet bench + oracle-dump + 262K needles + soak + SWE-bench slice)
+mise run soak                                                             # standalone managed live-server soak (27B DFlash2 SWE, 4B DP=2, Qwen-Image-2.1, Bonsai 5-Trit)
+mise run test-prep                                                        # verify/download pinned 4B test checkpoints (use test-prep-all for 2B–Flash-Next + Qwen-Image)
 mise run build                                                            # dashboard build + cargo build --release --features cuda
 mise run check-quick                                                      # fast CPU gate: fmt-check + clippy (cuda & cpu) + doc-check + simd-check + cuda-bin-check
-mise run test-quick                                                       # fast GPU unit tests: cargo test --release --features cuda --lib
+mise run test-quick                                                       # fast GPU unit tests: cargo test --release --features cuda --lib -- --test-threads=1
 mise run test-cpu                                                         # CPU-only unit & integration tests: cargo test --lib --tests
 mise run check                                                            # full release gate: check-quick + dashboard-check + oracle-check + perf-check + test + cuda-sanitize
 mise run cuda-bin-check                                                   # static cuobjdump STACK/LOCAL/SHARED/REG gate across sm_86/sm_89 (<0.4s)

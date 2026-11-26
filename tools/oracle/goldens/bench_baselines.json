@@ -122,6 +122,12 @@
           "decode_tok_per_s": 394.0,
           "prefill_tok_per_s": 5757.3,
           "mean_accepted_drafts": 1.65
+        },
+        "sm_89": {
+          "gpu_label": "1x NVIDIA GeForce RTX 4090",
+          "decode_tok_per_s": 394.0,
+          "prefill_tok_per_s": 5757.3,
+          "mean_accepted_drafts": 1.65
         }
       }
     },
@@ -182,6 +188,12 @@
       "hardware": {
         "sm_86": {
           "gpu_label": "1x NVIDIA GeForce RTX 3090 Ti",
+          "decode_tok_per_s": 235.7,
+          "prefill_tok_per_s": 5775.6,
+          "mean_accepted_drafts": 1.35
+        },
+        "sm_89": {
+          "gpu_label": "1x NVIDIA GeForce RTX 4090",
           "decode_tok_per_s": 235.7,
           "prefill_tok_per_s": 5775.6,
           "mean_accepted_drafts": 1.35

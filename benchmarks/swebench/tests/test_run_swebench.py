@@ -324,6 +324,65 @@ class RunSwebenchTests(unittest.TestCase):
             finally:
                 os.chdir(old_cwd)
 
+    def test_evaluate_gates_enforces_thresholds(self) -> None:
+        srv = run_swebench.ServerLogSummary(
+            total_turns=20,
+            cancelled_turns=0,
+            error_events=0,
+            thinking_budget_exhausted_events=0,
+            prompt_tokens=10000,
+            cached_prompt_tokens=9000,
+            output_tokens=2000,
+            reasoning_tokens=1000,
+            content_tokens=1000,
+            wall_time_s=40.0,
+            wall_output_tok_per_s=50.0,
+            prefix_cache_hit_pct=90.0,
+            reasoning_share_pct=50.0,
+            thinking_tokens_p50=50,
+            thinking_tokens_p90=80,
+            thinking_tokens_p99=100,
+            thinking_tokens_max=100,
+            stream_tps_p50=55.0,
+            stream_tps_mean=54.0,
+            stream_tps_p90=60.0,
+            stream_tps_max=65.0,
+            ttft_ms_p50=120.0,
+            ttft_ms_p90=200.0,
+            ttft_ms_max=300.0,
+        )
+        rep = run_swebench.RunReport(
+            output_dir="/tmp/swe",
+            submitted_count=5,
+            resolved_count=4,
+            resolved_normalized_count=4,
+            total_trajectory_turns=20,
+            total_format_errors=0,
+            instances=[],
+            server=srv,
+        )
+        self.assertEqual(
+            run_swebench.evaluate_gates(
+                rep,
+                min_submitted=5,
+                min_resolved=3,
+                max_server_errors=0,
+                max_budget_exhausted=0,
+                max_format_errors=1,
+                min_prefix_cache_hit_pct=85.0,
+                min_stream_tps_p50=45.0,
+            ),
+            [],
+        )
+        bad_failures = run_swebench.evaluate_gates(
+            rep,
+            min_submitted=6,
+            min_resolved=5,
+            min_prefix_cache_hit_pct=95.0,
+            min_stream_tps_p50=70.0,
+        )
+        self.assertEqual(len(bad_failures), 4)
+
 
 if __name__ == "__main__":
     unittest.main()
