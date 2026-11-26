@@ -1,8 +1,9 @@
 //! `models.dev` provider & model registry for zero-ceremony ARC-1.0 cloud routing.
 //!
 //! Fetches and caches `https://models.dev/api.json` at `~/.cache/warp34/models.dev.json`
-//! (24h TTL, offline-safe) so users can write `--router-cloud-models google/gemini-4-hydrogen,...`
-//! or `--router-upstream <any-models-dev-provider>` and automatically resolve:
+//! (24h TTL, offline-safe) so users can write `--router-cloud-models provider/model` (e.g.
+//! `anthropic/claude-sonnet-4-6`, `openrouter/google/gemini-2.5-pro`, `https://host/v1#model`)
+//! and automatically resolve:
 //! - Provider base URL and wire dialect (`OpenAiChatCompat`, `AnthropicMessages`, `OpenAiResponses`)
 //! - API key from the provider's `models.dev` `env` list (with automatic fallback to `openrouter`
 //!   when `OPENROUTER_API_KEY` is set and the direct provider key is not)
@@ -338,12 +339,11 @@ impl ModelsDevRegistry {
     }
 
     /// Resolves a single `--router-cloud-models` spec (e.g. `google/gemini-4-hydrogen`,
-    /// `medium=google/gemini-4-hydrogen`, `deepseek:deepseek-chat`, or `gemini-4-hydrogen`
-    /// with explicit `--router-upstream google`) using `env_lookup` for API keys.
+    /// `openrouter/anthropic/claude-sonnet-4-6`, `medium=deepseek/deepseek-chat`, or
+    /// `https://gateway.example.com/v1#my-model`) using `env_lookup` for API keys.
     pub fn resolve_spec<F>(
         &self,
         raw_spec: &str,
-        forced_upstream: Option<&str>,
         cli_api_key: Option<&str>,
         env_lookup: F,
     ) -> Result<ResolvedCloudSpec, String>
@@ -365,23 +365,6 @@ impl ModelsDevRegistry {
             (None, trimmed)
         };
 
-        // Parse optional explicit `provider:model` or `provider/model`.
-        let (prefix_prov, suffix_model) = if let Some((p, m)) = rest.split_once(':') {
-            if self.has_provider(p) {
-                (Some(p), m)
-            } else {
-                (None, rest)
-            }
-        } else if let Some((p, m)) = rest.split_once('/') {
-            if self.has_provider(p) {
-                (Some(p), m)
-            } else {
-                (None, rest)
-            }
-        } else {
-            (None, rest)
-        };
-
         let pick_key = |env_vars: &[String]| -> Option<String> {
             if let Some(k) = cli_api_key.filter(|s| !s.is_empty()) {
                 return Some(k.to_string());
@@ -394,40 +377,64 @@ impl ModelsDevRegistry {
             None
         };
 
-        // Decide `(provider_id, wire_model)`, preserving original URL casing for custom http(s):// endpoints.
-        let (provider_id, wire_model) = match forced_upstream {
-            Some(up) if !up.eq_ignore_ascii_case("auto") => {
-                let is_url = up.starts_with("http://") || up.starts_with("https://");
-                let prov_key = if is_url {
-                    up.trim_end_matches('/').to_string()
-                } else {
-                    up.to_ascii_lowercase()
-                };
-                if prov_key == "openrouter" {
-                    ("openrouter".to_string(), rest.to_string())
-                } else if prefix_prov == Some(prov_key.as_str()) {
-                    (prov_key, suffix_model.to_string())
-                } else {
-                    (prov_key, rest.to_string())
+        // Support inline custom OpenAI-compatible gateways: `https://host/v1#model-id`
+        // (preserving exact URL path casing).
+        let (provider_id, wire_model, prefix_prov, suffix_model) =
+            if rest.starts_with("http://") || rest.starts_with("https://") {
+                let (url, model) = rest.split_once('#').ok_or_else(|| {
+                format!(
+                    "custom gateway `{raw_spec}` must specify a model as `https://host/v1#<model>`"
+                )
+            })?;
+                let model = model.trim();
+                if model.is_empty() {
+                    return Err(format!("custom gateway `{raw_spec}` has an empty model id"));
                 }
-            }
-            _ => {
-                // Auto mode: prefer direct provider when its env key is present, otherwise
-                // fall back to OpenRouter if OPENROUTER_API_KEY is present.
+                (
+                    url.trim_end_matches('/').to_string(),
+                    model.to_string(),
+                    None,
+                    model,
+                )
+            } else {
+                // Parse optional explicit `provider:model` or `provider/model`.
+                let (prefix_prov, suffix_model) = if let Some((p, m)) = rest.split_once(':') {
+                    if self.has_provider(p) {
+                        (Some(p), m)
+                    } else {
+                        (None, rest)
+                    }
+                } else if let Some((p, m)) = rest.split_once('/') {
+                    if self.has_provider(p) {
+                        (Some(p), m)
+                    } else {
+                        (None, rest)
+                    }
+                } else {
+                    (None, rest)
+                };
+
+                // Prefer direct provider when its env key is present, otherwise fall back to
+                // OpenRouter if OPENROUTER_API_KEY is present. Explicit `openrouter/<vendor>/<model>`
+                // always stays on OpenRouter.
                 let openrouter_key = self
                     .resolve_provider_meta("openrouter")
                     .and_then(|(_, _, envs)| pick_key(&envs));
 
-                if let Some(p) = prefix_prov {
-                    let direct_key = self
-                        .resolve_provider_meta(p)
-                        .and_then(|(_, _, envs)| pick_key(&envs));
-                    if direct_key.is_some() {
-                        (p.to_string(), suffix_model.to_string())
-                    } else if openrouter_key.is_some() {
-                        ("openrouter".to_string(), format!("{p}/{suffix_model}"))
+                let (prov, wire) = if let Some(p) = prefix_prov {
+                    if p.eq_ignore_ascii_case("openrouter") {
+                        ("openrouter".to_string(), suffix_model.to_string())
                     } else {
-                        (p.to_string(), suffix_model.to_string())
+                        let direct_key = self
+                            .resolve_provider_meta(p)
+                            .and_then(|(_, _, envs)| pick_key(&envs));
+                        if direct_key.is_some() {
+                            (p.to_string(), suffix_model.to_string())
+                        } else if openrouter_key.is_some() {
+                            ("openrouter".to_string(), format!("{p}/{suffix_model}"))
+                        } else {
+                            (p.to_string(), suffix_model.to_string())
+                        }
                     }
                 } else if openrouter_key.is_some() {
                     ("openrouter".to_string(), rest.to_string())
@@ -435,9 +442,9 @@ impl ModelsDevRegistry {
                     (p, rest.to_string())
                 } else {
                     ("openrouter".to_string(), rest.to_string())
-                }
-            }
-        };
+                };
+                (prov, wire, prefix_prov, suffix_model)
+            };
 
         let (base_url, dialect, env_vars) =
             self.resolve_provider_meta(&provider_id).ok_or_else(|| {
@@ -476,11 +483,7 @@ impl ModelsDevRegistry {
     }
 
     /// Auto-detects default cloud models when `--router` is enabled without `--router-cloud-models`.
-    pub fn default_models_for_env<F>(
-        &self,
-        forced_upstream: Option<&str>,
-        env_lookup: F,
-    ) -> Vec<String>
+    pub fn default_models_for_env<F>(&self, env_lookup: F) -> Vec<String>
     where
         F: Fn(&str) -> Option<String>,
     {
@@ -491,52 +494,27 @@ impl ModelsDevRegistry {
                         .any(|e| env_lookup(e).is_some_and(|v| !v.is_empty()))
                 })
         };
-        let target_lc = forced_upstream
-            .map(|u| u.trim().to_ascii_lowercase())
-            .filter(|u| !u.is_empty() && u != "auto");
-        match target_lc.as_deref() {
-            Some("local" | "none") => Vec::new(),
-            Some("openrouter") => vec![
-                "anthropic/claude-sonnet-5.5".to_string(),
-                "anthropic/claude-opus-5.5".to_string(),
-            ],
-            Some("anthropic") => vec![
-                "anthropic/claude-haiku-5.5".to_string(),
-                "anthropic/claude-sonnet-5.5".to_string(),
-                "anthropic/claude-opus-5.5".to_string(),
-            ],
-            Some("openai") => vec!["openai/gpt-5.6-terra".to_string()],
-            Some("google") => vec![
-                "medium=google/gemini-4-hydrogen".to_string(),
-                "frontier=google/gemini-4-argon".to_string(),
-            ],
-            Some("deepseek") => vec!["fast=deepseek/deepseek-v4-pro".to_string()],
-            Some(_) => Vec::new(),
-            None => {
-                // Auto-detect from whichever provider keys are present in the environment.
-                let mut specs = Vec::new();
-                if has_key("openrouter") {
-                    specs.push("anthropic/claude-sonnet-5.5".to_string());
-                    specs.push("anthropic/claude-opus-5.5".to_string());
-                    return specs;
-                }
-                if has_key("anthropic") {
-                    specs.push("anthropic/claude-sonnet-5.5".to_string());
-                    specs.push("anthropic/claude-opus-5.5".to_string());
-                }
-                if has_key("google") {
-                    specs.push("medium=google/gemini-4-hydrogen".to_string());
-                    specs.push("frontier=google/gemini-4-argon".to_string());
-                }
-                if has_key("openai") {
-                    specs.push("openai/gpt-5.6-terra".to_string());
-                }
-                if has_key("deepseek") {
-                    specs.push("fast=deepseek/deepseek-v4-pro".to_string());
-                }
-                specs
-            }
+        let mut specs = Vec::new();
+        if has_key("openrouter") {
+            specs.push("openrouter/anthropic/claude-sonnet-5.5".to_string());
+            specs.push("openrouter/anthropic/claude-opus-5.5".to_string());
+            return specs;
         }
+        if has_key("anthropic") {
+            specs.push("anthropic/claude-sonnet-5.5".to_string());
+            specs.push("anthropic/claude-opus-5.5".to_string());
+        }
+        if has_key("google") {
+            specs.push("medium=google/gemini-4-hydrogen".to_string());
+            specs.push("frontier=google/gemini-4-argon".to_string());
+        }
+        if has_key("openai") {
+            specs.push("openai/gpt-5.6-terra".to_string());
+        }
+        if has_key("deepseek") {
+            specs.push("fast=deepseek/deepseek-v4-pro".to_string());
+        }
+        specs
     }
 
     fn find_provider_for_bare_model<F>(&self, model_id: &str, env_lookup: &F) -> Option<String>
@@ -799,7 +777,7 @@ mod tests {
 
         // Direct GEMINI_API_KEY set -> hits Google OpenAI-compat directly!
         let direct = reg
-            .resolve_spec("google/gemini-4-argon", None, None, |k| {
+            .resolve_spec("google/gemini-4-argon", None, |k| {
                 (k == "GEMINI_API_KEY").then(|| "gm-key".to_string())
             })
             .expect("resolve direct google");
@@ -815,7 +793,7 @@ mod tests {
 
         // No GEMINI_API_KEY, but OPENROUTER_API_KEY set -> auto-falls back to OpenRouter!
         let via_or = reg
-            .resolve_spec("google/gemini-4-hydrogen", None, None, |k| {
+            .resolve_spec("google/gemini-4-hydrogen", None, |k| {
                 (k == "OPENROUTER_API_KEY").then(|| "or-key".to_string())
             })
             .expect("resolve via openrouter");
@@ -824,21 +802,25 @@ mod tests {
         assert_eq!(via_or.endpoint.api_key.as_deref(), Some("or-key"));
         assert_eq!(via_or.prices, Some([1.5, 0.075, 0.083, 7.5]));
 
-        // Explicit --router-upstream openrouter forces OpenRouter even if GEMINI_API_KEY is set.
+        // Explicit `openrouter/<vendor>/<model>` forces OpenRouter even if GEMINI_API_KEY is set.
         let forced = reg
-            .resolve_spec("google/gemini-4-argon", Some("openrouter"), None, |k| {
+            .resolve_spec("openrouter/google/gemini-4-argon", None, |k| {
                 Some(format!("{k}-val"))
             })
-            .expect("forced openrouter");
+            .expect("explicit openrouter prefix");
         assert_eq!(forced.endpoint.provider_id, "openrouter");
         assert_eq!(forced.wire_model, "google/gemini-4-argon");
+        assert_eq!(
+            forced.endpoint.api_key.as_deref(),
+            Some("OPENROUTER_API_KEY-val")
+        );
     }
 
     #[test]
     fn capabilities_and_tier_inference_match_models_dev_metadata() {
         let reg = sample_registry();
         let ds = reg
-            .resolve_spec("deepseek/deepseek-v4-pro", None, None, |k| {
+            .resolve_spec("deepseek/deepseek-v4-pro", None, |k| {
                 (k == "DEEPSEEK_API_KEY").then(|| "ds-key".to_string())
             })
             .expect("resolve deepseek");
@@ -849,19 +831,17 @@ mod tests {
         assert_eq!(infer_tier_from_prices(ds.prices.unwrap()), "fast");
 
         assert_eq!(
-            reg.default_models_for_env(Some("openrouter"), |_| None),
-            vec!["anthropic/claude-sonnet-5.5", "anthropic/claude-opus-5.5"]
-        );
-        assert!(
-            reg.default_models_for_env(Some("local"), |_| Some("k".to_string()))
-                .is_empty()
+            reg.default_models_for_env(|k| (k == "OPENROUTER_API_KEY").then(|| "k".to_string())),
+            vec![
+                "openrouter/anthropic/claude-sonnet-5.5",
+                "openrouter/anthropic/claude-opus-5.5"
+            ]
         );
 
-        // Custom URL preserves case-sensitive path segments.
+        // Inline custom gateway URL preserves case-sensitive path segments.
         let custom = reg
             .resolve_spec(
-                "my-model",
-                Some("https://Gateway.Example.com/CustomPath/v1"),
+                "https://Gateway.Example.com/CustomPath/v1#my-model",
                 None,
                 |_| None,
             )
@@ -870,5 +850,6 @@ mod tests {
             custom.endpoint.base_url,
             "https://Gateway.Example.com/CustomPath/v1"
         );
+        assert_eq!(custom.wire_model, "my-model");
     }
 }

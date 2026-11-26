@@ -172,11 +172,10 @@ Serving Options (warp34 serve):
   --no-reasoning-effort-budget        Disable automatic OpenRouter % thinking caps (minimal=10%, low=20%,
                                       medium=50%, high=80%, xhigh/max=95% of min(max_tokens, 32k))
   --router [repo|dir]                 Enable native ARC-1.0 router (default: nchapman/ARC-1.0-W4A16-HGPTQ)
-  --router-upstream <provider|url>    Cloud spillover upstream: auto (default via models.dev), openrouter, google, anthropic, openai, deepseek, ..., or http(s)://...
   --router-policy <policy>            Routing policy: prefer-local (default), sage, or swift
   --router-min-p-pass <0..1>          Min local P(pass) for prefer-local (default: 0.72)
   --router-value <usd>                Override utility task value V in USD (default: 4.5 prefer-local/sage, 0.1 swift)
-  --router-cloud-models <csv>         Cloud models as provider/model or tier=provider/model (auto-detects API keys & pricing via models.dev)
+  --router-cloud-models <csv|none>    Cloud models as provider/model, openrouter/vendor/model, https://host/v1#model, or tier=... (none=local-only)
   --router-pin-pii <csv|none>         PII classes pinned locally (default: credential,government_id,financial_account,payment_card)
 
 Generation & Chat Options (warp34 chat / generate):
@@ -299,7 +298,6 @@ pub(crate) struct ServeCliConfig {
     pub(crate) api_key: Option<String>,
     pub(crate) api_key_env: Option<String>,
     pub(crate) router_model: Option<String>,
-    pub(crate) router_upstream: Option<String>,
     pub(crate) router_policy: Option<String>,
     pub(crate) router_min_p_pass: Option<f64>,
     pub(crate) router_value_usd: Option<f64>,
@@ -402,16 +400,6 @@ impl ServeCliConfig {
             } else {
                 self.router_model = Some(crate::arc_router::DEFAULT_ARC_ROUTER_MODEL.to_string());
             }
-            return Ok(true);
-        }
-        if flag == "--router-upstream" {
-            self.used = true;
-            *i += 1;
-            let value = args
-                .get(*i)
-                .cloned()
-                .ok_or_else(|| "missing --router-upstream value".to_string())?;
-            self.router_upstream = Some(value);
             return Ok(true);
         }
         if flag == "--router-policy" {

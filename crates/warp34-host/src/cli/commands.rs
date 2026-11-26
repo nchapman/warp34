@@ -1707,7 +1707,7 @@ pub(crate) fn run_serve(
         })
         .collect();
     let router_spec = serve.router_model.clone().or_else(|| {
-        (serve.router_upstream.is_some() || !serve.router_cloud_models.is_empty())
+        (!serve.router_cloud_models.is_empty())
             .then(|| crate::arc_router::DEFAULT_ARC_ROUTER_MODEL.to_string())
     });
     if let Some(ref spec) = router_spec {
@@ -1746,7 +1746,6 @@ pub(crate) fn run_serve(
             model_dir: router_dir,
             device_id: 0,
             local_model_name: model.clone(),
-            upstream: serve.router_upstream.clone(),
             upstream_api_key: None,
             cloud_model_filter: serve.router_cloud_models.clone(),
             policy,

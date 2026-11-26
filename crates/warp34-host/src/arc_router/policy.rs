@@ -176,7 +176,6 @@ fn find_native_arc_slot(catalog: &ArcRuntimeCatalog, id: &str) -> Option<usize> 
 pub fn resolve_cloud_candidates_from_registry<F>(
     registry: &ModelsDevRegistry,
     catalog: &ArcRuntimeCatalog,
-    forced_upstream: Option<&str>,
     cli_api_key: Option<&str>,
     filter: &[String],
     env_lookup: F,
@@ -184,8 +183,16 @@ pub fn resolve_cloud_candidates_from_registry<F>(
 where
     F: Fn(&str) -> Option<String>,
 {
+    if filter.len() == 1
+        && matches!(
+            filter[0].trim().to_ascii_lowercase().as_str(),
+            "none" | "local"
+        )
+    {
+        return Ok(Vec::new());
+    }
     let specs: Vec<String> = if filter.is_empty() {
-        registry.default_models_for_env(forced_upstream, &env_lookup)
+        registry.default_models_for_env(&env_lookup)
     } else {
         filter
             .iter()
@@ -199,7 +206,7 @@ where
 
     let mut out = Vec::with_capacity(specs.len());
     for raw in &specs {
-        let resolved = registry.resolve_spec(raw, forced_upstream, cli_api_key, &env_lookup)?;
+        let resolved = registry.resolve_spec(raw, cli_api_key, &env_lookup)?;
         let is_custom_url = resolved.endpoint.provider_id.starts_with("http://")
             || resolved.endpoint.provider_id.starts_with("https://");
         if resolved.endpoint.api_key.is_none() && !is_custom_url {

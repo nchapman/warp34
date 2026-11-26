@@ -41,10 +41,7 @@ pub struct ArcRouterConfig {
     pub model_dir: PathBuf,
     pub device_id: i32,
     pub local_model_name: String,
-    /// Optional forced upstream provider (e.g. `openrouter`, `google`, `anthropic`, `deepseek`,
-    /// `https://...`). When `None` or `"auto"`, each cloud model auto-detects its provider and
-    /// API key from `models.dev` + environment variables.
-    pub upstream: Option<String>,
+    /// Optional fallback API key (normally auto-detected per provider from `models.dev` env vars).
     pub upstream_api_key: Option<String>,
     pub cloud_model_filter: Vec<String>,
     pub policy: RoutingPolicy,
@@ -169,12 +166,10 @@ impl ArcRouter {
         let heads = ArcHeads::load(&cfg.model_dir)?;
         let local_slot = infer_local_slot(&cfg.local_model_name, &heads.catalog);
         let registry = ModelsDevRegistry::load_cached_or_fetch();
-        let wants_cloud = cfg.upstream.is_some() || !cfg.cloud_model_filter.is_empty();
-        let cloud_candidates = if wants_cloud {
+        let cloud_candidates = if !cfg.cloud_model_filter.is_empty() {
             resolve_cloud_candidates_from_registry(
                 &registry,
                 &heads.catalog,
-                cfg.upstream.as_deref(),
                 cfg.upstream_api_key.as_deref(),
                 &cfg.cloud_model_filter,
                 |var| std::env::var(var).ok(),
@@ -184,7 +179,6 @@ impl ArcRouter {
             resolve_cloud_candidates_from_registry(
                 &registry,
                 &heads.catalog,
-                None,
                 cfg.upstream_api_key.as_deref(),
                 &[],
                 |var| std::env::var(var).ok(),
