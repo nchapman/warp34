@@ -123,6 +123,16 @@ queue requests. The ingress/admission bounds remain 32; this flag is not an HTTP
 connection or queue-size control. Larger than 16 requires engine graph/IO changes,
 not merely a CLI override. Lower concurrency can reduce planned GDN state memory.
 
+### Speculative concurrency limits & `step_plain` fallback
+
+Speculative batch limits apply **per engine replica** (`--tp 2` is 1 replica across
+2 GPUs; `--dp 2` is 2 replicas, doubling total speculative concurrency):
+
+- **`MTP-3`:** batched speculative decoding up to **`B = 16`** concurrent requests per replica (`k = 3`).
+- **`DFlash2`:** batched speculative decoding up to **`B = 4`** concurrent requests per replica (`M = 8` on 27B, `32` verify rows at the GPU roofline knee; `B = 3` on 4B where `M = 16`).
+- **Fallback & mid-flight promotion:** bursts exceeding the speculative ceiling (`B > 4` for `DFlash2`) or multi-request batches containing `logprobs=true` automatically yield to `step_plain` (a lone `logprobs=true` request can still use single-slot speculation), while recording compact projected `ctx` memos (`1×H×2B` in Host RAM) so active sequences promote back into batched speculation mid-flight as soon as the plain-only request finishes or concurrency drops to `B <= 4`.
+- **Expected trade-off:** `--speculative dflash2` is tuned for `1–4` concurrent agents per replica. If you run sustained `B >= 8` short-context bursts with `--speculative dflash2` enabled (staying above `B = 4` the entire time), the background `ctx` recording adds ~`2.5 ms/step` (`-13%` to `-29%` throughput vs a plain server without `--speculative`; `< 2%` on long `20K+` contexts). For high-batch (`B >= 8`) chat serving, omit `--speculative` or scale replicas with `--dp`.
+
 `--ctx-size` (`-c`) sizes the shared GPU KV pool directly in tokens (so you never
 have to divide by 16-token pages), accepting human-friendly suffixes (`4k`, `16k`,
 `32k`, `64k`, `128k`, `256k`).

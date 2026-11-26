@@ -66,6 +66,7 @@ pub struct NativeProposer {
     mtp_prefill_max_rows: usize,
     memo_budget: usize,
     row_bytes: usize,
+    tap_row_bytes: usize,
     pub(crate) k: usize,
     max_k: usize,
     tail: Vec<DeviceBuffer>,
@@ -93,11 +94,6 @@ const MIN_DP_MEMO_BUDGET: usize = 512 * 1024 * 1024;
 const MAX_MEMO_ENTRIES: usize = 64;
 const MEMO_GROWTH_ROWS: usize = 512;
 const SERVING_PROPOSER_MAX_TAP_ROWS: usize = 2048;
-/// Maximum sequence length (`4,096` tokens = `<= 80 MiB`) recorded in host `PrefixMemo` for
-/// `DFlash2` (`20 KiB/row`). Longer prompts (`code-context-r64`, `60K/120K`) rely on the
-/// O(1) `prompt_len - cached >= sliding_window` ring shortcut without pageable `Vec` churn.
-const DFLASH_MEMO_MAX_TOKENS: usize = 4096;
-
 #[cfg(any(test, feature = "cuda"))]
 #[inline]
 pub(crate) fn plan_memo_budget(dp_size: usize) -> usize {
@@ -107,16 +103,14 @@ pub(crate) fn plan_memo_budget(dp_size: usize) -> usize {
 #[cfg(any(test, feature = "cuda"))]
 #[inline]
 pub(crate) fn memo_fits_budget_limit(
-    kind: SpeculativeKind,
+    _kind: SpeculativeKind,
     cur_tokens: usize,
     add_tokens: usize,
     row_bytes: usize,
     budget: usize,
 ) -> bool {
     let total_tokens = cur_tokens.saturating_add(add_tokens);
-    let within_dflash_cap =
-        kind != SpeculativeKind::DFlash2 || total_tokens <= DFLASH_MEMO_MAX_TOKENS;
-    within_dflash_cap && total_tokens.saturating_mul(row_bytes) <= budget
+    total_tokens.saturating_mul(row_bytes) <= budget
 }
 
 #[cfg(test)]
@@ -292,7 +286,7 @@ impl NativeProposer {
         let h = engine.cfg.hidden_size;
         let mtp_row_bytes = engine.cfg.hyper_hidden_size() * 2;
         let use_graph = engine.use_cuda_graph;
-        let (ranks, taps, k, row_bytes) = match config.kind {
+        let (ranks, taps, k, row_bytes, tap_row_bytes) = match config.kind {
             SpeculativeKind::Mtp => {
                 let model_dir = &engine.model_dir;
                 let ranks = if engine.ranks.len() <= 1 {
@@ -328,7 +322,13 @@ impl NativeProposer {
                         Ok(out)
                     })?
                 };
-                (Ranks::Mtp(ranks), vec![], config.mtp_k, mtp_row_bytes)
+                (
+                    Ranks::Mtp(ranks),
+                    vec![],
+                    config.mtp_k,
+                    mtp_row_bytes,
+                    mtp_row_bytes,
+                )
             }
             SpeculativeKind::DFlash2 => {
                 let name = config
@@ -374,8 +374,11 @@ impl NativeProposer {
                 };
                 let taps = ranks[0].cfg.target_layers.clone();
                 let k = ranks[0].cfg.block_size - 1;
-                let row_bytes = h * taps.len() * 2;
-                (Ranks::DFlash(ranks), taps, k, row_bytes)
+                // Host memos store projected `ctx = rms_norm(fc(tap_aux))` (`1 × H × 2B`, 5× smaller
+                // than raw `tap_aux_bf16` and 0-ULP exact); `tap_row_bytes` tracks raw GPU tap stride.
+                let row_bytes = h * 2;
+                let tap_row_bytes = h * taps.len() * 2;
+                (Ranks::DFlash(ranks), taps, k, row_bytes, tap_row_bytes)
             }
         };
         let tail = engine
@@ -440,7 +443,7 @@ impl NativeProposer {
                 let captured_verify_hidden = engine
                     .ranks
                     .iter()
-                    .map(|t| DeviceBuffer::alloc(t.device.device_id, (k + 1) * row_bytes))
+                    .map(|t| DeviceBuffer::alloc(t.device.device_id, (k + 1) * tap_row_bytes))
                     .collect::<Result<Vec<_>>>()?;
                 Ok(MtpBatchSlot {
                     tail: slot_tail,
@@ -479,6 +482,7 @@ impl NativeProposer {
             mtp_prefill_max_rows,
             memo_budget,
             row_bytes,
+            tap_row_bytes,
             k,
             max_k: k,
             tail,
@@ -581,6 +585,7 @@ impl NativeProposer {
                             .memos
                             .iter()
                             .chain(self.current.iter())
+                            .chain(self.plain_memos.values())
                             .chain(
                                 self.mtp_batch_slots
                                     .iter()
@@ -610,6 +615,58 @@ impl NativeProposer {
         self.row_bytes
     }
 
+    pub(crate) fn tap_row_bytes(&self) -> usize {
+        self.tap_row_bytes
+    }
+
+    pub(crate) fn is_dflash(&self) -> bool {
+        matches!(self.ranks, Ranks::DFlash(_))
+    }
+
+    /// Projects `rows` raw `[rows, 5*H]` BF16 target taps on rank 0 into `[rows, H]` BF16
+    /// `ctx = rms_norm(fc(tap_aux))` on `t0.stream` without mutating DFlash2 KV state.
+    pub(crate) fn project_plain_dflash_taps_rank0(
+        &mut self,
+        t0: &crate::model::Qwen3_5ModelRank,
+        tap_bf16: u64,
+        rows: usize,
+    ) -> Result<u64> {
+        let Ranks::DFlash(rs) = &mut self.ranks else {
+            return Err(loader_err("expected DFlash2 ranks for tap projection"));
+        };
+        rs[0].project_taps_to_ctx_no_sync(t0, tap_bf16, rows)
+    }
+
+    /// Appends committed `step_plain` DFlash2 slices by projecting `tap_aux_bf16` → `ctx`
+    /// in `<= DFLASH2_MAX_BATCH_ROWS` chunks on rank 0 and streaming projected `ctx` bytes D2H.
+    pub(crate) fn append_plain_dflash_taps_chunked_d2h(
+        &mut self,
+        t0: &crate::model::Qwen3_5ModelRank,
+        tap_base: u64,
+        slices: &[(u64, usize, &[i32])],
+    ) -> Result<()> {
+        if slices.is_empty() || self.row_bytes == 0 || self.tap_row_bytes == 0 {
+            return Ok(());
+        }
+        let max_chunk = self.max_rows.clamp(1, DFLASH2_MAX_BATCH_ROWS);
+        let tap_row_bytes = self.tap_row_bytes;
+        for &(req_id, tok_offset, tokens) in slices {
+            let mut sub_off = 0usize;
+            while sub_off < tokens.len() {
+                let take = (tokens.len() - sub_off).min(max_chunk);
+                let tap_ptr = tap_base + ((tok_offset + sub_off) * tap_row_bytes) as u64;
+                let ctx_ptr = self.project_plain_dflash_taps_rank0(t0, tap_ptr, take)?;
+                self.append_plain_slices_chunked_d2h(
+                    ctx_ptr,
+                    &[(req_id, 0, &tokens[sub_off..sub_off + take])],
+                    &t0.stream,
+                )?;
+                sub_off += take;
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) fn prefill_max_rows(&self) -> usize {
         self.mtp_prefill_max_rows
     }
@@ -619,7 +676,7 @@ impl NativeProposer {
     /// or sibling `plain_memos` so concurrent requests sharing a long harness never steal
     /// from each other.
     pub(crate) fn init_plain_memo(&mut self, req_id: u64, prefix_tokens: &[i32]) {
-        if !self.is_mtp() || self.row_bytes == 0 || self.plain_memos.contains_key(&req_id) {
+        if self.row_bytes == 0 || self.plain_memos.contains_key(&req_id) {
             return;
         }
         if prefix_tokens.is_empty() {
@@ -691,7 +748,7 @@ impl NativeProposer {
         tokens: &[i32],
         raw_hidden_bytes: &[u8],
     ) {
-        if !self.is_mtp() || tokens.is_empty() || self.row_bytes == 0 {
+        if tokens.is_empty() || self.row_bytes == 0 {
             return;
         }
         if raw_hidden_bytes.len() != tokens.len().saturating_mul(self.row_bytes) {
@@ -821,7 +878,7 @@ impl NativeProposer {
         slices: &[(u64, usize, &[i32])],
         stream: &crate::cuda::CudaStream,
     ) -> Result<()> {
-        if !self.is_mtp() || self.row_bytes == 0 || slices.is_empty() {
+        if self.row_bytes == 0 || slices.is_empty() {
             return Ok(());
         }
         let row_bytes = self.row_bytes;
@@ -1130,7 +1187,7 @@ impl NativeProposer {
                 rs.iter_mut()
                     .zip(&engine.ranks)
                     .zip(&ptrs)
-                    .map(|((r, t), &ptr)| move || r.ingest(t, ptr, chunk_rows)),
+                    .map(|((r, t), &ptr)| move || r.ingest_ctx(t, ptr, chunk_rows)),
             )
             .into_iter()
             .collect::<Result<Vec<_>>>()?;
@@ -1631,9 +1688,6 @@ impl NativeProposer {
         if tokens.is_empty() {
             return Ok(());
         }
-        if prompt_len > DFLASH_MEMO_MAX_TOKENS && matches!(self.ranks, Ranks::DFlash(_)) {
-            self.current = None;
-        }
         let dflash_win = match &self.ranks {
             Ranks::DFlash(rs) => rs
                 .first()
@@ -1666,28 +1720,41 @@ impl NativeProposer {
                     );
                     if aligned && within_cap {
                         let t0 = &engine.ranks[0];
+                        let step = self.max_rows.clamp(1, DFLASH2_MAX_BATCH_ROWS);
+                        let row_bytes = self.row_bytes;
+                        let tap_row_bytes = self.tap_row_bytes;
                         let copy_res: Result<()> = (|| {
+                            let Ranks::DFlash(rs) = &mut self.ranks else {
+                                return Err(loader_err("expected DFlash2 ranks"));
+                            };
                             t0.device.make_current()?;
-                            let len_bytes = skip_rows * self.row_bytes;
+                            let len_bytes = skip_rows * row_bytes;
                             let old_len = memo.features.len();
-                            grow_memo_features(
-                                &mut memo.features,
-                                old_len + len_bytes,
-                                self.row_bytes,
-                            );
-                            check_rc(
-                                // SAFETY: `features[0]` spans `len_bytes` on `t0.stream`, synchronized immediately below.
-                                unsafe {
-                                    ffi::warp34_memcpy_d2h_async(
-                                        memo.features[old_len..].as_mut_ptr().cast(),
-                                        features[0] as *const _,
-                                        len_bytes,
-                                        t0.stream.handle,
-                                    )
-                                },
-                                "DFlash prefill memo copy",
-                            )?;
-                            t0.stream.synchronize()
+                            grow_memo_features(&mut memo.features, old_len + len_bytes, row_bytes);
+                            let mut off_rows = 0usize;
+                            while off_rows < skip_rows {
+                                let take = (skip_rows - off_rows).min(step);
+                                let tap_ptr = features[0] + (off_rows * tap_row_bytes) as u64;
+                                let ctx_ptr =
+                                    rs[0].project_taps_to_ctx_no_sync(t0, tap_ptr, take)?;
+                                let dst_off = old_len + off_rows * row_bytes;
+                                check_rc(
+                                    // SAFETY: `ctx_ptr` spans `take * row_bytes` on `t0.stream`,
+                                    // synchronized immediately below before `scratch.reset()`.
+                                    unsafe {
+                                        ffi::warp34_memcpy_d2h_async(
+                                            memo.features[dst_off..].as_mut_ptr().cast(),
+                                            ctx_ptr as *const _,
+                                            take * row_bytes,
+                                            t0.stream.handle,
+                                        )
+                                    },
+                                    "DFlash prefill projected ctx memo copy",
+                                )?;
+                                t0.stream.synchronize()?;
+                                off_rows += take;
+                            }
+                            Ok(())
                         })();
                         if let Err(e) = copy_res {
                             self.current = None;
@@ -1718,7 +1785,7 @@ impl NativeProposer {
                 }
                 let tail_features: Vec<u64> = features
                     .iter()
-                    .map(|&p| p + (skip_rows * self.row_bytes) as u64)
+                    .map(|&p| p + (skip_rows * self.tap_row_bytes) as u64)
                     .collect();
                 if let Err(e) = self.ingest(engine, &tokens[skip_rows..], &tail_features) {
                     if let Ranks::DFlash(rs) = &mut self.ranks {
@@ -1757,7 +1824,7 @@ impl NativeProposer {
                 let take = (tokens.len() - offset).min(stage_cap);
                 let sub_features: Vec<u64> = features
                     .iter()
-                    .map(|&p| p + (offset * self.row_bytes) as u64)
+                    .map(|&p| p + (offset * self.tap_row_bytes) as u64)
                     .collect();
                 self.ingest(engine, &tokens[offset..offset + take], &sub_features)?;
                 offset += take;
@@ -1770,7 +1837,7 @@ impl NativeProposer {
         {
             return Err(loader_err("invalid committed proposer span"));
         }
-        // Both MTP and DFlash2 record aligned host feature memos up to `MEMO_BUDGET` so
+        // Both MTP and DFlash2 record aligned host feature memos up to `memo_budget` so
         // multi-prefix workloads (`prefix-primed`, multi-session agents) never reject a warm
         // target `MambaRadixCache` hit when the drafter's active GPU slot switched prefixes.
         if let Some(memo) = &self.current {
@@ -1792,7 +1859,9 @@ impl NativeProposer {
             }
         }
         let mut pending_pinned_memo_copy: Option<(usize, usize)> = None;
-        if let Some(memo) = &mut self.current {
+        if matches!(self.ranks, Ranks::Mtp(_))
+            && let Some(memo) = &mut self.current
+        {
             let t0 = &engine.ranks[0];
             if let Err(e) = t0.device.make_current() {
                 self.current = None;
@@ -1847,16 +1916,74 @@ impl NativeProposer {
         let ingest_res: Result<()> = match &mut self.ranks {
             Ranks::DFlash(rs) => {
                 let n = tokens.len();
-                crate::coordinated::run_tp_closures(
+                let res = crate::coordinated::run_tp_closures(
                     pool.as_deref(),
                     rs.iter_mut()
                         .zip(&engine.ranks)
                         .zip(features)
-                        .map(|((r, t), &ptr)| move || r.ingest(t, ptr, n)),
+                        .map(|((r, t), &ptr)| move || r.ingest_no_sync(t, ptr, n)),
                 )
                 .into_iter()
-                .collect::<Result<Vec<_>>>()
-                .map(|_| ())
+                .collect::<Result<Vec<_>>>();
+                if let Err(e) = res {
+                    Err(e)
+                } else {
+                    if let Some(memo) = &mut self.current {
+                        let t0 = &engine.ranks[0];
+                        let ctx_ptr = rs[0].last_ctx_ptr();
+                        let len_bytes = n * self.row_bytes;
+                        let old_len = memo.features.len();
+                        grow_memo_features(&mut memo.features, old_len + len_bytes, self.row_bytes);
+                        let copy_res = t0.device.make_current().and_then(|()| {
+                            if let Some(pinned) = &self.memo_pinned_staging
+                                && len_bytes > 0
+                                && len_bytes <= pinned.len_bytes
+                            {
+                                let r = check_rc(
+                                    // SAFETY: `ctx_ptr` spans `len_bytes` on `t0.stream`,
+                                    // synchronized immediately below before `scratch` reuse.
+                                    unsafe {
+                                        ffi::warp34_memcpy_d2h_async(
+                                            pinned.host_ptr,
+                                            ctx_ptr as *const _,
+                                            len_bytes,
+                                            t0.stream.handle,
+                                        )
+                                    },
+                                    "DFlash pinned ctx memo copy",
+                                );
+                                if r.is_ok() {
+                                    pending_pinned_memo_copy = Some((old_len, len_bytes));
+                                }
+                                r
+                            } else {
+                                check_rc(
+                                    // SAFETY: `ctx_ptr` spans `len_bytes` on `t0.stream`,
+                                    // synchronized immediately below.
+                                    unsafe {
+                                        ffi::warp34_memcpy_d2h_async(
+                                            memo.features[old_len..].as_mut_ptr().cast(),
+                                            ctx_ptr as *const _,
+                                            len_bytes,
+                                            t0.stream.handle,
+                                        )
+                                    },
+                                    "DFlash ctx memo copy",
+                                )
+                            }
+                        });
+                        if let Err(e) = copy_res {
+                            self.current = None;
+                            return Err(e);
+                        }
+                        memo.tokens.extend_from_slice(tokens);
+                    }
+                    engine.ranks.iter().try_for_each(|t| {
+                        t.device
+                            .make_current()
+                            .and_then(|()| t.stream.synchronize())
+                    })
+                }
             }
             Ranks::Mtp(rs) => {
                 let row_bytes = self.row_bytes;
@@ -1980,26 +2107,25 @@ impl NativeProposer {
                     self.ingest(engine, tokens, features)?;
                     return self.propose(engine, anchor, k);
                 }
-                let staged_memo = Self::stage_current_memo_append(
-                    &mut self.current,
-                    self.memo_pinned_staging.as_ref(),
-                    &engine.ranks[0],
-                    features[0],
-                    tokens,
-                    self.row_bytes,
-                    self.memo_budget,
-                )?;
-                let (memo_prev_lens, pending_pinned_memo_copy) =
-                    (staged_memo.prev_lens, staged_memo.pending_pinned);
                 let n = tokens.len();
                 let use_graph = engine.use_cuda_graph;
                 for r in rs.iter_mut() {
                     r.use_cuda_graph = use_graph;
                 }
                 if rs.len() == 1 {
-                    let res = rs[0]
-                        .ingest_no_sync(&engine.ranks[0], features[0], n)
-                        .and_then(|()| rs[0].forward_select_greedy(&engine.ranks[0], anchor));
+                    rs[0].ingest_no_sync(&engine.ranks[0], features[0], n)?;
+                    let staged_memo = Self::stage_current_memo_append(
+                        &mut self.current,
+                        self.memo_pinned_staging.as_ref(),
+                        &engine.ranks[0],
+                        rs[0].last_ctx_ptr(),
+                        tokens,
+                        self.row_bytes,
+                        self.memo_budget,
+                    )?;
+                    let (memo_prev_lens, pending_pinned_memo_copy) =
+                        (staged_memo.prev_lens, staged_memo.pending_pinned);
+                    let res = rs[0].forward_select_greedy(&engine.ranks[0], anchor);
                     let mut ids = match res {
                         Ok(ids) => ids,
                         Err(e) => {
@@ -2022,8 +2148,14 @@ impl NativeProposer {
                 let comm = engine.tp2_comm.as_deref();
                 let dflash_graph =
                     use_graph && rs.iter().all(DFlash2Rank::can_capture_select_greedy);
+                let mut memo_prev_lens = None;
+                let mut pending_pinned_memo_copy = None;
                 let outputs_res: Result<Vec<Vec<i32>>> = if dflash_graph {
                     use crate::coordinated::{ReplayPhase, replay_ranks};
+                    let current = &mut self.current;
+                    let pinned = self.memo_pinned_staging.as_ref();
+                    let row_bytes = self.row_bytes;
+                    let memo_budget = self.memo_budget;
                     let replay_res = replay_ranks(rs.len(), |phase, rank| {
                         let r = &mut rs[rank];
                         let t = &engine.ranks[rank];
@@ -2032,6 +2164,19 @@ impl NativeProposer {
                         match phase {
                             ReplayPhase::Upload => {
                                 r.ingest_no_sync(t, ptr, n)?;
+                                if rank == 0 {
+                                    let staged = Self::stage_current_memo_append(
+                                        current,
+                                        pinned,
+                                        t,
+                                        r.last_ctx_ptr(),
+                                        tokens,
+                                        row_bytes,
+                                        memo_budget,
+                                    )?;
+                                    memo_prev_lens = staged.prev_lens;
+                                    pending_pinned_memo_copy = staged.pending_pinned;
+                                }
                                 r.prepare_select_greedy_graph_inputs_async(t, anchor)
                             }
                             ReplayPhase::Capture => r.ensure_select_greedy_graph(t, comm),
@@ -2057,20 +2202,39 @@ impl NativeProposer {
                     }
                 } else {
                     let pool = engine.tp_workers.clone();
-                    crate::coordinated::run_tp_closures(
+                    let ingest_res = crate::coordinated::run_tp_closures(
                         pool.as_deref(),
                         rs.iter_mut()
-                            .zip(&mut engine.ranks)
+                            .zip(&engine.ranks)
                             .zip(features)
-                            .map(|((r, t), &ptr)| {
-                                move || -> Result<Vec<i32>> {
-                                    r.ingest_no_sync(t, ptr, n)?;
-                                    r.forward_select_greedy_tp(t, anchor, comm)
-                                }
-                            }),
+                            .map(|((r, t), &ptr)| move || r.ingest_no_sync(t, ptr, n)),
                     )
                     .into_iter()
-                    .collect::<Result<Vec<_>>>()
+                    .collect::<Result<Vec<_>>>();
+                    match ingest_res {
+                        Err(e) => Err(e),
+                        Ok(_) => {
+                            let staged = Self::stage_current_memo_append(
+                                &mut self.current,
+                                self.memo_pinned_staging.as_ref(),
+                                &engine.ranks[0],
+                                rs[0].last_ctx_ptr(),
+                                tokens,
+                                self.row_bytes,
+                                self.memo_budget,
+                            )?;
+                            memo_prev_lens = staged.prev_lens;
+                            pending_pinned_memo_copy = staged.pending_pinned;
+                            crate::coordinated::run_tp_closures(
+                                pool.as_deref(),
+                                rs.iter_mut().zip(&mut engine.ranks).map(|(r, t)| {
+                                    move || r.forward_select_greedy_tp(t, anchor, comm)
+                                }),
+                            )
+                            .into_iter()
+                            .collect::<Result<Vec<_>>>()
+                        }
+                    }
                 };
                 let mut outputs = match outputs_res {
                     Ok(o) => o,
@@ -2603,6 +2767,300 @@ impl NativeProposer {
         }
     }
 
+    fn stage_dflash_slot_ctx_d2h(
+        &mut self,
+        t0: &crate::model::Qwen3_5ModelRank,
+        slot: usize,
+        toks: &[i32],
+        ctx_ptr: u64,
+        pinned_cursor: &mut usize,
+    ) -> Result<Option<(usize, usize, usize)>> {
+        if toks.is_empty() || self.row_bytes == 0 {
+            return Ok(None);
+        }
+        let memo_opt = if slot == self.mtp_batch_active_slot {
+            &mut self.current
+        } else {
+            &mut self.mtp_batch_slots[slot].current
+        };
+        let Some(memo) = memo_opt.as_mut() else {
+            return Ok(None);
+        };
+        let aligned = memo.features.len() == memo.tokens.len().saturating_mul(self.row_bytes);
+        if !aligned
+            || !memo_fits_budget_limit(
+                SpeculativeKind::DFlash2,
+                memo.tokens.len(),
+                toks.len(),
+                self.row_bytes,
+                self.memo_budget,
+            )
+        {
+            *memo_opt = None;
+            return Ok(None);
+        }
+        let len_bytes = toks.len() * self.row_bytes;
+        let old_len = memo.features.len();
+        grow_memo_features(&mut memo.features, old_len + len_bytes, self.row_bytes);
+        if let Some(pinned) = &self.memo_pinned_staging
+            && len_bytes > 0
+            && pinned_cursor.saturating_add(len_bytes) <= pinned.len_bytes
+        {
+            let cur = *pinned_cursor;
+            check_rc(
+                // SAFETY: ctx_ptr spans len_bytes on t0.stream, synchronized before commit.
+                unsafe {
+                    ffi::warp34_memcpy_d2h_async(
+                        pinned.host_ptr.cast::<u8>().add(cur).cast(),
+                        ctx_ptr as *const _,
+                        len_bytes,
+                        t0.stream.handle,
+                    )
+                },
+                "batched DFlash pinned ctx memo copy",
+            )?;
+            *pinned_cursor = cur + len_bytes;
+            Ok(Some((cur, old_len, len_bytes)))
+        } else {
+            check_rc(
+                // SAFETY: memo.features[old_len..] spans len_bytes and stays live until sync.
+                unsafe {
+                    ffi::warp34_memcpy_d2h_async(
+                        memo.features[old_len..].as_mut_ptr().cast(),
+                        ctx_ptr as *const _,
+                        len_bytes,
+                        t0.stream.handle,
+                    )
+                },
+                "batched DFlash ctx memo copy",
+            )?;
+            Ok(None)
+        }
+    }
+
+    fn try_ingest_and_propose_dflash_batch(
+        &mut self,
+        engine: &mut Qwen3_5Engine,
+        slots: &[usize],
+        pending_ingests: &[&[i32]],
+        anchors: &[i32],
+        k_budgets: &[usize],
+    ) -> Result<Option<Vec<Vec<i32>>>> {
+        let b_reqs = slots.len();
+        if !(2..=crate::dflash::MAX_DFLASH_DRAFT_BATCH).contains(&b_reqs)
+            || pending_ingests.len() != b_reqs
+            || anchors.len() != b_reqs
+            || k_budgets.len() != b_reqs
+            || k_budgets.iter().all(|&k| k == 0)
+        {
+            return Ok(None);
+        }
+        let max_ingest_per_slot = self.max_rows.min(DFLASH2_MAX_BATCH_ROWS);
+        let can_batch = {
+            let Ranks::DFlash(rs) = &self.ranks else {
+                return Ok(None);
+            };
+            let slot_count = rs[0].batch_slot_count().min(self.mtp_batch_slots.len());
+            let slot_cap = rs[0].batch_slot_capacity();
+            let mut seen = 0u16;
+            rs.iter()
+                .zip(&engine.ranks)
+                .all(|(r, t)| r.can_batch_select_greedy(t, b_reqs))
+                && slots.iter().zip(pending_ingests).all(|(&s, &toks)| {
+                    let ok = s < slot_count
+                        && s < 16
+                        && (seen & (1u16 << s)) == 0
+                        && toks.len() <= max_ingest_per_slot
+                        && self.slot_processed(s) + toks.len() <= slot_cap;
+                    if s < 16 {
+                        seen |= 1u16 << s;
+                    }
+                    ok
+                })
+        };
+        if !can_batch {
+            return Ok(None);
+        }
+
+        let prev_active_slot = self.mtp_batch_active_slot;
+        let prev_slot_committed: Vec<usize> =
+            slots.iter().map(|&s| self.slot_processed(s)).collect();
+        let num_ranks = engine.ranks.len();
+        let captured_ptrs: Vec<Vec<u64>> = (0..num_ranks)
+            .map(|ri| {
+                slots
+                    .iter()
+                    .map(|&s| self.mtp_batch_slots[s].captured_verify_hidden[ri].addr())
+                    .collect()
+            })
+            .collect();
+        let prev_memo_lens: Vec<Option<(usize, usize)>> = slots
+            .iter()
+            .map(|&s| {
+                let m = if s == prev_active_slot {
+                    self.current.as_ref()
+                } else {
+                    self.mtp_batch_slots[s].current.as_ref()
+                };
+                m.map(|memo| (memo.tokens.len(), memo.features.len()))
+            })
+            .collect();
+        let rollback_batch = |this: &mut Self, engine: &Qwen3_5Engine, sync_streams: bool| {
+            if sync_streams {
+                for t in &engine.ranks {
+                    let _ = t.device.make_current();
+                    let _ = t.stream.synchronize();
+                }
+            }
+            if let Ranks::DFlash(rs) = &mut this.ranks {
+                for r in rs.iter_mut() {
+                    for (&slot, &prev_committed) in slots.iter().zip(&prev_slot_committed) {
+                        if r.select_batch_slot(slot).is_ok() {
+                            let _ = r.set_committed(prev_committed);
+                        }
+                    }
+                    let _ = r.select_batch_slot(prev_active_slot);
+                }
+            }
+            for (&slot, prev) in slots.iter().zip(&prev_memo_lens) {
+                let memo_opt = if slot == prev_active_slot {
+                    &mut this.current
+                } else {
+                    &mut this.mtp_batch_slots[slot].current
+                };
+                if let (Some(memo), Some((tl, fl))) = (memo_opt.as_mut(), *prev) {
+                    memo.tokens.truncate(tl);
+                    memo.features.truncate(fl);
+                } else {
+                    *memo_opt = None;
+                }
+            }
+        };
+        let mut staged_memos: Vec<Option<(usize, usize, usize)>> = vec![None; b_reqs];
+        let mut pinned_cursor = 0usize;
+
+        // Enqueue all slot ingests asynchronously on every rank (and stage rank 0 projected ctx D2H).
+        let ingest_res: Result<()> = (|| {
+            for rank in 0..num_ranks {
+                let t = &engine.ranks[rank];
+                t.device.make_current()?;
+                for (b, (&slot, &toks)) in slots.iter().zip(pending_ingests).enumerate() {
+                    if toks.is_empty() {
+                        continue;
+                    }
+                    let ctx_ptr = {
+                        let Ranks::DFlash(rs) = &mut self.ranks else {
+                            unreachable!()
+                        };
+                        let r = &mut rs[rank];
+                        r.select_batch_slot(slot)?;
+                        r.ingest_no_sync(t, captured_ptrs[rank][b], toks.len())?;
+                        r.last_ctx_ptr()
+                    };
+                    if rank == 0 {
+                        staged_memos[b] = self.stage_dflash_slot_ctx_d2h(
+                            t,
+                            slot,
+                            toks,
+                            ctx_ptr,
+                            &mut pinned_cursor,
+                        )?;
+                    }
+                }
+                let Ranks::DFlash(rs) = &mut self.ranks else {
+                    unreachable!()
+                };
+                rs[rank].select_batch_slot(prev_active_slot)?;
+            }
+            Ok(())
+        })();
+        if let Err(e) = ingest_res {
+            rollback_batch(self, engine, true);
+            return Err(e);
+        }
+
+        let comm = engine.tp2_comm.as_deref();
+        let use_graph = engine.use_cuda_graph;
+        let outputs_res: Result<Vec<Vec<Vec<i32>>>> = {
+            let Ranks::DFlash(rs) = &mut self.ranks else {
+                unreachable!()
+            };
+            for r in rs.iter_mut() {
+                r.use_cuda_graph = use_graph;
+            }
+            if use_graph {
+                use crate::coordinated::{ReplayPhase, replay_ranks};
+                let replay_res = replay_ranks(rs.len(), |phase, rank| {
+                    let r = &mut rs[rank];
+                    let t = &engine.ranks[rank];
+                    t.device.make_current()?;
+                    match phase {
+                        ReplayPhase::Upload => {
+                            r.prepare_batched_select_greedy_inputs_async(t, slots, anchors)
+                        }
+                        ReplayPhase::Capture => {
+                            r.ensure_batched_select_greedy_graph(t, b_reqs, comm)
+                        }
+                        ReplayPhase::Launch => {
+                            r.replay_batched_select_greedy_graph_async(t, b_reqs)
+                        }
+                    }
+                });
+                match replay_res {
+                    Ok(()) => rs
+                        .iter_mut()
+                        .zip(&engine.ranks)
+                        .map(|(r, t)| r.collect_batched_select_greedy_host(t, b_reqs))
+                        .collect::<Result<Vec<_>>>(),
+                    Err(error) => {
+                        if error.partial_launch {
+                            eprintln!(
+                                "[warp34] fatal: asymmetric DFlash batched TP graph launch failure: {}",
+                                error.source
+                            );
+                            std::process::abort();
+                        }
+                        Err(error.source)
+                    }
+                }
+            } else {
+                let pool = engine.tp_workers.clone();
+                crate::coordinated::run_tp_closures(
+                    pool.as_deref(),
+                    rs.iter_mut().zip(&engine.ranks).map(|(r, t)| {
+                        move || -> Result<Vec<Vec<i32>>> {
+                            t.device.make_current()?;
+                            r.prepare_batched_select_greedy_inputs_async(t, slots, anchors)?;
+                            r.forward_batched_select_greedy_eager_async(t, b_reqs, comm)?;
+                            r.collect_batched_select_greedy_host(t, b_reqs)
+                        }
+                    }),
+                )
+                .into_iter()
+                .collect::<Result<Vec<_>>>()
+            }
+        };
+
+        let mut outputs = match outputs_res {
+            Ok(o) => o,
+            Err(e) => {
+                rollback_batch(self, engine, true);
+                return Err(e);
+            }
+        };
+        if outputs.windows(2).any(|p| p[0] != p[1]) {
+            rollback_batch(self, engine, false);
+            return Err(loader_err("DFlash batched TP token disagreement"));
+        }
+
+        self.finish_batched_mtp_slot_commits(slots, pending_ingests, &staged_memos);
+        let mut drafts = outputs.swap_remove(0);
+        for (d, &kb) in drafts.iter_mut().zip(k_budgets) {
+            d.truncate(kb);
+        }
+        Ok(Some(drafts))
+    }
+
     pub(crate) fn try_ingest_and_propose_mtp_batch(
         &mut self,
         engine: &mut Qwen3_5Engine,
@@ -2611,6 +3069,15 @@ impl NativeProposer {
         anchors: &[i32],
         k_budgets: &[usize],
     ) -> Result<Option<Vec<Vec<i32>>>> {
+        if matches!(self.ranks, Ranks::DFlash(_)) {
+            return self.try_ingest_and_propose_dflash_batch(
+                engine,
+                slots,
+                pending_ingests,
+                anchors,
+                k_budgets,
+            );
+        }
         let b_reqs = slots.len();
         let k_max = k_budgets.iter().copied().max().unwrap_or(0);
         if !engine.use_cuda_graph
@@ -3487,10 +3954,21 @@ mod tests {
             512,
         ));
 
-        // `memo_fits_budget` caps wide DFlash features (`20,480 B/row`) at `DFLASH_MEMO_MAX_TOKENS`
-        // (`4,096` tokens) while allowing MTP features past `4,096` up to `MEMO_BUDGET`.
-        assert!(memo_fits_budget(SpeculativeKind::DFlash2, 0, 4096, 20_480));
-        assert!(!memo_fits_budget(SpeculativeKind::DFlash2, 0, 5000, 20_480));
+        // DFlash2 host memos store projected `ctx = rms_norm(fc(tap_aux))` (`1 × H × 2B`,
+        // `10,240 B/row` on 27B, 5× smaller than raw taps), so multi-turn SWE-bench agents
+        // fit past 4K up to `MEMO_BUDGET` just like MTP.
+        assert!(memo_fits_budget(
+            SpeculativeKind::DFlash2,
+            0,
+            65_536,
+            10_240
+        ));
+        assert!(!memo_fits_budget(
+            SpeculativeKind::DFlash2,
+            0,
+            500_000,
+            10_240
+        ));
         assert!(memo_fits_budget(SpeculativeKind::Mtp, 0, 5000, 4_096));
     }
 

@@ -1177,13 +1177,13 @@ fn finish_early_with_proposer(
         && num_tokens <= radix_tokens.len()
     {
         let prop = proposer_override.or(engine.speculative.as_ref());
-        let has_mtp = prop.is_some_and(|p| p.is_mtp());
+        let has_spec_features = prop.is_some();
         engine.try_publish_radix_node_to_shared_pool_with_features(
             &sched.radix,
             node_id,
             lora_id,
             &radix_tokens,
-            has_mtp,
+            has_spec_features,
             || prop.and_then(|p| p.export_shared_memo_features(&radix_tokens[..num_tokens])),
         );
     }

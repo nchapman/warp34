@@ -41,6 +41,9 @@ const DFLASH2_KV_PAGE_BLOCK_TOKENS: usize = 16;
 /// Maximum concurrent ring-buffer KV slots (`16` sessions) for multi-session `DFlash2` serving.
 pub const MAX_DFLASH_BATCH_SLOTS: usize = 16;
 
+/// Maximum concurrent sequences drafted in a single batched `DFlash2` forward + verify pass.
+pub const MAX_DFLASH_DRAFT_BATCH: usize = 4;
+
 /// Alignment/padding slack (`1 MiB`) added to the `DFlash2Rank` weight arena capacity.
 const DFLASH2_WEIGHT_ARENA_SLACK_BYTES: usize = 1024 * 1024;
 
@@ -734,6 +737,18 @@ pub(crate) fn serving_reserve(
     })
 }
 
+struct DFlashBatchIo {
+    graphs: [Option<CudaGraph>; MAX_DFLASH_DRAFT_BATCH],
+    hidden: DeviceBuffer,
+    projected: DeviceBuffer,
+    meta_dev: DeviceBuffer,
+    block_tables_dev: DeviceBuffer,
+    topk_ids_dev: DeviceBuffer,
+    topk_scores_dev: DeviceBuffer,
+    out_path_dev: DeviceBuffer,
+    max_blocks: usize,
+}
+
 struct DFlashGraphIo {
     forward_graph: Option<CudaGraph>,
     select_greedy_graphs: [Option<CudaGraph>; MAX_DFLASH_BATCH_SLOTS],
@@ -752,6 +767,7 @@ pub struct DFlash2Rank {
     tp: usize,
     target_embedding: u64,
     graph_io: DFlashGraphIo,
+    batch_io: Option<DFlashBatchIo>,
     _weights: DeviceArena,
     scratch: DeviceArena,
     kv: KvPool,
@@ -769,6 +785,7 @@ pub struct DFlash2Rank {
     batch_mode: bool,
     slot_committed: [usize; MAX_DFLASH_BATCH_SLOTS],
     proposal_anchor: Option<i32>,
+    last_ctx_ptr: u64,
     fc: Linear,
     hidden_norm: u64,
     final_norm: u64,
@@ -1415,6 +1432,7 @@ impl DFlash2Rank {
             tp,
             target_embedding: t.embed_tokens_ptr,
             graph_io,
+            batch_io: None,
             _weights: weights,
             scratch: DeviceArena::new(t.device.device_id, 32 * 1024 * 1024)?,
             kv,
@@ -1432,6 +1450,7 @@ impl DFlash2Rank {
             batch_mode: false,
             slot_committed: [0; MAX_DFLASH_BATCH_SLOTS],
             proposal_anchor: None,
+            last_ctx_ptr: 0,
             fc,
             hidden_norm,
             final_norm,
@@ -1522,6 +1541,9 @@ impl DFlash2Rank {
         if self.batch_mode != batch_mode {
             self.graph_io.forward_graph = None;
             self.graph_io.select_greedy_graphs = std::array::from_fn(|_| None);
+            if let Some(bio) = &mut self.batch_io {
+                bio.graphs = std::array::from_fn(|_| None);
+            }
             self.batch_mode = batch_mode;
         }
         self.slot_committed = [0; MAX_DFLASH_BATCH_SLOTS];
@@ -1558,6 +1580,9 @@ impl DFlash2Rank {
         if !self.batch_mode {
             self.graph_io.forward_graph = None;
             self.graph_io.select_greedy_graphs = std::array::from_fn(|_| None);
+            if let Some(bio) = &mut self.batch_io {
+                bio.graphs = std::array::from_fn(|_| None);
+            }
             self.batch_mode = true;
         }
         self.slot_committed = [0; MAX_DFLASH_BATCH_SLOTS];
@@ -1778,6 +1803,106 @@ impl DFlash2Rank {
             "DFlash QK norm/RoPE + KV write",
         )
     }
+    /// Device address of the projected `[rows, H]` BF16 context (`rms_norm(fc(tap_aux))`)
+    /// computed by the most recent [`Self::ingest_no_sync`] or [`Self::project_taps_to_ctx_no_sync`].
+    /// Valid in `self.scratch` until the next scratch-resetting operation on `t.stream`.
+    #[inline]
+    pub fn last_ctx_ptr(&self) -> u64 {
+        self.last_ctx_ptr
+    }
+
+    /// Projects `[rows, 5*H]` BF16 target taps into `[rows, H]` BF16 `ctx = rms_norm(fc(tap_aux))`
+    /// on `t.stream` without mutating KV or `committed` state. Returns the device address of `ctx`.
+    pub fn project_taps_to_ctx_no_sync(
+        &mut self,
+        t: &Qwen3_5ModelRank,
+        tap_bf16: u64,
+        rows: usize,
+    ) -> Result<u64> {
+        self.validate_target(t)?;
+        if rows == 0 {
+            self.last_ctx_ptr = 0;
+            return Ok(0);
+        }
+        let h = self.cfg.model.hidden_size;
+        if rows > self.max_rows
+            || tap_bf16 == 0
+            || !tap_bf16.is_multiple_of(2)
+            || tap_bf16
+                .checked_add((rows * self.cfg.target_layers.len() * h * 2) as u64)
+                .is_none()
+        {
+            return Err(loader_err("invalid DFlash tap projection"));
+        }
+        self.scratch.reset();
+        let projected = self.scratch.alloc_aligned(rows * h * 2)?;
+        let ctx = self.scratch.alloc_aligned(rows * h * 2)?;
+        let had_scratch = self
+            .scratch
+            .alloc_aligned(rows * h * self.cfg.target_layers.len() * 2)?;
+        self.fc.run(t, tap_bf16, projected, rows, had_scratch)?;
+        self.norm(t, projected, 0, self.hidden_norm, ctx, rows)?;
+        self.last_ctx_ptr = ctx;
+        Ok(ctx)
+    }
+
+    /// `ctx_bf16` is a live device span `[rows, H]` of pre-projected BF16 context
+    /// (`rms_norm(fc(tap_aux))`). Enqueues KV ingestion on `t.stream` without re-running `fc`/`norm`.
+    pub fn ingest_ctx_no_sync(
+        &mut self,
+        t: &Qwen3_5ModelRank,
+        ctx_bf16: u64,
+        rows: usize,
+    ) -> Result<()> {
+        self.validate_target(t)?;
+        if rows == 0 {
+            return Ok(());
+        }
+        let h = self.cfg.model.hidden_size;
+        if rows > self.max_rows
+            || rows > self.capacity - self.committed
+            || ctx_bf16 == 0
+            || !ctx_bf16.is_multiple_of(2)
+            || ctx_bf16.checked_add((rows * h * 2) as u64).is_none()
+        {
+            return Err(loader_err("invalid DFlash projected ctx ingest"));
+        }
+        self.proposal_anchor = None;
+        self.scratch.reset();
+        let kv = self.cfg.model.num_key_value_heads * self.cfg.model.head_dim / self.tp;
+        let had_scratch = self.scratch.alloc_aligned(rows * h * 2)?;
+        let packed = self.scratch.alloc_aligned(rows * 2 * kv * 2)?;
+        let (batch, pos) = self.metadata(t, rows)?;
+        for (l, layer) in self.layers.iter().enumerate() {
+            layer.kv.run(t, ctx_bf16, packed, rows, had_scratch)?;
+            self.rope_kv_write(
+                t,
+                packed,
+                0,
+                pos,
+                0,
+                layer,
+                &self.kv.layers[l].layout,
+                batch.write_slot_mapping,
+                rows,
+            )?;
+        }
+        self.committed += rows;
+        self.slot_committed[self.active_slot] = self.committed;
+        self.last_ctx_ptr = ctx_bf16;
+        Ok(())
+    }
+
+    /// Synchronous wrapper around [`Self::ingest_ctx_no_sync`] for memo replay.
+    pub fn ingest_ctx(&mut self, t: &Qwen3_5ModelRank, ctx_bf16: u64, rows: usize) -> Result<()> {
+        if rows == 0 {
+            self.validate_target(t)?;
+            return Ok(());
+        }
+        self.ingest_ctx_no_sync(t, ctx_bf16, rows)?;
+        t.stream.synchronize()
+    }
+
     /// `tap_bf16` is a live device span [rows, 5*H] of committed target taps in BF16.
     /// No unverified rows may be passed here. Enqueues context KV ingestion on `t.stream`
     /// without synchronizing the host thread so a subsequent `forward` on the same stream
@@ -1817,6 +1942,7 @@ impl DFlash2Rank {
         let (batch, pos) = self.metadata(t, rows)?;
         self.fc.run(t, tap_bf16, projected, rows, had_scratch)?;
         self.norm(t, projected, 0, self.hidden_norm, ctx, rows)?;
+        self.last_ctx_ptr = ctx;
         for (l, layer) in self.layers.iter().enumerate() {
             layer.kv.run(t, ctx, packed, rows, had_scratch)?;
             self.rope_kv_write(
@@ -1847,6 +1973,42 @@ impl DFlash2Rank {
         t.stream.synchronize()
     }
     #[allow(clippy::too_many_arguments)]
+    fn conv_rows(
+        &self,
+        t: &Qwen3_5ModelRank,
+        c: &Conv,
+        x: u64,
+        coeff: u64,
+        y: u64,
+        rows: usize,
+        side: i32,
+        had_scratch: u64,
+    ) -> Result<()> {
+        if side == 0 {
+            c.projection.run(t, x, coeff, rows, had_scratch)?;
+        }
+        check_rc(
+            // SAFETY: device pointers x, coeff, c.base, and y are valid allocations for rows * hidden_size BF16 elements.
+            unsafe {
+                ffi::warp34_dflash_conv_bf16(
+                    &t.stream.exec(0, 0),
+                    x as *const c_void,
+                    coeff as *const c_void,
+                    c.base as *const c_void,
+                    y as *mut c_void,
+                    rows as i32,
+                    self.cfg.model.hidden_size as i32,
+                    self.cfg.block_size as i32,
+                    self.cfg.group as i32,
+                    self.cfg.taps as i32,
+                    side,
+                )
+            },
+            "DFlash grouped conv",
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn conv(
         &self,
         t: &Qwen3_5ModelRank,
@@ -1857,29 +2019,7 @@ impl DFlash2Rank {
         side: i32,
         had_scratch: u64,
     ) -> Result<()> {
-        if side == 0 {
-            c.projection
-                .run(t, x, coeff, self.cfg.block_size, had_scratch)?;
-        }
-        check_rc(
-            // SAFETY: device pointers x, coeff, c.base, and y are valid allocations for block_size * hidden_size BF16 elements.
-            unsafe {
-                ffi::warp34_dflash_conv_bf16(
-                    &t.stream.exec(0, 0),
-                    x as *const c_void,
-                    coeff as *const c_void,
-                    c.base as *const c_void,
-                    y as *mut c_void,
-                    self.cfg.block_size as i32,
-                    self.cfg.model.hidden_size as i32,
-                    self.cfg.block_size as i32,
-                    self.cfg.group as i32,
-                    self.cfg.taps as i32,
-                    side,
-                )
-            },
-            "DFlash grouped conv",
-        )
+        self.conv_rows(t, c, x, coeff, y, self.cfg.block_size, side, had_scratch)
     }
     fn fixed_forward_batch_ptrs(&self) -> (Warp34AttentionBatch, u64, u64) {
         let m = self.cfg.block_size;
@@ -2198,6 +2338,581 @@ impl DFlash2Rank {
         })?;
         self.graph_io.select_greedy_graphs[slot_idx] = Some(graph);
         Ok(())
+    }
+
+    pub fn can_batch_select_greedy(&self, t: &Qwen3_5ModelRank, batch_size: usize) -> bool {
+        if !self.batch_mode
+            || !(2..=MAX_DFLASH_DRAFT_BATCH).contains(&batch_size)
+            || !self.can_capture_select_greedy()
+        {
+            return false;
+        }
+        let c = &self.cfg.model;
+        let (h, m, d) = (c.hidden_size, self.cfg.block_size, c.head_dim);
+        let (q, kv, i) = (
+            c.num_attention_heads * d / self.tp,
+            c.num_key_value_heads * d / self.tp,
+            c.intermediate_size / self.tp,
+        );
+        let total_m = batch_size * m;
+        let total_k = batch_size * (m - 1);
+        let topk_elems = total_k * self.cfg.top_k;
+        let num_splits = (256 / self.cfg.top_k).clamp(1, 16);
+        let logits_bytes = (total_k * t.local_vocab_size * 2).max(4 * 1024 * 1024);
+        let est_bytes = total_m * h * 2 * 5
+            + total_m * 2 * self.cfg.taps * (h / self.cfg.group) * 2
+            + total_m * (q + 2 * kv) * 2
+            + total_m * q * 2 * 2
+            + total_m * 2 * i * 2
+            + total_m * i * 2
+            + total_m * h.max(q).max(i) * 2
+            + total_k * h * 2 * 2
+            + logits_bytes
+            + topk_elems * num_splits * 8
+            + 64 * 1024;
+        est_bytes <= DFLASH2_FORWARD_GRAPH_ARENA_BYTES
+    }
+
+    fn current_batch_slot_max_blocks(&self) -> usize {
+        if self.ring_pages_dev_buf.is_some() {
+            self.rope_rows.div_ceil(DFLASH2_KV_PAGE_BLOCK_TOKENS)
+        } else {
+            self.all_pages.len() / self.batch_slot_count().max(1)
+        }
+    }
+
+    fn slot_pages_dev_addr(&self, slot: usize) -> (u64, usize) {
+        if let Some(ring_buf) = &self.ring_pages_dev_buf {
+            let logical_pages = self.rope_rows.div_ceil(DFLASH2_KV_PAGE_BLOCK_TOKENS);
+            (
+                ring_buf.addr() + (slot * logical_pages * 4) as u64,
+                logical_pages,
+            )
+        } else {
+            let slot_pages = self.all_pages.len() / self.batch_slot_count().max(1);
+            (
+                self.all_pages_dev + (slot * slot_pages * 4) as u64,
+                slot_pages,
+            )
+        }
+    }
+
+    fn ensure_batch_io(&mut self, t: &Qwen3_5ModelRank) -> Result<()> {
+        let max_blocks = self.current_batch_slot_max_blocks();
+        if self
+            .batch_io
+            .as_ref()
+            .is_some_and(|bio| bio.max_blocks == max_blocks)
+        {
+            return Ok(());
+        }
+        let dev = t.device.device_id;
+        let m = self.cfg.block_size;
+        let k = m - 1;
+        let h = self.cfg.model.hidden_size;
+        let max_b = MAX_DFLASH_DRAFT_BATCH;
+        let meta_i32s = max_b * (3 * m + 3) + 1;
+        let topk_elems = max_b * k * self.cfg.top_k;
+        self.batch_io = Some(DFlashBatchIo {
+            graphs: std::array::from_fn(|_| None),
+            hidden: DeviceBuffer::alloc(dev, max_b * m * h * 2)?,
+            projected: DeviceBuffer::alloc(dev, max_b * k * self.cfg.selector_rank * 2)?,
+            meta_dev: DeviceBuffer::alloc(dev, meta_i32s * 4)?,
+            block_tables_dev: DeviceBuffer::alloc(dev, max_b * max_blocks * 4)?,
+            topk_ids_dev: DeviceBuffer::alloc(dev, topk_elems * 4)?,
+            topk_scores_dev: DeviceBuffer::alloc(dev, topk_elems * 4)?,
+            out_path_dev: DeviceBuffer::alloc(dev, max_b * 2 * k * 4)?,
+            max_blocks,
+        });
+        Ok(())
+    }
+
+    fn fixed_batched_forward_ptrs(
+        &self,
+        batch_size: usize,
+    ) -> Result<(Warp34AttentionBatch, u64, u64)> {
+        let bio = self
+            .batch_io
+            .as_ref()
+            .ok_or_else(|| loader_err("DFlash batch_io not initialized"))?;
+        let m = self.cfg.block_size;
+        let total_m = batch_size * m;
+        let base = bio.meta_dev.addr();
+        let ids_ptr = base;
+        let pos_ptr = ids_ptr + (total_m * 4) as u64;
+        let slots_ptr = pos_ptr + (total_m * 4) as u64;
+        let q_start_ptr = slots_ptr + (total_m * 4) as u64;
+        let ctx_before_ptr = q_start_ptr + ((batch_size + 1) * 4) as u64;
+        let seq_after_ptr = ctx_before_ptr + (batch_size * 4) as u64;
+        let batch = Warp34AttentionBatch {
+            query_start_loc: q_start_ptr as *const i32,
+            context_lens_before: ctx_before_ptr as *const i32,
+            seq_lens_after: seq_after_ptr as *const i32,
+            block_tables: bio.block_tables_dev.addr() as *const i32,
+            write_slot_mapping: slots_ptr as *const i32,
+            valid_token_mask: core::ptr::null(),
+            valid_req_mask: core::ptr::null(),
+            num_reqs: batch_size as i32,
+            total_tokens: total_m as i32,
+            max_blocks_per_req: bio.max_blocks as i32,
+            max_q_len: m as i32,
+            max_seq_len: (self.capacity + m) as i32,
+            sliding_window: self.cfg.window as i32,
+            mask_mode: ffi::WARP34_ATTN_MASK_NONCAUSAL_WINDOW,
+            sm_scale: 1.0 / (self.cfg.model.head_dim as f32).sqrt(),
+            reserved: 0,
+        };
+        Ok((batch, ids_ptr, pos_ptr))
+    }
+
+    pub fn prepare_batched_select_greedy_inputs_async(
+        &mut self,
+        t: &Qwen3_5ModelRank,
+        slots: &[usize],
+        anchors: &[i32],
+    ) -> Result<()> {
+        self.validate_target(t)?;
+        let b = slots.len();
+        if !self.batch_mode || b != anchors.len() || !(2..=MAX_DFLASH_DRAFT_BATCH).contains(&b) {
+            return Err(loader_err("invalid DFlash batched forward inputs"));
+        }
+        self.slot_committed[self.active_slot] = self.committed;
+        let slot_count = self.batch_slot_count();
+        let m = self.cfg.block_size;
+        let cap = self.batch_slot_capacity();
+        for (&slot, &anchor) in slots.iter().zip(anchors) {
+            if slot >= slot_count
+                || anchor < 0
+                || anchor as usize >= self.cfg.model.vocab_size
+                || self.slot_committed[slot] > cap
+            {
+                return Err(loader_err("invalid DFlash batch slot or anchor"));
+            }
+        }
+        self.proposal_anchor = None;
+        self.ensure_batch_io(t)?;
+        let is_ring = self.ring_pages_dev_buf.is_some();
+        let phys_per_slot = if is_ring {
+            self.all_pages.len() / self.ring_slot_count
+        } else {
+            self.all_pages.len() / slot_count
+        };
+        let mut meta = Vec::with_capacity(b * (3 * m + 3) + 1);
+        for &anchor in anchors {
+            meta.push(anchor);
+            meta.resize(meta.len() + m - 1, self.cfg.mask_token);
+        }
+        for &slot in slots {
+            let before = self.slot_committed[slot];
+            meta.extend((before..before + m).map(|v| v as i32));
+        }
+        for &slot in slots {
+            let before = self.slot_committed[slot];
+            let base = slot * phys_per_slot;
+            for p in before..before + m {
+                let page_idx = if is_ring {
+                    (p / 16) % phys_per_slot
+                } else {
+                    p / 16
+                };
+                let phys_page = self.all_pages[base + page_idx];
+                meta.push(phys_page * 16 + (p % 16) as i32);
+            }
+        }
+        for idx in 0..=b {
+            meta.push((idx * m) as i32);
+        }
+        for &slot in slots {
+            meta.push(self.slot_committed[slot] as i32);
+        }
+        for &slot in slots {
+            meta.push((self.slot_committed[slot] + m) as i32);
+        }
+        let bio = self.batch_io.as_ref().unwrap();
+        bio.meta_dev.copy_from_host(&meta, &t.stream)?;
+        let max_blocks = bio.max_blocks;
+        let dst_base = bio.block_tables_dev.addr();
+        for (idx, &slot) in slots.iter().enumerate() {
+            let (src_addr, len_blocks) = self.slot_pages_dev_addr(slot);
+            debug_assert_eq!(len_blocks, max_blocks);
+            let dst_addr = dst_base + (idx * max_blocks * 4) as u64;
+            check_rc(
+                // SAFETY: src_addr and dst_addr each span max_blocks i32s on t.stream.
+                unsafe {
+                    ffi::warp34_memcpy_d2d_async(
+                        dst_addr as *mut c_void,
+                        src_addr as *const c_void,
+                        max_blocks * 4,
+                        t.stream.handle,
+                    )
+                },
+                "DFlash batch block_tables copy",
+            )?;
+        }
+        Ok(())
+    }
+
+    fn enqueue_batched_select_greedy_body(
+        &mut self,
+        t: &Qwen3_5ModelRank,
+        batch_size: usize,
+        comm: Option<&Tp2Collectives>,
+    ) -> Result<()> {
+        let (batch, ids_ptr, pos_ptr) = self.fixed_batched_forward_ptrs(batch_size)?;
+        let bio = self
+            .batch_io
+            .as_ref()
+            .ok_or_else(|| loader_err("DFlash batch_io not initialized"))?;
+        let hidden_addr = bio.hidden.addr();
+        let projected_addr = bio.projected.addr();
+        let topk_ids_addr = bio.topk_ids_dev.addr();
+        let topk_scores_addr = bio.topk_scores_dev.addr();
+        let out_path_addr = bio.out_path_dev.addr();
+
+        self.graph_io.forward_arena.reset();
+        let c = &self.cfg.model;
+        let (h, m, d) = (c.hidden_size, self.cfg.block_size, c.head_dim);
+        let k = m - 1;
+        let total_m = batch_size * m;
+        let total_k = batch_size * k;
+        let (q, kv, i) = (
+            c.num_attention_heads * d / self.tp,
+            c.num_key_value_heads * d / self.tp,
+            c.intermediate_size / self.tp,
+        );
+        let residual = self.graph_io.forward_arena.alloc_aligned(total_m * h * 2)?;
+        let x = self.graph_io.forward_arena.alloc_aligned(total_m * h * 2)?;
+        let normed = self.graph_io.forward_arena.alloc_aligned(total_m * h * 2)?;
+        let filtered = self.graph_io.forward_arena.alloc_aligned(total_m * h * 2)?;
+        let coeff = self
+            .graph_io
+            .forward_arena
+            .alloc_aligned(total_m * 2 * self.cfg.taps * (h / self.cfg.group) * 2)?;
+        let packed = self
+            .graph_io
+            .forward_arena
+            .alloc_aligned(total_m * (q + 2 * kv) * 2)?;
+        let qb = self.graph_io.forward_arena.alloc_aligned(total_m * q * 2)?;
+        let attn = self.graph_io.forward_arena.alloc_aligned(total_m * q * 2)?;
+        let tmp = self.graph_io.forward_arena.alloc_aligned(total_m * h * 2)?;
+        let gu = self
+            .graph_io
+            .forward_arena
+            .alloc_aligned(total_m * 2 * i * 2)?;
+        let act = self.graph_io.forward_arena.alloc_aligned(total_m * i * 2)?;
+        let had_scratch = self
+            .graph_io
+            .forward_arena
+            .alloc_aligned(total_m * h.max(q).max(i) * 2)?;
+        let draft_hidden = self.graph_io.forward_arena.alloc_aligned(total_k * h * 2)?;
+        let head_input = self.graph_io.forward_arena.alloc_aligned(total_k * h * 2)?;
+        let logits_bytes = total_k * t.local_vocab_size * 2;
+        let attn_split_ws_bytes = logits_bytes.max(4 * 1024 * 1024);
+        let logits = self
+            .graph_io
+            .forward_arena
+            .alloc_aligned(attn_split_ws_bytes)?;
+        let ex = t.stream.exec(0, 0);
+        let attn_ex = t.stream.exec(logits, attn_split_ws_bytes);
+        check_rc(
+            // SAFETY: ids_ptr holds total_m valid token IDs and residual holds total_m * h BF16s.
+            unsafe {
+                ffi::warp34_embed_lookup_f16_to_bf16(
+                    &ex,
+                    ids_ptr as *const i32,
+                    t.embed_tokens_ptr as *const c_void,
+                    residual as *mut c_void,
+                    total_m as i32,
+                    h as i32,
+                    t.cfg.vocab_size as i32,
+                )
+            },
+            "DFlash batched shared embedding",
+        )?;
+        for (l, layer) in self.layers.iter().enumerate() {
+            self.norm(
+                t,
+                if l == 0 { residual } else { x },
+                if l == 0 { 0 } else { residual },
+                layer.input_norm,
+                normed,
+                total_m,
+            )?;
+            self.conv_rows(
+                t,
+                &layer.attn_conv,
+                normed,
+                coeff,
+                filtered,
+                total_m,
+                0,
+                had_scratch,
+            )?;
+            layer.qkv.run(t, filtered, packed, total_m, had_scratch)?;
+            self.rope_kv_write(
+                t,
+                packed,
+                qb,
+                pos_ptr,
+                q / d,
+                layer,
+                &self.kv.layers[l].layout,
+                batch.write_slot_mapping,
+                total_m,
+            )?;
+            check_rc(
+                // SAFETY: kv layout and batched attention descriptor describe valid paged memory for batch_size reqs.
+                unsafe {
+                    ffi::warp34_paged_attention_bf16(
+                        &attn_ex,
+                        &self.kv.layers[l].layout,
+                        &batch,
+                        qb as *const c_void,
+                        attn as *mut c_void,
+                        (q / d) as i32,
+                    )
+                },
+                "DFlash batched paged attention",
+            )?;
+            layer.out.run(t, attn, tmp, total_m, had_scratch)?;
+            if let Some(comm) = comm {
+                comm.all_reduce_bf16(&ex, tmp, tmp, self.rank as i32, (total_m * h) as i32)?;
+            }
+            self.conv_rows(t, &layer.attn_conv, tmp, coeff, x, total_m, 1, had_scratch)?;
+            self.norm(t, x, residual, layer.post_norm, normed, total_m)?;
+            self.conv_rows(
+                t,
+                &layer.mlp_conv,
+                normed,
+                coeff,
+                filtered,
+                total_m,
+                0,
+                had_scratch,
+            )?;
+            layer.gate_up.run(t, filtered, gu, total_m, had_scratch)?;
+            check_rc(
+                // SAFETY: gu holds total_m * 2 * i BF16s, act holds total_m * i BF16s.
+                unsafe {
+                    ffi::warp34_silu_and_mul_bf16(
+                        &ex,
+                        gu as *const c_void,
+                        act as *mut c_void,
+                        total_m as i32,
+                        i as i32,
+                    )
+                },
+                "DFlash batched SiLU",
+            )?;
+            layer.down.run(t, act, tmp, total_m, had_scratch)?;
+            if let Some(comm) = comm {
+                comm.all_reduce_bf16(&ex, tmp, tmp, self.rank as i32, (total_m * h) as i32)?;
+            }
+            self.conv_rows(t, &layer.mlp_conv, tmp, coeff, x, total_m, 1, had_scratch)?;
+        }
+        self.norm(t, x, residual, self.final_norm, hidden_addr, total_m)?;
+        let draft_chunk_bytes = k * h * 2;
+        for idx in 0..batch_size {
+            let src = hidden_addr + ((idx * m + 1) * h * 2) as u64;
+            let dst = draft_hidden + (idx * draft_chunk_bytes) as u64;
+            check_rc(
+                // SAFETY: hidden_addr holds batch_size * m * h BF16s; draft_hidden holds batch_size * k * h BF16s.
+                unsafe {
+                    ffi::warp34_memcpy_d2d_async(
+                        dst as *mut c_void,
+                        src as *const c_void,
+                        draft_chunk_bytes,
+                        t.stream.handle,
+                    )
+                },
+                "DFlash batched pack draft hidden",
+            )?;
+        }
+        self.hp
+            .run(t, draft_hidden, projected_addr, total_k, had_scratch)?;
+        check_rc(
+            // SAFETY: draft_hidden holds total_k * h BF16s; head_input holds total_k * h FP16s.
+            unsafe {
+                ffi::warp34_cast_bf16_to_f16(
+                    &ex,
+                    draft_hidden as *const c_void,
+                    head_input as *mut c_void,
+                    (total_k * h) as i64,
+                )
+            },
+            "DFlash batched shared head cast",
+        )?;
+        t.lm_head
+            .as_ref()
+            .ok_or_else(|| loader_err("target checkpoint has no lm_head"))?
+            .forward(
+                &ex,
+                &t.cublas,
+                t.marlin_ws.addr(),
+                t.marlin_ws.len_bytes / 4,
+                head_input,
+                logits,
+                total_k,
+            )?;
+        let topk_elems = total_k * self.cfg.top_k;
+        let num_splits = (256 / self.cfg.top_k).clamp(1, 16);
+        let split_ids_ws = self
+            .graph_io
+            .forward_arena
+            .alloc_aligned(topk_elems * num_splits * 4)?;
+        let split_vals_ws = self
+            .graph_io
+            .forward_arena
+            .alloc_aligned(topk_elems * num_splits * 4)?;
+        check_rc(
+            // SAFETY: logits contains total_k FP16 rows; topk outputs hold total_k * top_k elements.
+            unsafe {
+                ffi::warp34_topk_rows_split_f16(
+                    &ex,
+                    logits as *const c_void,
+                    split_ids_ws as *mut i32,
+                    split_vals_ws as *mut f32,
+                    topk_ids_addr as *mut i32,
+                    topk_scores_addr as *mut f32,
+                    total_k as i32,
+                    t.local_vocab_size as i32,
+                    t.vocab_offset as i32,
+                    self.cfg.top_k as i32,
+                    num_splits as i32,
+                )
+            },
+            "DFlash batched top-k",
+        )?;
+        let n = self.cfg.top_k;
+        if let Some(comm) = comm {
+            comm.all_gather_topk_f32_i32(
+                &ex,
+                topk_scores_addr,
+                topk_ids_addr,
+                topk_scores_addr,
+                topk_ids_addr,
+                self.rank as i32,
+                total_k as i32,
+                n as i32,
+            )?;
+        }
+        let selector_rank = self.cfg.selector_rank as i32;
+        let vocab_size = self.cfg.model.vocab_size as i32;
+        for idx in 0..batch_size {
+            let ids_b = topk_ids_addr + (idx * k * n * 4) as u64;
+            let scores_b = topk_scores_addr + (idx * k * n * 4) as u64;
+            let proj_b = projected_addr + (idx * k * self.cfg.selector_rank * 2) as u64;
+            let out_path_b = out_path_addr + (idx * 2 * k * 4) as u64;
+            let out_confs_b = out_path_b + (k * 4) as u64;
+            let anchor_ptr_b = ids_ptr + (idx * m * 4) as u64;
+            check_rc(
+                // SAFETY: per-sequence slices of batch_io buffers are disjoint and sized for k proposals.
+                unsafe {
+                    ffi::warp34_dflash_select_greedy_dev_anchor_with_conf_bf16(
+                        &ex,
+                        ids_b as *const i32,
+                        scores_b as *const f32,
+                        proj_b as *const c_void,
+                        self.pred as *const c_void,
+                        self.succ as *const c_void,
+                        out_path_b as *mut i32,
+                        out_confs_b as *mut f32,
+                        anchor_ptr_b as *const i32,
+                        k as i32,
+                        n as i32,
+                        selector_rank,
+                        vocab_size,
+                    )
+                },
+                "DFlash batched greedy selector",
+            )?;
+        }
+        Ok(())
+    }
+
+    pub fn ensure_batched_select_greedy_graph(
+        &mut self,
+        t: &Qwen3_5ModelRank,
+        batch_size: usize,
+        comm: Option<&Tp2Collectives>,
+    ) -> Result<()> {
+        if !(2..=MAX_DFLASH_DRAFT_BATCH).contains(&batch_size) {
+            return Err(loader_err("invalid DFlash batch graph size"));
+        }
+        self.ensure_batch_io(t)?;
+        let g_idx = batch_size - 1;
+        if self.batch_io.as_ref().unwrap().graphs[g_idx].is_some() {
+            return Ok(());
+        }
+        t.stream.synchronize()?;
+        let graph = CudaGraph::capture(&t.stream, || {
+            self.enqueue_batched_select_greedy_body(t, batch_size, comm)
+        })?;
+        self.batch_io.as_mut().unwrap().graphs[g_idx] = Some(graph);
+        Ok(())
+    }
+
+    pub fn replay_batched_select_greedy_graph_async(
+        &self,
+        t: &Qwen3_5ModelRank,
+        batch_size: usize,
+    ) -> Result<()> {
+        let graph = self
+            .batch_io
+            .as_ref()
+            .and_then(|bio| bio.graphs.get(batch_size - 1))
+            .and_then(Option::as_ref)
+            .ok_or_else(|| loader_err("DFlash batched select_greedy graph not captured"))?;
+        graph.launch(&t.stream)
+    }
+
+    pub fn forward_batched_select_greedy_eager_async(
+        &mut self,
+        t: &Qwen3_5ModelRank,
+        batch_size: usize,
+        comm: Option<&Tp2Collectives>,
+    ) -> Result<()> {
+        self.ensure_batch_io(t)?;
+        self.enqueue_batched_select_greedy_body(t, batch_size, comm)
+    }
+
+    pub fn collect_batched_select_greedy_host(
+        &mut self,
+        t: &Qwen3_5ModelRank,
+        batch_size: usize,
+    ) -> Result<Vec<Vec<i32>>> {
+        let bio = self
+            .batch_io
+            .as_ref()
+            .ok_or_else(|| loader_err("DFlash batch_io not initialized"))?;
+        let k = self.cfg.block_size - 1;
+        let mut raw = vec![0u32; batch_size * 2 * k];
+        bio.out_path_dev.copy_to_host(&mut raw, &t.stream)?;
+        let gate = Self::offloaded_moe_draft_confidence_gate(t);
+        let mut out = Vec::with_capacity(batch_size);
+        for idx in 0..batch_size {
+            let base = idx * 2 * k;
+            let mut path: Vec<i32> = raw[base..base + k].iter().map(|&w| w as i32).collect();
+            if path.first().is_some_and(|&id| id < 0) {
+                return Err(loader_err("nonfinite DFlash edges"));
+            }
+            if let Some((max_draft, min_step_conf, min_cum_conf, allow_zero_drafts)) = gate {
+                let confs: Vec<f32> = raw[base + k..base + 2 * k]
+                    .iter()
+                    .map(|&w| f32::from_bits(w))
+                    .collect();
+                Self::truncate_path_by_step_confidences(
+                    &mut path,
+                    &confs,
+                    max_draft,
+                    min_step_conf,
+                    min_cum_conf,
+                    allow_zero_drafts,
+                );
+            }
+            out.push(path);
+        }
+        Ok(out)
     }
 
     pub fn prepare_select_greedy_graph_inputs_async(

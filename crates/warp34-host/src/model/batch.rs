@@ -1432,36 +1432,56 @@ impl Qwen3_5Engine {
             },
             "pipelined decode D2H output",
         )?;
-        let mtp_row_bytes = self
-            .speculative
-            .as_ref()
-            .filter(|p| p.is_mtp())
-            .map_or(0, |p| p.row_bytes());
-        let has_hidden = if mtp_row_bytes > 0
-            && let Some(hidden_buf) = r0.last_final_hidden_f16.as_ref()
-            && n.saturating_mul(mtp_row_bytes) <= hidden_buf.len_bytes
-        {
-            let hidden_addr = hidden_buf.addr();
+        let mut speculative = self.speculative.take();
+        let has_hidden_res: Result<bool> = (|| {
+            let Some(proposer) = speculative.as_mut() else {
+                return Ok(false);
+            };
+            let row_bytes = proposer.row_bytes();
+            if row_bytes == 0 {
+                return Ok(false);
+            }
+            let src_addr = if proposer.is_mtp() {
+                let Some(hidden_buf) = r0.last_final_hidden_f16.as_ref() else {
+                    return Ok(false);
+                };
+                if n.saturating_mul(row_bytes) > hidden_buf.len_bytes {
+                    return Ok(false);
+                }
+                hidden_buf.addr()
+            } else if proposer.is_dflash() {
+                let Some(tap_buf) = r0.tap_aux_bf16.as_ref() else {
+                    return Ok(false);
+                };
+                if n > crate::dflash::DFLASH2_MAX_BATCH_ROWS
+                    || n.saturating_mul(proposer.tap_row_bytes()) > tap_buf.len_bytes
+                {
+                    return Ok(false);
+                }
+                proposer.project_plain_dflash_taps_rank0(r0, tap_buf.addr(), n)?
+            } else {
+                return Ok(false);
+            };
             let dst = r0
                 .batched_decode_io
-                .ensure_pipeline_hidden_slot_ptr(slot, mtp_row_bytes)?;
+                .ensure_pipeline_hidden_slot_ptr(slot, row_bytes)?;
             check_rc(
-                // SAFETY: n <= MAX_BATCHED_DECODE_REQS and n * mtp_row_bytes <= hidden_buf.len_bytes.
+                // SAFETY: n <= MAX_BATCHED_DECODE_REQS and src_addr holds n * row_bytes on r0.stream.
                 // Ordered on r0.stream strictly after graph.launch(t) and before pipeline_done_events[slot].
                 unsafe {
                     ffi::warp34_memcpy_d2h_async(
                         dst.cast(),
-                        hidden_addr as *const c_void,
-                        n * mtp_row_bytes,
+                        src_addr as *const c_void,
+                        n * row_bytes,
                         r0.stream.handle,
                     )
                 },
-                "pipelined decode D2H MTP hidden",
+                "pipelined decode D2H speculative hidden",
             )?;
-            true
-        } else {
-            false
-        };
+            Ok(true)
+        })();
+        self.speculative = speculative;
+        let has_hidden = has_hidden_res?;
         r0.batched_decode_io.pipeline_done_events[slot].record(&r0.stream)?;
 
         Ok(InFlightDecodeTicket {

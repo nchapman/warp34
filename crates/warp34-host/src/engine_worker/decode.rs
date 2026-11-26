@@ -522,7 +522,15 @@ pub(super) fn step_plain(
             .materialize_pending_checkpoint(&mut seq.radix_state)
             .map_err(WorkerError::Cuda)?;
     }
+    let prev_batched_cap = sched.cfg.max_num_batched_tokens;
+    if engine.speculative.as_ref().is_some_and(|p| p.is_dflash()) {
+        let tap_cap = engine.ranks[0].max_tap_rows;
+        if tap_cap > 0 && tap_cap < prev_batched_cap {
+            sched.cfg.max_num_batched_tokens = tap_cap;
+        }
+    }
     let slices = sched.schedule_step();
+    sched.cfg.max_num_batched_tokens = prev_batched_cap;
     if slices.is_empty() {
         return Ok(());
     }
@@ -775,13 +783,13 @@ pub(super) fn step_plain(
             && (s.is_final_prefill_chunk || (num_tokens.is_multiple_of(2048) && num_tokens <= 8192))
             && num_tokens <= seq.radix_key_tokens.len()
         {
-            let has_mtp = engine.speculative.as_ref().is_some_and(|p| p.is_mtp());
+            let has_spec_features = engine.speculative.is_some();
             engine.try_publish_radix_node_to_shared_pool_with_features(
                 &sched.radix,
                 node_id,
                 seq.lora_id,
                 &seq.radix_key_tokens,
-                has_mtp,
+                has_spec_features,
                 || {
                     // Finish plain memo first if the request already terminated on prefill
                     // (`max_tokens <= 1` or immediate EOS) or read directly from `plain_memos`.
@@ -1238,13 +1246,24 @@ fn begin_plain_eager_hidden(
     let Some(mut proposer) = engine.speculative.take() else {
         return false;
     };
-    if !proposer.is_mtp() || proposer.row_bytes() == 0 {
+    if proposer.row_bytes() == 0 {
         engine.speculative = Some(proposer);
         return false;
     }
     let total_tokens: usize = slices.iter().map(|s| s.query_tokens.len()).sum();
     let r0 = &engine.ranks[0];
-    let (dev_src, is_dedicated_tap) = if total_tokens > 0
+    let is_dflash = proposer.is_dflash();
+    let (dev_src, is_dedicated_tap) = if is_dflash {
+        if total_tokens > 0
+            && total_tokens <= r0.max_tap_rows
+            && let Some(buf) = r0.tap_aux_bf16.as_ref()
+            && total_tokens.saturating_mul(proposer.tap_row_bytes()) <= buf.len_bytes
+        {
+            (Some(buf.addr()), true)
+        } else {
+            (None, false)
+        }
+    } else if total_tokens > 0
         && total_tokens <= r0.max_tap_rows
         && let Some(buf) = r0.last_final_hidden_f16.as_ref()
         && total_tokens.saturating_mul(proposer.row_bytes()) <= buf.len_bytes
@@ -1282,6 +1301,46 @@ fn begin_plain_eager_hidden(
         }
     }
     if !any_tracked {
+        engine.speculative = Some(proposer);
+        return false;
+    }
+    if is_dflash {
+        if total_tokens <= crate::dflash::DFLASH2_MAX_BATCH_ROWS
+            && will_sync_via_gpu_sampler
+            && proposer.can_stage_plain_tap_async(total_tokens)
+            && let Ok(ctx_ptr) = proposer.project_plain_dflash_taps_rank0(r0, dev_src, total_tokens)
+            && proposer
+                .enqueue_plain_tap_hidden_d2h(ctx_ptr, total_tokens, &r0.stream)
+                .is_ok()
+        {
+            engine.speculative = Some(proposer);
+            return true;
+        }
+        let mut tracked: Vec<(u64, usize, &[i32])> = Vec::with_capacity(slices.len());
+        let mut tok_off = 0usize;
+        for s in slices {
+            let n = s.query_tokens.len();
+            let off = tok_off;
+            tok_off += n;
+            if let Some(seq) = sched.active.iter().find(|seq| seq.req_id == s.req_id)
+                && proposer.has_plain_memo(s.req_id)
+            {
+                let radix_slice = if s.is_prefill_chunk {
+                    &seq.radix_key_tokens[s.ctx_len_before..s.ctx_len_before + n]
+                } else {
+                    &s.query_tokens
+                };
+                tracked.push((s.req_id, off, radix_slice));
+            }
+        }
+        if proposer
+            .append_plain_dflash_taps_chunked_d2h(r0, dev_src, &tracked)
+            .is_err()
+        {
+            for s in slices {
+                proposer.discard_plain_memo(s.req_id);
+            }
+        }
         engine.speculative = Some(proposer);
         return false;
     }
@@ -1366,7 +1425,7 @@ fn record_plain_pipelined_hidden(
     let Some(mut proposer) = engine.speculative.take() else {
         return;
     };
-    if !proposer.is_mtp() || proposer.row_bytes() == 0 {
+    if proposer.row_bytes() == 0 {
         engine.speculative = Some(proposer);
         return;
     }

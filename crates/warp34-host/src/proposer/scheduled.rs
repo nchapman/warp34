@@ -663,7 +663,7 @@ impl NativeProposer {
         self.batch_slot_tick_counter += 1;
         self.active_slot_last_used_tick = self.batch_slot_tick_counter;
         if pending_ingest_rows > 0 {
-            let h_bytes = self.row_bytes;
+            let h_bytes = self.tap_row_bytes;
             let src_ptrs = self.captured(engine)?;
             for (rank_idx, t) in engine.ranks.iter().enumerate() {
                 let src = src_ptrs[rank_idx];
@@ -1246,7 +1246,7 @@ impl NativeProposer {
         if items.is_empty() {
             return Ok(vec![]);
         }
-        let h_bytes = self.row_bytes;
+        let h_bytes = self.tap_row_bytes;
         struct PreparedItem {
             slot: usize,
             drafts: Vec<i32>,
