@@ -6,7 +6,7 @@ use warp34_host::arc_router::{
     input::{ApiProtocol, serialize_request},
     policy::{
         DecideInput, RouteTarget, RoutingBasis, RoutingPolicy, UpstreamTarget, decide,
-        infer_local_slot, resolve_cloud_slots,
+        infer_local_slot, resolve_cloud_candidates,
     },
 };
 
@@ -76,16 +76,21 @@ fn heads_catalog_slot_inference_and_policy_invariants() {
     assert_eq!(infer_local_slot("Qwen3.5-9B", &heads.catalog), 54);
     assert_eq!(infer_local_slot("Qwen3.5-4B", &heads.catalog), 54);
 
-    let or_slots =
-        resolve_cloud_slots(&UpstreamTarget::OpenRouter, &heads.catalog, &[]).expect("openrouter");
+    let or_slots = resolve_cloud_candidates(&UpstreamTarget::OpenRouter, &heads.catalog, &[])
+        .expect("openrouter");
     assert_eq!(or_slots.len(), 11);
-    let filtered = resolve_cloud_slots(
+    let filtered = resolve_cloud_candidates(
         &UpstreamTarget::OpenRouter,
         &heads.catalog,
-        &["anthropic/claude-opus-5.5".to_string()],
+        &[
+            "medium=meta/muse-spark-1.3-contributor".to_string(),
+            "strong=google/gemini-4-neon".to_string(),
+        ],
     )
     .expect("filtered");
-    assert_eq!(filtered.len(), 1);
+    assert_eq!(filtered.len(), 2);
+    assert_eq!(filtered[0].wire, "meta/muse-spark-1.3-contributor");
+    assert_eq!(filtered[1].wire, "google/gemini-4-neon");
 
     // Warm local KV must stay local even with cloud slots available.
     let zero_readout = vec![0.0f32; 1024];
@@ -98,7 +103,7 @@ fn heads_catalog_slot_inference_and_policy_invariants() {
             has_tools: false,
             warm_local_kv: true,
             local_slot: 54,
-            cloud_slots: &or_slots,
+            cloud_candidates: &or_slots,
             policy: RoutingPolicy::Utility { value_usd: 4.5 },
             pin_pii_classes: &HashSet::new(),
         },

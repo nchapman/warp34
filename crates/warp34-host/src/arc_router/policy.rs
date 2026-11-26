@@ -138,28 +138,103 @@ pub fn infer_local_slot(model_name: &str, catalog: &ArcRuntimeCatalog) -> usize 
     }
 }
 
-/// Filter cloud candidate slots by optional user-supplied model names or wire IDs.
-pub fn resolve_cloud_slots(
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CloudCandidate {
+    pub slot: usize,
+    pub name: String,
+    pub wire: String,
+}
+
+fn resolve_tier_slot(token: &str, catalog: &ArcRuntimeCatalog) -> Option<usize> {
+    let idx = match token {
+        "fast" | "cheap" | "small" => 3, // deepseek/deepseek-v4.1-flash
+        "medium" | "mid" => 2,           // anthropic/claude-sonnet-5.5
+        "strong" | "big" => 10,          // moonshotai/kimi-k3 ($3/$15 frontier reasoning)
+        "frontier" => 1,                 // anthropic/claude-opus-5.5
+        _ => return None,
+    };
+    (idx < catalog.models.len()).then_some(idx)
+}
+
+/// Filter cloud candidate slots by optional user-supplied model names, wire IDs, or `tier=wire`
+/// overrides (e.g. `medium=meta/muse-spark-1.3-contributor,strong=google/gemini-4-neon`).
+pub fn resolve_cloud_candidates(
     upstream: &UpstreamTarget,
     catalog: &ArcRuntimeCatalog,
     filter: &[String],
-) -> Result<Vec<usize>, String> {
+) -> Result<Vec<CloudCandidate>, String> {
     let base = upstream.default_cloud_slots(catalog);
     if filter.is_empty() {
-        return Ok(base);
+        return Ok(base
+            .into_iter()
+            .map(|slot| {
+                let m = &catalog.models[slot];
+                CloudCandidate {
+                    slot,
+                    name: m.name.clone(),
+                    wire: m.wire.clone().unwrap_or_else(|| m.name.clone()),
+                }
+            })
+            .collect());
     }
-    let wanted: HashSet<String> = filter
-        .iter()
-        .map(|s| s.trim().to_ascii_lowercase())
-        .filter(|s| !s.is_empty())
-        .collect();
     let mut matched = Vec::new();
-    for idx in base {
-        let m = &catalog.models[idx];
-        let name_l = m.name.to_ascii_lowercase();
-        let wire_l = m.wire.as_deref().unwrap_or("").to_ascii_lowercase();
-        if wanted.contains(&name_l) || wanted.contains(&wire_l) {
-            matched.push(idx);
+    for raw in filter {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if let Some((lhs, rhs)) = trimmed.split_once('=') {
+            let lhs_l = lhs.trim().to_ascii_lowercase();
+            let wire = rhs.trim().to_string();
+            if wire.is_empty() {
+                return Err(format!(
+                    "invalid --router-cloud-models override `{trimmed}`"
+                ));
+            }
+            let slot = resolve_tier_slot(&lhs_l, catalog)
+                .or_else(|| {
+                    base.iter().copied().find(|&idx| {
+                        let m = &catalog.models[idx];
+                        m.name.eq_ignore_ascii_case(&lhs_l)
+                            || m.wire
+                                .as_deref()
+                                .is_some_and(|w| w.eq_ignore_ascii_case(&lhs_l))
+                    })
+                })
+                .ok_or_else(|| {
+                    format!(
+                        "unknown tier/slot `{lhs}` in --router-cloud-models `{trimmed}` (use fast, medium, strong, or a built-in ARC model name)"
+                    )
+                })?;
+            matched.push(CloudCandidate {
+                slot,
+                name: wire.clone(),
+                wire,
+            });
+        } else {
+            let wanted = trimmed.to_ascii_lowercase();
+            let slot = base
+                .iter()
+                .copied()
+                .find(|&idx| {
+                    let m = &catalog.models[idx];
+                    m.name.eq_ignore_ascii_case(&wanted)
+                        || m.wire
+                            .as_deref()
+                            .is_some_and(|w| w.eq_ignore_ascii_case(&wanted))
+                })
+                .ok_or_else(|| {
+                    format!(
+                        "--router-cloud-models `{trimmed}` matched no eligible models for upstream {}",
+                        upstream.base_url()
+                    )
+                })?;
+            let m = &catalog.models[slot];
+            matched.push(CloudCandidate {
+                slot,
+                name: m.name.clone(),
+                wire: m.wire.clone().unwrap_or_else(|| m.name.clone()),
+            });
         }
     }
     if matched.is_empty() {
@@ -310,7 +385,7 @@ pub struct DecideInput<'a> {
     pub has_tools: bool,
     pub warm_local_kv: bool,
     pub local_slot: usize,
-    pub cloud_slots: &'a [usize],
+    pub cloud_candidates: &'a [CloudCandidate],
     pub policy: RoutingPolicy,
     pub pin_pii_classes: &'a HashSet<String>,
 }
@@ -344,7 +419,7 @@ pub fn decide(heads: &ArcHeads, input: &DecideInput<'_>) -> Result<RoutingDecisi
     };
 
     // 1. Local-only mode (no cloud upstream configured).
-    if input.cloud_slots.is_empty() {
+    if input.cloud_candidates.is_empty() {
         let effort = choose_effort_for_slot(
             heads,
             input.readout,
@@ -427,25 +502,26 @@ pub fn decide(heads: &ArcHeads, input: &DecideInput<'_>) -> Result<RoutingDecisi
 
     // Score cloud candidates by `V * P(pass) - expected_cost` (local cost = $0).
     let local_utility = value_usd * local_p;
-    let mut best_cloud: Option<(usize, f64, f64)> = None;
-    for &slot in input.cloud_slots {
-        let Some(pred) = preds.get(slot) else {
+    let mut best_cloud: Option<(&CloudCandidate, f64, f64)> = None;
+    for cand in input.cloud_candidates {
+        let Some(pred) = preds.get(cand.slot) else {
             continue;
         };
         if !pred.p_pass.is_finite() {
             continue;
         }
-        let rates = heads.catalog.model_prices[slot].unwrap_or([0.0; LEGS]);
+        let rates = heads.catalog.model_prices[cand.slot].unwrap_or([0.0; LEGS]);
         let cost = expected_cost_usd(&pred.usage, &rates);
         let util = value_usd * pred.p_pass - cost;
         if best_cloud.is_none_or(|(_, best_u, _)| util > best_u) {
-            best_cloud = Some((slot, util, pred.p_pass));
+            best_cloud = Some((cand, util, pred.p_pass));
         }
     }
 
-    let stay_local = match best_cloud {
-        None => true,
-        Some((_, best_u, _)) => local_utility >= best_u,
+    let stay_local = match (input.policy, best_cloud) {
+        (_, None) => true,
+        (RoutingPolicy::Utility { .. }, Some((_, best_u, _))) => local_utility >= best_u,
+        (RoutingPolicy::PreferLocal { .. }, Some((_, _, cloud_p))) => cloud_p <= local_p,
     };
 
     if stay_local {
@@ -467,15 +543,14 @@ pub fn decide(heads: &ArcHeads, input: &DecideInput<'_>) -> Result<RoutingDecisi
         });
     }
 
-    let (slot, _, cloud_p) = best_cloud.unwrap();
-    let entry = &heads.catalog.models[slot];
-    let wire = entry.wire.clone().unwrap_or_else(|| entry.name.clone());
-    let effort = choose_effort_for_slot(heads, input.readout, input.last_role, slot, value_usd);
+    let (cand, _, cloud_p) = best_cloud.unwrap();
+    let effort =
+        choose_effort_for_slot(heads, input.readout, input.last_role, cand.slot, value_usd);
     Ok(RoutingDecision {
         target: RouteTarget::Cloud {
-            slot,
-            name: entry.name.clone(),
-            wire,
+            slot: cand.slot,
+            name: cand.name.clone(),
+            wire: cand.wire.clone(),
         },
         p_pass: cloud_p,
         local_p_pass: local_p,

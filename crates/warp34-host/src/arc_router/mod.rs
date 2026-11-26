@@ -18,8 +18,8 @@ use encoder::ArcEncoderWorker;
 use heads::ArcHeads;
 use input::{ApiProtocol, serialize_request};
 use policy::{
-    DecideInput, RouteTarget, RoutingBasis, RoutingDecision, RoutingPolicy, UpstreamTarget, decide,
-    infer_local_slot, resolve_cloud_slots,
+    CloudCandidate, DecideInput, RouteTarget, RoutingBasis, RoutingDecision, RoutingPolicy,
+    UpstreamTarget, decide, infer_local_slot, resolve_cloud_candidates,
 };
 use proxy::UpstreamProxy;
 use serde::Serialize;
@@ -136,7 +136,7 @@ pub struct ArcRouter {
     encoder: ArcEncoderWorker,
     heads: ArcHeads,
     local_slot: usize,
-    cloud_slots: Vec<usize>,
+    cloud_candidates: Vec<CloudCandidate>,
     policy: RoutingPolicy,
     pin_pii_classes: HashSet<String>,
     proxy: Option<UpstreamProxy>,
@@ -147,9 +147,10 @@ impl ArcRouter {
     pub fn load(cfg: ArcRouterConfig) -> Result<Self, String> {
         let heads = ArcHeads::load(&cfg.model_dir)?;
         let local_slot = infer_local_slot(&cfg.local_model_name, &heads.catalog);
-        let (cloud_slots, proxy) = match cfg.upstream {
+        let (cloud_candidates, proxy) = match cfg.upstream {
             Some(target) => {
-                let slots = resolve_cloud_slots(&target, &heads.catalog, &cfg.cloud_model_filter)?;
+                let candidates =
+                    resolve_cloud_candidates(&target, &heads.catalog, &cfg.cloud_model_filter)?;
                 let api_key = cfg
                     .upstream_api_key
                     .or_else(|| std::env::var(target.default_api_key_env()).ok())
@@ -162,7 +163,7 @@ impl ArcRouter {
                     ));
                 }
                 let proxy = UpstreamProxy::new(target, api_key)?;
-                (slots, Some(proxy))
+                (candidates, Some(proxy))
             }
             None => (Vec::new(), None),
         };
@@ -171,7 +172,7 @@ impl ArcRouter {
             encoder,
             heads,
             local_slot,
-            cloud_slots,
+            cloud_candidates,
             policy: cfg.policy,
             pin_pii_classes: cfg.pin_pii_classes,
             proxy,
@@ -184,14 +185,9 @@ impl ArcRouter {
     }
 
     pub fn cloud_model_names(&self) -> Vec<String> {
-        self.cloud_slots
+        self.cloud_candidates
             .iter()
-            .map(|&s| {
-                self.heads.catalog.models[s]
-                    .wire
-                    .clone()
-                    .unwrap_or_else(|| self.heads.catalog.models[s].name.clone())
-            })
+            .map(|c| c.wire.clone())
             .collect()
     }
 
@@ -222,7 +218,7 @@ impl ArcRouter {
                 has_tools: canonical.has_tools,
                 warm_local_kv,
                 local_slot: self.local_slot,
-                cloud_slots: &self.cloud_slots,
+                cloud_candidates: &self.cloud_candidates,
                 policy: self.policy,
                 pin_pii_classes: &self.pin_pii_classes,
             },
