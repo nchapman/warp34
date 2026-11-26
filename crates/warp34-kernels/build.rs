@@ -1,6 +1,6 @@
 // Incremental parallel nvcc build for warp34-kernels.
-// Default fatbinary targets A100 (sm_80), 30-series (sm_86), and 40-series (sm_89);
-// override via WARP34_ARCH (e.g. WARP34_ARCH=sm_80, WARP34_ARCH=sm_86, WARP34_ARCH=sm_89, or WARP34_ARCH=sm_80,sm_86,sm_89).
+// Default fatbinary targets RTX 30-series (sm_86) and RTX 40-series (sm_89);
+// override via WARP34_ARCH (e.g. WARP34_ARCH=sm_86, WARP34_ARCH=sm_89, or WARP34_ARCH=sm_86,sm_89).
 use std::env::{var, var_os};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -49,7 +49,7 @@ fn main() {
     sources.sort();
     headers.sort();
 
-    let arch_spec = var("WARP34_ARCH").unwrap_or_else(|_| "sm_80,sm_86,sm_89".into());
+    let arch_spec = var("WARP34_ARCH").unwrap_or_else(|_| "sm_86,sm_89".into());
     let gencode_flags = build_gencode_flags(&arch_spec);
 
     let extra = var("WARP34_NVCC_EXTRA").unwrap_or_default();

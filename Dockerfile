@@ -42,10 +42,10 @@ RUN --mount=type=cache,id=warp34-cargo-registry,target=/root/.cargo/registry,sha
         target/release/build/warp34-* \
         target/release/warp34
 
-# Layer 2: Pre-build warp34-kernels sm_80 + sm_86 + sm_89 CUDA fatbinary (cached until crates/warp34-kernels changes).
+# Layer 2: Pre-build warp34-kernels sm_86 + sm_89 CUDA fatbinary (cached until crates/warp34-kernels changes).
 # Compress the embedded device code, not the executable with a runtime packer.
 ARG WARP34_NVCC_JOBS=8
-ARG WARP34_ARCH=sm_80,sm_86,sm_89
+ARG WARP34_ARCH=sm_86,sm_89
 ARG WARP34_NVCC_EXTRA=--compress-mode=size
 ENV WARP34_ARCH=${WARP34_ARCH} \
     WARP34_NVCC_EXTRA=${WARP34_NVCC_EXTRA}

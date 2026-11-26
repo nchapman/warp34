@@ -1,12 +1,12 @@
 # Project State
 
-Current verification status, architectural capabilities, and benchmark records for `warp34` across NVIDIA A100 (`sm_80`), RTX 30-series (`sm_86`), and RTX 40-series (`sm_89`) GPUs.
+Current verification status, architectural capabilities, and benchmark records for `warp34` across NVIDIA RTX 30-series (`sm_86`) and RTX 40-series (`sm_89`) GPUs.
 
 ---
 
 ## 1. Engine Status & Capabilities Summary
 
-`warp34` is feature-complete and verified across **1–2× A100 (`sm_80`)**, **1–4× RTX 30-series (`sm_86`, 8–24 GB)**, and **1–2× RTX 40-series (`sm_89`, 16–24 GB)** GPUs:
+`warp34` is feature-complete and verified across **1–4× RTX 30-series (`sm_86`, 8–24 GB)** and **1–2× RTX 40-series (`sm_89`, 16–24 GB)** GPUs:
 
 - **Model Families & Multi-Format Loader (`crates/warp34-host/src/{hub,loader,model}/`, [`MODELS.md`](MODELS.md)):**
   - Native download-on-first-use via `hf-hub = 1.0.0` (`--revision`, `--draft-revision`, `--offline`, Xet concurrent streaming).
@@ -112,7 +112,6 @@ Current verification status, architectural capabilities, and benchmark records f
 
 | Target Hardware | Architecture & Topology | Verified `warp34 bench` / Campaign Highlights (`TQ4` KV, `100%` Lossless Speculative Parity) |
 | --- | --- | --- |
-| **1–2× A100-SXM4-80GB** | `sm_80`, 108 SMs, 40 MiB L2, 2.04 TB/s HBM2e, NVLink P2P | **27B `TP=1`**: `63.5 tok/s` Plain / `150.0` `MTP-3` / **`199.3 tok/s` `DFlash2`** (`4,108 tok/s` prefill). **27B `TP=2` NVLink**: `83.1 tok/s` Plain / `200.8` `MTP-3` / **`241.3 tok/s` `DFlash2`** (`6,710 tok/s` prefill). **4B `TP=1`**: `146.1` Plain / `428.9` `MTP-3` / **`973.0 tok/s` `DFlash2`**. |
 | **4× RTX 3090 Dual-NVLink** | `sm_86`, 82 SMs, `NV4` P2P (`0<->3`, `1<->2`) + `TP=4 / EP=4` | **27B `TP=2` NVLink P2P**: `91.3 tok/s` Plain (`+60.4%` TTFT vs PCIe) / `154.6` `MTP-3` / **`197.0 tok/s` `DFlash2`**. **27B `TP=4`**: `129.1 tok/s` Plain / `291.0` `MTP-3` / **`438.3 tok/s` `DFlash2`** (`2.28 ms/tok`). **Flash-Next `TP=4 / EP=4`** (100% VRAM-resident 512 experts): `90.6 tok/s` Plain / **`147.2 tok/s` `MTP-3`** (`2,741 tok/s` prefill). |
 | **1–2× RTX 4090 (24 GB)** | `sm_89`, 128 SMs, 72 MiB L2, 1,008 GB/s, PCIe 4.0 x16 | **4B**: `TP=1` `222.2 / 566.8 / 1,409.3 tok/s`, `TP=2` `325.8 / 765.9 /` **`1,645.5 tok/s`** (`Plain / MTP-3 / DFlash2`). **27B**: `TP=1` `53.5 / 162.0 / 258.6 tok/s`, `TP=2` `88.5 / 230.1 / 333.6 tok/s`. **35B-A3B**: `TP=1` `225.5 / 501.9 tok/s`, `TP=2` `299.3 / 651.2 tok/s`. |
 | **1–2× RTX 3090 Ti (24 GB)** | `sm_86`, 84 SMs, 6 MiB L2, 1,008 GB/s, PCIe 4.0 x8 | **2B**: `TP=1` `343.2 / 851.6 tok/s`, `TP=2` `478.8 /` **`1,131.3 tok/s`**. **4B**: `TP=1` `211.5 / 534.2 / 1,288.0 tok/s`, `TP=2` `305.5 / 766.0 /` **`1,488.2 tok/s`**. **9B**: `TP=1` `150.2 / 356.9 tok/s`, `TP=2` `213.3 / 545.9 tok/s`. |
@@ -135,7 +134,6 @@ Current verification status, architectural capabilities, and benchmark records f
 - **Runtime Multi-Adapter LoRA (`Qwen3.5-9B` + Rank-16 Adapters on RTX 3090 Ti):**
   - `TP=1` (`MTP-3` + LoRA) **`262.17 tok/s`** vs `vLLM` (`MTP-3` + LoRA) `145.65 tok/s` (**`1.80×`**) and `SGLang` (Plain + LoRA) `76.02 tok/s` (**`3.45×`**); `TP=2` (`MTP-3` + LoRA) **`401.18 tok/s`** vs `vLLM` `126.90 tok/s` (**`3.16×`**) and `SGLang` `106.79 tok/s` (**`3.76×`**), with `max_abs_diff <= 1.25e-2` tensor parity and 100% greedy token match against HF PEFT.
 - **Image Generation & Editing (`Qwen-Image-2.1` & `Qwen-Image-2.1-Turbo`, 8 steps vs `diffusers` `BF16`):**
-  - **1–2× A100 80GB (`sm_80`)**: `FP16` `512×512` **`0.72 s`** (`TP=1`) / **`0.66 s`** (`TP=2`, **`1.41×`** vs `diffusers` `0.93 s`, `48.6 dB` PSNR vs `diffusers`, `57.8 dB` `TP=1 vs TP=2`); `1024×1024` **`2.91 s`** (`TP=1`) / **`2.66 s`** (`TP=2`, **`1.30×`** vs `3.46 s`, `56.6 dB` `TP=1 vs TP=2`); `W4A16-HGPTQ` (`9.82 GiB`) `512×512` **`0.79 s / 0.71 s`**, `1024×1024` **`3.32 s / 2.85 s`**.
   - **1–2× RTX 4090 (`sm_89`)**: `W4A16-HGPTQ` `TP=1` (1 GPU vs 2-GPU `diffusers`) `512×512` **`0.83 s`** (**`1.25×`** vs `1.05 s`, `52.4 dB` `TP=1 vs TP=2`), `1024×1024` **`3.68 s`** (**`1.23×`** vs `4.54 s`, `52.2 dB` `TP=1 vs TP=2`); `FP16` (2× 4090) `512×512` **`0.88 s`** (`52.0–54.3 dB` vs `diffusers`), `1024×1024` **`3.73 s`** (`55.4 dB` `TP=1 vs TP=2`).
   - **1–2× RTX 3090 Ti (`sm_86`)**: `W4A16-HGPTQ` (with automatic `W4A8` INT8 IMMA activation quantization on `sm_86`/`sm_89`) `512×512` **`0.98 s`** (`1.02 img/s`, `TP=1`, **`14.47×`** vs `diffusers` CPU-offloaded `14.18 s`, **`1.47×`** faster than `FP16 TP=2` on 1 card) / **`1.01 s`** (`TP=2`), `1024×1024` **`4.47 s`** (`TP=1`, **`4.66×`** vs `20.82 s`, **`1.31×`** faster than `FP16 TP=2` on 1 card) / **`4.19 s`** (`TP=2`, **`4.96×`** vs `20.82 s`); `FP16` `512×512` **`1.44 s`** (`TP=2`, `50.1 dB`), `1024×1024` **`5.84 s`** (`TP=2`, `48.8 dB`), `1024×1024` RGBA transparent **`37.23 dB`** T2I / **`42.70 dB`** edit (`0` `NaN`s), `Qwen-Image-2.1` (`CFG=4.0`) `512×512` **`3.42 s`** (**`5.04×`** vs `17.23 s`).
 - **Upstream `lm-eval==0.4.13` Quality & Speed Verification (`ifeval` + `gsm8k`, `--limit 50`, `FP16` KV):**
@@ -152,7 +150,7 @@ Current verification status, architectural capabilities, and benchmark records f
   - Suffixes of `9..=40` tokens execute as zero-sync 8-token sliced device-bridge launches (with slice-0 shared-expert overlap), `32..1024`-token suffixes enable `dynamic_short_adapt` to promote newly hot experts during `StreamedPrefill`, and `>= 1024`-token prompts promote top-frequency cold experts on Chunk 0 so subsequent chunks and decode run against an already-warmed `HotExpertCache`.
   - `M=1` (`Plain`), `M=4` (`MTP-3`), and `M=8` (`DFlash2`) share a 0-ULP M-invariant reduction tree across QSA (`target_splits = 8` for `num_tokens <= 16`), routed MoE (`moe_sparse_vec4_kernel` through `num_tokens <= 8` for `group_size == 64 && top_k >= 10`), and unquantized `DenseF16` small-N projections (`warp34_small_n_gemm_f16` through `N <= 10240`).
 - **CUDA 13 `ptxas` Alignment & Multi-Arch Fatbinary (`crates/warp34-kernels/build.rs`, `tq4_kv_common.cuh`):**
-  - Default `WARP34_ARCH=sm_80,sm_86,sm_89` builds native SASS cubins for all 3 architectures plus PTX with `--compress-mode=size` and shared `cuBLAS`/`cuBLASLt` runtime linkage (`Dockerfile` copies only `libcudart.so.13`, `libcublas.so.13`, and `libcublasLt.so.13` into `ubuntu:26.04`).
+  - Default `WARP34_ARCH=sm_86,sm_89` builds native SASS cubins for both architectures plus PTX with `--compress-mode=size` and shared `cuBLAS`/`cuBLASLt` runtime linkage (`Dockerfile` copies only `libcudart.so.13`, `libcublas.so.13`, and `libcublasLt.so.13` into `ubuntu:26.04`).
   - `block_tq4_0` and `qsa_block_tq4_0` enforce `static_assert(sizeof == 66 && alignof == 2)` without `#pragma pack(push, 1)` so CUDA 13.0 `ptxas` emits aligned 16-bit `STG.E.U16` / `LDG.E.U16` scale accesses instead of miscompiling 1-byte `__half` stores.
 - **Continuous Release Gate (`mise run check`):**
-  - `check-quick` (`fmt-check`, `clippy`, `clippy-cpu`, `doc-check` with `RUSTDOCFLAGS='-D warnings'`, `simd-check`, `cuda-bin-check` static `STACK == 0 && LOCAL == 0` audit across `sm_80`/`sm_86`/`sm_89`), `dashboard-check` (Vitest + TypeScript + Prettier), `oracle-check`, `perf-check` (manifest & campaign coverage validation across `suite.toml` and `{27b,35b,flash-next}-swe-multiclient.toml`), full GPU unit + 44 integration test targets (`cargo test --release --features cuda`), and `python3 tools/check_cuda_sanitizer.py` (`compute-sanitizer` `memcheck` + `racecheck` + `synccheck` across all 6 CUDA subsystems and `TP=2`).
+  - `check-quick` (`fmt-check`, `clippy`, `clippy-cpu`, `doc-check` with `RUSTDOCFLAGS='-D warnings'`, `simd-check`, `cuda-bin-check` static `STACK == 0 && LOCAL == 0` audit across `sm_86`/`sm_89`), `dashboard-check` (Vitest + TypeScript + Prettier), `oracle-check`, `perf-check` (manifest & campaign coverage validation across `suite.toml` and `{27b,35b,flash-next}-swe-multiclient.toml`), full GPU unit + 44 integration test targets (`cargo test --release --features cuda`), and `python3 tools/check_cuda_sanitizer.py` (`compute-sanitizer` `memcheck` + `racecheck` + `synccheck` across all 6 CUDA subsystems and `TP=2`).

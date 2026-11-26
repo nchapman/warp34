@@ -1,6 +1,6 @@
 # warp34 — Comprehensive Front-to-Back Feature Inventory
 
-`warp34` is a clean-room Rust + CUDA inference engine engineered for **Qwen 3.5 / 3.6 / 3.8 hybrid models** (GDN linear attention + full attention + MoE + Vision + MTP/DFlash2 + Paged TQ4/FP8 KV) targeting **1–4× NVIDIA A100 (`sm_80`), RTX 30-series (`sm_86`), and RTX 40-series (`sm_89`) GPUs** (primary targets: A100 40GB/80GB, RTX 3090 / 3090 Ti, RTX 4090, RTX 3060 Ti, and RTX 4060 Ti).
+`warp34` is a clean-room Rust + CUDA inference engine engineered for **Qwen 3.5 / 3.6 / 3.8 hybrid models** (GDN linear attention + full attention + MoE + Vision + MTP/DFlash2 + Paged TQ4/FP8 KV) targeting **1–4× NVIDIA RTX 30-series (`sm_86`) and RTX 40-series (`sm_89`) GPUs** (primary targets: RTX 3090 / 3090 Ti, RTX 4090, RTX 3060 Ti, and RTX 4060 Ti).
 
 This document inventories implemented capabilities, APIs, execution contracts, kernel specializations, and tooling. Verified benchmark and hardware qualification results live in [`STATE.md`](STATE.md).
 
@@ -368,6 +368,6 @@ The 22 section numbers are stable inventory references. Readiness IDs group thei
   * Shared cuBLAS dynamic linkage (`libcudart.so.13`, `libcublas.so.13`, `libcublasLt.so.13`) stored in a dedicated cacheable filesystem layer.
   * Standard Hugging Face cache & health checks: Binds `0.0.0.0` via `WARP34_HOST=0.0.0.0`, supports standard `-v ~/.cache/huggingface:/root/.cache/huggingface` mounts (plus non-root overrides via `--user "$(id -u):$(id -g)" -e HF_HOME=/cache`), and defines container health checks querying `GET /health`.
 * **Multi-Arch Fatbinary Support:**
-  * Compiles native SASS cubins for NVIDIA A100 (`sm_80`), Ampere (`sm_86`), and Ada Lovelace (`sm_89`) plus `compute_89` PTX fallback.
+  * Compiles native SASS cubins for Ampere (`sm_86`) and Ada Lovelace (`sm_89`) plus `compute_89` PTX fallback.
   * Embedded device code compression enabled (`WARP34_NVCC_EXTRA=--compress-mode=size`).
-  * Dynamic hardware detection (`warp34_device_props`) adapts CTA grid dimensions and shared memory allocations at runtime to the specific GPU SM count (from 28 SMs on RTX 3060 to 108 SMs on A100 and 142 SMs on RTX 4090).
+  * Dynamic hardware detection (`warp34_device_props`) adapts CTA grid dimensions and shared memory allocations at runtime to the specific GPU SM count (from 28 SMs on RTX 3060 to 142 SMs on RTX 4090).

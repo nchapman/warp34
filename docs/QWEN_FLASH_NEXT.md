@@ -1,6 +1,6 @@
 # Qwen3.8-Flash-Next (`qwen4_exp`) — Architecture & Verification Reference
 
-> **Posture:** Native, production-grade support for **`Qwen3.8-Flash-Next` (`Qwen4ExpForConditionalGeneration`, `model_type: "qwen4_exp"`)** across **1–4× NVIDIA A100 (`sm_80`), RTX 30-series (`sm_86`), and RTX 40-series (`sm_89`) GPUs** in `warp34`, built on the `CudaDeviceProps` / `warp34_device_props` multi-arch (`sm_80,sm_86,sm_89`) foundation.
+> **Posture:** Native, production-grade support for **`Qwen3.8-Flash-Next` (`Qwen4ExpForConditionalGeneration`, `model_type: "qwen4_exp"`)** across **1–4× NVIDIA RTX 30-series (`sm_86`) and RTX 40-series (`sm_89`) GPUs** in `warp34`, built on the `CudaDeviceProps` / `warp34_device_props` multi-arch (`sm_86,sm_89`) foundation.
 >
 > **Strategic Scope:** `Qwen3.8-Flash-Next` is the first open-weight release of the **Qwen4 architecture family** (`qwen4_exp` / `qwen4_exp_text`). Every primitive introduced here — **HyperConnection (`GatedResidual`)**, **Qwen Sparse Attention (`QSA`)**, **N-Gram Per-Layer Embeddings (`PLE`)**, **Tiered 512-Expert MoE Offloading**, and **Multi-Stream `Qwen4` `MTP`** — is a first-class, reusable `warp34` subsystem that composes cleanly with `CudaDeviceProps`, `KvPool`, `StateBundlePool`, `MambaRadixCache`, `CUDAGraphRunner`, and `warp34` oracle verification contracts.
 >

@@ -86,7 +86,7 @@ jobs:
             -e CARGO_HOME=/cargo \
             -e CUDA_HOME=/usr/local/cuda \
             -e LIBRARY_PATH=/usr/local/cuda/lib64/stubs \
-            -e WARP34_ARCH=sm_80,sm_86,sm_89 \
+            -e WARP34_ARCH=sm_86,sm_89 \
             -e WARP34_NVCC_JOBS=16 \
             -e WARP34_NVCC_EXTRA=--compress-mode=size \
             -e CARGO_INCREMENTAL=0 \
