@@ -881,6 +881,152 @@ fn extend_or_yield_mtp_batch(
     }
 }
 
+fn try_promote_plain_active_to_mtp_batch(
+    engine: &mut Qwen3_5Engine,
+    sched: &mut SchedulerV1,
+    requests: &mut HashMap<u64, Request>,
+    mtp_batch_slots: &mut MtpBatchSlots,
+) {
+    if sched.active.is_empty()
+        || engine.cfg.uses_tiered_moe()
+        || engine.speculative.is_none()
+        || sched.cfg.max_num_seqs < 2
+    {
+        return;
+    }
+    let Some(mut proposer) = engine.speculative.take() else {
+        return;
+    };
+    let slot_limit =
+        sched
+            .cfg
+            .max_num_seqs
+            .min(proposer.batch_slot_count())
+            .min(if proposer.is_dflash() {
+                crate::dflash::MAX_DFLASH_DRAFT_BATCH
+            } else {
+                crate::mtp::MAX_MTP_BATCH_SLOTS
+            });
+    let active_count = sched.active.len();
+    if active_count == 0 || active_count > slot_limit {
+        engine.speculative = Some(proposer);
+        return;
+    }
+    // Avoid bouncing into speculative batch mode if a plain-only waiting request would
+    // immediately force a yield back to `step_plain`.
+    if let Some(w0) = sched.waiting.front()
+        && (w0.custom_prefill
+            || !is_batched_mtp_eligible(&requests[&w0.req_id])
+            || waiting_needs_plain_for_unwarmed_long_radix(engine, &proposer, &mut sched.radix, w0))
+    {
+        engine.speculative = Some(proposer);
+        return;
+    }
+
+    let mut total_need_pages = 0usize;
+    let mut active_needs = Vec::with_capacity(active_count);
+    for seq in &sched.active {
+        let Some(req) = requests.get_mut(&seq.req_id) else {
+            engine.speculative = Some(proposer);
+            return;
+        };
+        let committed_len = seq.radix_state.token_ids.len();
+        let remaining_out = req
+            .sampler
+            .params
+            .max_tokens
+            .saturating_sub(seq.generated_tokens.len());
+        if !seq.is_prefill_complete()
+            || seq.custom_prefill
+            || seq.prefix_bidir_len.is_some()
+            || seq.generated_tokens.is_empty()
+            || committed_len == 0
+            || remaining_out < 2
+            || !is_batched_mtp_eligible(req)
+            || req.sampler.materialize_pending_constraint().is_err()
+            || !proposer.fits_mtp_batch_slot_capacity(committed_len)
+            || !proposer.can_restore_for_prompt(&seq.radix_state.token_ids, committed_len)
+        {
+            engine.speculative = Some(proposer);
+            return;
+        }
+        let need =
+            mtp_batch_pages_needed(committed_len, remaining_out, req.reserved_pages, proposer.k);
+        total_need_pages = total_need_pages.saturating_add(need);
+        active_needs.push((seq.req_id, need));
+    }
+    if total_need_pages > engine.ranks[0].kv_pool.num_pages {
+        engine.speculative = Some(proposer);
+        return;
+    }
+    if proposer.set_mtp_batch_mode(true).is_err() {
+        engine.speculative = Some(proposer);
+        return;
+    }
+
+    // Pre-assign distinct batch slots and validate per-slot capacity before mutating KV state.
+    let mut planned_slots: Vec<(usize, u64, usize)> = Vec::with_capacity(active_count);
+    let mut sim_occupied: [Option<()>; crate::mtp::MAX_PROPOSER_BATCH_SLOTS] =
+        std::array::from_fn(|_| None);
+    for (seq, &(_, need)) in sched.active.iter().zip(&active_needs) {
+        let Some(slot_idx) =
+            proposer.pick_free_mtp_batch_slot(&sim_occupied, &seq.radix_state.token_ids)
+        else {
+            let _ = proposer.set_mtp_batch_mode(false);
+            engine.speculative = Some(proposer);
+            return;
+        };
+        if !proposer.fits_mtp_batch_slot(slot_idx, seq.radix_state.token_ids.len()) {
+            let _ = proposer.set_mtp_batch_mode(false);
+            engine.speculative = Some(proposer);
+            return;
+        }
+        sim_occupied[slot_idx] = Some(());
+        planned_slots.push((slot_idx, seq.req_id, need));
+    }
+
+    let mut promoted_slots = Vec::with_capacity(active_count);
+    let mut prev_reserved = Vec::with_capacity(active_count);
+    let mut ok = true;
+    for (seq, &(slot_idx, _, need)) in sched.active.iter().zip(&planned_slots) {
+        if proposer
+            .restore_mtp_batch_slot(engine, slot_idx, &seq.radix_state.token_ids)
+            .is_err()
+        {
+            ok = false;
+            break;
+        }
+        let req = requests.get_mut(&seq.req_id).unwrap();
+        prev_reserved.push((seq.req_id, req.reserved_pages));
+        req.reserved_pages = need;
+        mtp_batch_slots[slot_idx] = Some((seq.req_id, Vec::new()));
+        promoted_slots.push((slot_idx, seq.req_id));
+    }
+
+    if !ok {
+        for (slot_idx, _) in promoted_slots {
+            mtp_batch_slots[slot_idx] = None;
+        }
+        for (req_id, old_res) in prev_reserved {
+            if let Some(req) = requests.get_mut(&req_id) {
+                req.reserved_pages = old_res;
+            }
+        }
+        let _ = proposer.set_mtp_batch_mode(false);
+        let _ = proposer.reset();
+        engine.speculative = Some(proposer);
+        return;
+    }
+
+    for (_, req_id) in promoted_slots {
+        proposer.discard_plain_memo(req_id);
+    }
+    if !sched.waiting.is_empty() {
+        admit_into_mtp_batch_slots(engine, &mut proposer, sched, requests, mtp_batch_slots);
+    }
+    engine.speculative = Some(proposer);
+}
+
 fn admit_requests(
     engine: &mut Qwen3_5Engine,
     sched: &mut SchedulerV1,
@@ -892,6 +1038,15 @@ fn admit_requests(
         mtp_batch_slots,
         ..
     } = speculation;
+    // If `step_plain` drained its plain-only request(s) (e.g. `logprobs` or a `B > 4` burst)
+    // and all remaining active decode sequences are spec-eligible with warm `plain_memos`,
+    // promote them mid-flight back into batched speculation without waiting for an idle drain.
+    if speculative_id.is_none()
+        && mtp_batch_slots.iter().all(|s| s.is_none())
+        && !sched.active.is_empty()
+    {
+        try_promote_plain_active_to_mtp_batch(engine, sched, requests, mtp_batch_slots);
+    }
     // Single-slot speculation handles `target_batch == 1` (`MTP` or `DFlash2`).
     // Batched multi-slot MTP handles `target_batch` in `2..=4` regardless of deeper queue depth.
     if speculative_id.is_none() && mtp_batch_slots.iter().all(|s| s.is_none()) {
