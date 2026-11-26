@@ -63,19 +63,28 @@ class ReleaseSoakTests(unittest.TestCase):
         metrics = {
             "requests": {"running": 1, "waiting": 0, "failed": 2},
             "http_responses": {"server_error": 1},
-            "pools": {"kv": {"active": 3}, "gdn": {"active": 1}},
+            "pools": {
+                "kv": {"capacity": 100, "active": 3},
+                "gdn": {"capacity": 16, "active": None},
+            },
             "tokens": {"prompt": 1000, "cached": 100, "generated": 50},
             "speculation": {"rounds": 10, "accepted_tokens": 5},
             "workers": [
                 {
                     "requests": {"running": 0, "waiting": 0, "failed": 0, "completed": 10},
                     "http_responses": {"server_error": 0},
-                    "pools": {"kv": {"active": 0}, "gdn": {"active": 0}},
+                    "pools": {
+                        "kv": {"capacity": 100, "active": 0},
+                        "gdn": {"capacity": 16, "active": 0},
+                    },
                 },
                 {
                     "requests": {"running": 0, "waiting": 0, "failed": 0, "completed": 0},
                     "http_responses": {"server_error": 0},
-                    "pools": {"kv": {"active": 2}, "gdn": {"active": 0}},
+                    "pools": {
+                        "kv": {"capacity": 100, "active": 2},
+                        "gdn": {"capacity": 16, "active": 0},
+                    },
                 },
             ],
         }
@@ -90,11 +99,36 @@ class ReleaseSoakTests(unittest.TestCase):
         joined = "\n".join(failures)
         self.assertIn("requests.running=1", joined)
         self.assertIn("leaked KV pages", joined)
-        self.assertIn("leaked GDN slots", joined)
+        self.assertIn("pools.gdn.active is null", joined)
         self.assertIn("unbalanced dispatch", joined)
         self.assertIn("prefix_cache_hit_pct", joined)
         self.assertIn("mean_accepted_drafts", joined)
         self.assertIn("VRAM growth", joined)
+
+    def test_load_swe_trajectories_parses_real_fixture_without_fallback(self) -> None:
+        trajs = soak.load_swe_trajectories(
+            soak.DEFAULT_SWE_FIXTURE, max_trajectories=2, max_turns_per_trajectory=3
+        )
+        self.assertEqual(len(trajs), 2)
+        self.assertEqual(len(trajs[0]), 3)
+        # Turn 2 extends turn 1 (multi-turn cumulative prefix).
+        self.assertGreater(len(trajs[0][1]), len(trajs[0][0]))
+
+    def test_find_cached_hf_repo_rejects_weightless_snapshot(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            snap = (
+                pathlib.Path(td)
+                / "models--nchapman--Fake-Bonsai"
+                / "snapshots"
+                / "abc123"
+            )
+            snap.mkdir(parents=True)
+            (snap / "config.json").write_text("{}", encoding="utf-8")
+            with mock.patch.dict("os.environ", {"HF_HUB_CACHE": td}, clear=False):
+                self.assertFalse(soak.find_cached_hf_repo("nchapman/Fake-Bonsai"))
+                (snap / "tokenizer.json").write_text("{}", encoding="utf-8")
+                (snap / "model.safetensors").write_bytes(b"weights")
+                self.assertTrue(soak.find_cached_hf_repo("nchapman/Fake-Bonsai"))
 
 
 class RunSuiteTests(unittest.TestCase):
@@ -182,6 +216,27 @@ class RunSuiteTests(unittest.TestCase):
         cmd = run_mock.call_args[0][0]
         self.assertIn("-i", cmd)
         self.assertIn("1", cmd)
+
+    def test_bench_strict_skip_emits_report_without_type_error(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            fake_bin = pathlib.Path(td) / "warp34"
+            fake_bin.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            with mock.patch.object(bench_reg, "detect_host_arch", return_value=("sm_86", 1)):
+                rc = bench_reg.main(
+                    [
+                        "--live",
+                        "--strict",
+                        "--case",
+                        "27b_tp2_plain",
+                        "--warp34-bin",
+                        str(fake_bin),
+                        "--out-dir",
+                        td,
+                    ]
+                )
+            self.assertEqual(rc, 1)
+            summary = (pathlib.Path(td) / "summary.md").read_text(encoding="utf-8")
+            self.assertIn("strict mode: skipped 27b_tp2_plain", summary)
 
 
 if __name__ == "__main__":

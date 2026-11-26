@@ -311,7 +311,7 @@ def parse_server_logs(log_paths: list[pathlib.Path]) -> ServerLogSummary:
                             turns.append(ev)
                     elif event == "inference.thinking_budget_exhausted":
                         exhausted += 1
-                    elif ev.get("level") in ("warn", "error"):
+                    elif ev.get("level") == "error":
                         errors += 1
         except OSError:
             continue
@@ -510,10 +510,19 @@ def format_markdown_report(report: RunReport) -> str:
     return "\n".join(lines) + "\n"
 
 
-def wait_for_server_health(host: str, port: int, timeout_s: float = 120.0) -> None:
+def wait_for_server_health(
+    host: str,
+    port: int,
+    timeout_s: float = 120.0,
+    proc: subprocess.Popen[Any] | None = None,
+) -> None:
     url = f"http://{host}:{port}/health"
     deadline = time.monotonic() + timeout_s
     while time.monotonic() < deadline:
+        if proc is not None and proc.poll() is not None:
+            raise RuntimeError(
+                f"warp34 server exited early with code {proc.returncode} before {url} became healthy"
+            )
         try:
             with urllib.request.urlopen(url, timeout=2.0) as resp:
                 if resp.status == 200:
@@ -776,6 +785,10 @@ def run_evaluation_harness(
 
 
 def main(argv: list[str] | None = None) -> int:
+    def _handle_sigterm(_signum: int, _frame: Any) -> None:
+        raise SystemExit(128 + signal.SIGTERM)
+
+    signal.signal(signal.SIGTERM, _handle_sigterm)
     parser = argparse.ArgumentParser(
         description="SWE-bench Verified runner, Docker test evaluator, and telemetry analyzer for warp34."
     )
@@ -861,7 +874,7 @@ def main(argv: list[str] | None = None) -> int:
                     stderr=subprocess.STDOUT,
                     start_new_session=True,
                 )
-                wait_for_server_health(args.host, args.port)
+                wait_for_server_health(args.host, args.port, proc=server_proc)
 
             api_base = f"http://{args.host}:{args.port}/v1"
             mswea_cmd = build_minisweagent_cmd(

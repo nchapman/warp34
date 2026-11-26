@@ -115,8 +115,11 @@ def query_vram_used_mib(cuda_visible_devices: str | None = None) -> float | None
         if cuda_visible_devices is not None
         else os.environ.get("CUDA_VISIBLE_DEVICES")
     )
-    if cvd and cvd.strip() and cvd.strip() not in ("-1", "none"):
-        cmd.extend(["-i", cvd.strip()])
+    if cvd is not None:
+        cleaned = cvd.strip()
+        if not cleaned or cleaned in ("-1", "none", "NoDevFiles"):
+            return None
+        cmd.extend(["-i", cleaned])
     try:
         proc = subprocess.run(cmd, check=True, capture_output=True, text=True, timeout=5.0)
         vals = [float(line.strip()) for line in proc.stdout.splitlines() if line.strip()]
@@ -138,7 +141,7 @@ def query_process_rss_mib(pid: int) -> float | None:
     return None
 
 
-def find_cached_hf_repo(repo_id: str) -> bool:
+def _hf_snapshot_dirs(repo_id: str) -> list[pathlib.Path]:
     hub_dir = pathlib.Path(
         os.environ.get("HF_HUB_CACHE")
         or (
@@ -147,11 +150,46 @@ def find_cached_hf_repo(repo_id: str) -> bool:
             else pathlib.Path.home() / ".cache" / "huggingface" / "hub"
         )
     )
-    repo_dir = hub_dir / f"models--{repo_id.replace('/', '--')}"
-    snapshots = repo_dir / "snapshots"
+    snapshots = hub_dir / f"models--{repo_id.replace('/', '--')}" / "snapshots"
     if not snapshots.is_dir():
-        return False
-    return any(p.is_dir() for p in snapshots.iterdir())
+        return []
+    return sorted([p for p in snapshots.iterdir() if p.is_dir()], reverse=True)
+
+
+def find_cached_hf_repo(repo_id: str, *, kind: str = "llm") -> bool:
+    """Return True iff a complete cached snapshot with weights/configs exists for `repo_id`."""
+    for snap in _hf_snapshot_dirs(repo_id):
+        if kind == "image":
+            if (
+                (snap / "model_index.json").is_file()
+                and (snap / "transformer" / "config.json").is_file()
+                and (snap / "vae" / "config.json").is_file()
+            ):
+                return True
+        else:
+            has_weights = (snap / "model.safetensors").is_file() or (
+                snap / "model.safetensors.index.json"
+            ).is_file()
+            if (snap / "config.json").is_file() and (snap / "tokenizer.json").is_file() and has_weights:
+                return True
+    return False
+
+
+def repo_supports_mtp(repo_id: str) -> bool:
+    """Return True if the cached checkpoint advertises MTP layers or carries `model_mtp.safetensors`."""
+    for snap in _hf_snapshot_dirs(repo_id):
+        if (snap / "model_mtp.safetensors").is_file():
+            return True
+        cfg_path = snap / "config.json"
+        if cfg_path.is_file():
+            try:
+                cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
+                text_cfg = cfg.get("text_config") if isinstance(cfg.get("text_config"), dict) else cfg
+                if int(text_cfg.get("mtp_num_hidden_layers", 0)) > 0:
+                    return True
+            except (OSError, ValueError, TypeError):
+                pass
+    return False
 
 
 def evaluate_metrics_conservation(
@@ -188,11 +226,17 @@ def evaluate_metrics_conservation(
                 f"{label}: http_responses.server_error={http_r.get('server_error')} != 0"
             )
         kv = pools.get("kv") or {}
-        if kv.get("active") is not None and int(kv["active"]) != 0:
-            failures.append(f"{label}: leaked KV pages pools.kv.active={kv['active']} != 0")
+        if int(kv.get("capacity", 0)) > 0:
+            if kv.get("active") is None:
+                failures.append(f"{label}: pools.kv.active is null (allocator accounting underflow)")
+            elif int(kv["active"]) != 0:
+                failures.append(f"{label}: leaked KV pages pools.kv.active={kv['active']} != 0")
         gdn = pools.get("gdn") or {}
-        if gdn.get("active") is not None and int(gdn["active"]) != 0:
-            failures.append(f"{label}: leaked GDN slots pools.gdn.active={gdn['active']} != 0")
+        if int(gdn.get("capacity", 0)) > 0:
+            if gdn.get("active") is None:
+                failures.append(f"{label}: pools.gdn.active is null (allocator accounting underflow)")
+            elif int(gdn["active"]) != 0:
+                failures.append(f"{label}: leaked GDN slots pools.gdn.active={gdn['active']} != 0")
 
     _check_snapshot(metrics, "aggregate")
 
@@ -324,6 +368,20 @@ class ManagedServer:
         with urllib.request.urlopen(url, timeout=10.0) as resp:
             return json.loads(resp.read().decode("utf-8"))
 
+    def _is_snapshot_drained(self, snap: dict[str, Any]) -> bool:
+        reqs = snap.get("requests") or {}
+        if int(reqs.get("running", 0)) != 0 or int(reqs.get("waiting", 0)) != 0:
+            return False
+        pools = snap.get("pools") or {}
+        for key in ("kv", "gdn"):
+            pool = pools.get(key) or {}
+            if int(pool.get("capacity", 0)) > 0 and pool.get("active") not in (0, None):
+                return False
+        for worker in snap.get("workers") or []:
+            if not self._is_snapshot_drained(worker):
+                return False
+        return True
+
     def wait_for_drain(self, timeout_s: float = 30.0) -> dict[str, Any]:
         deadline = time.monotonic() + timeout_s
         last: dict[str, Any] = {}
@@ -342,8 +400,7 @@ class ManagedServer:
                 last_err = exc
                 time.sleep(0.25)
                 continue
-            reqs = last.get("requests") or {}
-            if int(reqs.get("running", 0)) == 0 and int(reqs.get("waiting", 0)) == 0:
+            if self._is_snapshot_drained(last):
                 return last
             time.sleep(0.25)
         if not last and last_err is not None:
@@ -423,6 +480,8 @@ def send_chat_request(
             return "ok", int(usage.get("completion_tokens", 1)), None
 
         chunks = 0
+        saw_done = False
+        saw_logprobs = False
         while True:
             raw_line = resp.readline()
             if not raw_line:
@@ -432,11 +491,20 @@ def send_chat_request(
                 continue
             data_str = line[5:].strip()
             if data_str == "[DONE]":
+                saw_done = True
                 break
             chunks += 1
+            if logprobs and '"logprobs"' in data_str and '"logprobs":null' not in data_str.replace(" ", ""):
+                saw_logprobs = True
             if cancel_after_chunks is not None and chunks >= cancel_after_chunks:
                 conn.close()
                 return "cancelled", chunks, None
+        if not saw_done:
+            return "error", chunks, f"truncated SSE stream (no [DONE], chunks={chunks})"
+        if chunks == 0:
+            return "error", 0, "empty SSE stream (0 chunks before [DONE])"
+        if logprobs and not saw_logprobs:
+            return "error", chunks, "logprobs=true requested but no logprobs payload received"
         return "ok", chunks, None
     except Exception as exc:
         return "error", 0, str(exc)
@@ -447,36 +515,63 @@ def send_chat_request(
             pass
 
 
-def load_swe_prompts(fixture_path: pathlib.Path, max_turns: int) -> list[list[dict[str, Any]]]:
-    """Load intact multi-turn Open-SWE message prefixes from fixture JSON."""
-    if fixture_path.is_file():
-        data = json.loads(fixture_path.read_text(encoding="utf-8"))
-        prompts: list[list[dict[str, Any]]] = []
-        trajectories = data.get("trajectories") if isinstance(data, dict) else data
-        if isinstance(trajectories, list):
-            for traj in trajectories:
-                turns = traj.get("turns") if isinstance(traj, dict) else None
-                if isinstance(turns, list):
-                    for turn in turns:
-                        msgs = turn.get("messages") if isinstance(turn, dict) else None
-                        if isinstance(msgs, list) and msgs:
-                            prompts.append(msgs)
-                        if len(prompts) >= max_turns:
-                            return prompts
-        if prompts:
-            return prompts
-    # Deterministic fallback if fixture isn't present.
-    shared_sys = (
-        "You are a concise software engineering assistant debugging a Rust + CUDA "
-        "inference engine. Respond with a short technical summary.\n" * 40
-    )
-    return [
-        [
-            {"role": "system", "content": shared_sys},
-            {"role": "user", "content": f"Diagnose turn {i}: verify KV radix reuse and slot accounting."},
-        ]
-        for i in range(max_turns)
-    ]
+def load_swe_trajectories(
+    fixture_path: pathlib.Path,
+    *,
+    max_trajectories: int = 4,
+    max_turns_per_trajectory: int = 4,
+) -> list[list[list[dict[str, Any]]]]:
+    """Load intact multi-turn Open-SWE trajectories from `open_swe_intact_16k.json`.
+
+    Returns a list of trajectories; each trajectory is an ordered list of cumulative
+    ChatML `messages` prefixes so worker threads replay turns sequentially and exercise
+    real multi-turn prefix reuse in `MambaRadixCache`.
+    """
+    if not fixture_path.is_file():
+        raise FileNotFoundError(f"SWE soak fixture not found: {fixture_path}")
+    data = json.loads(fixture_path.read_text(encoding="utf-8"))
+    raw_trajs = data.get("trajectories") if isinstance(data, dict) else data
+    if not isinstance(raw_trajs, list):
+        raise ValueError(f"malformed SWE fixture {fixture_path}: expected 'trajectories' list")
+
+    parsed: list[list[list[dict[str, Any]]]] = []
+    for traj in raw_trajs[:max_trajectories]:
+        if not isinstance(traj, dict):
+            continue
+        turns = traj.get("turns")
+        if not isinstance(turns, list) or not turns:
+            continue
+        history: list[dict[str, Any]] = []
+        sys_prompt = traj.get("system")
+        if isinstance(sys_prompt, str) and sys_prompt.strip():
+            history.append({"role": "system", "content": sys_prompt})
+        turn_prompts: list[list[dict[str, Any]]] = []
+        for t_idx, turn in enumerate(turns[:max_turns_per_trajectory]):
+            if not isinstance(turn, dict):
+                continue
+            if isinstance(turn.get("messages"), list) and turn["messages"]:
+                turn_prompts.append(list(turn["messages"]))
+                continue
+            user_text = turn.get("user")
+            if isinstance(user_text, str) and user_text.strip():
+                history.append({"role": "user", "content": user_text})
+            tools = turn.get("tools")
+            if isinstance(tools, list) and tools:
+                obs = "\n".join(str(t) for t in tools[:4])
+                history.append({"role": "user", "content": f"Tool output:\n{obs}"})
+            if history:
+                turn_prompts.append(list(history))
+                history.append(
+                    {
+                        "role": "assistant",
+                        "content": f"Acknowledged step {t_idx + 1}; continuing investigation.",
+                    }
+                )
+        if turn_prompts:
+            parsed.append(turn_prompts)
+    if not parsed:
+        raise ValueError(f"SWE fixture {fixture_path} yielded 0 replayable trajectories")
+    return parsed
 
 
 def run_swe_27b_dflash2_soak(
@@ -509,55 +604,82 @@ def run_swe_27b_dflash2_soak(
         "--port",
         str(port),
     ]
-    total_turns = max(8, int(round(16 * duration_scale)))
-    prompts = load_swe_prompts(DEFAULT_SWE_FIXTURE, total_turns)
+    turns_per_agent = max(3, int(round(4 * duration_scale)))
+    trajectories = load_swe_trajectories(
+        DEFAULT_SWE_FIXTURE,
+        max_trajectories=4,
+        max_turns_per_trajectory=turns_per_agent,
+    )
+    total_turns = sum(len(t) for t in trajectories)
     failures: list[str] = []
     ok_cnt = cancel_cnt = fail_cnt = 0
 
     try:
         with ManagedServer(cmd, "127.0.0.1", port, log_path) as srv:
-            # Warmup request to establish baseline VRAM / RSS.
-            st, _, err = send_chat_request(
-                "127.0.0.1", port, model, prompts[0], max_tokens=32, stream=True
-            )
-            if st != "ok":
-                failures.append(f"warmup failed: {err}")
-            srv.wait_for_drain()
+            # B=4 warmup burst so CUDA graphs & workspaces settle before measuring VRAM/RSS delta.
+            with concurrent.futures.ThreadPoolExecutor(max_workers=len(trajectories)) as wpool:
+                wfuts = [
+                    wpool.submit(
+                        send_chat_request,
+                        "127.0.0.1",
+                        port,
+                        model,
+                        traj[0],
+                        max_tokens=24,
+                        stream=True,
+                        session_id=f"swe-warmup-{i}",
+                    )
+                    for i, traj in enumerate(trajectories)
+                ]
+                for fut in concurrent.futures.as_completed(wfuts):
+                    st, _, err = fut.result()
+                    if st != "ok":
+                        failures.append(f"warmup failed: {err}")
+            warmup_metrics = srv.wait_for_drain(timeout_s=30.0)
+            gen_before = int((warmup_metrics.get("tokens") or {}).get("generated", 0))
             vram_before = query_vram_used_mib(cuda_visible_devices)
             rss_before = query_process_rss_mib(srv.proc.pid) if srv.proc else None
 
-            load_t0 = time.monotonic()
-            with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
-                futs = []
-                for idx, msgs in enumerate(prompts):
-                    cancel_at = 3 if (idx % 7 == 6) else None
-                    use_logprobs = (idx % 5 == 4) and cancel_at is None
-                    futs.append(
-                        pool.submit(
-                            send_chat_request,
-                            "127.0.0.1",
-                            port,
-                            model,
-                            msgs,
-                            max_tokens=96,
-                            stream=True,
-                            cancel_after_chunks=cancel_at,
-                            logprobs=use_logprobs,
-                            session_id=f"swe-agent-{idx % 4}",
-                        )
+            def _run_agent(agent_idx: int, turn_list: list[list[dict[str, Any]]]) -> tuple[int, int, int, list[str]]:
+                a_ok = a_cancel = a_fail = 0
+                a_errs: list[str] = []
+                for t_idx, msgs in enumerate(turn_list):
+                    global_idx = agent_idx * len(turn_list) + t_idx
+                    cancel_at = 3 if (global_idx % 7 == 6) else None
+                    use_logprobs = (global_idx % 5 == 4) and cancel_at is None
+                    st, _, err = send_chat_request(
+                        "127.0.0.1",
+                        port,
+                        model,
+                        msgs,
+                        max_tokens=96,
+                        stream=True,
+                        cancel_after_chunks=cancel_at,
+                        logprobs=use_logprobs,
+                        session_id=f"swe-agent-{agent_idx}",
                     )
-                for fut in concurrent.futures.as_completed(futs):
-                    st, _, err = fut.result()
                     if st == "ok":
-                        ok_cnt += 1
+                        a_ok += 1
                     elif st == "cancelled":
-                        cancel_cnt += 1
+                        a_cancel += 1
                     else:
-                        fail_cnt += 1
-                        failures.append(f"request error: {err}")
+                        a_fail += 1
+                        a_errs.append(f"agent {agent_idx} turn {t_idx}: {err}")
+                return a_ok, a_cancel, a_fail, a_errs
+
+            load_t0 = time.monotonic()
+            with concurrent.futures.ThreadPoolExecutor(max_workers=len(trajectories)) as pool:
+                futs = [pool.submit(_run_agent, i, traj) for i, traj in enumerate(trajectories)]
+                for fut in concurrent.futures.as_completed(futs):
+                    a_ok, a_cancel, a_fail, a_errs = fut.result()
+                    ok_cnt += a_ok
+                    cancel_cnt += a_cancel
+                    fail_cnt += a_fail
+                    failures.extend(a_errs)
             load_elapsed = max(0.001, time.monotonic() - load_t0)
 
             metrics = srv.wait_for_drain(timeout_s=30.0)
+            gen_after = int((metrics.get("tokens") or {}).get("generated", 0))
             vram_after = query_vram_used_mib(cuda_visible_devices)
             rss_after = query_process_rss_mib(srv.proc.pid) if srv.proc else None
 
@@ -584,7 +706,7 @@ def run_swe_27b_dflash2_soak(
                 if rss_before is not None and rss_after is not None
                 else None
             )
-            gen_toks = int((metrics.get("tokens") or {}).get("generated", 0))
+            gen_toks = max(0, gen_after - gen_before)
             tps = gen_toks / load_elapsed
 
             cons_failures, cache_hit, mean_acc = evaluate_metrics_conservation(
@@ -602,7 +724,7 @@ def run_swe_27b_dflash2_soak(
                 passed=(len(failures) == 0 and fail_cnt == 0),
                 skipped=False,
                 elapsed_s=time.monotonic() - t0,
-                requests_sent=len(prompts),
+                requests_sent=total_turns,
                 requests_ok=ok_cnt,
                 requests_cancelled=cancel_cnt,
                 requests_failed=fail_cnt,
@@ -622,7 +744,7 @@ def run_swe_27b_dflash2_soak(
             passed=False,
             skipped=False,
             elapsed_s=time.monotonic() - t0,
-            requests_sent=len(prompts),
+            requests_sent=total_turns,
             requests_ok=ok_cnt,
             requests_cancelled=cancel_cnt,
             requests_failed=fail_cnt,
@@ -675,6 +797,30 @@ def run_dp2_4b_soak(
 
     try:
         with ManagedServer(cmd, "127.0.0.1", port, log_path) as srv:
+            # Warmup burst across both DP workers so CUDA graphs & host pools settle before measuring VRAM/RSS delta.
+            with concurrent.futures.ThreadPoolExecutor(max_workers=4) as wpool:
+                wfuts = [
+                    wpool.submit(
+                        send_chat_request,
+                        "127.0.0.1",
+                        port,
+                        model,
+                        [
+                            {"role": "system", "content": shared_prefix},
+                            {"role": "user", "content": f"Warmup session {i}."},
+                        ],
+                        max_tokens=16,
+                        stream=True,
+                        session_id=f"dp-warmup-{i}",
+                    )
+                    for i in range(4)
+                ]
+                for fut in concurrent.futures.as_completed(wfuts):
+                    st, _, err = fut.result()
+                    if st != "ok":
+                        failures.append(f"dp2 warmup failed: {err}")
+            warmup_metrics = srv.wait_for_drain(timeout_s=20.0)
+            gen_before = int((warmup_metrics.get("tokens") or {}).get("generated", 0))
             vram_before = query_vram_used_mib(cuda_visible_devices)
             rss_before = query_process_rss_mib(srv.proc.pid) if srv.proc else None
 
@@ -715,8 +861,20 @@ def run_dp2_4b_soak(
             load_elapsed = max(0.001, time.monotonic() - load_t0)
 
             metrics = srv.wait_for_drain(timeout_s=30.0)
+            gen_after = int((metrics.get("tokens") or {}).get("generated", 0))
             vram_after = query_vram_used_mib(cuda_visible_devices)
             rss_after = query_process_rss_mib(srv.proc.pid) if srv.proc else None
+            st, _, err = send_chat_request(
+                "127.0.0.1",
+                port,
+                model,
+                [{"role": "user", "content": "Reply with OK."}],
+                max_tokens=16,
+                stream=False,
+            )
+            if st != "ok":
+                failures.append(f"dp2 post-drain probe failed: {err}")
+            metrics = srv.wait_for_drain(timeout_s=15.0)
             vram_growth = (
                 (vram_after - vram_before)
                 if vram_before is not None and vram_after is not None
@@ -727,7 +885,7 @@ def run_dp2_4b_soak(
                 if rss_before is not None and rss_after is not None
                 else None
             )
-            gen_toks = int((metrics.get("tokens") or {}).get("generated", 0))
+            gen_toks = max(0, gen_after - gen_before)
             tps = gen_toks / load_elapsed
 
             cons_failures, cache_hit, mean_acc = evaluate_metrics_conservation(
@@ -838,7 +996,7 @@ def run_qwen_image_http_soak(
 ) -> SubphaseResult:
     t0 = time.monotonic()
     model = "nchapman/Qwen-Image-2.1-Turbo-W4A16-HGPTQ"
-    if not find_cached_hf_repo(model):
+    if not find_cached_hf_repo(model, kind="image"):
         return SubphaseResult(
             name="qwen_image_http",
             passed=True,
@@ -881,9 +1039,9 @@ def run_qwen_image_http_soak(
 
     def _run_image_cycle(cycle_tag: str) -> tuple[int, int]:
         c_ok = c_fail = 0
-        for label, extra in (
-            (f"{cycle_tag}_rgb_t2i", {"background": "opaque"}),
-            (f"{cycle_tag}_rgba_t2i", {"background": "transparent"}),
+        for label, extra, expected_color_type in (
+            (f"{cycle_tag}_rgb_t2i", {"background": "opaque"}, 2),
+            (f"{cycle_tag}_rgba_t2i", {"background": "transparent"}, 6),
         ):
             body = json.dumps(
                 {
@@ -905,9 +1063,11 @@ def run_qwen_image_http_soak(
                     data = json.loads(resp.read().decode("utf-8"))
                 png_bytes = base64.b64decode(data["data"][0]["b64_json"])
                 dims = parse_png_dimensions(png_bytes)
-                if dims is None or dims[0] != 512 or dims[1] != 512:
+                if dims is None or dims[0] != 512 or dims[1] != 512 or dims[2] != expected_color_type:
                     c_fail += 1
-                    failures.append(f"{label}: invalid PNG dims {dims}")
+                    failures.append(
+                        f"{label}: invalid PNG dims/color_type {dims} (expected 512x512 color_type={expected_color_type})"
+                    )
                 else:
                     c_ok += 1
             except Exception as exc:
@@ -928,9 +1088,11 @@ def run_qwen_image_http_soak(
         else:
             png_bytes = base64.b64decode(edit_resp["data"][0]["b64_json"])
             dims = parse_png_dimensions(png_bytes)
-            if dims is None or dims[0] != 512 or dims[1] != 512:
+            if dims is None or dims[0] != 512 or dims[1] != 512 or dims[2] != 2:
                 c_fail += 1
-                failures.append(f"{cycle_tag}_image_edit: invalid PNG dims {dims}")
+                failures.append(
+                    f"{cycle_tag}_image_edit: invalid PNG dims/color_type {dims} (expected 512x512 color_type=2)"
+                )
             else:
                 c_ok += 1
         return c_ok, c_fail
@@ -1057,10 +1219,6 @@ def run_bonsai_5trit_soak(
         model,
         "--tp",
         "1",
-        "--speculative",
-        "mtp",
-        "--mtp-k",
-        "3",
         "--kv-format",
         "tq4",
         "--offline",
@@ -1069,12 +1227,34 @@ def run_bonsai_5trit_soak(
         "--port",
         str(port),
     ]
+    if repo_supports_mtp(model):
+        cmd.extend(["--speculative", "mtp", "--mtp-k", "3"])
     failures: list[str] = []
     ok_cnt = cancel_cnt = fail_cnt = 0
     total_reqs = 12
 
     try:
         with ManagedServer(cmd, "127.0.0.1", port, log_path, env=env) as srv:
+            # Warmup burst so CUDA graphs settle before measuring VRAM/RSS delta.
+            with concurrent.futures.ThreadPoolExecutor(max_workers=4) as wpool:
+                wfuts = [
+                    wpool.submit(
+                        send_chat_request,
+                        "127.0.0.1",
+                        port,
+                        model,
+                        [{"role": "user", "content": f"Warmup {i}."}],
+                        max_tokens=16,
+                        stream=True,
+                    )
+                    for i in range(4)
+                ]
+                for fut in concurrent.futures.as_completed(wfuts):
+                    st, _, err = fut.result()
+                    if st != "ok":
+                        failures.append(f"bonsai warmup failed: {err}")
+            warmup_metrics = srv.wait_for_drain(timeout_s=20.0)
+            gen_before = int((warmup_metrics.get("tokens") or {}).get("generated", 0))
             vram_before = query_vram_used_mib(env.get("CUDA_VISIBLE_DEVICES"))
             rss_before = query_process_rss_mib(srv.proc.pid) if srv.proc else None
             load_t0 = time.monotonic()
@@ -1110,8 +1290,20 @@ def run_bonsai_5trit_soak(
                         failures.append(f"bonsai request error: {err}")
             load_elapsed = max(0.001, time.monotonic() - load_t0)
             metrics = srv.wait_for_drain(timeout_s=20.0)
+            gen_after = int((metrics.get("tokens") or {}).get("generated", 0))
             vram_after = query_vram_used_mib(env.get("CUDA_VISIBLE_DEVICES"))
             rss_after = query_process_rss_mib(srv.proc.pid) if srv.proc else None
+            st, _, err = send_chat_request(
+                "127.0.0.1",
+                port,
+                model,
+                [{"role": "user", "content": "Reply with OK."}],
+                max_tokens=16,
+                stream=False,
+            )
+            if st != "ok":
+                failures.append(f"bonsai post-drain probe failed: {err}")
+            metrics = srv.wait_for_drain(timeout_s=15.0)
             vram_growth = (
                 (vram_after - vram_before)
                 if vram_before is not None and vram_after is not None
@@ -1122,7 +1314,7 @@ def run_bonsai_5trit_soak(
                 if rss_before is not None and rss_after is not None
                 else None
             )
-            gen_toks = int((metrics.get("tokens") or {}).get("generated", 0))
+            gen_toks = max(0, gen_after - gen_before)
             tps = gen_toks / load_elapsed
             cons_failures, cache_hit, mean_acc = evaluate_metrics_conservation(
                 metrics,
@@ -1203,6 +1395,10 @@ def render_soak_markdown(results: list[SubphaseResult]) -> str:
 
 
 def main(argv: list[str] | None = None) -> int:
+    def _handle_sigterm(_signum: int, _frame: Any) -> None:
+        raise SystemExit(128 + signal.SIGTERM)
+
+    signal.signal(signal.SIGTERM, _handle_sigterm)
     parser = argparse.ArgumentParser(description="Managed live-server release soak for warp34")
     parser.add_argument(
         "--warp34-bin",

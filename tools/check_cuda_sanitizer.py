@@ -320,8 +320,11 @@ def find_compute_sanitizer() -> str:
 
 def discover_visible_gpus(env_cvd: str | None = None) -> list[str]:
     cvd = env_cvd if env_cvd is not None else os.environ.get("CUDA_VISIBLE_DEVICES")
-    if cvd is not None and cvd.strip():
-        return [tok.strip() for tok in cvd.split(",") if tok.strip()]
+    if cvd is not None:
+        cleaned = cvd.strip()
+        if not cleaned or cleaned in ("-1", "none", "NoDevFiles"):
+            return []
+        return [tok.strip() for tok in cleaned.split(",") if tok.strip()]
     proc = subprocess.run(
         ["nvidia-smi", "--query-gpu=index", "--format=csv,noheader"],
         capture_output=True,

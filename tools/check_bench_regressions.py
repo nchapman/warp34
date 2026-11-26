@@ -122,16 +122,10 @@ def detect_host_arch(
     cmd = ["nvidia-smi", "--query-gpu=compute_cap", "--format=csv,noheader"]
     if cvd is not None:
         cvd_clean = cvd.strip()
-        if cvd_clean in ("-1", "none", "NoDevFiles"):
+        if not cvd_clean or cvd_clean in ("-1", "none", "NoDevFiles"):
             caps: list[str] = []
-        elif cvd_clean:
-            cmd.extend(["-i", cvd_clean])
-            try:
-                proc = subprocess.run(cmd, check=True, capture_output=True, text=True)
-                caps = [line.strip() for line in proc.stdout.splitlines() if line.strip()]
-            except (FileNotFoundError, subprocess.SubprocessError):
-                caps = []
         else:
+            cmd.extend(["-i", cvd_clean])
             try:
                 proc = subprocess.run(cmd, check=True, capture_output=True, text=True)
                 caps = [line.strip() for line in proc.stdout.splitlines() if line.strip()]
@@ -630,19 +624,24 @@ def main(argv: list[str] | None = None) -> int:
                     evaluations.append(
                         CaseEvaluation(
                             case_id=case_id,
-                            model=str(case_spec["model"]),
+                            label=str(case_spec.get("label", case_id)),
+                            arch=arch,
                             mode_label=format_mode_label(case_spec.get("speculative"), case_spec),
                             prompt_source=str(case_spec.get("prompt_source", "synthetic")),
                             tp=req_tp,
                             decode_tok_per_s=None,
-                            sched_tok_per_s=None,
-                            mean_accepted=None,
-                            radix_speedup=None,
+                            prefill_tok_per_s=None,
+                            mean_accepted_drafts=None,
+                            radix_ttft_speedup_x=None,
+                            scheduler_decode_tok_per_s=None,
+                            vision_ttft_speedup_x=None,
                             baseline_decode_tok_per_s=None,
                             decode_delta_pct=None,
                             competitor_summary="—",
                             metrics=(),
-                            invariant_failures=(f"{case_id}: command failed (exit {proc.returncode}): {summary_err}",),
+                            invariant_failures=(
+                                f"{case_id}: command failed (exit {proc.returncode}): {summary_err}",
+                            ),
                         )
                     )
                     continue
@@ -659,17 +658,22 @@ def main(argv: list[str] | None = None) -> int:
                 )
             if args.strict and skipped_cases:
                 for msg in skipped_cases:
+                    cid = msg.split(":", 1)[0]
+                    spec = all_cases.get(cid, {})
                     evaluations.append(
                         CaseEvaluation(
-                            case_id=msg.split(":", 1)[0],
-                            model="—",
-                            mode_label="—",
-                            prompt_source="—",
-                            tp=0,
+                            case_id=cid,
+                            label=str(spec.get("label", cid)),
+                            arch=arch,
+                            mode_label=format_mode_label(spec.get("speculative"), spec),
+                            prompt_source=str(spec.get("prompt_source", "synthetic")),
+                            tp=int(spec.get("tp", 0)),
                             decode_tok_per_s=None,
-                            sched_tok_per_s=None,
-                            mean_accepted=None,
-                            radix_speedup=None,
+                            prefill_tok_per_s=None,
+                            mean_accepted_drafts=None,
+                            radix_ttft_speedup_x=None,
+                            scheduler_decode_tok_per_s=None,
+                            vision_ttft_speedup_x=None,
                             baseline_decode_tok_per_s=None,
                             decode_delta_pct=None,
                             competitor_summary="—",
@@ -695,7 +699,7 @@ def main(argv: list[str] | None = None) -> int:
         args.out_dir.mkdir(parents=True, exist_ok=True)
         (args.out_dir / "summary.md").write_text(report + "\n", encoding="utf-8")
 
-    return 0 if all(ev.passed for ev in evaluations) else 1
+    return 0 if (evaluations and all(ev.passed for ev in evaluations)) else 1
 
 
 if __name__ == "__main__":

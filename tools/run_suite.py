@@ -153,6 +153,15 @@ def build_oracle_dump_shell_cmd() -> str:
     )
 
 
+def slice_expected_count(slice_spec: str) -> int | None:
+    """Parse `start:end` slice syntax to compute expected task count."""
+    parts = slice_spec.split(":")
+    if len(parts) == 2 and parts[0].strip().isdigit() and parts[1].strip().isdigit():
+        count = int(parts[1].strip()) - int(parts[0].strip())
+        return count if count > 0 else None
+    return None
+
+
 def build_tier_stages(
     tier: str,
     run_dir: pathlib.Path,
@@ -273,24 +282,26 @@ def build_tier_stages(
         ),
     ]
 
+    strict_test_env = {"WARP34_STRICT_TESTS": "1"} if tier == "qualify" else {}
     gate_gpu: list[Stage] = [
         Stage(
             "test-lib",
             ("cargo", "test", "--release", "--features", "cuda", "--lib", "--", "--test-threads=1"),
-            "single",
-            description="GPU library unit tests",
+            "multi",
+            env=strict_test_env,
+            description="GPU library unit tests (single + TP=2)",
         ),
         Stage(
             "test-integration",
             ("cargo", "test", "--release", "--features", "cuda", "--tests", "--", "--test-threads=1"),
             "multi",
+            env=strict_test_env,
             description="Full release integration test suite (serialized)",
         ),
         Stage(
             "cuda-sanitize",
             (sys.executable, "tools/check_cuda_sanitizer.py", "--require-multi-gpu"),
             "multi",
-            env={"WARP34_PREBUILT_TESTS": "1"},
             description="compute-sanitizer (memcheck + racecheck + synccheck) across all subsystems + TP=2",
         ),
     ]
@@ -402,7 +413,7 @@ def build_tier_stages(
                     "--output",
                     str(run_dir / "swebench"),
                     "--min-submitted",
-                    "5",
+                    str(slice_expected_count(swebench_slice) or 5),
                     "--min-resolved",
                     str(swebench_min_resolved),
                     "--max-server-errors",
@@ -417,7 +428,7 @@ def build_tier_stages(
                     "45.0",
                 ),
                 "multi",
-                description="Pinned 5-task SWE-bench Verified live solve + deterministic server gates",
+                description="Pinned SWE-bench Verified live solve + deterministic server gates",
             ),
         ]
 
@@ -466,7 +477,7 @@ def run_preflight(
 
     if not skip_model_check and needed_gpus > 0:
         prep_cmd = [sys.executable, "tools/prep_test_models.py", "--check"]
-        if tier == "qualify":
+        if tier in ("qualify", "soak"):
             prep_cmd.append("--all")
         try:
             proc = subprocess.run(
@@ -478,7 +489,9 @@ def run_preflight(
                 timeout=30.0,
             )
             if proc.returncode != 0:
-                remediation = "mise run test-prep-all" if tier == "qualify" else "mise run test-prep"
+                remediation = (
+                    "mise run test-prep-all" if tier in ("qualify", "soak") else "mise run test-prep"
+                )
                 errors.append(
                     f"required test checkpoints missing/unverified (run `{remediation}`): "
                     + (proc.stderr.strip() or proc.stdout.strip())[:300]
@@ -578,7 +591,7 @@ def run_stage(
             log_f.write(f"\nstage {stage.name} timed out after {stage.timeout_s}s\n")
             rc = 124
             note = f"timed out after {stage.timeout_s}s"
-        except KeyboardInterrupt:
+        except (KeyboardInterrupt, SystemExit):
             if proc is not None:
                 _terminate_proc_group(proc)
             raise
@@ -671,7 +684,9 @@ def write_receipt(
     return md
 
 
-def load_resumed_passed_stages(resume_dir: pathlib.Path) -> set[str]:
+def load_resumed_passed_stages(
+    resume_dir: pathlib.Path, *, expected_tier: str | None = None
+) -> set[str]:
     summary_path = resume_dir / "summary.json"
     if not summary_path.is_file():
         return set()
@@ -689,6 +704,10 @@ def load_resumed_passed_stages(resume_dir: pathlib.Path) -> set[str]:
             file=sys.stderr,
         )
         return set()
+    if expected_tier is not None and data.get("tier") and data.get("tier") != expected_tier:
+        raise ValueError(
+            f"cannot resume tier {expected_tier!r} from {summary_path} (recorded tier={data.get('tier')!r})"
+        )
     return {
         str(s["name"])
         for s in data["stages"]
@@ -697,6 +716,10 @@ def load_resumed_passed_stages(resume_dir: pathlib.Path) -> set[str]:
 
 
 def main(argv: list[str] | None = None) -> int:
+    def _handle_sigterm(_signum: int, _frame: Any) -> None:
+        raise SystemExit(128 + signal.SIGTERM)
+
+    signal.signal(signal.SIGTERM, _handle_sigterm)
     parser = argparse.ArgumentParser(description="Unified warp34 verification suite orchestrator")
     parser.add_argument("tier", choices=TIERS, help="Verification tier to execute")
     parser.add_argument("--list", action="store_true", help="List ordered stages and exit")
@@ -741,16 +764,39 @@ def main(argv: list[str] | None = None) -> int:
             print(f"      cmd: {cmd_str}")
         return 0
 
-    skip_set = set(args.skip)
-    if args.from_stage:
-        names = [s.name for s in all_stages]
-        if args.from_stage not in names:
-            print(f"error: unknown --from stage {args.from_stage!r}; valid: {', '.join(names)}", file=sys.stderr)
-            return 2
-        cut = names.index(args.from_stage)
-        skip_set.update(names[:cut])
+    all_names = [s.name for s in all_stages]
+    unknown_skips = [name for name in args.skip if name not in all_names]
+    if unknown_skips:
+        print(
+            f"error: unknown --skip stage(s) {unknown_skips!r}; valid: {', '.join(all_names)}",
+            file=sys.stderr,
+        )
+        return 2
 
-    resumed_passed = load_resumed_passed_stages(args.resume) if args.resume else set()
+    skip_set = set(args.skip)
+    from_cut: int | None = None
+    if args.from_stage:
+        if args.from_stage not in all_names:
+            print(
+                f"error: unknown --from stage {args.from_stage!r}; valid: {', '.join(all_names)}",
+                file=sys.stderr,
+            )
+            return 2
+        from_cut = all_names.index(args.from_stage)
+        skip_set.update(all_names[:from_cut])
+
+    try:
+        resumed_passed = (
+            load_resumed_passed_stages(args.resume, expected_tier=args.tier)
+            if args.resume
+            else set()
+        )
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    # `--from <stage>` explicitly forces re-running stages at/after `<stage>` even on `--resume`.
+    if from_cut is not None:
+        resumed_passed.difference_update(all_names[from_cut:])
     active_stages = [s for s in all_stages if s.name not in skip_set and s.name not in resumed_passed]
 
     preflight_errors, visible_gpus = run_preflight(
