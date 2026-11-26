@@ -320,13 +320,14 @@ fn map_arc_effort_to_warp34(effort: &str, level: Option<&str>) -> &'static str {
     }
 }
 
-/// Select the best Stage-2 reasoning effort for `model_slot` using multi-block pooled history.
+/// Select the best Stage-2 reasoning effort for `model_slot` using multi-block pooled history,
+/// filtering to supported arms (`quality_support && usage_support`), using `catalog.stage_two_cost_weight`,
+/// and scoring each action by its best (`max`) supported arm (`rayline-arc-decide` parity).
 fn choose_effort_for_slot(
     heads: &ArcHeads,
     block_readouts: &[Vec<f32>],
     block_roles: &[String],
     model_slot: usize,
-    value_usd: f64,
 ) -> String {
     let actions: Vec<&super::heads::ArcActionEntry> = heads
         .catalog
@@ -340,7 +341,24 @@ fn choose_effort_for_slot(
     let all_arms: Vec<usize> = actions
         .iter()
         .flat_map(|a| a.arms.iter().copied())
+        .filter(|&arm| {
+            heads
+                .stage_two
+                .quality_support
+                .get(arm)
+                .copied()
+                .unwrap_or(false)
+                && heads
+                    .stage_two
+                    .usage_support
+                    .get(arm)
+                    .copied()
+                    .unwrap_or(false)
+        })
         .collect();
+    if all_arms.is_empty() {
+        return "medium".to_string();
+    }
     let Ok(scored) = heads
         .stage_two
         .predict_arms(block_readouts, block_roles, &[], &all_arms)
@@ -350,13 +368,12 @@ fn choose_effort_for_slot(
     let score_map: std::collections::HashMap<usize, super::heads::ArmScore> =
         scored.into_iter().collect();
     let rates = heads.catalog.model_prices[model_slot].unwrap_or([0.0; LEGS]);
-    let cost_weight = (1.0 / value_usd.max(0.05)).clamp(0.03, 10.0) as f32;
+    let cost_weight = heads.catalog.stage_two_cost_weight as f32;
 
     let mut best_effort = "medium";
     let mut best_score = f32::NEG_INFINITY;
     for action in &actions {
-        let mut sum = 0.0f32;
-        let mut cnt = 0usize;
+        let mut action_best = f32::NEG_INFINITY;
         for &arm in &action.arms {
             if let Some(s) = score_map.get(&arm) {
                 let arm_cost: f32 = s
@@ -366,16 +383,15 @@ fn choose_effort_for_slot(
                     .map(|(toks, r)| toks * (*r as f32))
                     .sum::<f32>()
                     / 1_000_000.0;
-                sum += s.quality - cost_weight * arm_cost;
-                cnt += 1;
+                let score = s.quality - cost_weight * arm_cost;
+                if score.is_finite() && score > action_best {
+                    action_best = score;
+                }
             }
         }
-        if cnt > 0 {
-            let mean = sum / cnt as f32;
-            if mean > best_score {
-                best_score = mean;
-                best_effort = map_arc_effort_to_warp34(&action.effort, action.level.as_deref());
-            }
+        if action_best > best_score {
+            best_score = action_best;
+            best_effort = map_arc_effort_to_warp34(&action.effort, action.level.as_deref());
         }
     }
     best_effort.to_string()
@@ -400,11 +416,27 @@ pub fn decide(heads: &ArcHeads, input: &DecideInput<'_>) -> Result<RoutingDecisi
         .last()
         .map(Vec::as_slice)
         .ok_or_else(|| "ARC decide requires at least one block readout".to_string())?;
-    // Regime 0 = tool-bearing coding/agentic, 1 = tool-free.
-    let regime = usize::from(!input.has_tools);
-    let preds: Vec<StageOnePrediction> = heads.stage_one.predict(decision_readout, regime)?;
-    let local_p = preds
-        .get(input.local_slot)
+    // Collect only the Stage-1 candidate indices for active local + cloud models
+    // (models[] indices != stage_one.candidates[] indices in arc-runtime.json!).
+    let local_cand = heads
+        .catalog
+        .stage_one_candidate_for_model(input.local_slot);
+    let mut active_cands = Vec::with_capacity(1 + input.cloud_candidates.len());
+    if let Some(c) = local_cand {
+        active_cands.push(c);
+    }
+    for cand in input.cloud_candidates {
+        if let Some(c) = heads.catalog.stage_one_candidate_for_model(cand.slot) {
+            active_cands.push(c);
+        }
+    }
+    let preds: Vec<StageOnePrediction> = heads.stage_one.predict_selected(
+        decision_readout,
+        heads.catalog.stage_one_regime,
+        &active_cands,
+    )?;
+    let local_p = local_cand
+        .and_then(|c| preds.get(c))
         .map(|p| p.p_pass)
         .filter(|p| p.is_finite())
         .unwrap_or(0.5);
@@ -434,7 +466,6 @@ pub fn decide(heads: &ArcHeads, input: &DecideInput<'_>) -> Result<RoutingDecisi
             input.block_readouts,
             input.block_roles,
             input.local_slot,
-            value_usd,
         );
         return Ok(RoutingDecision {
             target: RouteTarget::Local,
@@ -454,7 +485,6 @@ pub fn decide(heads: &ArcHeads, input: &DecideInput<'_>) -> Result<RoutingDecisi
             input.block_readouts,
             input.block_roles,
             input.local_slot,
-            value_usd,
         );
         return Ok(RoutingDecision {
             target: RouteTarget::Local,
@@ -474,7 +504,6 @@ pub fn decide(heads: &ArcHeads, input: &DecideInput<'_>) -> Result<RoutingDecisi
             input.block_readouts,
             input.block_roles,
             input.local_slot,
-            value_usd,
         );
         return Ok(RoutingDecision {
             target: RouteTarget::Local,
@@ -496,7 +525,6 @@ pub fn decide(heads: &ArcHeads, input: &DecideInput<'_>) -> Result<RoutingDecisi
             input.block_readouts,
             input.block_roles,
             input.local_slot,
-            value_usd,
         );
         return Ok(RoutingDecision {
             target: RouteTarget::Local,
@@ -509,11 +537,15 @@ pub fn decide(heads: &ArcHeads, input: &DecideInput<'_>) -> Result<RoutingDecisi
         });
     }
 
-    // Score cloud candidates by `V * P(pass) - expected_cost` (local cost = $0).
+    // Score cloud candidates by `V * P(pass) - expected_cost` (local cost = $0),
+    // indexing Stage-1 predictions through `stage_one_candidate_for_model`.
     let local_utility = value_usd * local_p;
     let mut best_cloud: Option<(&CloudCandidate, f64, f64)> = None;
     for cand in input.cloud_candidates {
-        let Some(pred) = preds.get(cand.slot) else {
+        let Some(cand_idx) = heads.catalog.stage_one_candidate_for_model(cand.slot) else {
+            continue;
+        };
+        let Some(pred) = preds.get(cand_idx) else {
             continue;
         };
         if !pred.p_pass.is_finite() {
@@ -539,7 +571,6 @@ pub fn decide(heads: &ArcHeads, input: &DecideInput<'_>) -> Result<RoutingDecisi
             input.block_readouts,
             input.block_roles,
             input.local_slot,
-            value_usd,
         );
         return Ok(RoutingDecision {
             target: RouteTarget::Local,
@@ -553,13 +584,7 @@ pub fn decide(heads: &ArcHeads, input: &DecideInput<'_>) -> Result<RoutingDecisi
     }
 
     let (cand, _, cloud_p) = best_cloud.unwrap();
-    let effort = choose_effort_for_slot(
-        heads,
-        input.block_readouts,
-        input.block_roles,
-        cand.slot,
-        value_usd,
-    );
+    let effort = choose_effort_for_slot(heads, input.block_readouts, input.block_roles, cand.slot);
     Ok(RoutingDecision {
         target: RouteTarget::Cloud {
             slot: cand.slot,

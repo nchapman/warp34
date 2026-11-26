@@ -402,7 +402,7 @@ impl OpenAiServerState {
     }
 
     pub(super) fn bind_session_to_worker(&self, session_key: String, dp_rank: usize) {
-        if !self.extra_workers.is_empty() {
+        if !self.extra_workers.is_empty() || self.arc_router.is_some() {
             self.dp_router.bind_session(session_key, dp_rank);
         }
     }
@@ -1327,15 +1327,23 @@ impl OpenAiServerState {
             .and_then(|k| self.dp_router.lookup_session(k))
             .is_some();
 
-        let decision = router
-            .route(protocol, body, warm_local_kv)
-            .await
-            .map_err(|e| {
-                error(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("ARC router error: {e}"),
-                )
-            })?;
+        let decision = match router.route(protocol, body, warm_local_kv).await {
+            Ok(d) => d,
+            Err(e) => {
+                // Fail open to local inference on transient router errors so serving never breaks.
+                eprintln!("[warp34-arc] router fallback to local: {e}");
+                if let Some(obj) = body.as_object_mut()
+                    && let Some(m) = obj.get("model").and_then(Value::as_str)
+                    && matches!(
+                        m.to_ascii_lowercase().as_str(),
+                        "auto" | "arc" | "arc-router"
+                    )
+                {
+                    obj.insert("model".to_string(), Value::String(self.model_name.clone()));
+                }
+                return Ok(None);
+            }
+        };
 
         match &decision.target {
             crate::arc_router::policy::RouteTarget::Cloud { wire, .. } => {
@@ -1392,12 +1400,16 @@ impl OpenAiServerState {
                         }
                     }
                     crate::arc_router::input::ApiProtocol::AnthropicMessages => {
-                        let out_cfg = obj.entry("output_config").or_insert_with(|| json!({}));
-                        if let Some(o_obj) = out_cfg.as_object_mut() {
-                            o_obj.insert(
-                                "effort".to_string(),
-                                Value::String(decision.reasoning_effort.clone()),
-                            );
+                        if decision.reasoning_effort == "none" {
+                            obj.insert("thinking".to_string(), json!({ "type": "disabled" }));
+                        } else {
+                            let out_cfg = obj.entry("output_config").or_insert_with(|| json!({}));
+                            if let Some(o_obj) = out_cfg.as_object_mut() {
+                                o_obj.insert(
+                                    "effort".to_string(),
+                                    Value::String(decision.reasoning_effort.clone()),
+                                );
+                            }
                         }
                     }
                 }

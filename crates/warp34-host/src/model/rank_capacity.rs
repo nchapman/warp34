@@ -25,6 +25,10 @@ pub(super) struct PoolCapacity {
     pub(super) checkpoint_host_slots: Option<usize>,
     /// Number of in-process data-parallel replicas (`>= 1`); divides per-rank host-RAM budgets.
     pub(super) dp_size: usize,
+    /// Encoder-only mode (e.g. ARC-1.0 router): offloads `embed_tokens` to zero-copy pinned
+    /// host RAM (since `lm_head` is never called), caps `scratch_arena` to 96 MiB, and skips
+    /// persisting L2 windows so the primary serving model keeps full L2 & VRAM headroom.
+    pub(super) encoder_only: bool,
 }
 
 /// Number of state slots allocated per active sequence in serving mode (three private

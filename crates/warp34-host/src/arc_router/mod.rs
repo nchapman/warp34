@@ -13,6 +13,8 @@ pub mod input;
 pub mod policy;
 pub mod proxy;
 
+use std::sync::Arc;
+
 use axum::http::{HeaderMap, HeaderName, HeaderValue};
 use encoder::ArcEncoderWorker;
 use heads::ArcHeads;
@@ -134,7 +136,7 @@ impl RouterMetrics {
 
 pub struct ArcRouter {
     encoder: ArcEncoderWorker,
-    heads: ArcHeads,
+    heads: Arc<ArcHeads>,
     local_slot: usize,
     cloud_candidates: Vec<CloudCandidate>,
     policy: RoutingPolicy,
@@ -170,7 +172,7 @@ impl ArcRouter {
         let encoder = ArcEncoderWorker::spawn(&cfg.model_dir, cfg.device_id)?;
         Ok(Self {
             encoder,
-            heads,
+            heads: Arc::new(heads),
             local_slot,
             cloud_candidates,
             policy: cfg.policy,
@@ -207,22 +209,44 @@ impl ArcRouter {
         warm_local_kv: bool,
     ) -> Result<RoutingDecision, String> {
         let t0 = std::time::Instant::now();
-        let canonical = serialize_request(protocol, body);
+        let body_clone = body.clone();
+        let canonical =
+            tokio::task::spawn_blocking(move || serialize_request(protocol, &body_clone))
+                .await
+                .map_err(|e| format!("ARC serialize join error: {e}"))?;
         let enc = self.encoder.encode_blocks(canonical.blocks).await?;
-        let mut decision = decide(
-            &self.heads,
-            &DecideInput {
-                block_readouts: &enc.block_readouts,
-                block_roles: &enc.block_roles,
-                prompt_tokens: enc.prompt_tokens,
-                has_tools: canonical.has_tools,
-                warm_local_kv,
-                local_slot: self.local_slot,
-                cloud_candidates: &self.cloud_candidates,
-                policy: self.policy,
-                pin_pii_classes: &self.pin_pii_classes,
-            },
-        )?;
+        let cloud_supported = self
+            .proxy
+            .as_ref()
+            .is_some_and(|p| p.supports_protocol(protocol));
+        let heads = Arc::clone(&self.heads);
+        let local_slot = self.local_slot;
+        let cloud_candidates = if cloud_supported {
+            self.cloud_candidates.clone()
+        } else {
+            Vec::new()
+        };
+        let policy = self.policy;
+        let pin_pii_classes = self.pin_pii_classes.clone();
+        let has_tools = canonical.has_tools;
+        let mut decision = tokio::task::spawn_blocking(move || {
+            decide(
+                &heads,
+                &DecideInput {
+                    block_readouts: &enc.block_readouts,
+                    block_roles: &enc.block_roles,
+                    prompt_tokens: enc.prompt_tokens,
+                    has_tools,
+                    warm_local_kv,
+                    local_slot,
+                    cloud_candidates: &cloud_candidates,
+                    policy,
+                    pin_pii_classes: &pin_pii_classes,
+                },
+            )
+        })
+        .await
+        .map_err(|e| format!("ARC decide join error: {e}"))??;
         decision.latency_ms = t0.elapsed().as_secs_f64() * 1000.0;
         self.metrics.record(&decision);
         Ok(decision)

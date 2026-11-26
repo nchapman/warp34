@@ -1,8 +1,11 @@
 //! Dedicated single-thread ARC-1.0 CUDA encoder worker sharing the host process.
 //!
-//! Runs `nchapman/ARC-1.0-W4A16-HGPTQ` (12 layers, 1024 hidden dim, W4A16-HGPTQ, no `lm_head`)
-//! with per-block readout extraction, head+tail context windowing up to 32,768 tokens, and
-//! incremental prefix caching so consecutive agent turns only prefill the newly appended block(s).
+//! Runs `nchapman/ARC-1.0-W4A16-HGPTQ` (12 layers, 1024 hidden dim, W4A16-HGPTQ, no `lm_head`,
+//! offloaded host `embed_tokens` + 96 MiB scratch arena) with:
+//! - Per-block readout extraction + head+tail 32K context windowing
+//! - Multi-session LRU KV+GDN prefix cache (8 resident sessions sharing a 4,096-page KV pool)
+//!   so concurrent agent workers only prefill newly appended turns (~3–10 ms)
+//! - Bounded per-block tokenization memo (`>= 256 B`, 32 MiB cap)
 
 #[cfg(feature = "cuda")]
 use std::collections::HashMap;
@@ -12,9 +15,20 @@ use std::time::Duration;
 use super::input::ArcRoleBlock;
 
 const ENCODER_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
-/// 2,048 KV pages × 16 tokens/page = 32,768 tokens (~192 MiB KV pool for 3 full-attn layers).
+/// 4,096 KV pages × 16 tokens/page = 65,536 total tokens across up to 8 concurrent sessions.
 #[cfg(feature = "cuda")]
-const ENCODER_KV_PAGES: usize = 2048;
+const ENCODER_KV_PAGES: usize = 4096;
+/// Max tokens per individual session (leaves headroom for concurrent sessions in the pool).
+#[cfg(feature = "cuda")]
+const ENCODER_PER_SESSION_MAX_CTX: usize = 32_768;
+/// Resident LRU GDN+KV sessions (handles 6–8 concurrent SWE-bench/agent workers without thrashing).
+#[cfg(feature = "cuda")]
+const ENCODER_MAX_SESSIONS: usize = 8;
+/// Cap per-block tokenization memo at ~32 MiB of serialized text + token IDs.
+#[cfg(feature = "cuda")]
+const BLOCK_MEMO_MAX_BYTES: usize = 32 * 1024 * 1024;
+#[cfg(feature = "cuda")]
+const BLOCK_MEMO_MIN_TEXT_BYTES: usize = 256;
 
 /// Encoder output for one request: one `1024`-dim `f32` readout per retained role block.
 #[derive(Debug, Clone)]
@@ -42,10 +56,193 @@ pub struct ArcEncoderWorker {
     tx: mpsc::SyncSender<EncodeJob>,
 }
 
+/// Splits literal reserved vision tokens inside block content (`<|vision_start|>` etc.) so
+/// source code mentioning them tokenizes as ordinary text rather than special vision IDs.
+#[cfg(feature = "cuda")]
+fn tokenize_block_safe(
+    engine: &crate::model::Qwen3_5Engine,
+    block: &ArcRoleBlock,
+) -> Result<Vec<i32>, String> {
+    const VISION_LITERALS: [&str; 5] = [
+        "<|vision_start|>",
+        "<|image_pad|>",
+        "<|vision_end|>",
+        "<|vision_pad|>",
+        "<|video_pad|>",
+    ];
+    let serialized = block.serialized();
+    if !VISION_LITERALS.iter().any(|pat| serialized.contains(pat)) {
+        return engine
+            .encode(&serialized)
+            .map_err(|e| format!("ARC tokenize failed: {e}"));
+    }
+    // Cut right after `<|` whenever a vision literal appears so each half tokenizes as text.
+    let mut out = Vec::new();
+    let mut rest = serialized.as_str();
+    while !rest.is_empty() {
+        let next_hit = VISION_LITERALS
+            .iter()
+            .filter_map(|pat| rest.find(pat))
+            .min();
+        let Some(pos) = next_hit else {
+            out.extend_from_slice(
+                &engine
+                    .encode(rest)
+                    .map_err(|e| format!("ARC tokenize failed: {e}"))?,
+            );
+            break;
+        };
+        let split = pos + 2; // right after `<|`
+        out.extend_from_slice(
+            &engine
+                .encode(&rest[..split])
+                .map_err(|e| format!("ARC tokenize failed: {e}"))?,
+        );
+        rest = &rest[split..];
+    }
+    Ok(out)
+}
+
+#[cfg(feature = "cuda")]
+struct BlockTokenMemo {
+    entries: HashMap<String, Vec<i32>>,
+    approx_bytes: usize,
+}
+
+#[cfg(feature = "cuda")]
+impl BlockTokenMemo {
+    fn new() -> Self {
+        Self {
+            entries: HashMap::new(),
+            approx_bytes: 0,
+        }
+    }
+
+    fn tokenize(
+        &mut self,
+        engine: &crate::model::Qwen3_5Engine,
+        block: &ArcRoleBlock,
+    ) -> Result<Vec<i32>, String> {
+        let key = block.serialized();
+        if key.len() < BLOCK_MEMO_MIN_TEXT_BYTES {
+            return tokenize_block_safe(engine, block);
+        }
+        if let Some(cached) = self.entries.get(&key) {
+            return Ok(cached.clone());
+        }
+        let toks = tokenize_block_safe(engine, block)?;
+        let entry_bytes = key.len() + toks.len() * 4;
+        if entry_bytes <= BLOCK_MEMO_MAX_BYTES / 4 {
+            if self.approx_bytes + entry_bytes > BLOCK_MEMO_MAX_BYTES {
+                self.entries.clear();
+                self.approx_bytes = 0;
+            }
+            self.approx_bytes += entry_bytes;
+            self.entries.insert(key, toks.clone());
+        }
+        Ok(toks)
+    }
+}
+
+#[cfg(feature = "cuda")]
+struct ResidentSession {
+    state_slot: usize,
+    kv_pages: Vec<i32>,
+    tokens: Vec<i32>,
+    readouts: HashMap<usize, Vec<f32>>,
+    last_used: u64,
+}
+
+#[cfg(feature = "cuda")]
+struct SessionPool {
+    sessions: Vec<ResidentSession>,
+    free_slots: Vec<usize>,
+    free_pages: Vec<i32>,
+    tick: u64,
+}
+
+#[cfg(feature = "cuda")]
+impl SessionPool {
+    fn new(total_pages: usize, max_sessions: usize) -> Self {
+        Self {
+            sessions: Vec::with_capacity(max_sessions),
+            free_slots: (0..max_sessions).rev().collect(),
+            free_pages: (0..total_pages as i32).rev().collect(),
+            tick: 0,
+        }
+    }
+
+    fn next_tick(&mut self) -> u64 {
+        self.tick += 1;
+        self.tick
+    }
+
+    fn evict_lru_except(&mut self, protect_idx: Option<usize>) -> bool {
+        let victim = self
+            .sessions
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| Some(*i) != protect_idx)
+            .min_by_key(|(_, s)| s.last_used)
+            .map(|(i, _)| i);
+        let Some(idx) = victim else {
+            return false;
+        };
+        let evicted = self.sessions.swap_remove(idx);
+        self.free_slots.push(evicted.state_slot);
+        self.free_pages.extend(evicted.kv_pages);
+        true
+    }
+
+    fn ensure_free_pages(&mut self, needed: usize, protect_idx: Option<usize>) -> bool {
+        while self.free_pages.len() < needed {
+            // Note: `swap_remove` can move `protect_idx` if it was the last element.
+            let last_idx = self.sessions.len().saturating_sub(1);
+            let adjusted_protect = protect_idx;
+            if !self.evict_lru_except(adjusted_protect) {
+                return false;
+            }
+            let _ = last_idx;
+        }
+        true
+    }
+
+    /// Finds an exact-match session or the longest strict-prefix session whose cached readouts
+    /// cover all offsets in `0..session.tokens.len()`.
+    fn find_best_prefix(&self, flat_tokens: &[i32], offsets: &[usize]) -> Option<(usize, bool)> {
+        let mut best: Option<(usize, usize, bool)> = None;
+        for (idx, sess) in self.sessions.iter().enumerate() {
+            let slen = sess.tokens.len();
+            if slen == 0 || slen > flat_tokens.len() {
+                continue;
+            }
+            if flat_tokens[..slen] != sess.tokens[..] {
+                continue;
+            }
+            let all_prefix_offsets_cached = offsets
+                .iter()
+                .filter(|&&o| o < slen)
+                .all(|o| sess.readouts.contains_key(o));
+            if !all_prefix_offsets_cached {
+                continue;
+            }
+            let is_exact = slen == flat_tokens.len();
+            if best.is_none_or(|(_, best_len, _)| slen > best_len) {
+                best = Some((idx, slen, is_exact));
+            }
+        }
+        best.map(|(idx, _, is_exact)| (idx, is_exact))
+    }
+
+    fn allocate_pages(&mut self, count: usize) -> Vec<i32> {
+        let split = self.free_pages.len().saturating_sub(count);
+        self.free_pages.split_off(split)
+    }
+}
+
 /// Applies head+tail block selection when tokenized blocks exceed `max_ctx`:
 /// preserves leading system + first user task block (up to `max_ctx / 3`), then packs
-/// as many most-recent blocks from the tail as fit. If a single block alone exceeds the
-/// budget, keeps its head+tail tokens so the total never exceeds `max_ctx`.
+/// as many most-recent blocks from the tail as fit.
 #[cfg(feature = "cuda")]
 fn select_head_tail_blocks(
     block_tokens: Vec<(String, Vec<i32>)>,
@@ -71,7 +268,6 @@ fn select_head_tail_blocks(
     let head_budget = (max_ctx / 3).max(256);
     let mut head_count = 0usize;
     let mut head_used = 0usize;
-    let mut seen_user = false;
     for (role, toks) in &block_tokens {
         if head_used + toks.len() > head_budget && head_count > 0 {
             break;
@@ -79,16 +275,13 @@ fn select_head_tail_blocks(
         head_used += toks.len();
         head_count += 1;
         if role == "user" {
-            seen_user = true;
             break;
         }
     }
     if head_count == 0 && !block_tokens.is_empty() {
         head_count = 1;
     }
-    let _ = seen_user;
 
-    // Pack tail blocks in reverse until remaining budget is full.
     let mut head_blocks: Vec<(String, Vec<i32>)> = Vec::new();
     let mut head_len = 0usize;
     for (role, mut toks) in block_tokens.iter().take(head_count).cloned() {
@@ -116,7 +309,6 @@ fn select_head_tail_blocks(
         }
         if toks.len() > avail {
             if tail_rev.is_empty() {
-                // Keep the very end of the latest block so we always include the latest turn.
                 let start = toks.len() - avail;
                 toks = toks.split_off(start);
                 tail_len += toks.len();
@@ -158,6 +350,7 @@ impl ArcEncoderWorker {
                     &model_dir,
                     device_id,
                     ENCODER_KV_PAGES,
+                    ENCODER_MAX_SESSIONS,
                 ) {
                     Ok(e) => e,
                     Err(e) => {
@@ -165,23 +358,19 @@ impl ArcEncoderWorker {
                         return;
                     }
                 };
-                let max_ctx = engine.encoder_max_context();
+                let total_pages = engine.encoder_kv_pages();
+                let max_ctx = (total_pages * 16).min(ENCODER_PER_SESSION_MAX_CTX);
                 let _ = ready_tx.send(Ok(()));
 
-                // Single-slot incremental prefix cache: when a multi-turn conversation strictly
-                // appends new role blocks to the previous call, reuse the slot-0 KV/GDN state
-                // and cached block readouts, prefilling only the newly appended tail tokens.
-                let mut prev_tokens: Vec<i32> = Vec::new();
-                let mut prev_readouts: HashMap<usize, Vec<f32>> = HashMap::new();
+                let mut memo = BlockTokenMemo::new();
+                let mut pool = SessionPool::new(total_pages, ENCODER_MAX_SESSIONS);
 
                 while let Ok(job) = rx.recv() {
                     let result = (|| -> Result<EncodeResponse, String> {
                         let mut tokenized_blocks = Vec::with_capacity(job.blocks.len());
                         let mut total_prompt_tokens = 0usize;
                         for block in &job.blocks {
-                            let toks = engine
-                                .encode(&block.serialized())
-                                .map_err(|e| format!("ARC tokenize failed: {e}"))?;
+                            let toks = memo.tokenize(&engine, block)?;
                             total_prompt_tokens += toks.len();
                             if !toks.is_empty() {
                                 tokenized_blocks.push((block.role.clone(), toks));
@@ -196,12 +385,77 @@ impl ArcEncoderWorker {
                             return Err("ARC encoder produced empty windowed tokens".to_string());
                         }
 
-                        // Exact repeat of previous prompt: return cached readouts in ~0 ms.
-                        if flat_tokens == prev_tokens
-                            && offsets.iter().all(|o| prev_readouts.contains_key(o))
+                        let pages_needed = flat_tokens.len().div_ceil(16);
+                        let tick = pool.next_tick();
+
+                        if let Some((sess_idx, is_exact)) =
+                            pool.find_best_prefix(&flat_tokens, &offsets)
                         {
-                            let block_readouts =
-                                offsets.iter().map(|o| prev_readouts[o].clone()).collect();
+                            if is_exact {
+                                let sess = &mut pool.sessions[sess_idx];
+                                sess.last_used = tick;
+                                let block_readouts =
+                                    offsets.iter().map(|o| sess.readouts[o].clone()).collect();
+                                return Ok(EncodeResponse {
+                                    block_readouts,
+                                    block_roles: roles,
+                                    prompt_tokens: total_prompt_tokens,
+                                });
+                            }
+
+                            // Strict prefix extension: take the session out of the pool so page
+                            // evictions cannot invalidate its index, grow its KV pages, and prefill
+                            // only the newly appended tail tokens.
+                            let mut sess = pool.sessions.swap_remove(sess_idx);
+                            let extra_pages = pages_needed.saturating_sub(sess.kv_pages.len());
+                            if extra_pages > 0 {
+                                if !pool.ensure_free_pages(extra_pages, None) {
+                                    pool.free_slots.push(sess.state_slot);
+                                    pool.free_pages.extend(sess.kv_pages);
+                                    return Err("ARC encoder KV pool exhausted".to_string());
+                                }
+                                let added = pool.allocate_pages(extra_pages);
+                                sess.kv_pages.extend(added);
+                            }
+
+                            let prev_len = sess.tokens.len();
+                            let mut missing_indices = Vec::new();
+                            let mut missing_offsets = Vec::new();
+                            for (i, &off) in offsets.iter().enumerate() {
+                                if off >= prev_len {
+                                    missing_indices.push(i);
+                                    missing_offsets.push(off);
+                                }
+                            }
+                            let new_rows = match engine.encode_readouts_at_offsets_in_slot_f32(
+                                &flat_tokens,
+                                prev_len,
+                                &missing_offsets,
+                                sess.state_slot,
+                                &sess.kv_pages,
+                            ) {
+                                Ok(rows) => rows,
+                                Err(e) => {
+                                    pool.free_slots.push(sess.state_slot);
+                                    pool.free_pages.extend(sess.kv_pages);
+                                    return Err(format!("ARC encode failed: {e}"));
+                                }
+                            };
+
+                            let mut block_readouts: Vec<Vec<f32>> = vec![Vec::new(); offsets.len()];
+                            for (i, &off) in offsets.iter().enumerate() {
+                                if off < prev_len {
+                                    block_readouts[i].clone_from(&sess.readouts[&off]);
+                                }
+                            }
+                            for (idx, row) in missing_indices.into_iter().zip(new_rows) {
+                                sess.readouts.insert(offsets[idx], row.clone());
+                                block_readouts[idx] = row;
+                            }
+                            sess.tokens = flat_tokens;
+                            sess.last_used = tick;
+                            pool.sessions.push(sess);
+
                             return Ok(EncodeResponse {
                                 block_readouts,
                                 block_roles: roles,
@@ -209,67 +463,48 @@ impl ArcEncoderWorker {
                             });
                         }
 
-                        // Strict prefix extension: keep slot-0 KV/GDN state and prefill only tail.
-                        let is_strict_extension = !prev_tokens.is_empty()
-                            && flat_tokens.len() > prev_tokens.len()
-                            && flat_tokens[..prev_tokens.len()] == prev_tokens[..]
-                            && offsets
-                                .iter()
-                                .filter(|&&o| o < prev_tokens.len())
-                                .all(|o| prev_readouts.contains_key(o));
+                        // Cold miss: allocate a fresh slot + KV pages (evicting LRU sessions as needed).
+                        if pool.free_slots.is_empty() && !pool.evict_lru_except(None) {
+                            return Err("ARC encoder has no free state slots".to_string());
+                        }
+                        if !pool.ensure_free_pages(pages_needed, None) {
+                            return Err("ARC encoder KV pool exhausted".to_string());
+                        }
+                        let state_slot = pool
+                            .free_slots
+                            .pop()
+                            .ok_or_else(|| "ARC encoder missing free state slot".to_string())?;
+                        let kv_pages = pool.allocate_pages(pages_needed);
 
-                        let (start_offset, missing_indices, missing_offsets) =
-                            if is_strict_extension {
-                                let mut m_idx = Vec::new();
-                                let mut m_off = Vec::new();
-                                for (i, &off) in offsets.iter().enumerate() {
-                                    if off >= prev_tokens.len() {
-                                        m_idx.push(i);
-                                        m_off.push(off);
-                                    }
-                                }
-                                (prev_tokens.len(), m_idx, m_off)
-                            } else {
-                                (
-                                    0usize,
-                                    (0..offsets.len()).collect::<Vec<_>>(),
-                                    offsets.clone(),
-                                )
-                            };
-
-                        let new_rows = match engine.encode_readouts_at_offsets_f32(
+                        let rows = match engine.encode_readouts_at_offsets_in_slot_f32(
                             &flat_tokens,
-                            start_offset,
-                            &missing_offsets,
+                            0,
+                            &offsets,
+                            state_slot,
+                            &kv_pages,
                         ) {
                             Ok(rows) => rows,
                             Err(e) => {
-                                // Clear incremental cache on any CUDA/state error so the next
-                                // request starts clean from offset 0.
-                                prev_tokens.clear();
-                                prev_readouts.clear();
+                                pool.free_slots.push(state_slot);
+                                pool.free_pages.extend(kv_pages);
                                 return Err(format!("ARC encode failed: {e}"));
                             }
                         };
 
-                        let mut block_readouts: Vec<Vec<f32>> = vec![Vec::new(); offsets.len()];
-                        if is_strict_extension {
-                            for (i, &off) in offsets.iter().enumerate() {
-                                if off < prev_tokens.len() {
-                                    block_readouts[i].clone_from(&prev_readouts[&off]);
-                                }
-                            }
-                        } else {
-                            prev_readouts.clear();
+                        let mut readouts = HashMap::with_capacity(offsets.len());
+                        for (&off, row) in offsets.iter().zip(&rows) {
+                            readouts.insert(off, row.clone());
                         }
-                        for (idx, row) in missing_indices.into_iter().zip(new_rows) {
-                            prev_readouts.insert(offsets[idx], row.clone());
-                            block_readouts[idx] = row;
-                        }
-                        prev_tokens = flat_tokens;
+                        pool.sessions.push(ResidentSession {
+                            state_slot,
+                            kv_pages,
+                            tokens: flat_tokens,
+                            readouts,
+                            last_used: tick,
+                        });
 
                         Ok(EncodeResponse {
-                            block_readouts,
+                            block_readouts: rows,
                             block_roles: roles,
                             prompt_tokens: total_prompt_tokens,
                         })

@@ -125,19 +125,36 @@ fn write_python_string(s: &str, out: &mut String) {
 }
 
 fn strip_billing_header(text: &str) -> String {
-    let mut lines = text.lines();
-    let Some(first) = lines.next() else {
-        return String::new();
-    };
-    if first
-        .trim_start()
-        .to_ascii_lowercase()
-        .starts_with("x-anthropic-billing-header:")
-    {
-        let rest: Vec<&str> = lines.collect();
-        rest.join("\n").trim_start_matches('\n').to_string()
-    } else {
-        text.to_string()
+    let kept: Vec<&str> = text
+        .lines()
+        .filter(|line| {
+            !line
+                .trim_start()
+                .to_ascii_lowercase()
+                .starts_with("x-anthropic-billing-header:")
+        })
+        .collect();
+    kept.join("\n").trim_start_matches('\n').to_string()
+}
+
+fn wrap_tool_result_content(content: Option<&Value>) -> Value {
+    match content {
+        None | Some(Value::Null) => Value::Array(Vec::new()),
+        Some(Value::String(s)) => {
+            if s.is_empty() {
+                Value::Array(Vec::new())
+            } else {
+                json!([{ "type": "text", "text": s }])
+            }
+        }
+        Some(Value::Array(arr)) => {
+            let cleaned: Vec<Value> = arr
+                .iter()
+                .filter_map(|p| clean_content_part(p, false))
+                .collect();
+            Value::Array(cleaned)
+        }
+        Some(other) => json!([{ "type": "text", "text": other.to_string() }]),
     }
 }
 
@@ -199,6 +216,9 @@ fn clean_content_part(part: &Value, is_leading_system: bool) -> Option<Value> {
             } else {
                 raw.to_string()
             };
+            if text.is_empty() && is_leading_system {
+                return None;
+            }
             Some(json!({ "type": "text", "text": text }))
         }
         "thinking" => {
@@ -213,8 +233,7 @@ fn clean_content_part(part: &Value, is_leading_system: bool) -> Option<Value> {
             let data = obj.get("data").and_then(Value::as_str).unwrap_or("");
             Some(json!({
                 "type": "redacted_thinking",
-                "chars": data.chars().count(),
-                "count": 1
+                "chars": data.chars().count()
             }))
         }
         "tool_use" | "server_tool_use" => {
@@ -239,32 +258,19 @@ fn clean_content_part(part: &Value, is_leading_system: bool) -> Option<Value> {
             if let Some(id) = obj.get("tool_use_id").and_then(Value::as_str) {
                 out.insert("tool_use_id".to_string(), Value::String(id.to_string()));
             }
-            if let Some(content) = obj.get("content") {
-                if let Some(arr) = content.as_array() {
-                    let cleaned: Vec<Value> = arr
-                        .iter()
-                        .filter_map(|p| clean_content_part(p, false))
-                        .collect();
-                    out.insert("content".to_string(), Value::Array(cleaned));
-                } else {
-                    out.insert("content".to_string(), content.clone());
-                }
-            }
+            out.insert(
+                "content".to_string(),
+                wrap_tool_result_content(obj.get("content")),
+            );
             if obj.get("is_error").and_then(Value::as_bool) == Some(true) {
                 out.insert("is_error".to_string(), Value::Bool(true));
             }
             Some(Value::Object(out))
         }
-        "image_url" => {
-            let url = obj
-                .get("image_url")
-                .and_then(|u| u.as_str().or_else(|| u.get("url").and_then(Value::as_str)))
-                .unwrap_or("");
-            Some(json!({
-                "type": "image",
-                "source": { "type": "url", "url": url }
-            }))
-        }
+        // Guard against base64 media DoS (e.g. 1 MB PNG -> 300K tokens on the encoder thread).
+        "image_url" | "image" | "input_image" => Some(json!({ "type": "image" })),
+        "document" | "input_file" | "file" => Some(json!({ "type": "document" })),
+        "input_audio" | "audio" => Some(json!({ "type": "audio" })),
         _ => {
             let mut out = obj.clone();
             out.remove("cache_control");
@@ -300,7 +306,11 @@ fn extract_parts_from_content(content: Option<&Value>, is_leading_system: bool) 
             } else {
                 s.clone()
             };
-            vec![json!({ "type": "text", "text": text })]
+            if text.is_empty() {
+                Vec::new()
+            } else {
+                vec![json!({ "type": "text", "text": text })]
+            }
         }
         Some(Value::Array(items)) => items
             .iter()
@@ -367,6 +377,21 @@ fn renumber_tool_ids(messages: &mut [CanonicalMessage]) {
             {
                 obj.insert("tool_use_id".to_string(), Value::String(map_id(&id)));
             }
+        }
+        // Sort tool_result parts within a message by their sequential tN call order.
+        if msg.parts.len() > 1
+            && msg
+                .parts
+                .iter()
+                .all(|p| p.get("type").and_then(Value::as_str) == Some("tool_result"))
+        {
+            msg.parts.sort_by_key(|p| {
+                p.get("tool_use_id")
+                    .and_then(Value::as_str)
+                    .and_then(|s| s.strip_prefix('t'))
+                    .and_then(|n| n.parse::<usize>().ok())
+                    .unwrap_or(usize::MAX)
+            });
         }
     }
 }
@@ -459,10 +484,7 @@ pub fn serialize_request(protocol: ApiProtocol, raw: &Value) -> SerializedArcInp
                             );
                         } else if item_type == "function_call_output" {
                             let id = item.get("call_id").and_then(Value::as_str).unwrap_or("");
-                            let content = item
-                                .get("output")
-                                .cloned()
-                                .unwrap_or_else(|| Value::String(String::new()));
+                            let content = wrap_tool_result_content(item.get("output"));
                             push_or_merge(
                                 &mut canonical,
                                 "user",
@@ -502,10 +524,7 @@ pub fn serialize_request(protocol: ApiProtocol, raw: &Value) -> SerializedArcInp
                             .get("tool_call_id")
                             .and_then(Value::as_str)
                             .unwrap_or("");
-                        let content = msg
-                            .get("content")
-                            .cloned()
-                            .unwrap_or_else(|| Value::String(String::new()));
+                        let content = wrap_tool_result_content(msg.get("content"));
                         push_or_merge(
                             &mut canonical,
                             "user",

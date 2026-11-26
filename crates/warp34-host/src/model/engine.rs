@@ -442,15 +442,22 @@ impl Qwen3_5Engine {
         )
     }
 
-    /// Loads a lightweight single-GPU encoder engine (small KV + state pool, no CUDA graphs).
-    pub fn load_for_encoder_on_device(dir: &Path, device_id: i32, kv_pages: usize) -> Result<Self> {
+    /// Loads a lightweight single-GPU encoder engine (offloaded host `embed_tokens`,
+    /// 96 MiB scratch arena, custom KV pages & GDN state slots, no CUDA graphs).
+    pub fn load_for_encoder_on_device(
+        dir: &Path,
+        device_id: i32,
+        kv_pages: usize,
+        state_slots: usize,
+    ) -> Result<Self> {
         Self::load_from_dir_with_capacity_on_devices(
             dir,
             &[device_id],
             KvFormatPolicy::Fp16,
             PoolCapacity {
                 kv_pages: Some(kv_pages),
-                state_slots: Some(2),
+                state_slots: Some(state_slots.max(2)),
+                encoder_only: true,
                 ..PoolCapacity::default()
             },
             false,

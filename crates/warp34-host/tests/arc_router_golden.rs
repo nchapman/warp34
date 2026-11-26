@@ -60,6 +60,29 @@ fn canonical_serializer_formats_openai_anthropic_and_responses() {
     assert_eq!(turn.blocks[4].role, "user");
     assert!(turn.blocks[4].content.contains("\"tool_use_id\": \"t1\""));
     assert!(turn.blocks[4].content.contains("\"type\": \"tool_result\""));
+    assert!(
+        turn.blocks[4]
+            .content
+            .contains("\"content\": [{\"text\": \"README.md\", \"type\": \"text\"}]")
+    );
+
+    // Base64 media DoS guard: large inline image payloads must collapse to a tiny placeholder.
+    let huge_b64 = "A".repeat(100_000);
+    let media_req = serde_json::json!({
+        "messages": [{
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "Describe this image."},
+                {"type": "image_url", "image_url": {"url": format!("data:image/png;base64,{huge_b64}")}}
+            ]
+        }]
+    });
+    let media_turn = serialize_request(ApiProtocol::OpenAiChat, &media_req);
+    assert!(
+        media_turn.serialized_text().len() < 256,
+        "base64 media payload was not bounded: {} bytes",
+        media_turn.serialized_text().len()
+    );
 
     let anth = serde_json::json!({
         "system": "Sys prompt",
@@ -100,6 +123,13 @@ fn heads_catalog_slot_inference_and_policy_invariants() {
         return;
     };
     let heads = ArcHeads::load(&dir).expect("load ARC heads");
+    // Verify C1 fix: stage_one.candidates[] order != models[] order for cloud slots.
+    assert_eq!(heads.catalog.stage_one_candidate_for_model(0), Some(3)); // claude-haiku-5.5
+    assert_eq!(heads.catalog.stage_one_candidate_for_model(1), Some(10)); // claude-opus-5.5
+    assert_eq!(heads.catalog.stage_one_candidate_for_model(2), Some(15)); // claude-sonnet-5.5
+    assert_eq!(heads.catalog.stage_one_candidate_for_model(53), Some(53)); // qwen3.8-flash-next
+    assert_eq!(heads.catalog.stage_one_candidate_for_model(54), Some(54)); // qwen3.5-9b
+    assert_eq!(heads.catalog.stage_one_candidate_for_model(55), Some(55)); // qwen3.8-27b
     assert_eq!(infer_local_slot("Qwen3.5-35B-A3B", &heads.catalog), 53);
     assert_eq!(infer_local_slot("Qwen3.8-Flash-Next", &heads.catalog), 53);
     assert_eq!(infer_local_slot("Qwen3.5-27B", &heads.catalog), 55);
@@ -146,6 +176,7 @@ fn heads_catalog_slot_inference_and_policy_invariants() {
 
 #[cfg(feature = "cuda")]
 #[test]
+#[allow(clippy::cognitive_complexity)]
 fn arc_encoder_and_heads_match_goldens() {
     use warp34_host::model::Qwen3_5Engine;
 
@@ -154,7 +185,7 @@ fn arc_encoder_and_heads_match_goldens() {
         return;
     };
     let heads = ArcHeads::load(&dir).expect("load ARC heads");
-    let mut engine = Qwen3_5Engine::load_for_encoder_on_device(&dir, 0, 2048)
+    let mut engine = Qwen3_5Engine::load_for_encoder_on_device(&dir, 0, 2048, 4)
         .expect("load ARC-1.0-W4A16-HGPTQ on GPU 0");
 
     // 1. Verify signals.pii.payload probabilities against all 54 cases in goldens.signals.jsonl.
@@ -238,10 +269,14 @@ fn arc_encoder_and_heads_match_goldens() {
         "expected tight PII parity with canonical arc-role-blocks-v2 (got mean_abs_diff={mean_abs_diff:.4})"
     );
 
-    // 2. Verify token_count + Stage-1/Stage-2 parity across goldens.jsonl (54 decision cases).
+    // 2. Verify 54/54 exact token_count + Stage-1/Stage-2 consistency across goldens.jsonl.
     let gold_txt = std::fs::read_to_string(dir.join("goldens.jsonl")).expect("goldens.jsonl");
     let mut gold_checked = 0usize;
     let mut exact_tok_matches = 0usize;
+    let active_cands: Vec<usize> = [0usize, 1, 2, 3, 10, 53, 54, 55]
+        .into_iter()
+        .filter_map(|m| heads.catalog.stage_one_candidate_for_model(m))
+        .collect();
     for line in gold_txt.lines().filter(|l| !l.trim().is_empty()) {
         let row: serde_json::Value = serde_json::from_str(line).expect("parse decision golden");
         let Some(req_body) = row.pointer("/request/request") else {
@@ -269,12 +304,28 @@ fn arc_encoder_and_heads_match_goldens() {
         let rows = engine
             .encode_readouts_at_offsets_f32(&flat, 0, &offsets)
             .expect("forward");
-        let regime = usize::from(!turn.has_tools);
         let preds = heads
             .stage_one
-            .predict(rows.last().unwrap(), regime)
+            .predict(rows.last().unwrap(), heads.catalog.stage_one_regime)
             .expect("stage_one");
         assert_eq!(preds.len(), heads.catalog.models.len());
+
+        // Verify sparse active-only Stage-1 prediction (P3) matches full prediction bit-for-bit.
+        if gold_checked == 0 {
+            let sparse = heads
+                .stage_one
+                .predict_selected(
+                    rows.last().unwrap(),
+                    heads.catalog.stage_one_regime,
+                    &active_cands,
+                )
+                .expect("stage_one sparse");
+            assert_eq!(sparse.len(), preds.len());
+            for &cand_idx in &active_cands {
+                assert!((sparse[cand_idx].p_pass - preds[cand_idx].p_pass).abs() < 1e-12);
+                assert_eq!(sparse[cand_idx].usage, preds[cand_idx].usage);
+            }
+        }
         // Verify Stage-2 multi-block pooled prediction succeeds cleanly on every golden case.
         let all_arms: Vec<usize> = (0..8).collect();
         let s2 = heads
@@ -288,9 +339,9 @@ fn arc_encoder_and_heads_match_goldens() {
         "ARC goldens.jsonl checked={gold_checked} exact_token_count_matches={exact_tok_matches}/{gold_checked}"
     );
     assert_eq!(gold_checked, 54, "expected 54 decision golden cases");
-    assert!(
-        exact_tok_matches >= 40,
-        "expected strong token_count parity on goldens.jsonl, got {exact_tok_matches}/{gold_checked}"
+    assert_eq!(
+        exact_tok_matches, 54,
+        "expected 54/54 exact token_count parity on goldens.jsonl, got {exact_tok_matches}/{gold_checked}"
     );
 
     // 3. Verify incremental prefix extension matches fresh full prefill.

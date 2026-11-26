@@ -177,7 +177,7 @@ Serving Options (warp34 serve):
   --router-min-p-pass <0..1>          Min local P(pass) for prefer-local (default: 0.72)
   --router-value <usd>                Override utility task value V in USD (default: 4.5 prefer-local/sage, 0.1 swift)
   --router-cloud-models <csv>         Optional comma-separated cloud model filter (default: all upstream models)
-  --router-pin-pii <csv|none>         PII classes pinned locally (default: credential,government_id,financial_account,payment_card,health,any)
+  --router-pin-pii <csv|none>         PII classes pinned locally (default: credential,government_id,financial_account,payment_card)
 
 Generation & Chat Options (warp34 chat / generate):
   -p, --prompt <text>                 Prompt text (omit in terminal with `warp34 chat` for interactive REPL)

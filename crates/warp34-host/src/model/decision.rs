@@ -259,50 +259,54 @@ impl Qwen3_5Engine {
             .collect())
     }
 
-    /// Returns the maximum token context supported by this encoder's KV pool.
-    pub fn encoder_max_context(&self) -> usize {
-        self.ranks.first().map_or(0, |r| r.kv_pool.num_pages * 16)
+    /// Returns the total number of KV pages allocated in this encoder's KV pool.
+    pub fn encoder_kv_pages(&self) -> usize {
+        self.ranks.first().map_or(0, |r| r.kv_pool.num_pages)
     }
 
-    /// Runs a prefill-only forward pass over `tokens[start_offset..]` (skipping `lm_head` logits),
-    /// reusing the existing slot-0 KV/GDN state when `start_offset > 0`, and returns the
-    /// post-`GemmaRMSNorm` hidden vectors `[hidden_size]` (`f32`) at each requested `offsets` index
-    /// (every offset must satisfy `start_offset <= off < tokens.len()`).
-    pub fn encode_readouts_at_offsets_f32(
+    /// Returns the maximum token context supported by this encoder's KV pool.
+    pub fn encoder_max_context(&self) -> usize {
+        self.encoder_kv_pages() * 16
+    }
+
+    /// Runs a prefill-only forward pass over `tokens[start_offset..]` (skipping `lm_head` logits)
+    /// in `state_slot` using caller-managed `block_table`, reusing existing KV/GDN state when
+    /// `start_offset > 0`, and returns post-`GemmaRMSNorm` hidden vectors at `offsets`.
+    pub fn encode_readouts_at_offsets_in_slot_f32(
         &mut self,
         tokens: &[i32],
         start_offset: usize,
         offsets: &[usize],
+        state_slot: usize,
+        block_table: &[i32],
     ) -> Result<Vec<Vec<f32>>> {
         if tokens.is_empty() {
             return Err(loader_err(
-                "encode_readouts_at_offsets_f32 requires at least 1 token",
+                "encode_readouts_at_offsets_in_slot_f32 requires at least 1 token",
             ));
         }
         const PAGE_SIZE: usize = 16;
-        let max_ctx = self.ranks[0].kv_pool.num_pages * PAGE_SIZE;
-        if tokens.len() > max_ctx {
+        let pages_needed = tokens.len().div_ceil(PAGE_SIZE);
+        if block_table.len() < pages_needed {
             return Err(loader_err(
-                "encode_readouts_at_offsets_f32: tokens exceed encoder max_ctx",
+                "encode_readouts_at_offsets_in_slot_f32: block_table too short",
             ));
         }
         if start_offset > tokens.len() {
             return Err(loader_err(
-                "encode_readouts_at_offsets_f32: start_offset out of range",
+                "encode_readouts_at_offsets_in_slot_f32: start_offset out of range",
             ));
         }
         for &off in offsets {
             if off < start_offset || off >= tokens.len() {
                 return Err(loader_err(
-                    "encode_readouts_at_offsets_f32: readout offset out of range",
+                    "encode_readouts_at_offsets_in_slot_f32: readout offset out of range",
                 ));
             }
         }
         if start_offset == tokens.len() {
             return Ok(Vec::new());
         }
-        let pages_needed = tokens.len().div_ceil(PAGE_SIZE);
-        let block_table: Vec<i32> = (0..pages_needed as i32).collect();
         let max_chunk = self
             .ranks
             .iter()
@@ -329,9 +333,9 @@ impl Qwen3_5Engine {
                 &[EngineBatchSlice {
                     tokens: chunk,
                     ctx_len_before: offset,
-                    block_table: &block_table,
-                    state_in_slot: 0,
-                    state_out_slot: 0,
+                    block_table: &block_table[..pages_needed],
+                    state_in_slot: state_slot as i32,
+                    state_out_slot: state_slot as i32,
                     has_initial_state: offset > 0,
                     spec_slots: &[],
                     checkpoints: &[],
@@ -350,6 +354,24 @@ impl Qwen3_5Engine {
             offset = end;
         }
         Ok(results)
+    }
+
+    /// Convenience wrapper running `encode_readouts_at_offsets_in_slot_f32` in slot 0 with
+    /// contiguous KV pages `0..pages_needed`.
+    pub fn encode_readouts_at_offsets_f32(
+        &mut self,
+        tokens: &[i32],
+        start_offset: usize,
+        offsets: &[usize],
+    ) -> Result<Vec<Vec<f32>>> {
+        let pages_needed = tokens.len().div_ceil(16);
+        if pages_needed > self.encoder_kv_pages() {
+            return Err(loader_err(
+                "encode_readouts_at_offsets_f32: tokens exceed encoder max_ctx",
+            ));
+        }
+        let block_table: Vec<i32> = (0..pages_needed as i32).collect();
+        self.encode_readouts_at_offsets_in_slot_f32(tokens, start_offset, offsets, 0, &block_table)
     }
 
     /// Runs a prefill-only forward pass over `tokens` (skipping `lm_head` logits) and returns

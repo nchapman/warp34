@@ -1410,6 +1410,9 @@ impl Qwen3_5ModelRank {
         if should_use_compact_tiered_moe_scratch(cfg, tp_size, free_vram, capacity.lora_reserve) {
             scratch_bytes = crate::scheduler::DEFAULT_SCRATCH_ARENA_BYTES;
         }
+        if capacity.encoder_only {
+            scratch_bytes = scratch_bytes.min(96 * 1024 * 1024);
+        }
         let pages = requested_kv_pages.unwrap_or(DEFAULT_TARGET_KV_PAGES);
         let (page_bytes, state_bytes) =
             target_pool_geometry_with_fp8(cfg, tp_size, kv_policy, supports_fp8_kv);
@@ -1471,16 +1474,24 @@ impl Qwen3_5ModelRank {
                 .saturating_add(vision)
         });
         let boot_persistent_bytes = BATCH_META_ARENA_BYTES.saturating_add(marlin_ws_bytes);
-        let (est_weight_bytes, use_host_embed) = plan_host_embed_with_serving_budget(
-            cfg,
-            raw_est_weight_bytes,
-            scratch_bytes,
-            staging_bytes,
-            free_vram,
-            boot_persistent_bytes,
-            Some(steady_bytes),
-            desired_gpu_steady_bytes,
-        );
+        let (est_weight_bytes, use_host_embed) = if capacity.encoder_only {
+            let embed_bytes = cfg
+                .vocab_size
+                .saturating_mul(cfg.hidden_size)
+                .saturating_mul(2);
+            (raw_est_weight_bytes.saturating_sub(embed_bytes), true)
+        } else {
+            plan_host_embed_with_serving_budget(
+                cfg,
+                raw_est_weight_bytes,
+                scratch_bytes,
+                staging_bytes,
+                free_vram,
+                boot_persistent_bytes,
+                Some(steady_bytes),
+                desired_gpu_steady_bytes,
+            )
+        };
         // `PinnedUploadRing::new` allocates two device repack staging buffers concurrently.
         let min_boot_bytes = est_weight_bytes
             .saturating_add(scratch_bytes)
@@ -1504,8 +1515,12 @@ impl Qwen3_5ModelRank {
 
         let mut weight_arena = DeviceArena::new_on_stream(device_id, est_weight_bytes, &stream)?;
         let scratch_arena = DeviceArena::new_on_stream(device_id, scratch_bytes, &stream)?;
-        let _ = stream
-            .set_persisting_l2_window(scratch_arena.allocation_base(), scratch_arena.capacity());
+        if !capacity.encoder_only {
+            let _ = stream.set_persisting_l2_window(
+                scratch_arena.allocation_base(),
+                scratch_arena.capacity(),
+            );
+        }
         let batch_meta_arena =
             DeviceArena::new_on_stream(device_id, BATCH_META_ARENA_BYTES, &stream)?;
         let marlin_ws = DeviceBuffer::alloc_on_stream(device_id, marlin_ws_bytes, &stream)?;

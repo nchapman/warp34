@@ -43,12 +43,34 @@ pub struct ArcModelEntry {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct ArcActionEntry {
+    #[serde(default)]
+    pub action_id: Option<String>,
     pub model: usize,
     pub effort: String,
     #[serde(default)]
     pub level: Option<String>,
     #[serde(default)]
     pub arms: Vec<usize>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ArcStageOneCandidateMeta {
+    pub model: usize,
+    #[serde(default)]
+    pub latency_factor: Option<f64>,
+    #[serde(default)]
+    pub withheld: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ArcStageOneMeta {
+    pub candidates: Vec<ArcStageOneCandidateMeta>,
+    #[serde(default)]
+    pub regime: usize,
+    #[serde(default)]
+    pub cost_weight: f64,
+    #[serde(default)]
+    pub latency_weight: f64,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -62,6 +84,7 @@ pub struct ArcRuntimeJson {
     pub models: Vec<ArcModelEntry>,
     pub actions: Vec<ArcActionEntry>,
     pub fallback_action: usize,
+    pub stage_one: ArcStageOneMeta,
     pub stage_two: ArcStageTwoMeta,
 }
 
@@ -81,6 +104,13 @@ pub struct ArcRuntimeCatalog {
     pub models: Vec<ArcModelEntry>,
     pub actions: Vec<ArcActionEntry>,
     pub fallback_action: usize,
+    /// Maps `model_idx` (index into `models[]`) -> `stage_one` candidate index (`0..56`).
+    pub model_to_candidate: Vec<Option<usize>>,
+    /// Per-`stage_one` candidate latency factor (from `stage_one.candidates[].latency_factor`).
+    pub candidate_latency_factor: Vec<Option<f64>>,
+    pub stage_one_regime: usize,
+    pub stage_one_cost_weight: f64,
+    pub stage_one_latency_weight: f64,
     pub stage_two_cost_weight: f64,
     pub stage_two_support_columns: Vec<String>,
     /// Per-model 4-leg prices (USD per million tokens), indexed by `model_idx`.
@@ -92,11 +122,25 @@ pub struct ArcRuntimeCatalog {
 }
 
 impl ArcRuntimeCatalog {
+    /// Returns the Stage-1 candidate index for a given `models[]` slot.
+    pub fn stage_one_candidate_for_model(&self, model_slot: usize) -> Option<usize> {
+        self.model_to_candidate.get(model_slot).copied().flatten()
+    }
+
     pub fn load(model_dir: &Path) -> Result<Self, String> {
         let rt_bytes = std::fs::read(model_dir.join("runtime/arc-runtime.json"))
             .map_err(|e| format!("read runtime/arc-runtime.json: {e}"))?;
         let rt: ArcRuntimeJson = serde_json::from_slice(&rt_bytes)
             .map_err(|e| format!("parse runtime/arc-runtime.json: {e}"))?;
+
+        let mut model_to_candidate = vec![None; rt.models.len()];
+        let mut candidate_latency_factor = Vec::with_capacity(rt.stage_one.candidates.len());
+        for (cand_idx, cand) in rt.stage_one.candidates.iter().enumerate() {
+            if cand.model < model_to_candidate.len() && cand.withheld.is_none() {
+                model_to_candidate[cand.model] = Some(cand_idx);
+            }
+            candidate_latency_factor.push(cand.latency_factor);
+        }
 
         let prices_bytes = std::fs::read(model_dir.join("runtime/prices.json"))
             .map_err(|e| format!("read runtime/prices.json: {e}"))?;
@@ -154,6 +198,11 @@ impl ArcRuntimeCatalog {
             models: rt.models,
             actions: rt.actions,
             fallback_action: rt.fallback_action,
+            model_to_candidate,
+            candidate_latency_factor,
+            stage_one_regime: rt.stage_one.regime,
+            stage_one_cost_weight: rt.stage_one.cost_weight,
+            stage_one_latency_weight: rt.stage_one.latency_weight,
             stage_two_cost_weight: rt.stage_two.cost_weight,
             stage_two_support_columns: rt.stage_two.support_columns,
             model_prices,
@@ -547,6 +596,17 @@ impl StageOneHead {
         readout: &[f32],
         regime: usize,
     ) -> Result<Vec<StageOnePrediction>, String> {
+        self.predict_selected(readout, regime, &[])
+    }
+
+    /// Evaluates Stage-1 only for `candidate_indices` (or all candidates when empty),
+    /// avoiding unnecessary `5 × 4 × 1024` f64 usage dot products for withheld/unused models.
+    pub fn predict_selected(
+        &self,
+        readout: &[f32],
+        regime: usize,
+        candidate_indices: &[usize],
+    ) -> Result<Vec<StageOnePrediction>, String> {
         if readout.len() != self.dim || regime >= self.regimes {
             return Err(format!(
                 "stage_one readout dim {} (expected {}) or regime {} out of range",
@@ -556,6 +616,12 @@ impl StageOneHead {
             ));
         }
         let (m_count, c_count, d) = (self.members, self.candidates, self.dim);
+        let mut active = vec![candidate_indices.is_empty(); c_count];
+        for &c in candidate_indices {
+            if c < c_count {
+                active[c] = true;
+            }
+        }
         let z: Vec<f64> = readout
             .iter()
             .zip(&self.mean)
@@ -593,7 +659,10 @@ impl StageOneHead {
                     }
                 }
             }
-            for c in 0..c_count {
+            for (c, &is_active) in active.iter().enumerate() {
+                if !is_active {
+                    continue;
+                }
                 let mc = m * c_count + c;
                 if self.p_ok[mc] {
                     let interaction =
@@ -771,6 +840,7 @@ pub struct StageTwoHead {
     quality: LinearF32,
     usage: LinearF32,
     pub quality_support: Vec<bool>,
+    pub usage_support: Vec<bool>,
 }
 
 impl StageTwoHead {
@@ -819,6 +889,12 @@ impl StageTwoHead {
             .iter()
             .position(|c| c == "quality")
             .ok_or_else(|| "stage_two support_columns missing `quality`".to_string())?;
+        let u_cols: Vec<usize> = (0..LEGS)
+            .filter_map(|leg| {
+                let name = format!("usage.{leg}");
+                support_columns.iter().position(|c| c == &name)
+            })
+            .collect();
         Ok(Self {
             arms,
             dim: context.columns,
@@ -835,6 +911,11 @@ impl StageTwoHead {
             usage,
             quality_support: (0..arms)
                 .map(|arm| support[arm * width + q_col] > 0)
+                .collect(),
+            usage_support: (0..arms)
+                .map(|arm| {
+                    u_cols.is_empty() || u_cols.iter().all(|&col| support[arm * width + col] > 0)
+                })
                 .collect(),
         })
     }
