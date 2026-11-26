@@ -50,7 +50,8 @@ impl UpstreamProxy {
         mut body: Value,
         wire_model: &str,
         decision: &RoutingDecision,
-    ) -> Response {
+        anthropic_beta: Option<&str>,
+    ) -> (Response, bool) {
         let base = endpoint.base_url.trim_end_matches('/');
         let url = match (endpoint.dialect, protocol) {
             (WireDialect::AnthropicNative, ApiProtocol::AnthropicMessages) => {
@@ -74,11 +75,29 @@ impl UpstreamProxy {
 
         if let Some(obj) = body.as_object_mut() {
             obj.insert("model".to_string(), Value::String(wire_model.to_string()));
+            // Strip local-only extension fields that strict native OpenAI/Anthropic APIs reject.
+            if matches!(
+                endpoint.dialect,
+                WireDialect::OpenAiNative | WireDialect::AnthropicNative
+            ) {
+                for local_ext in [
+                    "chat_template_kwargs",
+                    "thinking_budget",
+                    "top_k",
+                    "min_p",
+                    "repetition_penalty",
+                ] {
+                    obj.remove(local_ext);
+                }
+            }
         }
 
         let mut req = self.client.post(&url).json(&body);
         if endpoint.dialect == WireDialect::AnthropicNative {
             req = req.header("anthropic-version", "2023-06-01");
+            if let Some(beta) = anthropic_beta.filter(|s| !s.is_empty()) {
+                req = req.header("anthropic-beta", beta);
+            }
             if let Some(key) = &endpoint.api_key {
                 req = req.header("x-api-key", key);
             }
@@ -96,23 +115,34 @@ impl UpstreamProxy {
         let upstream_resp = match req.send().await {
             Ok(r) => r,
             Err(e) => {
-                let msg = format!(
-                    "{{\"error\":{{\"message\":\"ARC cloud upstream ({}) request failed: {e}\",\"type\":\"upstream_error\"}}}}",
-                    endpoint.provider_id
+                let err_msg = format!(
+                    "ARC cloud upstream ({}) request failed: {}",
+                    endpoint.provider_id,
+                    e.without_url()
                 );
-                let mut resp = Response::new(Body::from(msg));
+                let payload = match protocol {
+                    ApiProtocol::AnthropicMessages => serde_json::json!({
+                        "type": "error",
+                        "error": { "type": "api_error", "message": err_msg }
+                    }),
+                    _ => serde_json::json!({
+                        "error": { "message": err_msg, "type": "upstream_error" }
+                    }),
+                };
+                let mut resp = Response::new(Body::from(payload.to_string()));
                 *resp.status_mut() = StatusCode::BAD_GATEWAY;
                 resp.headers_mut().insert(
                     axum::http::header::CONTENT_TYPE,
                     HeaderValue::from_static("application/json"),
                 );
                 super::apply_routing_headers(resp.headers_mut(), decision);
-                return resp;
+                return (resp, true);
             }
         };
 
         let status = StatusCode::from_u16(upstream_resp.status().as_u16())
             .unwrap_or(StatusCode::BAD_GATEWAY);
+        let is_err = !status.is_success();
         let content_type = upstream_resp
             .headers()
             .get(reqwest::header::CONTENT_TYPE)
@@ -138,6 +168,6 @@ impl UpstreamProxy {
             );
         }
         super::apply_routing_headers(resp.headers_mut(), decision);
-        resp
+        (resp, is_err)
     }
 }

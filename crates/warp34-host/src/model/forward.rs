@@ -1085,7 +1085,6 @@ impl Qwen3_5ModelRank {
             final_hc_pre_normed,
         )?;
         self.last_norm_hidden_ptr = final_out;
-        self.last_pre_norm_hidden_ptr = s.residual;
         self.last_norm_hidden_rows = rows;
         self.last_mtp_hidden_ptr = match &self.final_residual {
             FinalResidual::SingleStream {

@@ -62,6 +62,8 @@ pub struct RouterMetrics {
     pub effort_low: AtomicU64,
     pub effort_medium: AtomicU64,
     pub effort_high: AtomicU64,
+    pub router_fallbacks: AtomicU64,
+    pub cloud_upstream_errors: AtomicU64,
     pub total_router_latency_us: AtomicU64,
 }
 
@@ -76,6 +78,8 @@ pub struct RouterMetricsSnapshot {
     pub effort_low: u64,
     pub effort_medium: u64,
     pub effort_high: u64,
+    pub router_fallbacks: u64,
+    pub cloud_upstream_errors: u64,
     pub mean_router_latency_ms: f64,
 }
 
@@ -117,6 +121,14 @@ impl RouterMetrics {
             .fetch_add((d.latency_ms * 1000.0) as u64, Ordering::Relaxed);
     }
 
+    pub fn record_fallback(&self) {
+        self.router_fallbacks.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_cloud_error(&self) {
+        self.cloud_upstream_errors.fetch_add(1, Ordering::Relaxed);
+    }
+
     pub fn snapshot(&self) -> RouterMetricsSnapshot {
         let total = self.total_requests.load(Ordering::Relaxed);
         let total_us = self.total_router_latency_us.load(Ordering::Relaxed);
@@ -130,6 +142,8 @@ impl RouterMetrics {
             effort_low: self.effort_low.load(Ordering::Relaxed),
             effort_medium: self.effort_medium.load(Ordering::Relaxed),
             effort_high: self.effort_high.load(Ordering::Relaxed),
+            router_fallbacks: self.router_fallbacks.load(Ordering::Relaxed),
+            cloud_upstream_errors: self.cloud_upstream_errors.load(Ordering::Relaxed),
             mean_router_latency_ms: if total > 0 {
                 (total_us as f64 / total as f64) / 1000.0
             } else {
@@ -269,6 +283,7 @@ impl ArcRouter {
         let policy = self.policy;
         let pin_pii_classes = self.pin_pii_classes.clone();
         let has_tools = canonical.has_tools;
+        let has_images = canonical.has_images;
         let mut decision = tokio::task::spawn_blocking(move || {
             decide(
                 &heads,
@@ -277,6 +292,7 @@ impl ArcRouter {
                     block_roles: &enc.block_roles,
                     prompt_tokens: enc.prompt_tokens,
                     has_tools,
+                    has_images,
                     warm_local_kv,
                     local_slot,
                     cloud_candidates: &cloud_candidates,

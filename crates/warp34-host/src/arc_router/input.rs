@@ -33,6 +33,7 @@ pub struct SerializedArcInput {
     pub blocks: Vec<ArcRoleBlock>,
     pub last_role: String,
     pub has_tools: bool,
+    pub has_images: bool,
     pub turn_count: usize,
 }
 
@@ -267,8 +268,9 @@ fn clean_content_part(part: &Value, is_leading_system: bool) -> Option<Value> {
             }
             Some(Value::Object(out))
         }
-        // Guard against base64 media DoS (e.g. 1 MB PNG -> 300K tokens on the encoder thread).
+        // Guard against base64 media DoS (e.g. 1 MB PNG/video -> 300K tokens on the encoder thread).
         "image_url" | "image" | "input_image" => Some(json!({ "type": "image" })),
+        "video_url" | "video" | "input_video" => Some(json!({ "type": "video" })),
         "document" | "input_file" | "file" => Some(json!({ "type": "document" })),
         "input_audio" | "audio" => Some(json!({ "type": "audio" })),
         _ => {
@@ -403,6 +405,104 @@ fn extract_tool_definitions(raw: &Value) -> Vec<Value> {
         .unwrap_or_default()
 }
 
+fn extract_responses_reasoning_summary(item: &Value) -> String {
+    item.get("summary")
+        .and_then(Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|s| s.get("text").and_then(Value::as_str))
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+        .or_else(|| {
+            item.get("text")
+                .and_then(Value::as_str)
+                .map(ToString::to_string)
+        })
+        .unwrap_or_default()
+}
+
+fn collect_responses_messages(raw: &Value, canonical: &mut Vec<CanonicalMessage>) {
+    if let Some(inst) = raw.get("instructions").and_then(Value::as_str) {
+        let parts = extract_parts_from_content(Some(&Value::String(inst.to_string())), true);
+        push_or_merge(canonical, "system", parts);
+    }
+    match raw.get("input") {
+        Some(Value::String(s)) => {
+            push_or_merge(
+                canonical,
+                "user",
+                vec![json!({ "type": "text", "text": s })],
+            );
+        }
+        Some(Value::Array(items)) => {
+            for item in items {
+                let item_type = item.get("type").and_then(Value::as_str).unwrap_or("");
+                if item_type == "function_call" {
+                    let id = item
+                        .get("call_id")
+                        .or_else(|| item.get("id"))
+                        .and_then(Value::as_str)
+                        .unwrap_or("");
+                    let name = item.get("name").and_then(Value::as_str).unwrap_or("");
+                    let args = item
+                        .get("arguments")
+                        .and_then(Value::as_str)
+                        .and_then(|s| serde_json::from_str::<Value>(s).ok())
+                        .unwrap_or_else(|| {
+                            item.get("arguments")
+                                .cloned()
+                                .unwrap_or_else(|| Value::Object(Map::new()))
+                        });
+                    push_or_merge(
+                        canonical,
+                        "assistant",
+                        vec![json!({
+                            "type": "tool_use",
+                            "id": id,
+                            "name": name,
+                            "input": args,
+                        })],
+                    );
+                } else if item_type == "function_call_output" {
+                    let id = item.get("call_id").and_then(Value::as_str).unwrap_or("");
+                    let content = wrap_tool_result_content(item.get("output"));
+                    push_or_merge(
+                        canonical,
+                        "user",
+                        vec![json!({
+                            "type": "tool_result",
+                            "tool_use_id": id,
+                            "content": content,
+                        })],
+                    );
+                } else if item_type == "reasoning" {
+                    let summary = extract_responses_reasoning_summary(item);
+                    if !summary.is_empty() {
+                        push_or_merge(
+                            canonical,
+                            "assistant",
+                            vec![json!({ "type": "thinking", "thinking": summary })],
+                        );
+                    }
+                } else {
+                    let raw_role = item.get("role").and_then(Value::as_str).unwrap_or("user");
+                    let role = match raw_role {
+                        "system" | "developer" => "system",
+                        "assistant" => "assistant",
+                        _ => "user",
+                    };
+                    let is_lead_sys =
+                        role == "system" && canonical.iter().all(|m| m.role != "user");
+                    let parts = extract_parts_from_content(item.get("content"), is_lead_sys);
+                    push_or_merge(canonical, role, parts);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
 /// Serializes an incoming OpenAI / Responses / Anthropic JSON request into canonical
 /// `arc-role-blocks-v2` role blocks matching `rayline-arc-input`.
 pub fn serialize_request(protocol: ApiProtocol, raw: &Value) -> SerializedArcInput {
@@ -439,80 +539,7 @@ pub fn serialize_request(protocol: ApiProtocol, raw: &Value) -> SerializedArcInp
                 }
             }
         }
-        ApiProtocol::OpenAiResponses => {
-            if let Some(inst) = raw.get("instructions").and_then(Value::as_str) {
-                let parts =
-                    extract_parts_from_content(Some(&Value::String(inst.to_string())), true);
-                push_or_merge(&mut canonical, "system", parts);
-            }
-            match raw.get("input") {
-                Some(Value::String(s)) => {
-                    push_or_merge(
-                        &mut canonical,
-                        "user",
-                        vec![json!({ "type": "text", "text": s })],
-                    );
-                }
-                Some(Value::Array(items)) => {
-                    for item in items {
-                        let item_type = item.get("type").and_then(Value::as_str).unwrap_or("");
-                        if item_type == "function_call" {
-                            let id = item
-                                .get("call_id")
-                                .or_else(|| item.get("id"))
-                                .and_then(Value::as_str)
-                                .unwrap_or("");
-                            let name = item.get("name").and_then(Value::as_str).unwrap_or("");
-                            let args = item
-                                .get("arguments")
-                                .and_then(Value::as_str)
-                                .and_then(|s| serde_json::from_str::<Value>(s).ok())
-                                .unwrap_or_else(|| {
-                                    item.get("arguments")
-                                        .cloned()
-                                        .unwrap_or_else(|| Value::Object(Map::new()))
-                                });
-                            push_or_merge(
-                                &mut canonical,
-                                "assistant",
-                                vec![json!({
-                                    "type": "tool_use",
-                                    "id": id,
-                                    "name": name,
-                                    "input": args,
-                                })],
-                            );
-                        } else if item_type == "function_call_output" {
-                            let id = item.get("call_id").and_then(Value::as_str).unwrap_or("");
-                            let content = wrap_tool_result_content(item.get("output"));
-                            push_or_merge(
-                                &mut canonical,
-                                "user",
-                                vec![json!({
-                                    "type": "tool_result",
-                                    "tool_use_id": id,
-                                    "content": content,
-                                })],
-                            );
-                        } else {
-                            let raw_role =
-                                item.get("role").and_then(Value::as_str).unwrap_or("user");
-                            let role = match raw_role {
-                                "system" | "developer" => "system",
-                                "assistant" => "assistant",
-                                _ => "user",
-                            };
-                            let is_lead_sys =
-                                role == "system" && canonical.iter().all(|m| m.role != "user");
-                            let parts =
-                                extract_parts_from_content(item.get("content"), is_lead_sys);
-                            push_or_merge(&mut canonical, role, parts);
-                        }
-                    }
-                }
-                _ => {}
-            }
-        }
+        ApiProtocol::OpenAiResponses => collect_responses_messages(raw, &mut canonical),
         ApiProtocol::OpenAiChat => {
             if let Some(messages) = raw.get("messages").and_then(Value::as_array) {
                 let mut seen_non_system = false;
@@ -591,6 +618,11 @@ pub fn serialize_request(protocol: ApiProtocol, raw: &Value) -> SerializedArcInp
 
     renumber_tool_ids(&mut canonical);
 
+    let has_images = canonical.iter().any(|m| {
+        m.parts
+            .iter()
+            .any(|p| p.get("type").and_then(Value::as_str) == Some("image"))
+    });
     let mut blocks: Vec<ArcRoleBlock> = canonical
         .into_iter()
         .map(|m| ArcRoleBlock {
@@ -615,6 +647,7 @@ pub fn serialize_request(protocol: ApiProtocol, raw: &Value) -> SerializedArcInp
         blocks,
         last_role,
         has_tools,
+        has_images,
         turn_count,
     }
 }

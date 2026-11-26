@@ -408,9 +408,10 @@ fn expected_cost_usd(usage: &[f64; LEGS], rates: &[f64; LEGS]) -> f64 {
 }
 
 /// Map ARC Stage-2 `(effort, level)` action fields to `warp34`'s canonical reasoning effort.
-fn map_arc_effort_to_warp34(effort: &str, level: Option<&str>) -> &'static str {
+/// ARC-1.0 encodes no-thinking as `level == Some("none")` (e.g. `("default", Some("none"))`).
+pub(crate) fn map_arc_effort_to_warp34(effort: &str, level: Option<&str>) -> &'static str {
     match (effort, level) {
-        ("none", _) => "none",
+        ("none", _) | (_, Some("none")) => "none",
         ("high", Some("up")) => "high",
         ("high", Some("down")) => "low",
         ("high", _) => "high",
@@ -424,12 +425,14 @@ fn map_arc_effort_to_warp34(effort: &str, level: Option<&str>) -> &'static str {
 
 /// Select the best Stage-2 reasoning effort for `model_slot` using multi-block pooled history,
 /// filtering to supported arms (`quality_support && usage_support`), using `catalog.stage_two_cost_weight`,
-/// and scoring each action by its best (`max`) supported arm (`rayline-arc-decide` parity).
+/// effective `rates_override` (from `models.dev` when present), and scoring each action by its
+/// best (`max`) supported arm (`rayline-arc-decide` parity).
 fn choose_effort_for_slot(
     heads: &ArcHeads,
     block_readouts: &[Vec<f32>],
     block_roles: &[String],
     model_slot: usize,
+    rates_override: Option<[f64; LEGS]>,
 ) -> String {
     let actions: Vec<&super::heads::ArcActionEntry> = heads
         .catalog
@@ -469,7 +472,9 @@ fn choose_effort_for_slot(
     };
     let score_map: std::collections::HashMap<usize, super::heads::ArmScore> =
         scored.into_iter().collect();
-    let rates = heads.catalog.model_prices[model_slot].unwrap_or([0.0; LEGS]);
+    let rates = rates_override
+        .or(heads.catalog.model_prices[model_slot])
+        .unwrap_or([0.0; LEGS]);
     let cost_weight = heads.catalog.stage_two_cost_weight as f32;
 
     let mut best_effort = "medium";
@@ -504,6 +509,7 @@ pub struct DecideInput<'a> {
     pub block_roles: &'a [String],
     pub prompt_tokens: usize,
     pub has_tools: bool,
+    pub has_images: bool,
     pub warm_local_kv: bool,
     pub local_slot: usize,
     pub cloud_candidates: &'a [CloudCandidate],
@@ -568,6 +574,7 @@ pub fn decide(heads: &ArcHeads, input: &DecideInput<'_>) -> Result<RoutingDecisi
             input.block_readouts,
             input.block_roles,
             input.local_slot,
+            None,
         );
         return Ok(RoutingDecision {
             target: RouteTarget::Local,
@@ -587,6 +594,7 @@ pub fn decide(heads: &ArcHeads, input: &DecideInput<'_>) -> Result<RoutingDecisi
             input.block_readouts,
             input.block_roles,
             input.local_slot,
+            None,
         );
         return Ok(RoutingDecision {
             target: RouteTarget::Local,
@@ -606,6 +614,7 @@ pub fn decide(heads: &ArcHeads, input: &DecideInput<'_>) -> Result<RoutingDecisi
             input.block_readouts,
             input.block_roles,
             input.local_slot,
+            None,
         );
         return Ok(RoutingDecision {
             target: RouteTarget::Local,
@@ -627,6 +636,7 @@ pub fn decide(heads: &ArcHeads, input: &DecideInput<'_>) -> Result<RoutingDecisi
             input.block_readouts,
             input.block_roles,
             input.local_slot,
+            None,
         );
         return Ok(RoutingDecision {
             target: RouteTarget::Local,
@@ -641,11 +651,17 @@ pub fn decide(heads: &ArcHeads, input: &DecideInput<'_>) -> Result<RoutingDecisi
 
     // Score cloud candidates by `V * P(pass) - expected_cost` (local cost = $0),
     // indexing Stage-1 predictions through `stage_one_candidate_for_model`, filtering by
-    // `models.dev` capabilities (`tool_call`, `context_limit`), and using live prices if present.
+    // `models.dev` capabilities (`tool_call`, `supports_image`, `context_limit`), and using
+    // live prices if present. Under `PreferLocal`, only consider cloud models that strictly
+    // beat `local_p` so a weaker cheap model cannot block a stronger frontier model.
     let local_utility = value_usd * local_p;
+    let require_better_p_pass = matches!(input.policy, RoutingPolicy::PreferLocal { .. });
     let mut best_cloud: Option<(&CloudCandidate, f64, f64)> = None;
     for cand in input.cloud_candidates {
         if input.has_tools && !cand.capabilities.tool_call {
+            continue;
+        }
+        if input.has_images && !cand.capabilities.supports_image {
             continue;
         }
         if cand
@@ -664,6 +680,9 @@ pub fn decide(heads: &ArcHeads, input: &DecideInput<'_>) -> Result<RoutingDecisi
         if !pred.p_pass.is_finite() {
             continue;
         }
+        if require_better_p_pass && pred.p_pass <= local_p {
+            continue;
+        }
         let rates = cand
             .price_override
             .or(heads.catalog.model_prices[cand.slot])
@@ -678,7 +697,7 @@ pub fn decide(heads: &ArcHeads, input: &DecideInput<'_>) -> Result<RoutingDecisi
     let stay_local = match (input.policy, best_cloud) {
         (_, None) => true,
         (RoutingPolicy::Utility { .. }, Some((_, best_u, _))) => local_utility >= best_u,
-        (RoutingPolicy::PreferLocal { .. }, Some((_, _, cloud_p))) => cloud_p <= local_p,
+        (RoutingPolicy::PreferLocal { .. }, Some(_)) => false,
     };
 
     if stay_local {
@@ -687,6 +706,7 @@ pub fn decide(heads: &ArcHeads, input: &DecideInput<'_>) -> Result<RoutingDecisi
             input.block_readouts,
             input.block_roles,
             input.local_slot,
+            None,
         );
         return Ok(RoutingDecision {
             target: RouteTarget::Local,
@@ -700,8 +720,13 @@ pub fn decide(heads: &ArcHeads, input: &DecideInput<'_>) -> Result<RoutingDecisi
     }
 
     let (cand, _, cloud_p) = best_cloud.unwrap();
-    let raw_effort =
-        choose_effort_for_slot(heads, input.block_readouts, input.block_roles, cand.slot);
+    let raw_effort = choose_effort_for_slot(
+        heads,
+        input.block_readouts,
+        input.block_roles,
+        cand.slot,
+        cand.price_override,
+    );
     let effort = cand.capabilities.clamp_effort(&raw_effort);
     Ok(RoutingDecision {
         target: RouteTarget::Cloud {
@@ -717,4 +742,20 @@ pub fn decide(heads: &ArcHeads, input: &DecideInput<'_>) -> Result<RoutingDecisi
         pii_triggered: pii.triggered_classes,
         latency_ms: t0.elapsed().as_secs_f64() * 1000.0,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stage_two_level_none_maps_to_none_effort() {
+        assert_eq!(map_arc_effort_to_warp34("default", Some("none")), "none");
+        assert_eq!(map_arc_effort_to_warp34("high", Some("none")), "none");
+        assert_eq!(map_arc_effort_to_warp34("none", None), "none");
+        assert_eq!(map_arc_effort_to_warp34("default", Some("down")), "low");
+        assert_eq!(map_arc_effort_to_warp34("default", Some("up")), "high");
+        assert_eq!(map_arc_effort_to_warp34("high", Some("down")), "low");
+        assert_eq!(map_arc_effort_to_warp34("medium", None), "medium");
+    }
 }

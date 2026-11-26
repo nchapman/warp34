@@ -349,6 +349,9 @@ impl OpenAiServerState {
         WorkerError,
     > {
         if self.extra_workers.is_empty() {
+            if let Some(k) = session_key {
+                self.bind_session_to_worker(k.to_string(), 0);
+            }
             return Ok((0, &self.worker, None));
         }
         let samples: Vec<crate::dp_router::WorkerLoadSample> = self
@@ -637,13 +640,31 @@ async fn metrics(State(s): State<Arc<OpenAiServerState>>) -> impl IntoResponse {
              warp34_arc_router_warm_kv_local_total {}\n\
              # HELP warp34_arc_router_latency_ms_mean Mean ARC-1.0 routing latency in milliseconds\n\
              # TYPE warp34_arc_router_latency_ms_mean gauge\n\
-             warp34_arc_router_latency_ms_mean {:.3}",
+             warp34_arc_router_latency_ms_mean {:.3}\n\
+             # HELP warp34_arc_router_effort_total Requests by ARC-1.0 selected reasoning effort\n\
+             # TYPE warp34_arc_router_effort_total counter\n\
+             warp34_arc_router_effort_total{{effort=\"none\"}} {}\n\
+             warp34_arc_router_effort_total{{effort=\"low\"}} {}\n\
+             warp34_arc_router_effort_total{{effort=\"medium\"}} {}\n\
+             warp34_arc_router_effort_total{{effort=\"high\"}} {}\n\
+             # HELP warp34_arc_router_fallbacks_total Router fail-open fallbacks to local\n\
+             # TYPE warp34_arc_router_fallbacks_total counter\n\
+             warp34_arc_router_fallbacks_total {}\n\
+             # HELP warp34_arc_router_cloud_errors_total Upstream cloud proxy errors\n\
+             # TYPE warp34_arc_router_cloud_errors_total counter\n\
+             warp34_arc_router_cloud_errors_total {}",
             rm.total_requests,
             rm.local_requests,
             rm.cloud_requests,
             rm.pii_pinned_requests,
             rm.warm_kv_stayed_local,
-            rm.mean_router_latency_ms
+            rm.mean_router_latency_ms,
+            rm.effort_none,
+            rm.effort_low,
+            rm.effort_medium,
+            rm.effort_high,
+            rm.router_fallbacks,
+            rm.cloud_upstream_errors,
         );
     }
     (
@@ -1307,6 +1328,8 @@ impl OpenAiServerState {
         protocol: crate::arc_router::input::ApiProtocol,
         bypass_header: bool,
         session_key: Option<&str>,
+        anthropic_beta: Option<&str>,
+        force_local: bool,
         body: &mut Value,
     ) -> Result<Option<ArcRouteOutcome>, ApiError> {
         let Some(router) = &self.arc_router else {
@@ -1321,16 +1344,18 @@ impl OpenAiServerState {
         {
             return Ok(None);
         }
-        // KV-cache boundary awareness: if caller carries a warm session key bound to a local worker,
-        // stay local to preserve the resident KV prefix cache.
-        let warm_local_kv = session_key
-            .and_then(|k| self.dp_router.lookup_session(k))
-            .is_some();
+        // KV-cache boundary awareness: stay local when caller carries a warm session key bound
+        // to a local worker, or when continuing a local `previous_response_id` chain.
+        let warm_local_kv = force_local
+            || session_key
+                .and_then(|k| self.dp_router.lookup_session(k))
+                .is_some();
 
         let decision = match router.route(protocol, body, warm_local_kv).await {
             Ok(d) => d,
             Err(e) => {
                 // Fail open to local inference on transient router errors so serving never breaks.
+                router.metrics().record_fallback();
                 eprintln!("[warp34-arc] router fallback to local: {e}");
                 if let Some(obj) = body.as_object_mut()
                     && let Some(m) = obj.get("model").and_then(Value::as_str)
@@ -1354,9 +1379,13 @@ impl OpenAiServerState {
                 if let Some(proxy) = router.proxy()
                     && crate::arc_router::proxy::UpstreamProxy::supports_protocol(ep, protocol)
                 {
-                    let resp = proxy
-                        .forward(ep, protocol, body.clone(), wire, &decision)
+                    let taken_body = std::mem::take(body);
+                    let (resp, is_err) = proxy
+                        .forward(ep, protocol, taken_body, wire, &decision, anthropic_beta)
                         .await;
+                    if is_err {
+                        router.metrics().record_cloud_error();
+                    }
                     return Ok(Some(ArcRouteOutcome::Proxied(resp)));
                 }
             }
@@ -1399,6 +1428,9 @@ impl OpenAiServerState {
                     }
                     crate::arc_router::input::ApiProtocol::OpenAiResponses => {
                         let reasoning = obj.entry("reasoning").or_insert_with(|| json!({}));
+                        if reasoning.is_null() {
+                            *reasoning = json!({});
+                        }
                         if let Some(r_obj) = reasoning.as_object_mut() {
                             r_obj.insert(
                                 "effort".to_string(),
@@ -1407,17 +1439,33 @@ impl OpenAiServerState {
                         }
                     }
                     crate::arc_router::input::ApiProtocol::AnthropicMessages => {
-                        if decision.reasoning_effort == "none" {
-                            obj.insert("thinking".to_string(), json!({ "type": "disabled" }));
-                        } else {
-                            let out_cfg = obj.entry("output_config").or_insert_with(|| json!({}));
-                            if let Some(o_obj) = out_cfg.as_object_mut() {
-                                o_obj.insert(
-                                    "effort".to_string(),
-                                    Value::String(decision.reasoning_effort.clone()),
-                                );
-                            }
-                        }
+                        // Per Anthropic's Messages spec, omitting `thinking` explicitly disables
+                        // thinking — do not override an omitted `thinking` field into enabled.
+                    }
+                }
+            } else if protocol == crate::arc_router::input::ApiProtocol::AnthropicMessages
+                && obj
+                    .get("thinking")
+                    .and_then(|v| v.get("type"))
+                    .and_then(Value::as_str)
+                    == Some("adaptive")
+                && obj
+                    .get("output_config")
+                    .and_then(|v| v.get("effort"))
+                    .is_none_or(Value::is_null)
+            {
+                if decision.reasoning_effort == "none" {
+                    obj.insert("thinking".to_string(), json!({ "type": "disabled" }));
+                } else {
+                    let out_cfg = obj.entry("output_config").or_insert_with(|| json!({}));
+                    if out_cfg.is_null() {
+                        *out_cfg = json!({});
+                    }
+                    if let Some(o_obj) = out_cfg.as_object_mut() {
+                        o_obj.insert(
+                            "effort".to_string(),
+                            Value::String(decision.reasoning_effort.clone()),
+                        );
                     }
                 }
             }
@@ -1431,12 +1479,6 @@ async fn generate(
     request: Request,
     chat: bool,
 ) -> Result<Response, ApiError> {
-    // Held through body consumption and the complete output stream, not just response creation.
-    let admission = s
-        .admission
-        .clone()
-        .try_acquire_owned()
-        .map_err(admission_error)?;
     let bypass_router = request
         .headers()
         .get("x-warp34-bypass-router")
@@ -1455,6 +1497,8 @@ async fn generate(
                 crate::arc_router::input::ApiProtocol::OpenAiChat,
                 bypass_router,
                 session_key.as_deref(),
+                None,
+                false,
                 &mut json,
             )
             .await?
@@ -1466,6 +1510,13 @@ async fn generate(
     } else {
         None
     };
+    // Acquire local GPU admission only after cloud spillover is ruled out so slow cloud TTFB
+    // cannot starve local GPU requests.
+    let admission = s
+        .admission
+        .clone()
+        .try_acquire_owned()
+        .map_err(admission_error)?;
     let prep_state = s.clone();
     let inline_fast = !chat
         && body_len <= 16 * 1024
@@ -2153,11 +2204,6 @@ async fn responses_create(
     State(s): State<Arc<OpenAiServerState>>,
     request: Request,
 ) -> Result<Response, ApiError> {
-    let admission = s
-        .admission
-        .clone()
-        .try_acquire_owned()
-        .map_err(admission_error)?;
     let caller_scope = responses_caller_scope(&s, request.headers());
     let bypass_router = request
         .headers()
@@ -2171,17 +2217,26 @@ async fn responses_create(
         .filter(|s| !s.is_empty())
         .map(|s| format!("sess:{s}"));
     let mut body = read_json(&s, request).await?;
-    let prev_resp_session = body
+    let prev_resp_id = body
         .get("previous_response_id")
         .and_then(Value::as_str)
         .filter(|s| !s.is_empty())
-        .map(|s| format!("resp:{s}"));
-    let session_key = prev_resp_session.or(header_session);
+        .map(ToString::to_string);
+    let has_local_prev_resp = prev_resp_id.as_deref().is_some_and(|id| {
+        s.response_store
+            .get_response(id, caller_scope.as_deref().unwrap_or(""))
+            .is_some()
+    });
+    let session_key = prev_resp_id
+        .map(|id| format!("resp:{id}"))
+        .or(header_session);
     let arc_decision = match s
         .maybe_arc_route(
             crate::arc_router::input::ApiProtocol::OpenAiResponses,
             bypass_router,
             session_key.as_deref(),
+            None,
+            has_local_prev_resp,
             &mut body,
         )
         .await?
@@ -2190,6 +2245,11 @@ async fn responses_create(
         Some(ArcRouteOutcome::Local(d)) => Some(d),
         None => None,
     };
+    let admission = s
+        .admission
+        .clone()
+        .try_acquire_owned()
+        .map_err(admission_error)?;
     let request_id = s.next_request_id.fetch_add(1, Ordering::Relaxed) + 1;
     let (chat_req, mut meta) = crate::responses_api::translate_responses_to_chat(
         &body,
@@ -2525,16 +2585,16 @@ async fn anthropic_messages(
     State(s): State<Arc<OpenAiServerState>>,
     request: Request,
 ) -> Result<Response, ApiError> {
-    let admission = s
-        .admission
-        .clone()
-        .try_acquire_owned()
-        .map_err(|err| to_anthropic_err(admission_error(err)))?;
     let bypass_router = request
         .headers()
         .get("x-warp34-bypass-router")
         .and_then(|v| v.to_str().ok())
         .is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true"));
+    let anthropic_beta = request
+        .headers()
+        .get("anthropic-beta")
+        .and_then(|v| v.to_str().ok())
+        .map(ToString::to_string);
     let session_key = request
         .headers()
         .get("x-session-id")
@@ -2547,6 +2607,8 @@ async fn anthropic_messages(
             crate::arc_router::input::ApiProtocol::AnthropicMessages,
             bypass_router,
             session_key.as_deref(),
+            anthropic_beta.as_deref(),
+            false,
             &mut body,
         )
         .await
@@ -2556,6 +2618,11 @@ async fn anthropic_messages(
         Some(ArcRouteOutcome::Local(d)) => Some(d),
         None => None,
     };
+    let admission = s
+        .admission
+        .clone()
+        .try_acquire_owned()
+        .map_err(|err| to_anthropic_err(admission_error(err)))?;
     let request_id = s.next_request_id.fetch_add(1, Ordering::Relaxed) + 1;
     let (chat_req, mut meta) =
         crate::anthropic_api::translate_anthropic_to_chat(&body, &s.model_name, request_id, true)

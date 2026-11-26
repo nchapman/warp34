@@ -177,12 +177,11 @@ impl SessionPool {
         self.tick
     }
 
-    fn evict_lru_except(&mut self, protect_idx: Option<usize>) -> bool {
+    fn evict_lru(&mut self) -> bool {
         let victim = self
             .sessions
             .iter()
             .enumerate()
-            .filter(|(i, _)| Some(*i) != protect_idx)
             .min_by_key(|(_, s)| s.last_used)
             .map(|(i, _)| i);
         let Some(idx) = victim else {
@@ -194,15 +193,11 @@ impl SessionPool {
         true
     }
 
-    fn ensure_free_pages(&mut self, needed: usize, protect_idx: Option<usize>) -> bool {
+    fn ensure_free_pages(&mut self, needed: usize) -> bool {
         while self.free_pages.len() < needed {
-            // Note: `swap_remove` can move `protect_idx` if it was the last element.
-            let last_idx = self.sessions.len().saturating_sub(1);
-            let adjusted_protect = protect_idx;
-            if !self.evict_lru_except(adjusted_protect) {
+            if !self.evict_lru() {
                 return false;
             }
-            let _ = last_idx;
         }
         true
     }
@@ -297,9 +292,29 @@ fn select_head_tail_blocks(
     }
 
     let tail_budget = max_ctx.saturating_sub(head_len);
-    let mut tail_rev: Vec<(String, Vec<i32>)> = Vec::new();
+    let tail_slice = &block_tokens[head_count..];
+    // Drop from the middle in fixed 4,096-token quanta so long >32K agent trajectories keep a
+    // stable `[head, tail_start..]` prefix across multiple turns instead of cold-prefilling 32K
+    // on every single turn.
+    const DROP_QUANTUM: usize = 4096;
+    let tail_total: usize = tail_slice.iter().map(|(_, t)| t.len()).sum();
+    let min_drop = tail_total.saturating_sub(tail_budget);
+    let target_drop = if min_drop == 0 {
+        0
+    } else {
+        let quantum_drop = min_drop.div_ceil(DROP_QUANTUM) * DROP_QUANTUM;
+        quantum_drop.min(tail_total.saturating_sub(tail_budget / 2).max(min_drop))
+    };
+    let mut dropped = 0usize;
+    let mut start_idx = 0usize;
+    while start_idx + 1 < tail_slice.len() && dropped < target_drop {
+        dropped += tail_slice[start_idx].1.len();
+        start_idx += 1;
+    }
+
+    let mut tail_kept: Vec<(String, Vec<i32>)> = Vec::new();
     let mut tail_len = 0usize;
-    for (role, mut toks) in block_tokens.iter().skip(head_count).rev().cloned() {
+    for (role, mut toks) in tail_slice[start_idx..].iter().cloned() {
         if toks.is_empty() {
             continue;
         }
@@ -308,23 +323,17 @@ fn select_head_tail_blocks(
             break;
         }
         if toks.len() > avail {
-            if tail_rev.is_empty() {
-                let start = toks.len() - avail;
-                toks = toks.split_off(start);
-                tail_len += toks.len();
-                tail_rev.push((role, toks));
-            }
-            break;
+            let cut = toks.len() - avail;
+            toks = toks.split_off(cut);
         }
         tail_len += toks.len();
-        tail_rev.push((role, toks));
+        tail_kept.push((role, toks));
     }
-    tail_rev.reverse();
 
     let mut flat = Vec::with_capacity(head_len + tail_len);
-    let mut offsets = Vec::with_capacity(head_blocks.len() + tail_rev.len());
-    let mut roles = Vec::with_capacity(head_blocks.len() + tail_rev.len());
-    for (role, toks) in head_blocks.into_iter().chain(tail_rev) {
+    let mut offsets = Vec::with_capacity(head_blocks.len() + tail_kept.len());
+    let mut roles = Vec::with_capacity(head_blocks.len() + tail_kept.len());
+    for (role, toks) in head_blocks.into_iter().chain(tail_kept) {
         if toks.is_empty() {
             continue;
         }
@@ -366,6 +375,9 @@ impl ArcEncoderWorker {
                 let mut pool = SessionPool::new(total_pages, ENCODER_MAX_SESSIONS);
 
                 while let Ok(job) = rx.recv() {
+                    if job.reply.is_closed() {
+                        continue;
+                    }
                     let result = (|| -> Result<EncodeResponse, String> {
                         let mut tokenized_blocks = Vec::with_capacity(job.blocks.len());
                         let mut total_prompt_tokens = 0usize;
@@ -409,7 +421,7 @@ impl ArcEncoderWorker {
                             let mut sess = pool.sessions.swap_remove(sess_idx);
                             let extra_pages = pages_needed.saturating_sub(sess.kv_pages.len());
                             if extra_pages > 0 {
-                                if !pool.ensure_free_pages(extra_pages, None) {
+                                if !pool.ensure_free_pages(extra_pages) {
                                     pool.free_slots.push(sess.state_slot);
                                     pool.free_pages.extend(sess.kv_pages);
                                     return Err("ARC encoder KV pool exhausted".to_string());
@@ -464,10 +476,10 @@ impl ArcEncoderWorker {
                         }
 
                         // Cold miss: allocate a fresh slot + KV pages (evicting LRU sessions as needed).
-                        if pool.free_slots.is_empty() && !pool.evict_lru_except(None) {
+                        if pool.free_slots.is_empty() && !pool.evict_lru() {
                             return Err("ARC encoder has no free state slots".to_string());
                         }
-                        if !pool.ensure_free_pages(pages_needed, None) {
+                        if !pool.ensure_free_pages(pages_needed) {
                             return Err("ARC encoder KV pool exhausted".to_string());
                         }
                         let state_slot = pool

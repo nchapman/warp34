@@ -353,7 +353,10 @@ impl ModelsDevRegistry {
         let trimmed = raw_spec.trim();
         let (explicit_tier, rest) = if let Some((lhs, rhs)) = trimmed.split_once('=') {
             let tier = lhs.trim().to_ascii_lowercase();
-            if matches!(tier.as_str(), "fast" | "medium" | "strong" | "frontier") {
+            if matches!(
+                tier.as_str(),
+                "fast" | "cheap" | "small" | "medium" | "mid" | "strong" | "big" | "frontier"
+            ) {
                 (Some(tier), rhs.trim())
             } else {
                 (None, trimmed)
@@ -391,16 +394,21 @@ impl ModelsDevRegistry {
             None
         };
 
-        // Decide `(provider_id, wire_model)`.
+        // Decide `(provider_id, wire_model)`, preserving original URL casing for custom http(s):// endpoints.
         let (provider_id, wire_model) = match forced_upstream {
             Some(up) if !up.eq_ignore_ascii_case("auto") => {
-                let up_lc = up.to_ascii_lowercase();
-                if up_lc == "openrouter" {
-                    ("openrouter".to_string(), rest.to_string())
-                } else if prefix_prov == Some(up_lc.as_str()) {
-                    (up_lc, suffix_model.to_string())
+                let is_url = up.starts_with("http://") || up.starts_with("https://");
+                let prov_key = if is_url {
+                    up.trim_end_matches('/').to_string()
                 } else {
-                    (up_lc, rest.to_string())
+                    up.to_ascii_lowercase()
+                };
+                if prov_key == "openrouter" {
+                    ("openrouter".to_string(), rest.to_string())
+                } else if prefix_prov == Some(prov_key.as_str()) {
+                    (prov_key, suffix_model.to_string())
+                } else {
+                    (prov_key, rest.to_string())
                 }
             }
             _ => {
@@ -483,8 +491,15 @@ impl ModelsDevRegistry {
                         .any(|e| env_lookup(e).is_some_and(|v| !v.is_empty()))
                 })
         };
-        let target = forced_upstream.filter(|u| !u.eq_ignore_ascii_case("auto"));
-        match target {
+        let target_lc = forced_upstream
+            .map(|u| u.trim().to_ascii_lowercase())
+            .filter(|u| !u.is_empty() && u != "auto");
+        match target_lc.as_deref() {
+            Some("local" | "none") => Vec::new(),
+            Some("openrouter") => vec![
+                "anthropic/claude-sonnet-5.5".to_string(),
+                "anthropic/claude-opus-5.5".to_string(),
+            ],
             Some("anthropic") => vec![
                 "anthropic/claude-haiku-5.5".to_string(),
                 "anthropic/claude-sonnet-5.5".to_string(),
@@ -677,6 +692,7 @@ fn cache_file_path() -> Option<PathBuf> {
 }
 
 fn fetch_models_dev_blocking() -> Option<Vec<u8>> {
+    const MAX_REGISTRY_BYTES: usize = 32 * 1024 * 1024;
     // Run a tiny async reqwest fetch on an isolated current-thread runtime so calling from
     // either sync startup code or inside a tokio runtime never panics.
     std::thread::spawn(|| {
@@ -693,7 +709,14 @@ fn fetch_models_dev_blocking() -> Option<Vec<u8>> {
             if !resp.status().is_success() {
                 return None;
             }
-            resp.bytes().await.ok().map(|b| b.to_vec())
+            if resp
+                .content_length()
+                .is_some_and(|n| n as usize > MAX_REGISTRY_BYTES)
+            {
+                return None;
+            }
+            let bytes = resp.bytes().await.ok()?;
+            (bytes.len() <= MAX_REGISTRY_BYTES).then(|| bytes.to_vec())
         })
     })
     .join()
@@ -704,7 +727,7 @@ fn write_cache_atomic(path: &PathBuf, bytes: &[u8]) {
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    let tmp = path.with_extension("json.tmp");
+    let tmp = path.with_extension(format!("json.{}.tmp", std::process::id()));
     if std::fs::write(&tmp, bytes).is_ok() {
         let _ = std::fs::rename(&tmp, path);
     }
@@ -824,5 +847,28 @@ mod tests {
         assert!(!ds.capabilities.supports_image);
         assert_eq!(ds.capabilities.clamp_effort("medium"), "low");
         assert_eq!(infer_tier_from_prices(ds.prices.unwrap()), "fast");
+
+        assert_eq!(
+            reg.default_models_for_env(Some("openrouter"), |_| None),
+            vec!["anthropic/claude-sonnet-5.5", "anthropic/claude-opus-5.5"]
+        );
+        assert!(
+            reg.default_models_for_env(Some("local"), |_| Some("k".to_string()))
+                .is_empty()
+        );
+
+        // Custom URL preserves case-sensitive path segments.
+        let custom = reg
+            .resolve_spec(
+                "my-model",
+                Some("https://Gateway.Example.com/CustomPath/v1"),
+                None,
+                |_| None,
+            )
+            .expect("custom url");
+        assert_eq!(
+            custom.endpoint.base_url,
+            "https://Gateway.Example.com/CustomPath/v1"
+        );
     }
 }

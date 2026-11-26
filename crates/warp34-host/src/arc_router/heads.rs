@@ -528,7 +528,15 @@ impl StageOneHead {
             .ok_or_else(|| "empty stage_one.ens_point".to_string())?;
         let ens_point: Vec<usize> = read_i64(archive, &p("ens_point"), &[points])?
             .into_iter()
-            .map(|i| usize::try_from(i).map_err(|_| format!("invalid ens_point {i}")))
+            .map(|i| {
+                let idx = usize::try_from(i).map_err(|_| format!("invalid ens_point {i}"))?;
+                if idx >= m {
+                    return Err(format!(
+                        "stage_one.ens_point {idx} out of range (members={m})"
+                    ));
+                }
+                Ok(idx)
+            })
             .collect::<Result<_, _>>()?;
 
         let orderer = Orderer {
@@ -691,11 +699,11 @@ impl StageOneHead {
             }
         }
 
-        let points = self.ens_point.len();
         Ok((0..c_count)
             .map(|c| {
                 let (mut total, mut count) = (0.0, 0usize);
                 let mut legs = [0.0; LEGS];
+                let mut leg_counts = [0usize; LEGS];
                 for (i, &member) in self.ens_point.iter().enumerate() {
                     let mapped = platt_f64(
                         p[member * c_count + c],
@@ -707,8 +715,18 @@ impl StageOneHead {
                         total += mapped;
                         count += 1;
                     }
-                    for (leg, sum) in legs.iter_mut().enumerate() {
-                        *sum += usage[(member * c_count + c) * LEGS + leg];
+                    for leg in 0..LEGS {
+                        let v = usage[(member * c_count + c) * LEGS + leg];
+                        if v.is_finite() {
+                            legs[leg] += v;
+                            leg_counts[leg] += 1;
+                        }
+                    }
+                }
+                let mut avg_legs = [f64::NAN; LEGS];
+                for leg in 0..LEGS {
+                    if leg_counts[leg] > 0 {
+                        avg_legs[leg] = legs[leg] / leg_counts[leg] as f64;
                     }
                 }
                 StageOnePrediction {
@@ -717,7 +735,7 @@ impl StageOneHead {
                     } else {
                         f64::NAN
                     },
-                    usage: legs.map(|sum| sum / points as f64),
+                    usage: avg_legs,
                 }
             })
             .collect())

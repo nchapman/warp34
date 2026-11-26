@@ -78,12 +78,31 @@ fn canonical_serializer_formats_openai_anthropic_and_responses() {
         }]
     });
     let media_turn = serialize_request(ApiProtocol::OpenAiChat, &media_req);
+    assert!(media_turn.has_images);
     assert!(
         media_turn.serialized_text().len() < 256,
         "base64 media payload was not bounded: {} bytes",
         media_turn.serialized_text().len()
     );
+}
 
+#[test]
+fn responses_reasoning_item_maps_to_assistant() {
+    let resp_reasoning = serde_json::json!({
+        "input": [
+            {"role": "user", "content": "Solve x+1=2"},
+            {"type": "reasoning", "summary": [{"type": "summary_text", "text": "x must be 1"}]},
+            {"role": "assistant", "content": "x = 1"}
+        ]
+    });
+    let rturn = serialize_request(ApiProtocol::OpenAiResponses, &resp_reasoning);
+    assert_eq!(rturn.blocks.len(), 2);
+    assert_eq!(rturn.blocks[1].role, "assistant");
+    assert!(rturn.blocks[1].content.contains("x must be 1"));
+}
+
+#[test]
+fn canonical_serializer_handles_anthropic_and_responses() {
     let anth = serde_json::json!({
         "system": "Sys prompt",
         "messages": [{"role": "user", "content": [{"type": "text", "text": "Hi"}]}]
@@ -162,6 +181,7 @@ fn heads_catalog_slot_inference_and_policy_invariants() {
             block_roles: &roles,
             prompt_tokens: 128,
             has_tools: false,
+            has_images: false,
             warm_local_kv: true,
             local_slot: 54,
             cloud_candidates: &or_slots,

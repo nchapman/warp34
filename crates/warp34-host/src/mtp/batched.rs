@@ -244,7 +244,7 @@ impl Qwen3_5MtpRank {
         check_rc(
             // SAFETY: qkv_proj_buf and output buffers span total_tokens strided rows on t.stream.
             unsafe {
-                ffi::warp34_fused_qk_rmsnorm_rope_gate_strided_f16(
+                ffi::warp34_fused_qk_rmsnorm_rope_gate_strided_yarn_f16(
                     &ex,
                     q_gate_ptr as *const c_void,
                     k_raw_ptr as *const c_void,
@@ -268,6 +268,10 @@ impl Qwen3_5MtpRank {
                     qkv_row_stride,
                     t.cfg.rope_theta,
                     t.cfg.rms_norm_eps,
+                    t.cfg.yarn_factor,
+                    t.cfg.yarn_low,
+                    t.cfg.yarn_inv_span,
+                    t.cfg.yarn_mscale,
                 )
             },
             "MTP batched ingest rope",
@@ -674,7 +678,7 @@ impl Qwen3_5MtpRank {
         check_rc(
             // SAFETY: qkv_proj_buf and output buffers hold b_reqs strided rows on t.stream.
             unsafe {
-                ffi::warp34_fused_qk_rmsnorm_rope_gate_strided_f16(
+                ffi::warp34_fused_qk_rmsnorm_rope_gate_strided_yarn_f16(
                     ex,
                     q_gate_ptr as *const c_void,
                     k_raw_ptr as *const c_void,
@@ -698,6 +702,10 @@ impl Qwen3_5MtpRank {
                     qkv_row_stride,
                     t.cfg.rope_theta,
                     t.cfg.rms_norm_eps,
+                    t.cfg.yarn_factor,
+                    t.cfg.yarn_low,
+                    t.cfg.yarn_inv_span,
+                    t.cfg.yarn_mscale,
                 )
             },
             "MTP batched rope",

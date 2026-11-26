@@ -266,7 +266,7 @@ impl Qwen3_5MtpRank {
             check_rc(
                 // SAFETY: q_gate_ptr, k_raw_ptr, and output buffers are valid strided device buffers for 1 token, positions_ptr contains valid position on t.stream.
                 unsafe {
-                    ffi::warp34_fused_qk_rmsnorm_rope_gate_strided_f16(
+                    ffi::warp34_fused_qk_rmsnorm_rope_gate_strided_yarn_f16(
                         &ex,
                         q_gate_ptr as *const c_void,
                         k_raw_ptr as *const c_void,
@@ -290,6 +290,10 @@ impl Qwen3_5MtpRank {
                         qkv_row_stride,
                         t.cfg.rope_theta,
                         t.cfg.rms_norm_eps,
+                        t.cfg.yarn_factor,
+                        t.cfg.yarn_low,
+                        t.cfg.yarn_inv_span,
+                        t.cfg.yarn_mscale,
                     )
                 },
                 "warp34_fused_qk_rmsnorm_rope_gate_strided_f16",
@@ -1261,7 +1265,7 @@ impl Qwen3_5MtpRank {
         check_rc(
             // SAFETY: q_gate_ptr, k_raw_ptr, and output buffers are valid strided device buffers.
             unsafe {
-                ffi::warp34_fused_qk_rmsnorm_rope_gate_strided_f16(
+                ffi::warp34_fused_qk_rmsnorm_rope_gate_strided_yarn_f16(
                     &ex,
                     q_gate_ptr as *const c_void,
                     k_raw_ptr as *const c_void,
@@ -1285,6 +1289,10 @@ impl Qwen3_5MtpRank {
                     qkv_row_stride,
                     t.cfg.rope_theta,
                     t.cfg.rms_norm_eps,
+                    t.cfg.yarn_factor,
+                    t.cfg.yarn_low,
+                    t.cfg.yarn_inv_span,
+                    t.cfg.yarn_mscale,
                 )
             },
             "warp34_fused_qk_rmsnorm_rope_gate_strided_f16 (MTP)",
