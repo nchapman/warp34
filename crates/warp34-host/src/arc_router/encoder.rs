@@ -3,11 +3,11 @@
 //! Runs `nchapman/ARC-1.0-W4A16-HGPTQ` (12 layers, 1024 hidden dim, W4A16-HGPTQ, no `lm_head`,
 //! offloaded host `embed_tokens` + 96 MiB scratch arena) with:
 //! - Per-block readout extraction + head+tail 32K context windowing
-//! - Multi-session LRU KV+GDN prefix cache (8 resident sessions sharing a 4,096-page KV pool)
+//! - Multi-session LRU KV+GDN prefix cache (16 resident sessions sharing a 4,096-page KV pool)
 //!   so concurrent agent workers only prefill newly appended turns (~3–10 ms)
 //! - Bounded per-block tokenization memo (`>= 256 B`, 32 MiB cap)
 
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", test))]
 use std::collections::HashMap;
 use std::sync::mpsc;
 use std::time::Duration;
@@ -15,15 +15,15 @@ use std::time::Duration;
 use super::input::ArcRoleBlock;
 
 const ENCODER_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
-/// 4,096 KV pages × 16 tokens/page = 65,536 total tokens across up to 8 concurrent sessions.
-#[cfg(feature = "cuda")]
+/// 4,096 KV pages × 16 tokens/page = 65,536 total tokens across up to 16 concurrent sessions.
+#[cfg(any(feature = "cuda", test))]
 const ENCODER_KV_PAGES: usize = 4096;
 /// Max tokens per individual session (leaves headroom for concurrent sessions in the pool).
 #[cfg(feature = "cuda")]
 const ENCODER_PER_SESSION_MAX_CTX: usize = 32_768;
-/// Resident LRU GDN+KV sessions (handles 6–8 concurrent SWE-bench/agent workers without thrashing).
-#[cfg(feature = "cuda")]
-const ENCODER_MAX_SESSIONS: usize = 8;
+/// Resident LRU GDN+KV sessions (2× headroom over typical 2-card 8-worker concurrency; ~24 MiB extra GDN state).
+#[cfg(any(feature = "cuda", test))]
+const ENCODER_MAX_SESSIONS: usize = 16;
 /// Cap per-block tokenization memo at ~32 MiB of serialized text + token IDs.
 #[cfg(feature = "cuda")]
 const BLOCK_MEMO_MAX_BYTES: usize = 32 * 1024 * 1024;
@@ -144,7 +144,7 @@ impl BlockTokenMemo {
     }
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", test))]
 struct ResidentSession {
     state_slot: usize,
     kv_pages: Vec<i32>,
@@ -153,7 +153,7 @@ struct ResidentSession {
     last_used: u64,
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", test))]
 struct SessionPool {
     sessions: Vec<ResidentSession>,
     free_slots: Vec<usize>,
@@ -161,7 +161,7 @@ struct SessionPool {
     tick: u64,
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", test))]
 impl SessionPool {
     fn new(total_pages: usize, max_sessions: usize) -> Self {
         Self {
@@ -551,5 +551,53 @@ impl ArcEncoderWorker {
             .await
             .map_err(|_| "ARC encoder timed out".to_string())?
             .map_err(|_| "ARC encoder dropped response".to_string())?
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn session_pool_handles_16_concurrent_interleaved_sessions_without_thrashing() {
+        let mut pool = SessionPool::new(ENCODER_KV_PAGES, ENCODER_MAX_SESSIONS);
+        assert_eq!(ENCODER_MAX_SESSIONS, 16);
+
+        // Insert 16 distinct 128-token sessions (8 KV pages each = 128 pages total).
+        for s in 0..16usize {
+            let tokens: Vec<i32> = (0..128).map(|i| (s as i32) * 10_000 + i).collect();
+            let pages_needed = tokens.len().div_ceil(16);
+            assert!(pool.ensure_free_pages(pages_needed));
+            let state_slot = pool.free_slots.pop().expect("slot available for <=16");
+            let kv_pages = pool.allocate_pages(pages_needed);
+            let tick = pool.next_tick();
+            let mut readouts = HashMap::new();
+            readouts.insert(127, vec![s as f32; 4]);
+            pool.sessions.push(ResidentSession {
+                state_slot,
+                kv_pages,
+                tokens,
+                readouts,
+                last_used: tick,
+            });
+        }
+        assert_eq!(pool.sessions.len(), 16);
+        assert!(pool.free_slots.is_empty());
+
+        // Every one of the 16 sessions hits its prefix when extended with a new turn.
+        for s in 0..16usize {
+            let mut ext: Vec<i32> = (0..128).map(|i| (s as i32) * 10_000 + i).collect();
+            ext.extend((0..32).map(|i| (s as i32) * 10_000 + 128 + i));
+            let hit = pool.find_best_prefix(&ext, &[127, 159]);
+            assert!(
+                matches!(hit, Some((_, false))),
+                "session {s} should hit strict prefix without eviction"
+            );
+        }
+
+        // 17th session gracefully evicts LRU (session 0) and reclaims its slot + KV pages.
+        assert!(pool.evict_lru());
+        assert_eq!(pool.free_slots.len(), 1);
+        assert_eq!(pool.sessions.len(), 15);
     }
 }
