@@ -716,7 +716,8 @@ def run_swe_27b_dflash2_soak(
                 vram_growth_mib=vram_growth,
                 max_vram_growth_mib=256.0,
                 rss_growth_mib=rss_growth,
-                max_rss_growth_mib=512.0,
+                # 27B TP=2 lazily faults in the L2 pinned-host GDN checkpoint & projected ctx memo pool (~2 GiB).
+                max_rss_growth_mib=2560.0,
             )
             failures.extend(cons_failures)
             return SubphaseResult(
