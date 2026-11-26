@@ -1,16 +1,16 @@
 # warp34
 
-A [fast](#performance) single-binary inference engine for **Qwen 3.5–3.8 Flash-Next** on **NVIDIA RTX 30 and 40-series GPUs**—outperforming `vLLM`, `SGLang`, and `llama.cpp` across prefill, decode, continuous batching, and long-context coding agents.
+A [fast](#performance) single-binary inference engine for **Qwen 3.5–3.8 Flash-Next**, **PrismML Ternary Bonsai**, and **Qwen-Image-2.1** on **NVIDIA RTX 30/40-series and A100 GPUs**—outperforming `vLLM`, `SGLang`, and `llama.cpp` across prefill, decode, continuous batching, and long-context coding agents.
 
 [![Release](https://img.shields.io/github/v/release/nchapman/warp34.svg)](https://github.com/nchapman/warp34/releases/latest)
 [![Docker](https://github.com/nchapman/warp34/actions/workflows/docker.yml/badge.svg)](https://github.com/nchapman/warp34/actions/workflows/docker.yml)
 [![License: Apache-2.0](https://img.shields.io/badge/License-Apache--2.0-blue.svg)](LICENSE)
-[![CUDA](https://img.shields.io/badge/CUDA-sm__86%20%7C%20sm__89-76b900.svg)](docs/HARDWARE.md)
+[![CUDA](https://img.shields.io/badge/CUDA-sm__80%20%7C%20sm__86%20%7C%20sm__89-76b900.svg)](docs/HARDWARE.md)
 [![Models on HF](https://img.shields.io/badge/Hugging%20Face-nchapman%2Fmodels-ffd21e.svg)](https://huggingface.co/nchapman/models)
 
-[Quickstart](#quickstart) · [Models](#pick-a-model-for-your-gpu) · [Performance](#performance) · [APIs & Agents](#apis--coding-agents) · [Docs](#documentation)
+[Quickstart](#quickstart) · [Models](#pick-a-model-for-your-gpu) · [Images](#image-generation--editing) · [Performance](#performance) · [APIs & Agents](#apis--coding-agents) · [Docs](#documentation)
 
-Written in Rust and CUDA with zero Python and zero NCCL. Built specifically for Qwen's hybrid Gated DeltaNet + full-attention architecture on RTX 30-series (`sm_86`) and RTX 40-series (`sm_89`) NVIDIA GPUs.
+Written in Rust and CUDA with zero Python and zero NCCL. Built specifically for Qwen's hybrid Gated DeltaNet + full-attention LLMs and `Qwen-Image-2.1` diffusion on `sm_80`, `sm_86`, and `sm_89` GPUs.
 
 ![warp34 embedded web dashboard](docs/assets/dashboard.png)
 
@@ -18,7 +18,7 @@ Written in Rust and CUDA with zero Python and zero NCCL. Built specifically for 
 
 ## Quickstart
 
-**Requirements:** Linux `x86_64` (AVX2/FMA), an NVIDIA RTX 30 or 40-series GPU, and a CUDA 13-capable driver (R580+).
+**Requirements:** Linux `x86_64` (AVX2/FMA), an NVIDIA A100 or RTX 30/40-series GPU, and a CUDA 13-capable driver (R580+).
 
 > The examples below use `Qwen3.8-27B-W4A16-HGPTQ` (24 GB GPU). On **8–16 GB GPUs**, swap in a smaller checkpoint from [Pick a Model for Your GPU](#pick-a-model-for-your-gpu).
 
@@ -54,7 +54,7 @@ mise install && mise run build
 ./target/release/warp34 serve nchapman/Qwen3.8-27B-W4A16-HGPTQ
 ```
 
-*(Tip: set `WARP34_ARCH=sm_89` or `sm_86` before `mise run build` to compile only your GPU arch.)*
+*(Tip: set `WARP34_ARCH=sm_80`, `sm_86`, or `sm_89` before `mise run build` to compile only your GPU arch.)*
 
 ### Verify
 
@@ -76,11 +76,12 @@ Open **`http://127.0.0.1:8000/`** for the live dashboard, **`/playground`** to t
 
 ## Highlights
 
-- **Purpose-built CUDA kernels:** Shared-weight `W4A8`/`W2A8` INT8 IMMA prefill, Marlin quantized decode, fused GDN recurrence, and lossless `MTP-3` / `DFlash2` speculation.
+- **Purpose-built CUDA kernels:** Shared-weight `W4A8`/`W2A8` INT8 IMMA prefill, Marlin `W4A16`/`W2A16` decode, native `1.75 bpw` 5-Trit ternary GEMV/MMA, fused GDN recurrence, and lossless `MTP-3` / batched `DFlash2` speculation.
 - **Zero-config VRAM & long context:** Built-in 4-bit TurboQuant KV (`tq4`, 3.07× compression) and an automatic memory planner fit Vision, `MTP-3`, and `128K–256K` context on one card with zero flags.
 - **180B `Qwen3.8-Flash-Next` on 1–2 consumer GPUs:** Streams n-gram tables via `mmap`, caches hot experts in VRAM, prefetches cold experts over PCIe, and evaluates misses on AVX-512/AVX2 CPU.
-- **All APIs in one binary:** OpenAI Chat/Completions, OpenAI Responses, Anthropic Messages (with `<think>`-aware XGrammar structured outputs & tool constraints), and zero-decode `/v1/systemone` & `/v1/decisions` classifiers.
-- **Multi-GPU & Multi-LoRA:** Native `TP=2`/`TP=4` without NCCL or `--ipc=host`, plus up to **62 hot-swappable LoRA adapters** (`--lora-modules`).
+- **Native image generation & editing (`Qwen-Image-2.1`):** Full text-to-image, single/multi-image editing, and 4-channel RGBA transparency via CLI (`warp34 image`), OpenAI `/v1/images/*`, and 1-click Web Playground editing.
+- **All APIs in one binary:** OpenAI Chat/Completions, Responses, and Images, Anthropic Messages (with `<think>`-aware XGrammar structured outputs & tool constraints), and zero-decode `/v1/systemone` & `/v1/decisions` classifiers.
+- **Multi-GPU & Multi-LoRA:** Native `TP=2`/`TP=4` and in-process Data Parallelism (`--dp` with shared Host-RAM prefix pool) without NCCL or `--ipc=host`, plus up to **62 hot-swappable LoRA adapters** (`--lora-modules`).
 
 ---
 
@@ -90,11 +91,26 @@ All checkpoints below come from [`nchapman/models`](https://huggingface.co/nchap
 
 | GPU VRAM | Recommended Checkpoint (`nchapman/...`) | Footprint (`128K tq4`) | Notes |
 |---|---|---:|---|
-| **8 GB** | `Qwen3.5-9B-W2.6A16-HGPTQ-RCO` | `6.0 GiB` | Vision + `MTP-3` + `128K` on 8 GB |
-| **12 GB** | `Qwen3.5-9B-W4A16-HGPTQ` | `8.6 GiB` | Full 4-bit quality; alt: `Qwen3.8-27B-W2.2A16-HGPTQ-RCO` (`64K`) |
+| **8 GB** | `Qwen3.5-9B-W2.6A16-HGPTQ-RCO` | `6.0 GiB` | Vision + `MTP-3` + `128K` on 8 GB; ultra-compact alt: `Ternary-Bonsai-2-9B-warp34` (`1.75 bpw`) |
+| **12 GB** | `Qwen3.5-9B-W4A16-HGPTQ` | `8.6 GiB` | Full 4-bit quality; 27B alts: `Ternary-Bonsai-2.5-27B-warp34` (`1.75 bpw`) or `Qwen3.8-27B-W2.2A16-HGPTQ-RCO` |
 | **16 GB** | `Qwen3.8-27B-W2.6A16-HGPTQ-RCO` | `14.6 GiB` | Flagship 27B; fast MoE alt: `Qwen3.6-35B-A3B-W2.6A16-HGPTQ-RCO` |
 | **1× 24 GB** | `Qwen3.8-27B-W4A16-HGPTQ` | `~19 GiB` | Flagship 27B (`128K–256K`); also fits `35B-A3B` W4 or `180B Flash-Next` W2.6 |
 | **2× 24 GB** (`--tp 2`) | `Qwen3.8-Flash-Next-W2.6A16-HGPTQ-RCO` | `20.8 GiB/GPU` | Flagship 180B MoE + `128K–256K` + `MTP-3` / `DFlash2` |
+
+**PrismML Ternary Bonsai (`1.75 bpw` native 5-Trit):** `Ternary-Bonsai-2-2B-warp34`, `Ternary-Bonsai-2-4B-warp34`, `Ternary-Bonsai-2-9B-warp34`, and `Ternary-Bonsai-2.5-27B-warp34` run directly with `warp34 serve nchapman/<model>` (automatic `MTP-3` on `4B`/`9B`/`27B`).
+
+### Image Generation & Editing
+
+`warp34` runs **`Qwen-Image-2.1`** and **`Qwen-Image-2.1-Turbo`** for text-to-image, single/multi-image editing, and native RGBA transparency—use `nchapman/Qwen-Image-2.1-Turbo-W4A16-HGPTQ` or `nchapman/Qwen-Image-2.1-W4A16-HGPTQ` (`~10 GiB` weights, fits on 1× 16–24 GB GPU), or upstream `Qwen/Qwen-Image-2.1*` (`BF16`, `2× 24 GB` `--tp 2` or `A100 80 GB`):
+
+```sh
+# CLI generation (add --image input.png to edit, --rgba for transparent PNG)
+warp34 image nchapman/Qwen-Image-2.1-Turbo-W4A16-HGPTQ \
+  -p "A macro photo of a mechanical watch" --size 1024x1024 -o watch.png
+
+# OpenAI-compatible HTTP server (/v1/images/generations, /v1/images/edits, & Web Playground)
+warp34 serve nchapman/Qwen-Image-2.1-Turbo-W4A16-HGPTQ
+```
 
 ---
 
@@ -159,7 +175,7 @@ End-to-end HTTP serving p50 (`tok/s`, `W4A16-HGPTQ`):
 
 A single `warp34 serve` instance speaks all protocols simultaneously with shared hybrid prefix caching:
 
-- **OpenAI:** `/v1/chat/completions`, `/v1/completions`, `/v1/responses`
+- **OpenAI:** `/v1/chat/completions`, `/v1/completions`, `/v1/responses`; `/v1/images/generations` & `/v1/images/edits` *(when serving `Qwen-Image-2.1`)*
 - **Anthropic:** `/v1/messages`, `/v1/messages/count_tokens` (native `thinking` + `tool_use`, strips Claude Code billing headers so prefix caches stay warm)
 - **Decisions:** `/v1/systemone`, `/v1/decisions` (single-prefill zero-decode classification)
 - **UI & Metrics:** `/` dashboard, `/playground`, `/connect`, `/metrics` (Prometheus)
@@ -178,9 +194,9 @@ Common flags (`--tp 2`, `--draft-model`, `--lora-modules`, `--api-key-env`, `--o
 
 ## Scope & Limitations
 
-- **Qwen hybrid family only:** Qwen 3.5–3.8, `Qwen3.8-Flash-Next`, and `GLiDE`/`d3` decision models. For Llama, Mistral, Gemma, or DeepSeek, use `vLLM`, `SGLang`, or `llama.cpp`.
-- **Hardware & OS:** Linux `x86_64` with NVIDIA RTX 30-series (`sm_86`) or RTX 40-series (`sm_89`) GPUs. No macOS, Windows, ROCm, or pre-Ampere support.
-- **Single-node only:** Supports `TP=1`, `TP=2`, and `TP=4` on one machine; multi-node distributed serving is out of scope.
+- **Qwen family only:** Qwen 3.5–3.8, `Qwen3.8-Flash-Next`, `PrismML Ternary Bonsai` (Qwen-architecture), `Qwen-Image-2.1`, and `GLiDE`/`d3` decision models. For Llama, Mistral, Gemma, or DeepSeek, use `vLLM`, `SGLang`, or `llama.cpp`.
+- **Hardware & OS:** Linux `x86_64` with NVIDIA A100 (`sm_80`), RTX 30-series (`sm_86`), or RTX 40-series (`sm_89`) GPUs. No macOS, Windows, ROCm, or pre-Ampere support.
+- **Single-node only:** Supports `TP=1`/`2`/`4` and in-process `--dp` on one machine; multi-node distributed serving is out of scope.
 
 ---
 
