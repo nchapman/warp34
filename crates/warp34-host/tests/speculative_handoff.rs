@@ -1687,11 +1687,20 @@ fn mtp_plain_memo_siblings_and_dp_l2_warmup_and_hol_yield_regressions() {
             )
             .unwrap();
         let mut prefix_out = Vec::new();
-        while prefix_out.len() < 2 {
-            if let Some(GenerationEvent::Token { id, .. }) = active_mtp.events.recv().await {
-                prefix_out.push(id);
+        tokio::time::timeout(Duration::from_secs(30), async {
+            while prefix_out.len() < 2 {
+                match active_mtp.events.recv().await {
+                    Some(GenerationEvent::Token { id, .. }) => prefix_out.push(id),
+                    Some(GenerationEvent::Finished { .. }) => {
+                        panic!("active_mtp finished early before 2 tokens")
+                    }
+                    Some(GenerationEvent::Error(e)) => panic!("active_mtp errored early: {e}"),
+                    None => panic!("active_mtp stream closed before 2 tokens"),
+                }
             }
-        }
+        })
+        .await
+        .expect("timed out waiting for first 2 active_mtp tokens");
         let mut unwarmed_req = distinct_2120[..2112].to_vec();
         unwarmed_req.extend_from_slice(&base_ids[..16]);
         let mut s_unwarmed = w2
@@ -1754,30 +1763,37 @@ fn non_gdn_l2_hydration_allocates_unique_state_slots_without_corrupting_pool() {
         8,
     )
     .unwrap();
-    // Configure `e0` as a pure full-attention + PLE model (`!is_hybrid_gdn && uses_ple()`).
+    // Configure `e0` as a pure full-attention + PLE model (`!is_hybrid_gdn && uses_ple()`),
+    // and truncate `kv_pool` downward to verify immutable page strides on truncated TP ranks.
     e0.cfg.num_hidden_layers = e0.cfg.num_full_attention_layers();
     e0.cfg.ple_embed_dim = 64;
     e0.cfg.ple_layer_ids = vec![0];
-    let slots0 = e0.ranks[0].state_pool.total_slots;
-    e0.ranks[0]
-        .state_pool
-        .ple_ngram_context
-        .resize(slots0, [0, 0]);
+    e0.ranks[0].kv_pool.truncate_pages(96);
+    e0.ranks[0].state_pool.init_ple_state(64, 0).unwrap();
     e0.ranks[0].checkpoint_pool = None;
     assert!(!e0.has_checkpoint_pool());
     e0.set_dp_prefix_pool(0, Arc::clone(&l2));
 
-    // Publish two distinct 256-token prefixes from e0 into L2 with distinct PLE n-gram contexts.
+    // Publish two distinct 256-token prefixes from e0 into L2 with distinct PLE n-gram contexts
+    // AND distinct nonzero `ple_conv_state` buffers.
+    let ple_slot_bytes = e0.ranks[0].state_pool.ple_conv_slot_bytes();
+    assert!(ple_slot_bytes > 0);
+    let conv_a = vec![0xA5u8; ple_slot_bytes];
+    let conv_b = vec![0x5Au8; ple_slot_bytes];
     let seq_a: Vec<i32> = (10..266).collect();
     let seq_b: Vec<i32> = (500..756).collect();
     let mut rad0 = warp34_host::radix::MambaRadixCache::new(16, 64);
-    for (seq, ple_ctx) in [(&seq_a, [42, 99]), (&seq_b, [77, 88])] {
+    for (seq, ple_ctx, conv_bytes) in [(&seq_a, [42, 99], &conv_a), (&seq_b, [77, 88], &conv_b)] {
         let mut pages = Vec::with_capacity(16);
         for _ in 0..16 {
             pages.push(e0.ranks[0].kv_pool.alloc_page().unwrap());
         }
         let slot = e0.alloc_state_slot_from(&mut rad0).unwrap();
         e0.ranks[0].state_pool.ple_ngram_context[slot as usize] = ple_ctx;
+        e0.ranks[0]
+            .state_pool
+            .import_ple_conv_host_bytes_to_slot(slot, conv_bytes, &e0.ranks[0].stream)
+            .unwrap();
         let ins = rad0.insert(seq, &pages, &[], slot, 0);
         e0.try_publish_radix_node_to_shared_pool_with_features(
             &rad0,
@@ -1791,8 +1807,8 @@ fn non_gdn_l2_hydration_allocates_unique_state_slots_without_corrupting_pool() {
     assert_eq!(l2.stats().entries, 2);
 
     // Hydrate BOTH prefixes onto e1 while slot 0 is actively owned by an in-flight sequence,
-    // verify PLE contexts round-trip into distinct `state_pool` slots (`!= 0`), then evict the
-    // radix cache and verify `state_pool.free_count()` never pushes duplicate `0`s!
+    // verify PLE contexts AND `ple_conv_state` round-trip into distinct `state_pool` slots (`!= 0`),
+    // then evict the radix cache and verify `state_pool.free_count()` never pushes duplicate `0`s!
     let mut e1 = Qwen3_5Engine::load_for_serving(
         "Qwen/Qwen3.5-4B",
         1,
@@ -1805,17 +1821,19 @@ fn non_gdn_l2_hydration_allocates_unique_state_slots_without_corrupting_pool() {
     e1.cfg.num_hidden_layers = e1.cfg.num_full_attention_layers();
     e1.cfg.ple_embed_dim = 64;
     e1.cfg.ple_layer_ids = vec![0];
-    let slots1 = e1.ranks[0].state_pool.total_slots;
-    e1.ranks[0]
-        .state_pool
-        .ple_ngram_context
-        .resize(slots1, [0, 0]);
+    e1.ranks[0].kv_pool.truncate_pages(80);
+    e1.ranks[0].state_pool.init_ple_state(64, 0).unwrap();
     e1.ranks[0].checkpoint_pool = None;
     e1.set_dp_prefix_pool(1, Arc::clone(&l2));
     let total_slots = e1.ranks[0].state_pool.total_slots;
     let active_slot = e1.ranks[0].state_pool.alloc_slot().unwrap();
     assert_eq!(active_slot, 0);
+    let conv_active = vec![0xCCu8; ple_slot_bytes];
     e1.ranks[0].state_pool.ple_ngram_context[0] = [111, 222];
+    e1.ranks[0]
+        .state_pool
+        .import_ple_conv_host_bytes_to_slot(0, &conv_active, &e1.ranks[0].stream)
+        .unwrap();
 
     let mut q_a = seq_a.clone();
     q_a.push(999);
@@ -1836,6 +1854,14 @@ fn non_gdn_l2_hydration_allocates_unique_state_slots_without_corrupting_pool() {
         [111, 222],
         "active slot 0 PLE context must not be clobbered by !is_hybrid_gdn L2 hydration"
     );
+    assert_eq!(
+        e1.ranks[0]
+            .state_pool
+            .export_ple_conv_slot_to_host_bytes(0, &e1.ranks[0].stream)
+            .unwrap(),
+        conv_active,
+        "active slot 0 PLE conv state must not be clobbered"
+    );
     let node_a = rad.match_prefix(&seq_a).last_node;
     let node_b = rad.match_prefix(&seq_b).last_node;
     let (_, _, slot_a) = rad.node_kv_pages_and_mamba(node_a).unwrap();
@@ -1850,6 +1876,20 @@ fn non_gdn_l2_hydration_allocates_unique_state_slots_without_corrupting_pool() {
     assert_eq!(
         e1.ranks[0].state_pool.ple_ngram_context[slot_b as usize],
         [77, 88]
+    );
+    assert_eq!(
+        e1.ranks[0]
+            .state_pool
+            .export_ple_conv_slot_to_host_bytes(slot_a, &e1.ranks[0].stream)
+            .unwrap(),
+        conv_a
+    );
+    assert_eq!(
+        e1.ranks[0]
+            .state_pool
+            .export_ple_conv_slot_to_host_bytes(slot_b, &e1.ranks[0].stream)
+            .unwrap(),
+        conv_b
     );
 
     // Evict all hydrated radix entries and release their state slots back to `e1`.

@@ -230,11 +230,37 @@ impl SharedDpPrefixPool {
     /// length is within `max_delta` tokens of `tokens.len()`. Used to throttle redundant
     /// synchronous D2H publishes on every short turn of a pinned multi-turn agent.
     pub fn has_recent_prefix_within(&self, lora_id: i32, tokens: &[i32], max_delta: usize) -> bool {
+        self.has_recent_prefix_within_for_features(lora_id, tokens, max_delta, false)
+    }
+
+    /// Like [`Self::has_recent_prefix_within`], but when `has_features_hint` is `true`, exempts
+    /// an exact-length stored entry whose `proposer_features` is `None` so an in-place upgrade
+    /// to `Some(features)` is not blocked by stride throttling.
+    pub fn has_recent_prefix_within_for_features(
+        &self,
+        lora_id: i32,
+        tokens: &[i32],
+        max_delta: usize,
+        has_features_hint: bool,
+    ) -> bool {
         if self.max_bytes == 0 || tokens.len() <= max_delta || self.is_empty() {
             return false;
         }
         let min_len = tokens.len() - max_delta;
         let st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if has_features_hint {
+            let exact_key = PoolKey {
+                lora_id,
+                len: tokens.len(),
+                hash: hash_prefix_tokens(lora_id, tokens),
+            };
+            if let Some(existing) = st.entries.get(&exact_key)
+                && existing.token_ids.as_slice() == tokens
+                && existing.proposer_features.is_none()
+            {
+                return false;
+            }
+        }
         let candidate_lens: Vec<usize> = st
             .lengths
             .range(min_len..=tokens.len())
@@ -588,6 +614,11 @@ mod tests {
         assert!(pool.has_recent_prefix_within(-1, &turn2_8k, 4096));
         // turn3_11k is > 4096 tokens past turn1_6k -> stride throttle returns false.
         assert!(!pool.has_recent_prefix_within(-1, &turn3_11k, 4096));
+        // Exact-entry feature upgrade (`None -> Some`) must bypass stride throttling even when
+        // a shorter harness (`harness_4k`) is also within `max_delta`.
+        assert!(!pool.has_recent_prefix_within_for_features(-1, &turn1_6k, 4096, true));
+        assert!(pool.has_recent_prefix_within_for_features(-1, &turn1_6k, 4096, false));
+        assert!(pool.has_recent_prefix_within_for_features(-1, &turn2_8k, 4096, true));
 
         // Publishing turn3_11k supersedes turn1_6k (> 4096) while keeping harness_4k (<= 4096).
         assert!(pool.insert(make_entry(-1, turn3_11k.clone(), 1024)));

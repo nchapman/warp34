@@ -851,15 +851,23 @@ impl DpRouterCore {
         } else {
             Vec::new()
         };
-        let l2_matched_tokens =
-            if self.policy == DpRoutingPolicy::Prefix && !prompt_tokens.is_empty() {
-                self.l2_pool
-                    .as_ref()
-                    .and_then(|pool| pool.peek_longest_match(lora_id, prompt_tokens, 0))
-                    .map_or(0, |(len, _)| len)
-            } else {
-                0
-            };
+        let l2_matched_tokens = if self.policy == DpRoutingPolicy::Prefix
+            && !prompt_tokens.is_empty()
+        {
+            self.l2_pool
+                .as_ref()
+                .and_then(|pool| {
+                    if lora_id >= 0 {
+                        let salted = crate::lora::salt_radix_key_for_lora(prompt_tokens, lora_id);
+                        pool.peek_longest_match(lora_id, &salted, 0)
+                    } else {
+                        pool.peek_longest_match(lora_id, prompt_tokens, 0)
+                    }
+                })
+                .map_or(0, |(len, _)| len)
+        } else {
+            0
+        };
         let pinned_worker = session_key.and_then(|k| self.lookup_session(k));
 
         let (chosen, uncached_prompt_tokens) = {

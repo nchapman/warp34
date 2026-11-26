@@ -661,7 +661,7 @@ impl Snapshot {
         } else if snapshots.iter().all(|s| s.status == "stopping") {
             "stopping"
         } else {
-            "error"
+            "unhealthy"
         };
         agg.workers = snapshots.to_vec();
         for w in &snapshots[1..] {
@@ -954,5 +954,15 @@ mod tests {
         let degraded_prom = degraded.prometheus();
         assert!(degraded_prom.contains("warp34_dp_worker_healthy{dp_rank=\"0\"} 1"));
         assert!(degraded_prom.contains("warp34_dp_worker_healthy{dp_rank=\"2\"} 0"));
+
+        t0.set_status("unavailable");
+        t1.set_status("unavailable");
+        let outage = Snapshot::aggregate(&[t0.snapshot(), t1.snapshot(), t2.snapshot()]);
+        assert_eq!(outage.status, "unhealthy");
+        assert!(
+            outage
+                .prometheus()
+                .contains("warp34_status{state=\"unhealthy\"} 1")
+        );
     }
 }

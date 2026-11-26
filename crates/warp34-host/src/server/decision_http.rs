@@ -172,8 +172,13 @@ async fn run_candidate_queries_radix_shared(
     if queries.is_empty() {
         return Ok(Vec::new());
     }
+    let longest_prompt = queries
+        .iter()
+        .map(|(p, _)| p.as_slice())
+        .max_by_key(|p| p.len())
+        .unwrap_or(&queries[0].0);
     let (_dp_rank, target_worker, _inflight) = s
-        .select_worker(lora_id, &queries[0].0, images, None)
+        .select_worker(lora_id, longest_prompt, images, None)
         .map_err(worker_api_err)?;
     let mut results = Vec::with_capacity(queries.len());
     let mut iter = queries.into_iter();
@@ -216,8 +221,13 @@ async fn run_code_readout_queries_raw(
     if queries.is_empty() {
         return Ok((Vec::new(), 0, 0));
     }
+    let longest_prompt = queries
+        .iter()
+        .map(|q| q.token_ids.as_slice())
+        .max_by_key(|p| p.len())
+        .unwrap_or(&queries[0].token_ids);
     let (_dp_rank, target_worker, _inflight) = s
-        .select_worker(lora_id, &queries[0].token_ids, images, None)
+        .select_worker(lora_id, longest_prompt, images, None)
         .map_err(worker_api_err)?;
     let mut input_tokens = 0usize;
     let mut cached_tokens = 0usize;
