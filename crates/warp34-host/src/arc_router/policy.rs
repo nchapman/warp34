@@ -102,7 +102,7 @@ impl RoutingPolicy {
         match policy.trim().to_ascii_lowercase().as_str() {
             "prefer-local" | "prefer_local" => Ok(Self::PreferLocal {
                 min_p_pass,
-                value_usd: value_usd_override.unwrap_or(4.5),
+                value_usd: value_usd_override.unwrap_or(1.5),
             }),
             "sage" => Ok(Self::Utility {
                 value_usd: value_usd_override.unwrap_or(4.5),

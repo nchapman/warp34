@@ -1719,7 +1719,7 @@ pub(crate) fn run_serve(
         .map_err(|e| format!("resolve ARC router model `{spec}`: {e}"))?;
         let policy = crate::arc_router::policy::RoutingPolicy::from_args(
             serve.router_policy.as_deref().unwrap_or("prefer-local"),
-            serve.router_min_p_pass.unwrap_or(0.72),
+            serve.router_min_p_pass.unwrap_or(0.55),
             serve.router_value_usd,
         )?;
         let pin_pii_classes: std::collections::HashSet<String> =
