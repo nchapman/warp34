@@ -434,7 +434,7 @@ impl Qwen3_5ModelRank {
         self.max_tap_rows = max_tap_rows;
         self.tap_aux_bf16 = tap_aux_bf16;
         self.last_final_hidden_f16 = last_final_hidden_f16;
-        if export_final_hidden && self.rank == 0 {
+        if (export_final_hidden || !tap_layer_ids.is_empty()) && self.rank == 0 {
             let _ = self
                 .batched_decode_io
                 .ensure_pipeline_hidden_slot_ptr(0, self.cfg.hyper_hidden_size() * 2);

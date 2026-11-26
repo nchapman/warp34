@@ -1909,3 +1909,149 @@ fn non_gdn_l2_hydration_allocates_unique_state_slots_without_corrupting_pool() {
     }
     assert_eq!(seen.len(), total_slots);
 }
+
+#[test]
+fn dflash2_projected_ctx_plain_recovery_and_batched_draft_parity() {
+    let target_model = "nchapman/Qwen3.5-4B-W4A16-HGPTQ";
+    let draft_model = "nchapman/Qwen3.5-4B-DFlash2";
+    if common::require_or_skip_cached_model(
+        target_model,
+        "dflash2_projected_ctx_plain_recovery_and_batched_draft_parity",
+    )
+    .is_none()
+        || common::require_or_skip_cached_model(
+            draft_model,
+            "dflash2_projected_ctx_plain_recovery_and_batched_draft_parity",
+        )
+        .is_none()
+    {
+        return;
+    }
+    let _gpu_guard = GPU_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+
+    let worker = EngineWorker::from_loader(
+        move || {
+            Qwen3_5Engine::load_for_serving_with_speculative(
+                target_model,
+                1,
+                KvFormatPolicy::Tq4,
+                Some(2048),
+                true,
+                4,
+                Some(&SpeculativeConfig {
+                    kind: SpeculativeKind::DFlash2,
+                    draft_model: Some(draft_model.into()),
+                    mtp_k: 0,
+                }),
+            )
+            .map_err(|e| e.to_string())
+        },
+        SchedulerConfig {
+            max_num_seqs: 4,
+            ..SchedulerConfig::default()
+        },
+    )
+    .unwrap();
+
+    let tok = worker.tokenizer.as_ref().unwrap().clone();
+    let encode = |text: &str| -> Vec<i32> {
+        tok.encode(text, false)
+            .unwrap()
+            .get_ids()
+            .iter()
+            .map(|&id| id as i32)
+            .collect()
+    };
+
+    let shared_prefix = "Systems engineering notes: lock-free ring buffers use acquire-release atomic indices, cache-line padding avoids false sharing across producer and consumer threads, and power-of-two capacities replace modulo with bitmasks. ".repeat(6);
+    let t1_prompt = encode(&format!(
+        "{shared_prefix}Turn 1: Write a concise Rust RingBuffer struct."
+    ));
+    let t2_suffix = encode(" Turn 2: Add push with Acquire/Release ordering.");
+    let t3_suffix = encode(" Turn 3: Add pop and explain empty/full checks.");
+    let t4a_suffix = encode(" Turn 4A: Write a unit test for wrap-around.");
+    let t4b_suffix = encode(" Turn 4B: Summarize memory ordering guarantees.");
+
+    let mut greedy = params();
+    greedy.max_tokens = 32;
+    let mut plain_logprobs = greedy.clone();
+    plain_logprobs.logprobs = true;
+    plain_logprobs.top_logprobs = 2;
+
+    rt.block_on(async {
+        // Turn 1: initial DFlash2 speculative turn.
+        let mut st1 = worker.submit(t1_prompt.clone(), greedy.clone(), None).unwrap();
+        let (out1, _) = tokio::time::timeout(Duration::from_secs(120), collect_with_cached(&mut st1, 32))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!out1.is_empty());
+
+        // Turn 2: logprobs forces `step_plain`, recording projected `ctx` into `plain_memos`.
+        let mut t2_prompt = t1_prompt.clone();
+        t2_prompt.extend_from_slice(&out1);
+        t2_prompt.extend_from_slice(&t2_suffix);
+        let mut st2 = worker
+            .submit(t2_prompt.clone(), plain_logprobs.clone(), None)
+            .unwrap();
+        let (out2, cached2) =
+            tokio::time::timeout(Duration::from_secs(120), collect_with_cached(&mut st2, 32))
+                .await
+                .unwrap()
+                .unwrap();
+        assert!(!out2.is_empty());
+        assert!(cached2 > 0, "Turn 2 should reuse warm radix prefix from Turn 1");
+
+        // Turn 3: greedy continuation MUST recover DFlash2 from projected `ctx` `plain_memos`
+        // while preserving the warm radix prefix from Turn 2.
+        let mut t3_prompt = t2_prompt.clone();
+        t3_prompt.extend_from_slice(&out2);
+        t3_prompt.extend_from_slice(&t3_suffix);
+        let mut st3 = worker.submit(t3_prompt.clone(), greedy.clone(), None).unwrap();
+        let (out3, cached3) =
+            tokio::time::timeout(Duration::from_secs(120), collect_with_cached(&mut st3, 32))
+                .await
+                .unwrap()
+                .unwrap();
+        assert!(!out3.is_empty());
+        assert!(
+            cached3 >= t2_prompt.len().saturating_sub(64),
+            "Turn 3 should hit warm radix prefix after step_plain recovery (cached={cached3}, t2_len={})",
+            t2_prompt.len()
+        );
+
+        // Turn 4: concurrent B=2 greedy continuations exercise batched DFlash2 drafting
+        // (`try_ingest_and_propose_dflash_batch` + `batched_select_greedy_graphs`).
+        let mut t4a_prompt = t3_prompt.clone();
+        t4a_prompt.extend_from_slice(&out3);
+        t4a_prompt.extend_from_slice(&t4a_suffix);
+        let mut t4b_prompt = t3_prompt.clone();
+        t4b_prompt.extend_from_slice(&out3);
+        t4b_prompt.extend_from_slice(&t4b_suffix);
+
+        let mut st4a = worker.submit(t4a_prompt, greedy.clone(), None).unwrap();
+        let mut st4b = worker.submit(t4b_prompt, greedy.clone(), None).unwrap();
+        let (res4a, res4b) = tokio::time::timeout(
+            Duration::from_secs(120),
+            async {
+                tokio::join!(
+                    collect_with_cached(&mut st4a, 32),
+                    collect_with_cached(&mut st4b, 32),
+                )
+            },
+        )
+        .await
+        .unwrap();
+        let (out4a, cached4a) = res4a.unwrap();
+        let (out4b, cached4b) = res4b.unwrap();
+        assert!(!out4a.is_empty());
+        assert!(!out4b.is_empty());
+        assert!(cached4a > 0 && cached4b > 0, "B=2 DFlash2 turns should reuse warm radix prefix");
+    });
+
+    drop(worker);
+}
