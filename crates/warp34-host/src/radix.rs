@@ -16,6 +16,7 @@
 //!    **committed** (`emitted_len`) snapshots into `MambaRadixCache`.
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 /// Maximum uncheckpointed KV page span (`512` pages = `8,192` tokens at `page_size = 16`)
 /// allowed when tombstoning a superseded linear internal node at Priority 1, or when
@@ -112,6 +113,7 @@ pub struct MambaRadixCache {
     mamba_evictable_slots: usize,
     mamba_protected_slots: usize,
     promoted_host_to_vram: std::collections::HashMap<i32, i32>,
+    dp_prefix_observer: Option<(usize, Arc<crate::dp_router::DpPrefixDirectory>)>,
     pub total_lookups: u64,
     pub total_lookup_tokens: u64,
     pub total_hit_tokens: u64,
@@ -142,6 +144,7 @@ impl MambaRadixCache {
             mamba_evictable_slots: 0,
             mamba_protected_slots: 0,
             promoted_host_to_vram: std::collections::HashMap::new(),
+            dp_prefix_observer: None,
             total_lookups: 0,
             total_lookup_tokens: 0,
             total_hit_tokens: 0,
@@ -158,7 +161,21 @@ impl MambaRadixCache {
         self.tick_counter
     }
 
+    /// Attaches a shared [`crate::dp_router::DpPrefixDirectory`] observer for in-process
+    /// data-parallel routing (`DP > 1`). Every `insert`, leaf eviction, and `reset` updates
+    /// the directory directly with zero drift.
+    pub fn set_dp_prefix_observer(
+        &mut self,
+        dp_rank: usize,
+        dir: Arc<crate::dp_router::DpPrefixDirectory>,
+    ) {
+        self.dp_prefix_observer = Some((dp_rank, dir));
+    }
+
     pub fn reset(&mut self) {
+        if let Some((dp_rank, ref dir)) = self.dp_prefix_observer {
+            dir.clear_worker(dp_rank);
+        }
         self.nodes.clear();
         self.free_nodes.clear();
         self.full_lru.clear();
@@ -504,6 +521,82 @@ impl MambaRadixCache {
         }
     }
 
+    /// Returns `(total_tokens, kv_pages, mamba_slot)` for `node_id` along its root-to-node
+    /// chain if `node_id` holds a live checkpoint slot and all KV pages reside in L1 VRAM.
+    /// Used by the cross-replica DP L2 prefix pool to export newly committed prefixes.
+    pub fn node_kv_pages_and_mamba(&self, node_id: RadixNodeId) -> Option<(usize, Vec<i32>, i32)> {
+        if self.disable || node_id == RadixNodeId::ROOT || node_id.0 >= self.nodes.len() {
+            return None;
+        }
+        let mamba_slot = self.nodes[node_id.0].mamba_value?;
+        if mamba_slot < 0 {
+            return None;
+        }
+        let mut chain = Vec::new();
+        let mut cur = node_id;
+        while cur != RadixNodeId::ROOT {
+            chain.push(cur);
+            cur = self.nodes[cur.0].parent?;
+        }
+        chain.reverse();
+        let total_pages: usize = chain.iter().map(|&nid| self.nodes[nid.0].value.len()).sum();
+        if total_pages == 0 {
+            return None;
+        }
+        let mut kv_pages = Vec::with_capacity(total_pages);
+        for nid in chain {
+            for &pid in &self.nodes[nid.0].value {
+                if pid < 0 || crate::cache::is_host_kv_page(pid) {
+                    return None;
+                }
+                kv_pages.push(pid);
+            }
+        }
+        Some((kv_pages.len() * self.page_size, kv_pages, mamba_slot))
+    }
+
+    /// Read-only prefix lookup returning the longest matched token count with a live
+    /// checkpoint under `self.active_lora_id`, without mutating LRU order or hit counters.
+    pub fn peek_matched_tokens(&self, token_ids: &[i32]) -> usize {
+        if self.disable || token_ids.len() < self.page_size {
+            return 0;
+        }
+        let aligned_len = (token_ids.len() / self.page_size) * self.page_size;
+        let salted_buf;
+        let key = if self.active_lora_id >= 0 {
+            salted_buf = crate::lora::salt_radix_key_for_lora(
+                &token_ids[..aligned_len],
+                self.active_lora_id,
+            );
+            salted_buf.as_slice()
+        } else {
+            &token_ids[..aligned_len]
+        };
+        let mut cur = RadixNodeId::ROOT;
+        let mut offset = 0usize;
+        let mut best = 0usize;
+        while offset < key.len() {
+            let first_page = &key[offset..offset + self.page_size];
+            let Some(&child_id) = self.nodes[cur.0].children.get(first_page) else {
+                break;
+            };
+            let child = &self.nodes[child_id.0];
+            let prefix_len = self.page_aligned_common_prefix_len(&child.key, &key[offset..]);
+            if prefix_len == 0 {
+                break;
+            }
+            if prefix_len < child.key.len() {
+                break;
+            }
+            offset += child.key.len();
+            if child.mamba_value.is_some() {
+                best = offset;
+            }
+            cur = child_id;
+        }
+        best
+    }
+
     /// Increments `mamba_lock_ref` on `node_id` (if `mamba_value.is_some()`) and `full_lock_ref`
     /// on `[node_id .. root)` (`mamba_radix_cache.py:922-948`).
     pub fn inc_lock_ref(&mut self, node_id: RadixNodeId) {
@@ -707,6 +800,12 @@ impl MambaRadixCache {
             terminal_node = cur_node;
         }
 
+        if let Some((dp_rank, ref dir)) = self.dp_prefix_observer {
+            let hashes = crate::dp_router::compute_chained_prefix_hashes_raw(token_ids);
+            let first_new_block = key_offset / crate::dp_router::DP_PREFIX_BLOCK_TOKENS;
+            dir.record_insert_with_checkpoint(dp_rank, &hashes, first_new_block);
+        }
+
         RadixInsertResult {
             existing_prefix_tokens: key_offset,
             mamba_already_existed,
@@ -785,9 +884,63 @@ impl MambaRadixCache {
         }
     }
 
+    fn notify_tombstone_node(&self, id: RadixNodeId) {
+        let Some((dp_rank, ref dir)) = self.dp_prefix_observer else {
+            return;
+        };
+        let mut chain = Vec::new();
+        let mut cur = id;
+        while cur != RadixNodeId::ROOT {
+            chain.push(cur);
+            match self.nodes[cur.0].parent {
+                Some(p) => cur = p,
+                None => break,
+            }
+        }
+        chain.reverse();
+        let mut full_tokens = Vec::new();
+        for &nid in &chain {
+            full_tokens.extend_from_slice(&self.nodes[nid.0].key);
+        }
+        let all_hashes = crate::dp_router::compute_chained_prefix_hashes_raw(&full_tokens);
+        if let Some(&term_hash) = all_hashes.last() {
+            dir.record_tombstone_hash(dp_rank, term_hash);
+        }
+    }
+
+    fn notify_retire_node(&self, id: RadixNodeId) {
+        let Some((dp_rank, ref dir)) = self.dp_prefix_observer else {
+            return;
+        };
+        let mut chain = Vec::new();
+        let mut cur = id;
+        while cur != RadixNodeId::ROOT {
+            chain.push(cur);
+            match self.nodes[cur.0].parent {
+                Some(p) => cur = p,
+                None => break,
+            }
+        }
+        chain.reverse();
+        let mut full_tokens = Vec::new();
+        let mut start_offset = 0usize;
+        for &nid in &chain {
+            if nid == id {
+                start_offset = full_tokens.len();
+            }
+            full_tokens.extend_from_slice(&self.nodes[nid.0].key);
+        }
+        let all_hashes = crate::dp_router::compute_chained_prefix_hashes_raw(&full_tokens);
+        let first_owned = start_offset / crate::dp_router::DP_PREFIX_BLOCK_TOKENS;
+        if first_owned < all_hashes.len() {
+            dir.record_evict_hashes(dp_rank, &all_hashes[first_owned..]);
+        }
+    }
+
     #[inline]
     fn retire_dead_node(&mut self, id: RadixNodeId) {
         debug_assert!(id != RadixNodeId::ROOT);
+        self.notify_retire_node(id);
         let node = &mut self.nodes[id.0];
         debug_assert!(node.alive);
         node.alive = false;
@@ -984,6 +1137,7 @@ impl MambaRadixCache {
             }
             if !self.nodes[nid.0].children.is_empty() || self.nodes[nid.0].full_lock_ref > 0 {
                 self.nodes[nid.0].mamba_value = None;
+                self.notify_tombstone_node(nid);
                 if self.nodes[nid.0].mamba_lock_ref == 0 {
                     self.mamba_evictable_slots = self.mamba_evictable_slots.saturating_sub(1);
                     self.mamba_lru_remove(nid);
@@ -1006,6 +1160,7 @@ impl MambaRadixCache {
             return None;
         }
         let slot = self.nodes[nid.0].mamba_value.take()?;
+        self.notify_tombstone_node(nid);
         self.mamba_evictable_slots = self.mamba_evictable_slots.saturating_sub(1);
         self.mamba_lru_remove(nid);
         Some(slot)
@@ -1066,6 +1221,7 @@ impl MambaRadixCache {
             if !self.nodes[nid.0].children.is_empty() {
                 // Internal node: tombstone its Mamba state while preserving KV pages for children.
                 if let Some(ms) = self.nodes[nid.0].mamba_value.take() {
+                    self.notify_tombstone_node(nid);
                     out.freed_mamba_slots.push(ms);
                     self.mamba_evictable_slots = self.mamba_evictable_slots.saturating_sub(1);
                 }
@@ -1364,6 +1520,7 @@ pub struct PlannedCheckpoint {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct RadixDonationOutcome {
     pub donated_seq_len: usize,
+    pub donated_node: Option<RadixNodeId>,
     pub freed_kv_pages: Vec<i32>,
     pub freed_draft_pages: Vec<i32>,
     pub freed_mamba_slots: Vec<i32>,
@@ -1639,6 +1796,7 @@ impl ReqRadixState {
                 radix.mark_node_decode_tail(ins.terminal_node);
             }
             outcome.donated_seq_len = cache_len;
+            outcome.donated_node = Some(ins.terminal_node);
             outcome
                 .freed_kv_pages
                 .extend_from_slice(&ins.freed_duplicate_kv_pages);

@@ -173,8 +173,12 @@ pub struct KvLayerBuffer {
     pub layout: Warp34KvLayerLayout,
     /// Optional QSA indexer raw key cache `[num_pages * block_size, indexer_head_dim]` in `FP16`.
     pub qsa_raw_k_buf: Option<DeviceBuffer>,
+    /// Physical bytes per page in `qsa_raw_k_buf` (`0` when unallocated), invariant across `truncate_pages`.
+    pub qsa_raw_k_page_stride: usize,
     /// Optional QSA indexer 4:1 compressed key cache `[num_pages * (block_size / compress_ratio), indexer_head_dim]` in `FP16`.
     pub qsa_comp_k_buf: Option<DeviceBuffer>,
+    /// Physical bytes per page in `qsa_comp_k_buf` (`0` when unallocated), invariant across `truncate_pages`.
+    pub qsa_comp_k_page_stride: usize,
 }
 
 /// Ascending physical-order free-page bitmap (`O(1)` amortized scan via `next_word`).
@@ -267,12 +271,16 @@ impl PageBitmap {
 }
 
 #[cfg(feature = "cuda")]
+const KV_DMA_STAGING_BYTES: usize = 8 * 1024 * 1024;
+
+#[cfg(feature = "cuda")]
 pub struct KvPool {
     pub device_id: i32,
     pub num_pages: usize,
     pub block_size: usize,
     pub layers: Vec<KvLayerBuffer>,
     pub host_swap: Option<HostKvSwapPool>,
+    dma_staging: std::sync::Mutex<Option<Option<crate::cuda::MappedHostBuffer>>>,
     free_pages: PageBitmap,
 }
 
@@ -341,7 +349,9 @@ impl KvPool {
                 v_buf,
                 layout,
                 qsa_raw_k_buf: None,
+                qsa_raw_k_page_stride: 0,
                 qsa_comp_k_buf: None,
+                qsa_comp_k_page_stride: 0,
             });
         }
         let free_pages = PageBitmap::new(num_pages);
@@ -351,26 +361,29 @@ impl KvPool {
             block_size,
             layers,
             host_swap: None,
+            dma_staging: std::sync::Mutex::new(None),
             free_pages,
         })
     }
 
+    /// Immutable physical per-page byte strides `(k, v, qsa_raw_k, qsa_comp_k)` for a layer.
+    /// Safe even after `truncate_pages()` reduces logical `self.num_pages` without resizing buffers.
+    #[inline]
+    pub fn layer_page_strides(layer: &KvLayerBuffer) -> (usize, usize, usize, usize) {
+        (
+            layer.layout.k_page_stride_bytes as usize,
+            layer.layout.v_page_stride_bytes as usize,
+            layer.qsa_raw_k_page_stride,
+            layer.qsa_comp_k_page_stride,
+        )
+    }
+
     /// Total bytes across all full-attention layers for a single 16-token KV page on this rank.
     pub fn page_bundle_bytes(&self) -> usize {
-        let vram_pages = self.num_pages.max(1);
         self.layers
             .iter()
             .map(|l| {
-                let k = l.layout.k_page_stride_bytes as usize;
-                let v = l.layout.v_page_stride_bytes as usize;
-                let raw = l
-                    .qsa_raw_k_buf
-                    .as_ref()
-                    .map_or(0, |b| b.len_bytes / vram_pages);
-                let comp = l
-                    .qsa_comp_k_buf
-                    .as_ref()
-                    .map_or(0, |b| b.len_bytes / vram_pages);
+                let (k, v, raw, comp) = Self::layer_page_strides(l);
                 k + v + raw + comp
             })
             .sum()
@@ -391,11 +404,15 @@ impl KvPool {
         compress_ratio: usize,
     ) -> Result<()> {
         let ratio = compress_ratio.max(1);
-        let raw_bytes = self.num_pages * self.block_size * (indexer_head_dim + 8) * 2;
-        let comp_bytes = self.num_pages * (self.block_size / ratio) * indexer_head_dim * 2;
+        let raw_page_stride = self.block_size * (indexer_head_dim + 8) * 2;
+        let comp_page_stride = (self.block_size / ratio) * indexer_head_dim * 2;
+        let raw_bytes = self.num_pages * raw_page_stride;
+        let comp_bytes = self.num_pages * comp_page_stride;
         for layer in &mut self.layers {
             layer.qsa_raw_k_buf = Some(DeviceBuffer::alloc(self.device_id, raw_bytes)?);
+            layer.qsa_raw_k_page_stride = raw_page_stride;
             layer.qsa_comp_k_buf = Some(DeviceBuffer::alloc(self.device_id, comp_bytes)?);
+            layer.qsa_comp_k_page_stride = comp_page_stride;
         }
         if let Some(max_host_pages) = self.host_swap.as_ref().map(|h| h.max_pages) {
             self.enable_host_swap(max_host_pages);
@@ -500,6 +517,290 @@ impl KvPool {
             free_host_after_copy,
             stream,
         )
+    }
+
+    /// Copies `vram_pages` (`0..num_pages`) from GPU VRAM into a single contiguous host byte
+    /// buffer (layer-major: K, V, optional QSA raw K, optional QSA comp K) on `stream`.
+    /// Used by the cross-replica DP L2 prefix pool to publish warm KV pages without mutating
+    /// this rank's L1 VRAM ownership.
+    pub fn export_pages_to_host_bytes(
+        &self,
+        vram_pages: &[i32],
+        stream: &crate::cuda::CudaStream,
+    ) -> Result<Vec<u8>> {
+        if vram_pages.is_empty() || self.layers.is_empty() {
+            return Ok(Vec::new());
+        }
+        for &pid in vram_pages {
+            if pid < 0 || (pid as usize) >= self.num_pages {
+                return Err(crate::cuda::CudaError::with_detail(
+                    -2,
+                    "invalid VRAM page ID in export_pages_to_host_bytes",
+                    format!("pid={pid} not in 0..{}", self.num_pages),
+                ));
+            }
+        }
+        let n = vram_pages.len();
+        let total_bytes = self.page_bundle_bytes() * n;
+        let mut out = vec![0u8; total_bytes];
+        crate::cuda::CudaDevice {
+            device_id: self.device_id,
+        }
+        .make_current()?;
+
+        // Coalesce contiguous VRAM page runs to minimize per-page D2H memcpy launches.
+        let mut runs: Vec<(usize, usize, usize)> = Vec::new();
+        let mut i = 0usize;
+        while i < n {
+            let start_pid = vram_pages[i] as usize;
+            let mut len = 1usize;
+            while i + len < n && vram_pages[i + len] as usize == start_pid + len {
+                len += 1;
+            }
+            runs.push((i, start_pid, len));
+            i += len;
+        }
+
+        let mut stage_guard = self.dma_staging.lock().unwrap();
+        let stage_opt = stage_guard
+            .get_or_insert_with(|| crate::cuda::MappedHostBuffer::alloc(KV_DMA_STAGING_BYTES).ok())
+            .as_ref();
+        let mut stage_used = 0usize;
+        let mut pending: Vec<(usize, usize, usize)> = Vec::new();
+        let flush_d2h = |stage: &crate::cuda::MappedHostBuffer,
+                         pending: &mut Vec<(usize, usize, usize)>,
+                         stage_used: &mut usize,
+                         out: &mut [u8]|
+         -> Result<()> {
+            if pending.is_empty() {
+                return Ok(());
+            }
+            stream.synchronize()?;
+            for &(stage_off, dst_off, len) in pending.iter() {
+                // SAFETY: `stage_off + len <= stage.len_bytes` and `dst_off + len <= out.len()`,
+                // and `stream.synchronize()` completed all queued D2H DMA writes into `stage`.
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        (stage.host_ptr as *const u8).add(stage_off),
+                        out.as_mut_ptr().add(dst_off),
+                        len,
+                    );
+                }
+            }
+            pending.clear();
+            *stage_used = 0;
+            Ok(())
+        };
+
+        let mut cursor = 0usize;
+        for layer in &self.layers {
+            let (k_stride, v_stride, raw_stride, comp_stride) = Self::layer_page_strides(layer);
+
+            let mut copy_buf = |dev_addr: u64, stride: usize, label: &'static str| -> Result<()> {
+                if stride == 0 {
+                    return Ok(());
+                }
+                for &(page_idx, vram_start, run_len) in &runs {
+                    let bytes = run_len * stride;
+                    let dst_off = cursor + page_idx * stride;
+                    let src = dev_addr + (vram_start * stride) as u64;
+                    if let Some(stage) = stage_opt
+                        && stage.len_bytes > 0
+                    {
+                        let mut off = 0usize;
+                        while off < bytes {
+                            let take = (bytes - off).min(stage.len_bytes);
+                            if stage_used + take > stage.len_bytes {
+                                flush_d2h(stage, &mut pending, &mut stage_used, &mut out)?;
+                            }
+                            crate::cuda::check_rc(
+                                // SAFETY: `stage_used + take <= stage.len_bytes` in pinned host
+                                // memory; `src + off` is bounds-checked within `0..self.num_pages`.
+                                unsafe {
+                                    warp34_kernels::ffi::warp34_memcpy_d2h_async(
+                                        (stage.host_ptr as *mut u8).add(stage_used).cast(),
+                                        (src + off as u64) as *const core::ffi::c_void,
+                                        take,
+                                        stream.handle,
+                                    )
+                                },
+                                label,
+                            )?;
+                            pending.push((stage_used, dst_off + off, take));
+                            stage_used += take;
+                            off += take;
+                        }
+                    } else {
+                        crate::cuda::check_rc(
+                            // SAFETY: `out` is sized to `total_bytes` covering every layer and
+                            // page; `src` is bounds-checked within `0..self.num_pages`.
+                            unsafe {
+                                warp34_kernels::ffi::warp34_memcpy_d2h_async(
+                                    out.as_mut_ptr().add(dst_off).cast(),
+                                    src as *const core::ffi::c_void,
+                                    bytes,
+                                    stream.handle,
+                                )
+                            },
+                            label,
+                        )?;
+                    }
+                }
+                cursor += n * stride;
+                Ok(())
+            };
+
+            copy_buf(layer.k_buf.addr(), k_stride, "KvPool export K D2H")?;
+            copy_buf(layer.v_buf.addr(), v_stride, "KvPool export V D2H")?;
+            if let Some(raw) = &layer.qsa_raw_k_buf {
+                copy_buf(raw.addr(), raw_stride, "KvPool export QSA raw K D2H")?;
+            }
+            if let Some(comp) = &layer.qsa_comp_k_buf {
+                copy_buf(comp.addr(), comp_stride, "KvPool export QSA comp K D2H")?;
+            }
+        }
+        if let Some(stage) = stage_opt
+            && stage.len_bytes > 0
+        {
+            flush_d2h(stage, &mut pending, &mut stage_used, &mut out)?;
+        } else {
+            stream.synchronize()?;
+        }
+        Ok(out)
+    }
+
+    /// Copies a host byte buffer produced by [`Self::export_pages_to_host_bytes`] into
+    /// freshly allocated `dst_vram_pages` (`0..num_pages`) on `stream`.
+    pub fn import_pages_from_host_bytes(
+        &self,
+        dst_vram_pages: &[i32],
+        bytes: &[u8],
+        stream: &crate::cuda::CudaStream,
+    ) -> Result<()> {
+        if dst_vram_pages.is_empty() || self.layers.is_empty() {
+            return Ok(());
+        }
+        for &pid in dst_vram_pages {
+            if pid < 0 || (pid as usize) >= self.num_pages {
+                return Err(crate::cuda::CudaError::with_detail(
+                    -2,
+                    "invalid VRAM page ID in import_pages_from_host_bytes",
+                    format!("pid={pid} not in 0..{}", self.num_pages),
+                ));
+            }
+        }
+        let n = dst_vram_pages.len();
+        let expected_bytes = self.page_bundle_bytes() * n;
+        if bytes.len() != expected_bytes {
+            return Err(crate::cuda::CudaError::with_detail(
+                -2,
+                "KvPool import byte length mismatch",
+                format!("got {} bytes, expected {expected_bytes}", bytes.len()),
+            ));
+        }
+
+        crate::cuda::CudaDevice {
+            device_id: self.device_id,
+        }
+        .make_current()?;
+
+        let mut runs: Vec<(usize, usize, usize)> = Vec::new();
+        let mut i = 0usize;
+        while i < n {
+            let start_pid = dst_vram_pages[i] as usize;
+            let mut len = 1usize;
+            while i + len < n && dst_vram_pages[i + len] as usize == start_pid + len {
+                len += 1;
+            }
+            runs.push((i, start_pid, len));
+            i += len;
+        }
+
+        let mut stage_guard = self.dma_staging.lock().unwrap();
+        let stage_opt = stage_guard
+            .get_or_insert_with(|| crate::cuda::MappedHostBuffer::alloc(KV_DMA_STAGING_BYTES).ok())
+            .as_ref();
+        let mut stage_used = 0usize;
+
+        let mut cursor = 0usize;
+        for layer in &self.layers {
+            let (k_stride, v_stride, raw_stride, comp_stride) = Self::layer_page_strides(layer);
+
+            let mut copy_buf = |dev_addr: u64, stride: usize, label: &'static str| -> Result<()> {
+                if stride == 0 {
+                    return Ok(());
+                }
+                for &(page_idx, vram_start, run_len) in &runs {
+                    let copy_bytes = run_len * stride;
+                    let src_off = cursor + page_idx * stride;
+                    let dst = dev_addr + (vram_start * stride) as u64;
+                    if let Some(stage) = stage_opt
+                        && stage.len_bytes > 0
+                    {
+                        let mut off = 0usize;
+                        while off < copy_bytes {
+                            let take = (copy_bytes - off).min(stage.len_bytes);
+                            if stage_used + take > stage.len_bytes {
+                                stream.synchronize()?;
+                                stage_used = 0;
+                            }
+                            // SAFETY: `stage_used + take <= stage.len_bytes` and `src_off + off + take <= bytes.len()`.
+                            unsafe {
+                                std::ptr::copy_nonoverlapping(
+                                    bytes.as_ptr().add(src_off + off),
+                                    (stage.host_ptr as *mut u8).add(stage_used),
+                                    take,
+                                );
+                            }
+                            crate::cuda::check_rc(
+                                // SAFETY: `stage` stays untouched until `stream.synchronize()` before
+                                // resetting `stage_used` or returning; `dst` is within `0..self.num_pages`.
+                                unsafe {
+                                    warp34_kernels::ffi::warp34_memcpy_h2d_async(
+                                        (dst + off as u64) as *mut core::ffi::c_void,
+                                        (stage.host_ptr as *const u8).add(stage_used).cast(),
+                                        take,
+                                        stream.handle,
+                                    )
+                                },
+                                label,
+                            )?;
+                            stage_used += take;
+                            off += take;
+                        }
+                    } else {
+                        crate::cuda::check_rc(
+                            // SAFETY: `bytes.len() == expected_bytes`; `dst` is bounds-checked
+                            // within `0..self.num_pages`, and we sync before returning.
+                            unsafe {
+                                warp34_kernels::ffi::warp34_memcpy_h2d_async(
+                                    dst as *mut core::ffi::c_void,
+                                    bytes.as_ptr().add(src_off).cast(),
+                                    copy_bytes,
+                                    stream.handle,
+                                )
+                            },
+                            label,
+                        )?;
+                    }
+                }
+                cursor += n * stride;
+                Ok(())
+            };
+
+            copy_buf(layer.k_buf.addr(), k_stride, "KvPool import K H2D")?;
+            copy_buf(layer.v_buf.addr(), v_stride, "KvPool import V H2D")?;
+            if let Some(raw) = &layer.qsa_raw_k_buf {
+                copy_buf(raw.addr(), raw_stride, "KvPool import QSA raw K H2D")?;
+            }
+            if let Some(comp) = &layer.qsa_comp_k_buf {
+                copy_buf(comp.addr(), comp_stride, "KvPool import QSA comp K H2D")?;
+            }
+        }
+        if stage_opt.is_none_or(|s| s.len_bytes == 0) || stage_used > 0 {
+            stream.synchronize()?;
+        }
+        Ok(())
     }
 
     /// Clamps logical page capacity downward so `TP=2` ranks operate in lockstep even when
@@ -681,12 +982,153 @@ impl StateBundlePool {
         Ok(())
     }
 
+    /// Bytes per slot in `ple_conv_state` (`0` when PLE conv1d state is unallocated).
+    #[inline]
+    pub fn ple_conv_slot_bytes(&self) -> usize {
+        if self.ple_conv_state.is_some() {
+            self.ple_conv_dim * 9 * 2
+        } else {
+            0
+        }
+    }
+
+    /// Exports a single slot's PLE dilated conv1d state (`[ple_conv_dim, 9]` `FP16`) to host bytes.
+    pub fn export_ple_conv_slot_to_host_bytes(
+        &self,
+        slot: i32,
+        stream: &crate::cuda::CudaStream,
+    ) -> Result<Vec<u8>> {
+        let Some(buf) = &self.ple_conv_state else {
+            return Ok(Vec::new());
+        };
+        let slot_bytes = self.ple_conv_slot_bytes();
+        if slot_bytes == 0 {
+            return Ok(Vec::new());
+        }
+        let idx = usize::try_from(slot).map_err(|_| {
+            crate::cuda::CudaError::with_detail(-2, "invalid PLE conv slot", format!("slot={slot}"))
+        })?;
+        let off = idx.checked_mul(slot_bytes).ok_or_else(|| {
+            crate::cuda::CudaError::with_detail(
+                -2,
+                "PLE conv slot offset overflow",
+                format!("slot={slot}"),
+            )
+        })?;
+        if off + slot_bytes > buf.len_bytes {
+            return Err(crate::cuda::CudaError::with_detail(
+                -2,
+                "PLE conv slot out of bounds",
+                format!("slot={slot}, total_slots={}", self.total_slots),
+            ));
+        }
+        crate::cuda::CudaDevice {
+            device_id: self.device_id,
+        }
+        .make_current()?;
+        let mut out = vec![0u8; slot_bytes];
+        crate::cuda::check_rc(
+            // SAFETY: `off + slot_bytes <= buf.len_bytes` and `out.len() == slot_bytes`.
+            unsafe {
+                warp34_kernels::ffi::warp34_memcpy_d2h_async(
+                    out.as_mut_ptr().cast(),
+                    (buf.addr() + off as u64) as *const core::ffi::c_void,
+                    slot_bytes,
+                    stream.handle,
+                )
+            },
+            "StateBundlePool export PLE conv state D2H",
+        )?;
+        stream.synchronize()?;
+        Ok(out)
+    }
+
+    /// Imports host bytes into a single slot's PLE dilated conv1d state (`[ple_conv_dim, 9]` `FP16`).
+    pub fn import_ple_conv_host_bytes_to_slot(
+        &self,
+        slot: i32,
+        bytes: &[u8],
+        stream: &crate::cuda::CudaStream,
+    ) -> Result<()> {
+        let Some(buf) = &self.ple_conv_state else {
+            return if bytes.is_empty() {
+                Ok(())
+            } else {
+                Err(crate::cuda::CudaError::with_detail(
+                    -2,
+                    "unexpected PLE conv bytes for unallocated state",
+                    format!("got {} bytes", bytes.len()),
+                ))
+            };
+        };
+        let slot_bytes = self.ple_conv_slot_bytes();
+        if bytes.len() != slot_bytes {
+            return Err(crate::cuda::CudaError::with_detail(
+                -2,
+                "PLE conv byte length mismatch",
+                format!("got {} bytes, expected {slot_bytes}", bytes.len()),
+            ));
+        }
+        if slot_bytes == 0 {
+            return Ok(());
+        }
+        let idx = usize::try_from(slot).map_err(|_| {
+            crate::cuda::CudaError::with_detail(-2, "invalid PLE conv slot", format!("slot={slot}"))
+        })?;
+        let off = idx.checked_mul(slot_bytes).ok_or_else(|| {
+            crate::cuda::CudaError::with_detail(
+                -2,
+                "PLE conv slot offset overflow",
+                format!("slot={slot}"),
+            )
+        })?;
+        if off + slot_bytes > buf.len_bytes {
+            return Err(crate::cuda::CudaError::with_detail(
+                -2,
+                "PLE conv slot out of bounds",
+                format!("slot={slot}, total_slots={}", self.total_slots),
+            ));
+        }
+        crate::cuda::CudaDevice {
+            device_id: self.device_id,
+        }
+        .make_current()?;
+        crate::cuda::check_rc(
+            // SAFETY: `off + slot_bytes <= buf.len_bytes` and `bytes.len() == slot_bytes`.
+            unsafe {
+                warp34_kernels::ffi::warp34_memcpy_h2d_async(
+                    (buf.addr() + off as u64) as *mut core::ffi::c_void,
+                    bytes.as_ptr().cast(),
+                    slot_bytes,
+                    stream.handle,
+                )
+            },
+            "StateBundlePool import PLE conv state H2D",
+        )?;
+        stream.synchronize()?;
+        Ok(())
+    }
+
     pub fn free_count(&self) -> usize {
         self.free_slots.len()
     }
 
     pub fn alloc_slot(&mut self) -> Option<i32> {
-        self.free_slots.pop()
+        if let Some(slot) = self.free_slots.pop() {
+            return Some(slot);
+        }
+        if self.layers.is_empty()
+            && self.ple_conv_state.is_none()
+            && self.ple_ngram_context.is_empty()
+        {
+            let slot = i32::try_from(self.total_slots).ok()?;
+            if is_checkpoint_pool_slot(slot) {
+                return None;
+            }
+            self.total_slots += 1;
+            return Some(slot);
+        }
+        None
     }
 
     pub fn free_slot(&mut self, slot: i32) {
@@ -907,5 +1349,19 @@ mod tests {
         bm.reset();
         assert_eq!(bm.free_count(), 130);
         assert_eq!(bm.alloc(), Some(0));
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn stateless_state_bundle_pool_mints_unique_slots_when_initial_pool_empty() {
+        let mut pool = StateBundlePool::new(0, &[], 0, 0, 4, 0, 0, 0).unwrap();
+        assert_eq!(pool.total_slots, 0);
+        assert_eq!(pool.alloc_slot(), Some(0));
+        assert_eq!(pool.alloc_slot(), Some(1));
+        assert_eq!(pool.total_slots, 2);
+        pool.free_slot(0);
+        assert_eq!(pool.alloc_slot(), Some(0));
+        assert_eq!(pool.alloc_slot(), Some(2));
+        assert_eq!(pool.total_slots, 3);
     }
 }

@@ -370,7 +370,7 @@ impl Qwen3_5Engine {
                 &archive,
                 vcfg,
                 &self.cfg.quant,
-                0,
+                r0.device.device_id,
                 &r0.stream,
             )?
             .ok_or_else(|| loader_err("vision weights not found in safetensors archive"))?;

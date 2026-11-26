@@ -40,6 +40,9 @@ pub struct Qwen3_5Engine {
     pub active_lora_id: i32,
     pub slice_lora_ids: Vec<i32>,
     pub serving_fit: Option<ServingAutoFitPlan>,
+    pub dp_rank: usize,
+    pub dp_size: usize,
+    pub dp_prefix_pool: Option<std::sync::Arc<crate::dp_prefix_pool::SharedDpPrefixPool>>,
 }
 
 #[derive(Clone, Debug)]
@@ -225,7 +228,38 @@ impl Qwen3_5Engine {
         speculative: Option<&crate::proposer::SpeculativeConfig>,
         lora_modules: &[crate::lora::LoraModuleSpec],
     ) -> Result<Self> {
+        let devices: Vec<i32> = (0..tp_size).map(|r| r as i32).collect();
+        Self::load_for_serving_with_auto_fit_on_devices(
+            model_spec,
+            &devices,
+            1,
+            kv_policy,
+            allow_kv_format_stepdown,
+            requested_kv_pages,
+            use_cuda_graph,
+            max_num_seqs,
+            speculative,
+            lora_modules,
+        )
+    }
+
+    /// Serving admission and activation bound to explicit CUDA `devices` (length `1`, `2`, or `4`),
+    /// scaling host-RAM swap/checkpoint budgets by `1 / (tp * dp_size)` for in-process DP replicas.
+    #[allow(clippy::too_many_arguments)]
+    pub fn load_for_serving_with_auto_fit_on_devices(
+        model_spec: &str,
+        devices: &[i32],
+        dp_size: usize,
+        kv_policy: KvFormatPolicy,
+        allow_kv_format_stepdown: bool,
+        requested_kv_pages: Option<usize>,
+        use_cuda_graph: bool,
+        max_num_seqs: usize,
+        speculative: Option<&crate::proposer::SpeculativeConfig>,
+        lora_modules: &[crate::lora::LoraModuleSpec],
+    ) -> Result<Self> {
         use crate::proposer::SpeculativeKind;
+        let tp_size = devices.len();
         let base_state_slots = serving_state_slots(max_num_seqs)?;
         assert!(matches!(tp_size, 1 | 2 | 4), "tp_size must be 1, 2, or 4");
         if let Some(config) = speculative
@@ -248,6 +282,7 @@ impl Qwen3_5Engine {
             state_slots: Some(base_state_slots),
             lora_reserve,
             enable_checkpoint_pool: true,
+            dp_size: dp_size.max(1),
             ..PoolCapacity::default()
         };
         let mut resolved_draft: Option<std::path::PathBuf> = None;
@@ -280,10 +315,10 @@ impl Qwen3_5Engine {
             }
         }
         let (mut fit_plan, dflash_reserve_bytes, dflash_min_state_slots) =
-            Qwen3_5ModelRank::fit_serving_plan(
+            Qwen3_5ModelRank::fit_serving_plan_on_devices(
                 &archive,
                 &cfg,
-                tp_size,
+                devices,
                 kv_policy,
                 allow_kv_format_stepdown,
                 requested_kv_pages,
@@ -308,9 +343,9 @@ impl Qwen3_5Engine {
         capacity.dflash_reserve_bytes = dflash_reserve_bytes;
         capacity.dflash_min_state_slots = dflash_min_state_slots;
 
-        let mut engine = Self::load_from_dir_with_capacity(
+        let mut engine = Self::load_from_dir_with_capacity_on_devices(
             &dir,
-            tp_size,
+            devices,
             fit_plan.kv_policy,
             capacity,
             use_cuda_graph,
@@ -441,6 +476,25 @@ impl Qwen3_5Engine {
         capacity: PoolCapacity,
         use_cuda_graph: bool,
     ) -> Result<Self> {
+        let devices: Vec<i32> = (0..tp_size).map(|r| r as i32).collect();
+        Self::load_from_dir_with_capacity_on_devices(
+            dir,
+            &devices,
+            kv_policy,
+            capacity,
+            use_cuda_graph,
+        )
+    }
+
+    fn load_from_dir_with_capacity_on_devices(
+        dir: &Path,
+        devices: &[i32],
+        kv_policy: KvFormatPolicy,
+        capacity: PoolCapacity,
+        use_cuda_graph: bool,
+    ) -> Result<Self> {
+        let tp_size = devices.len();
+        assert!(matches!(tp_size, 1 | 2 | 4), "tp_size must be 1, 2, or 4");
         let tok_path = dir.join("tokenizer.json");
         let tok_handle = tok_path.exists().then(|| {
             std::thread::spawn(move || {
@@ -487,9 +541,10 @@ impl Qwen3_5Engine {
 
             let tp2_comm = if tp_size > 1 {
                 // Max collective payload: 4096 tokens * 5120 hidden_size * 2 bytes = 40 MiB
-                Some(Arc::new(Tp2Collectives::new_for_tp(
-                    tp_size,
+                Some(Arc::new(Tp2Collectives::new_for_tp_with_devices(
+                    devices,
                     40 * 1024 * 1024,
+                    true,
                 )?))
             } else {
                 None
@@ -519,21 +574,24 @@ impl Qwen3_5Engine {
                     cfg_ref,
                     0,
                     tp_size,
-                    0,
+                    devices[0],
                     kv_policy,
                     rank_capacity,
                     shared_vocab_ref,
                 )?]
             } else {
-                let handles: Vec<_> = (0..tp_size)
-                    .map(|r| {
+                let handles: Vec<_> = devices
+                    .iter()
+                    .copied()
+                    .enumerate()
+                    .map(|(r, dev_id)| {
                         s.spawn(move || {
                             Qwen3_5ModelRank::load_rank_pre_pool(
                                 archive_ref,
                                 cfg_ref,
                                 r,
                                 tp_size,
-                                r as i32,
+                                dev_id,
                                 kv_policy,
                                 rank_capacity,
                                 shared_vocab_ref,
@@ -593,10 +651,13 @@ impl Qwen3_5Engine {
                 Ok(out)
             })?
         };
-        // Drop cached pages for one-shot backbone/expert `.safetensors` files, then
-        // sequentially prefault PLE `.safetensors` shards into host page cache when
-        // `MemAvailable` leaves at least 8 GiB of headroom.
-        archive.drop_page_cache();
+        // Drop cached pages for one-shot backbone/expert `.safetensors` files when single-replica
+        // (under DP > 1, sibling replicas may still be reading the same shards in parallel), then
+        // sequentially prefault PLE `.safetensors` shards into host page cache when `MemAvailable`
+        // leaves at least 8 GiB of headroom.
+        if capacity.dp_size <= 1 {
+            archive.drop_page_cache();
+        }
         if let Some((_, ref ple_mmap_table)) = ple_shared {
             const PLE_PREFAULT_SAFETY_HEADROOM_BYTES: usize = 8 * 1024 * 1024 * 1024;
             let _ =
@@ -680,7 +741,20 @@ impl Qwen3_5Engine {
             active_lora_id: crate::lora::BASE_MODEL_LORA_ID,
             slice_lora_ids: Vec::new(),
             serving_fit: None,
+            dp_rank: 0,
+            dp_size: rank_capacity.dp_size.max(1),
+            dp_prefix_pool: None,
         })
+    }
+
+    /// Attaches the process-wide L2 Host-RAM prefix pool shared across DP replicas.
+    pub fn set_dp_prefix_pool(
+        &mut self,
+        dp_rank: usize,
+        pool: std::sync::Arc<crate::dp_prefix_pool::SharedDpPrefixPool>,
+    ) {
+        self.dp_rank = dp_rank;
+        self.dp_prefix_pool = Some(pool);
     }
 
     /// Loads and attaches one or more PEFT LoRA adapters onto all TP ranks of this engine.

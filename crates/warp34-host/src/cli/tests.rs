@@ -1552,6 +1552,8 @@ fn bench_and_profile_diff_cli_validation_and_forwarding() {
         gpu_sm_tag: "sm_86".to_string(),
         gpu_sm_count: 84,
         tp_size: 1,
+        dp_size: 1,
+        dp_routing: "prefix",
         total_vram_bytes: 24 * 1024 * 1024 * 1024,
         post_load_free_vram_bytes: 467 * 1024 * 1024,
         kv_policy: KvFormatPolicy::Tq4All,
@@ -1627,6 +1629,8 @@ fn serve_boot_banner_formats_lora_and_tq4_tail_variants() {
         gpu_sm_tag: "sm_86".to_string(),
         gpu_sm_count: 84,
         tp_size: 1,
+        dp_size: 1,
+        dp_routing: "prefix",
         total_vram_bytes: 24 * 1024 * 1024 * 1024,
         post_load_free_vram_bytes: 1024 * 1024 * 1024,
         kv_policy: KvFormatPolicy::Tq4,
@@ -1866,4 +1870,36 @@ fn speculative_auto_resolves_mtp_dflash2_and_off() {
     .err()
     .unwrap();
     assert!(err.contains("--draft-model cannot be combined with --speculative off"));
+}
+
+#[cfg(feature = "cuda")]
+#[test]
+fn dp_cli_options_and_validation() {
+    let dp3 = parse(&[
+        "serve",
+        "org/model",
+        "--dp",
+        "3",
+        "--dp-routing",
+        "least-loaded",
+    ]);
+    assert_eq!(dp3.dp, 3);
+    assert!(!dp3.dp_auto);
+    assert_eq!(
+        dp3.serve.options.dp_routing,
+        crate::dp_router::DpRoutingPolicy::LeastLoaded
+    );
+    assert!(validate_cuda_command(&dp3, "serve").is_ok());
+
+    let dp_auto = parse(&["serve", "org/model", "--dp", "auto"]);
+    assert!(dp_auto.dp_auto);
+    assert!(validate_cuda_command(&dp_auto, "serve").is_ok());
+
+    // --dp > 1 is rejected on single-sequence subcommands.
+    let gen_dp = parse(&["generate", "org/model", "--dp", "2"]);
+    assert!(validate_cuda_command(&gen_dp, "generate").is_err());
+
+    // --dp 0 is rejected.
+    let dp0 = parse(&["serve", "org/model", "--dp", "0"]);
+    assert!(validate_cuda_command(&dp0, "serve").is_err());
 }

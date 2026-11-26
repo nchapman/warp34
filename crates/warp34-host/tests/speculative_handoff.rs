@@ -1369,3 +1369,543 @@ fn realistic_swe_trajectory_caches_across_plain_mtp_and_dflash2() {
         "DFlash2 cached prefix depths must match Plain on every trajectory turn"
     );
 }
+
+#[test]
+fn mtp_plain_memo_siblings_and_dp_l2_warmup_and_hol_yield_regressions() {
+    use std::sync::Arc;
+    use warp34_host::dp_prefix_pool::SharedDpPrefixPool;
+
+    if common::require_or_skip_cached_model(
+        "Qwen/Qwen3.5-4B",
+        "mtp_plain_memo_siblings_and_dp_l2_warmup_and_hol_yield_regressions",
+    )
+    .is_none()
+    {
+        return;
+    }
+    let _gpu_guard = GPU_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+
+    let l2_pool = Arc::new(SharedDpPrefixPool::new(512 * 1024 * 1024, 16));
+
+    // Phase 1: `max_tokens = 1` warmup on an MTP worker (`1024` KV pages -> `max_tap_rows = 256`
+    // while `mtp_prefill_max_rows = 2048`) must publish BOTH KV+GDN AND `proposer_features` to L2.
+    let pool_w0 = Arc::clone(&l2_pool);
+    let w0 = EngineWorker::from_loader(
+        move || {
+            let mut engine = Qwen3_5Engine::load_for_serving(
+                "Qwen/Qwen3.5-4B",
+                1,
+                KvFormatPolicy::Tq4,
+                Some(1024),
+                true,
+                16,
+            )
+            .map_err(|e| e.to_string())?;
+            engine
+                .enable_speculative(&SpeculativeConfig {
+                    kind: SpeculativeKind::Mtp,
+                    mtp_k: 3,
+                    draft_model: None,
+                })
+                .map_err(|e| e.to_string())?;
+            engine.set_dp_prefix_pool(0, pool_w0);
+            Ok(engine)
+        },
+        SchedulerConfig::default(),
+    )
+    .unwrap();
+
+    let base_ids: Vec<i32> = w0
+        .tokenizer
+        .as_ref()
+        .unwrap()
+        .encode(
+            "Explain modern CPU out-of-order execution, register renaming, reorder buffers, and speculative branch recovery in detail. ",
+            false,
+        )
+        .unwrap()
+        .get_ids()
+        .iter()
+        .map(|&id| id as i32)
+        .collect();
+    let mut harness_2112 = Vec::with_capacity(2120);
+    while harness_2112.len() < 2120 {
+        harness_2112.extend_from_slice(&base_ids);
+    }
+    harness_2112.truncate(2120); // > 2048 -> donates 2112-token (33-chunk) prefix
+
+    rt.block_on(async {
+        let mut warm = w0
+            .submit(
+                harness_2112.clone(),
+                SamplingParams {
+                    max_tokens: 1,
+                    ignore_eos: true,
+                    temperature: 0.0,
+                    ..SamplingParams::default()
+                },
+                None,
+            )
+            .unwrap();
+        let (_, _) =
+            tokio::time::timeout(Duration::from_secs(60), collect_with_cached(&mut warm, 1))
+                .await
+                .unwrap()
+                .unwrap();
+        w0.shutdown().await.unwrap();
+    });
+
+    assert!(
+        l2_pool.stats().publishes >= 1,
+        "max_tokens=1 MTP warmup must publish to SharedDpPrefixPool"
+    );
+    assert_eq!(
+        l2_pool.peek_longest_match(-1, &harness_2112, 0),
+        Some((2112, true)),
+        "max_tokens=1 MTP warmup must include proposer_features in L2"
+    );
+
+    // Phase 2: Fresh MTP worker `w1` hydrates the 2112-token prefix from L2, runs a concurrent
+    // `B=6` burst sharing that >2048 harness (forcing `step_plain`), and then runs Turn 2 on
+    // sibling #5 — proving `init_plain_memo` did NOT steal the shared harness memo from siblings
+    // 1..5 and that Turn 2 resumes MTP-3 with full cached prefix!
+    let pool_w1 = Arc::clone(&l2_pool);
+    let w1 = EngineWorker::from_loader(
+        move || {
+            let mut engine = Qwen3_5Engine::load_for_serving(
+                "Qwen/Qwen3.5-4B",
+                1,
+                KvFormatPolicy::Tq4,
+                Some(1024),
+                true,
+                16,
+            )
+            .map_err(|e| e.to_string())?;
+            engine
+                .enable_speculative(&SpeculativeConfig {
+                    kind: SpeculativeKind::Mtp,
+                    mtp_k: 3,
+                    draft_model: None,
+                })
+                .map_err(|e| e.to_string())?;
+            engine.set_dp_prefix_pool(1, pool_w1);
+            Ok(engine)
+        },
+        SchedulerConfig::default(),
+    )
+    .unwrap();
+
+    rt.block_on(async {
+        // Hydrate L2 onto `w1` and confirm MTP-3 verify rounds fire immediately.
+        let mut hydrated_prompt = harness_2112[..2112].to_vec();
+        hydrated_prompt.extend_from_slice(&base_ids[..16]);
+        let mut s_hyd = w1
+            .submit(
+                hydrated_prompt,
+                SamplingParams {
+                    max_tokens: 16,
+                    ignore_eos: true,
+                    temperature: 0.0,
+                    ..SamplingParams::default()
+                },
+                None,
+            )
+            .unwrap();
+        let (_, hyd_cached) =
+            tokio::time::timeout(Duration::from_secs(60), collect_with_cached(&mut s_hyd, 16))
+                .await
+                .unwrap()
+                .unwrap();
+        assert_eq!(hyd_cached, 2112);
+        assert!(w1.stats.verify_rounds.load(Ordering::Relaxed) > 0);
+
+        // Concurrent B=6 burst (> MAX_MTP_BATCH_SLOTS = 4) sharing the 2112-token harness:
+        // all 6 enter `step_plain`, and sibling #5 must still retain its plain_memo for Turn 2!
+        let mut streams = Vec::new();
+        let mut prompts_b6 = Vec::new();
+        for idx in 0..6usize {
+            let mut p = harness_2112[..2112].to_vec();
+            p.push(base_ids[idx % base_ids.len()]);
+            p.extend_from_slice(&base_ids[..20]);
+            streams.push(
+                w1.submit(
+                    p.clone(),
+                    SamplingParams {
+                        max_tokens: 16,
+                        ignore_eos: true,
+                        temperature: 0.0,
+                        ..SamplingParams::default()
+                    },
+                    None,
+                )
+                .unwrap(),
+            );
+            prompts_b6.push(p);
+        }
+        let mut outs_b6 = Vec::new();
+        for s in &mut streams {
+            let (toks, cached) =
+                tokio::time::timeout(Duration::from_secs(60), collect_with_cached(s, 16))
+                    .await
+                    .unwrap()
+                    .unwrap();
+            assert_eq!(cached, 2112, "every B=6 sibling must hit the 2112-token prefix");
+            outs_b6.push(toks);
+        }
+
+        // Turn 2 of sibling #5 (2112 + 21 + 16 = 2149 tokens + 16 new suffix = 2165 tokens,
+        // so aligned 2112+32 = 2144 > 2112!) must resume MTP-3 cleanly without losing cache!
+        let rounds_before_turn2 = w1.stats.verify_rounds.load(Ordering::Relaxed);
+        let mut sib5_turn2 = prompts_b6[5].clone();
+        sib5_turn2.extend_from_slice(&outs_b6[5]);
+        sib5_turn2.extend_from_slice(&base_ids[..16]);
+        let mut s_turn2 = w1
+            .submit(
+                sib5_turn2,
+                SamplingParams {
+                    max_tokens: 16,
+                    ignore_eos: true,
+                    temperature: 0.0,
+                    ..SamplingParams::default()
+                },
+                None,
+            )
+            .unwrap();
+        let (_, turn2_cached) =
+            tokio::time::timeout(Duration::from_secs(60), collect_with_cached(&mut s_turn2, 16))
+                .await
+                .unwrap()
+                .unwrap();
+        assert!(
+            turn2_cached >= 2112,
+            "sibling #5 Turn 2 must hit full cached prefix >= 2112, got {turn2_cached}"
+        );
+        assert!(
+            w1.stats.verify_rounds.load(Ordering::Relaxed) > rounds_before_turn2,
+            "sibling #5 Turn 2 must resume MTP-3 verify rounds (plain_memo was not stolen by sibling #0)"
+        );
+
+        // Phase 3: Insert a distinct 2112-token prefix into L2 WITHOUT proposer_features
+        // (simulating a plain-mode spillover entry) and submit it WHILE an MTP request is
+        // actively decoding. The worker must yield MTP to `step_plain` instead of starving
+        // `sched.waiting` in an infinite head-of-line stall!
+        w1.shutdown().await.unwrap();
+    });
+
+    let plain_l2 = Arc::new(SharedDpPrefixPool::new(512 * 1024 * 1024, 16));
+    let alt_tok = *base_ids.iter().find(|&&t| t != base_ids[0]).unwrap();
+    let mut distinct_2120 = harness_2112.clone();
+    distinct_2120[0] = alt_tok;
+    {
+        let pool_p = Arc::clone(&plain_l2);
+        let wp = EngineWorker::from_loader(
+            move || {
+                let mut engine = Qwen3_5Engine::load_for_serving(
+                    "Qwen/Qwen3.5-4B",
+                    1,
+                    KvFormatPolicy::Tq4,
+                    Some(512),
+                    true,
+                    16,
+                )
+                .map_err(|e| e.to_string())?;
+                engine.set_dp_prefix_pool(0, pool_p);
+                Ok(engine)
+            },
+            SchedulerConfig::default(),
+        )
+        .unwrap();
+        rt.block_on(async {
+            let mut s = wp
+                .submit(
+                    distinct_2120.clone(),
+                    SamplingParams {
+                        max_tokens: 1,
+                        ignore_eos: true,
+                        temperature: 0.0,
+                        ..SamplingParams::default()
+                    },
+                    None,
+                )
+                .unwrap();
+            let _ = tokio::time::timeout(Duration::from_secs(60), collect_with_cached(&mut s, 1))
+                .await
+                .unwrap()
+                .unwrap();
+            wp.shutdown().await.unwrap();
+        });
+    }
+    assert_eq!(
+        plain_l2.peek_longest_match(-1, &distinct_2120, 0),
+        Some((2112, false)),
+        "plain-mode max_tokens=1 warmup must publish KV+GDN with proposer_features=None"
+    );
+
+    let pool_w2 = Arc::clone(&plain_l2);
+    let w2 = EngineWorker::from_loader(
+        move || {
+            let mut engine = Qwen3_5Engine::load_for_serving(
+                "Qwen/Qwen3.5-4B",
+                1,
+                KvFormatPolicy::Tq4,
+                Some(1024),
+                true,
+                16,
+            )
+            .map_err(|e| e.to_string())?;
+            engine
+                .enable_speculative(&SpeculativeConfig {
+                    kind: SpeculativeKind::Mtp,
+                    mtp_k: 3,
+                    draft_model: None,
+                })
+                .map_err(|e| e.to_string())?;
+            engine.set_dp_prefix_pool(1, pool_w2);
+            Ok(engine)
+        },
+        SchedulerConfig::default(),
+    )
+    .unwrap();
+
+    rt.block_on(async {
+        // Start an active MTP request first, wait for 2 tokens so it is mid-decode in MTP batch mode,
+        // then enqueue the 2112-token unwarmed L2 request behind it!
+        let mut active_mtp = w2
+            .submit(
+                base_ids.clone(),
+                SamplingParams {
+                    max_tokens: 48,
+                    ignore_eos: true,
+                    temperature: 0.0,
+                    ..SamplingParams::default()
+                },
+                None,
+            )
+            .unwrap();
+        let mut prefix_out = Vec::new();
+        tokio::time::timeout(Duration::from_secs(30), async {
+            while prefix_out.len() < 2 {
+                match active_mtp.events.recv().await {
+                    Some(GenerationEvent::Token { id, .. }) => prefix_out.push(id),
+                    Some(GenerationEvent::Finished { .. }) => {
+                        panic!("active_mtp finished early before 2 tokens")
+                    }
+                    Some(GenerationEvent::Error(e)) => panic!("active_mtp errored early: {e}"),
+                    None => panic!("active_mtp stream closed before 2 tokens"),
+                }
+            }
+        })
+        .await
+        .expect("timed out waiting for first 2 active_mtp tokens");
+        let mut unwarmed_req = distinct_2120[..2112].to_vec();
+        unwarmed_req.extend_from_slice(&base_ids[..16]);
+        let mut s_unwarmed = w2
+            .submit(
+                unwarmed_req,
+                SamplingParams {
+                    max_tokens: 16,
+                    ignore_eos: true,
+                    temperature: 0.0,
+                    ..SamplingParams::default()
+                },
+                None,
+            )
+            .unwrap();
+        // Both must finish promptly without head-of-line queue starvation, and `s_unwarmed`
+        // must hydrate all 2112 tokens from L2!
+        let (res_active, res_unwarmed) = tokio::time::timeout(Duration::from_secs(30), async {
+            let mut rem_active = prefix_out;
+            while let Some(ev) = active_mtp.events.recv().await {
+                match ev {
+                    GenerationEvent::Token { id, .. } => rem_active.push(id),
+                    GenerationEvent::Finished { .. } => break,
+                    GenerationEvent::Error(e) => return Err(e.to_string()),
+                }
+            }
+            let (_, cached) = collect_with_cached(&mut s_unwarmed, 16).await?;
+            Ok::<_, String>((rem_active.len(), cached))
+        })
+        .await
+        .expect("unwarmed >=2048 radix arrival must not deadlock behind active MTP")
+        .unwrap();
+        assert_eq!(res_active, 48);
+        assert_eq!(res_unwarmed, 2112);
+        w2.shutdown().await.unwrap();
+    });
+}
+
+#[test]
+fn non_gdn_l2_hydration_allocates_unique_state_slots_without_corrupting_pool() {
+    use std::sync::Arc;
+    use warp34_host::dp_prefix_pool::SharedDpPrefixPool;
+
+    if common::require_or_skip_cached_model(
+        "Qwen/Qwen3.5-4B",
+        "non_gdn_l2_hydration_allocates_unique_state_slots_without_corrupting_pool",
+    )
+    .is_none()
+    {
+        return;
+    }
+    let _gpu_guard = GPU_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+    let l2 = Arc::new(SharedDpPrefixPool::new(256 * 1024 * 1024, 16));
+    let mut e0 = Qwen3_5Engine::load_for_serving(
+        "Qwen/Qwen3.5-4B",
+        1,
+        KvFormatPolicy::Tq4,
+        Some(128),
+        false,
+        8,
+    )
+    .unwrap();
+    // Configure `e0` as a pure full-attention + PLE model (`!is_hybrid_gdn && uses_ple()`),
+    // and truncate `kv_pool` downward to verify immutable page strides on truncated TP ranks.
+    e0.cfg.num_hidden_layers = e0.cfg.num_full_attention_layers();
+    e0.cfg.ple_embed_dim = 64;
+    e0.cfg.ple_layer_ids = vec![0];
+    e0.ranks[0].kv_pool.truncate_pages(96);
+    e0.ranks[0].state_pool.init_ple_state(64, 0).unwrap();
+    e0.ranks[0].checkpoint_pool = None;
+    assert!(!e0.has_checkpoint_pool());
+    e0.set_dp_prefix_pool(0, Arc::clone(&l2));
+
+    // Publish two distinct 256-token prefixes from e0 into L2 with distinct PLE n-gram contexts
+    // AND distinct nonzero `ple_conv_state` buffers.
+    let ple_slot_bytes = e0.ranks[0].state_pool.ple_conv_slot_bytes();
+    assert!(ple_slot_bytes > 0);
+    let conv_a = vec![0xA5u8; ple_slot_bytes];
+    let conv_b = vec![0x5Au8; ple_slot_bytes];
+    let seq_a: Vec<i32> = (10..266).collect();
+    let seq_b: Vec<i32> = (500..756).collect();
+    let mut rad0 = warp34_host::radix::MambaRadixCache::new(16, 64);
+    for (seq, ple_ctx, conv_bytes) in [(&seq_a, [42, 99], &conv_a), (&seq_b, [77, 88], &conv_b)] {
+        let mut pages = Vec::with_capacity(16);
+        for _ in 0..16 {
+            pages.push(e0.ranks[0].kv_pool.alloc_page().unwrap());
+        }
+        let slot = e0.alloc_state_slot_from(&mut rad0).unwrap();
+        e0.ranks[0].state_pool.ple_ngram_context[slot as usize] = ple_ctx;
+        e0.ranks[0]
+            .state_pool
+            .import_ple_conv_host_bytes_to_slot(slot, conv_bytes, &e0.ranks[0].stream)
+            .unwrap();
+        let ins = rad0.insert(seq, &pages, &[], slot, 0);
+        e0.try_publish_radix_node_to_shared_pool_with_features(
+            &rad0,
+            ins.terminal_node,
+            -1,
+            seq,
+            false,
+            || None,
+        );
+    }
+    assert_eq!(l2.stats().entries, 2);
+
+    // Hydrate BOTH prefixes onto e1 while slot 0 is actively owned by an in-flight sequence,
+    // verify PLE contexts AND `ple_conv_state` round-trip into distinct `state_pool` slots (`!= 0`),
+    // then evict the radix cache and verify `state_pool.free_count()` never pushes duplicate `0`s!
+    let mut e1 = Qwen3_5Engine::load_for_serving(
+        "Qwen/Qwen3.5-4B",
+        1,
+        KvFormatPolicy::Tq4,
+        Some(128),
+        false,
+        8,
+    )
+    .unwrap();
+    e1.cfg.num_hidden_layers = e1.cfg.num_full_attention_layers();
+    e1.cfg.ple_embed_dim = 64;
+    e1.cfg.ple_layer_ids = vec![0];
+    e1.ranks[0].kv_pool.truncate_pages(80);
+    e1.ranks[0].state_pool.init_ple_state(64, 0).unwrap();
+    e1.ranks[0].checkpoint_pool = None;
+    e1.set_dp_prefix_pool(1, Arc::clone(&l2));
+    let total_slots = e1.ranks[0].state_pool.total_slots;
+    let active_slot = e1.ranks[0].state_pool.alloc_slot().unwrap();
+    assert_eq!(active_slot, 0);
+    let conv_active = vec![0xCCu8; ple_slot_bytes];
+    e1.ranks[0].state_pool.ple_ngram_context[0] = [111, 222];
+    e1.ranks[0]
+        .state_pool
+        .import_ple_conv_host_bytes_to_slot(0, &conv_active, &e1.ranks[0].stream)
+        .unwrap();
+
+    let mut q_a = seq_a.clone();
+    q_a.push(999);
+    let mut q_b = seq_b.clone();
+    q_b.push(999);
+    let mut rad = warp34_host::radix::MambaRadixCache::new(16, 64);
+    assert!(
+        e1.try_hydrate_waiting_from_shared_pool(&mut rad, -1, &q_a)
+            .is_some()
+    );
+    assert!(
+        e1.try_hydrate_waiting_from_shared_pool(&mut rad, -1, &q_b)
+            .is_some()
+    );
+    assert_eq!(e1.ranks[0].state_pool.free_count(), total_slots - 3);
+    assert_eq!(
+        e1.ranks[0].state_pool.ple_ngram_context[0],
+        [111, 222],
+        "active slot 0 PLE context must not be clobbered by !is_hybrid_gdn L2 hydration"
+    );
+    assert_eq!(
+        e1.ranks[0]
+            .state_pool
+            .export_ple_conv_slot_to_host_bytes(0, &e1.ranks[0].stream)
+            .unwrap(),
+        conv_active,
+        "active slot 0 PLE conv state must not be clobbered"
+    );
+    let node_a = rad.match_prefix(&seq_a).last_node;
+    let node_b = rad.match_prefix(&seq_b).last_node;
+    let (_, _, slot_a) = rad.node_kv_pages_and_mamba(node_a).unwrap();
+    let (_, _, slot_b) = rad.node_kv_pages_and_mamba(node_b).unwrap();
+    assert_ne!(slot_a, 0);
+    assert_ne!(slot_b, 0);
+    assert_ne!(slot_a, slot_b);
+    assert_eq!(
+        e1.ranks[0].state_pool.ple_ngram_context[slot_a as usize],
+        [42, 99]
+    );
+    assert_eq!(
+        e1.ranks[0].state_pool.ple_ngram_context[slot_b as usize],
+        [77, 88]
+    );
+    assert_eq!(
+        e1.ranks[0]
+            .state_pool
+            .export_ple_conv_slot_to_host_bytes(slot_a, &e1.ranks[0].stream)
+            .unwrap(),
+        conv_a
+    );
+    assert_eq!(
+        e1.ranks[0]
+            .state_pool
+            .export_ple_conv_slot_to_host_bytes(slot_b, &e1.ranks[0].stream)
+            .unwrap(),
+        conv_b
+    );
+
+    // Evict all hydrated radix entries and release their state slots back to `e1`.
+    let ev = rad.evict_full_pages(64);
+    e1.free_kv_pages(&ev.freed_kv_pages);
+    e1.free_state_slots(&ev.freed_mamba_slots);
+    assert_eq!(e1.ranks[0].state_pool.free_count(), total_slots - 1);
+
+    // Allocate all remaining free slots: NONE of them may alias `active_slot == 0`!
+    let mut seen = std::collections::HashSet::new();
+    seen.insert(active_slot);
+    while let Some(s) = e1.ranks[0].state_pool.alloc_slot() {
+        assert!(
+            seen.insert(s),
+            "duplicate state_pool slot {s} after !is_hybrid_gdn L2 eviction!"
+        );
+    }
+    assert_eq!(seen.len(), total_slots);
+}

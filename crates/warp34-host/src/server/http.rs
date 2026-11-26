@@ -32,6 +32,12 @@ use tokio_stream::{Stream, StreamExt};
 const BODY_LIMIT: usize = 32 * 1024 * 1024;
 const BODY_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Loader closure for a single in-process DP LLM/Decision replica.
+pub type DpEngineLoader = Box<
+    dyn FnOnce(usize, Arc<crate::dp_router::DpPrefixDirectory>) -> Result<Qwen3_5Engine, String>
+        + Send,
+>;
+
 pub struct OpenAiServerState {
     pub model_name: String,
     api_key: Option<crate::api_auth::ApiKey>,
@@ -40,7 +46,11 @@ pub struct OpenAiServerState {
     pub default_reasoning_budget: Option<usize>,
     pub default_reasoning_budget_message: Option<String>,
     pub reasoning_effort_budget: bool,
+    max_num_seqs: usize,
     pub worker: EngineWorker,
+    extra_workers: Vec<EngineWorker>,
+    dp_router: Arc<crate::dp_router::DpRouterCore>,
+    dp_prefix_pool: Option<Arc<crate::dp_prefix_pool::SharedDpPrefixPool>>,
     pub metrics: Arc<crate::telemetry::Telemetry>,
     next_request_id: AtomicU64,
     pub allow_remote_images: bool,
@@ -83,14 +93,106 @@ impl OpenAiServerState {
         options: super::ServeOptions,
         loader: impl FnOnce() -> Result<Qwen3_5Engine, String> + Send + 'static,
     ) -> Result<Arc<Self>, String> {
+        Self::from_loaders_with_options(
+            model_name,
+            allow_remote_images,
+            options,
+            vec![Box::new(move |_dp_rank, _dir| loader())],
+        )
+    }
+
+    /// Loads `loaders.len()` (`>= 1`) independent data-parallel engine replicas in parallel
+    /// and attaches a shared [`crate::dp_router::DpPrefixDirectory`] observer to each replica's
+    /// `MambaRadixCache` when `dp > 1`.
+    pub fn from_loaders_with_options(
+        model_name: String,
+        allow_remote_images: bool,
+        options: super::ServeOptions,
+        loaders: Vec<DpEngineLoader>,
+    ) -> Result<Arc<Self>, String> {
         options.validate()?;
+        if loaders.is_empty() {
+            return Err("from_loaders_with_options requires at least one loader".to_owned());
+        }
+        let dp_size = loaders.len();
+        let shared_l2_pool = if dp_size > 1 {
+            crate::dp_prefix_pool::SharedDpPrefixPool::auto_sized(16)
+        } else {
+            None
+        };
+        let dp_router = crate::dp_router::DpRouterCore::with_l2_pool(
+            dp_size,
+            options.dp_routing,
+            shared_l2_pool.clone(),
+        );
         let config = SchedulerConfig {
             max_num_seqs: options.max_num_seqs,
             ..SchedulerConfig::default()
         };
-        let mut worker = EngineWorker::from_loader(loader, config)?;
-        worker.set_max_model_len(options.max_model_len)?;
-        let mut state = Self::with_worker(model_name, worker, allow_remote_images);
+        let mut workers = if dp_size == 1 {
+            let loader = loaders.into_iter().next().unwrap();
+            let dir = Arc::clone(&dp_router.prefix_dir);
+            let mut w = EngineWorker::from_loader(move || loader(0, dir), config)?;
+            w.set_max_model_len(options.max_model_len)?;
+            vec![w]
+        } else {
+            let max_model_len = options.max_model_len;
+            if let Some(pool) = &shared_l2_pool {
+                eprintln!(
+                    "[warp34] DP shared L2 host-RAM prefix pool enabled ({:.2} GiB cap across {dp_size} replicas)",
+                    pool.max_bytes() as f64 / (1024.0 * 1024.0 * 1024.0)
+                );
+            }
+            let results: Vec<Result<EngineWorker, String>> = std::thread::scope(|s| {
+                let handles: Vec<_> = loaders
+                    .into_iter()
+                    .enumerate()
+                    .map(|(dp_rank, loader)| {
+                        let cfg = config;
+                        let dir = Arc::clone(&dp_router.prefix_dir);
+                        let pool = shared_l2_pool.clone();
+                        s.spawn(move || {
+                            let mut w = EngineWorker::from_loader(
+                                move || {
+                                    let mut engine = loader(dp_rank, Arc::clone(&dir))?;
+                                    engine.radix.set_dp_prefix_observer(dp_rank, dir);
+                                    if let Some(pool) = pool {
+                                        engine.set_dp_prefix_pool(dp_rank, pool);
+                                    }
+                                    Ok(engine)
+                                },
+                                cfg,
+                            )?;
+                            w.set_max_model_len(max_model_len)?;
+                            Ok(w)
+                        })
+                    })
+                    .collect();
+                handles
+                    .into_iter()
+                    .map(|h| {
+                        h.join()
+                            .unwrap_or_else(|_| Err("DP replica loader thread panicked".to_owned()))
+                    })
+                    .collect()
+            });
+            let mut ok_workers = Vec::with_capacity(dp_size);
+            let mut first_err: Option<String> = None;
+            for res in results {
+                match res {
+                    Ok(w) => ok_workers.push(w),
+                    Err(e) if first_err.is_none() => first_err = Some(e),
+                    Err(_) => {}
+                }
+            }
+            if let Some(err) = first_err {
+                return Err(err);
+            }
+            ok_workers
+        };
+        let primary = workers.remove(0);
+        let mut state =
+            Self::with_workers(model_name, primary, workers, dp_router, allow_remote_images);
         // This newly created state has not been shared with any request handler.
         let unshared = Arc::get_mut(&mut state).expect("unshared server state");
         unshared.api_key = options.api_key;
@@ -99,13 +201,35 @@ impl OpenAiServerState {
         unshared.default_reasoning_budget = options.reasoning_budget;
         unshared.default_reasoning_budget_message = options.reasoning_budget_message;
         unshared.reasoning_effort_budget = options.reasoning_effort_budget;
+        unshared.max_num_seqs = options.max_num_seqs;
+        unshared.dp_prefix_pool = shared_l2_pool;
         Ok(state)
     }
+
     fn with_worker(
         model_name: String,
         worker: EngineWorker,
         allow_remote_images: bool,
     ) -> Arc<Self> {
+        let dp_router =
+            crate::dp_router::DpRouterCore::new(1, crate::dp_router::DpRoutingPolicy::Prefix);
+        Self::with_workers(
+            model_name,
+            worker,
+            Vec::new(),
+            dp_router,
+            allow_remote_images,
+        )
+    }
+
+    fn with_workers(
+        model_name: String,
+        worker: EngineWorker,
+        extra_workers: Vec<EngineWorker>,
+        dp_router: Arc<crate::dp_router::DpRouterCore>,
+        allow_remote_images: bool,
+    ) -> Arc<Self> {
+        let dp_size = 1 + extra_workers.len();
         let constraint_factory = worker.tokenizer.as_ref().and_then(|t| {
             let eos: Vec<u32> = worker
                 .eos_token_ids
@@ -130,6 +254,9 @@ impl OpenAiServerState {
         };
         let metrics = worker.stats.telemetry.clone();
         metrics.set_model(model_name.clone());
+        for w in &extra_workers {
+            w.stats.telemetry.set_model(model_name.clone());
+        }
         Arc::new(Self {
             model_name,
             api_key: None,
@@ -138,16 +265,158 @@ impl OpenAiServerState {
             default_reasoning_budget: None,
             default_reasoning_budget_message: None,
             reasoning_effort_budget: true,
+            max_num_seqs: SchedulerConfig::default().max_num_seqs,
             worker,
+            extra_workers,
+            dp_router,
+            dp_prefix_pool: None,
             allow_remote_images,
             response_store: crate::responses_api::ResponseStore::default(),
             constraint_factory,
             decoded_vocab,
             metrics,
             next_request_id: AtomicU64::new(0),
-            preprocessing: Arc::new(Semaphore::new(32)),
-            admission: Arc::new(Semaphore::new(32)),
+            preprocessing: Arc::new(Semaphore::new(32 * dp_size)),
+            admission: Arc::new(Semaphore::new(32 * dp_size)),
         })
+    }
+
+    #[inline]
+    pub fn dp_size(&self) -> usize {
+        1 + self.extra_workers.len()
+    }
+
+    #[inline]
+    pub fn worker_at(&self, dp_rank: usize) -> &EngineWorker {
+        if dp_rank == 0 {
+            &self.worker
+        } else {
+            &self.extra_workers[dp_rank - 1]
+        }
+    }
+
+    pub fn all_workers(&self) -> impl Iterator<Item = &EngineWorker> {
+        std::iter::once(&self.worker).chain(self.extra_workers.iter())
+    }
+
+    pub fn snapshot_metrics(&self) -> crate::telemetry::Snapshot {
+        if self.extra_workers.is_empty() {
+            return self.metrics.snapshot();
+        }
+        let snaps: Vec<crate::telemetry::Snapshot> = self
+            .all_workers()
+            .map(|w| {
+                let mut snap = w.stats.telemetry.snapshot();
+                if w.is_panicked() || w.is_stopping() {
+                    snap.status = "unavailable";
+                }
+                snap
+            })
+            .collect();
+        crate::telemetry::Snapshot::aggregate(&snaps)
+    }
+
+    /// Selects a DP worker using the configured [`crate::dp_router::DpRoutingPolicy`],
+    /// returning `(dp_rank, worker, Option<InflightGuard>)`.
+    ///
+    /// Maximum serving context length across healthy DP workers (supporting heterogeneous VRAM).
+    pub fn max_healthy_model_len(&self) -> usize {
+        self.all_workers()
+            .filter(|w| !w.is_panicked() && !w.is_stopping())
+            .map(EngineWorker::max_model_len)
+            .max()
+            .unwrap_or_else(|| self.worker.max_model_len())
+    }
+
+    /// When `images` is non-empty and the model has a vision encoder, hashes the
+    /// content-hashed multimodal radix key (`vision::compute_multimodal_radix_key`) so
+    /// multi-turn VLM prompts match the exact keys stored in `MambaRadixCache`.
+    pub(super) fn select_worker(
+        &self,
+        lora_id: i32,
+        prompt_tokens: &[i32],
+        images: &[crate::vision::PreprocessedImage],
+        session_key: Option<&str>,
+    ) -> Result<
+        (
+            usize,
+            &EngineWorker,
+            Option<crate::dp_router::InflightGuard>,
+        ),
+        WorkerError,
+    > {
+        if self.extra_workers.is_empty() {
+            return Ok((0, &self.worker, None));
+        }
+        let samples: Vec<crate::dp_router::WorkerLoadSample> = self
+            .all_workers()
+            .enumerate()
+            .map(|(dp_rank, w)| {
+                let panicked = w.is_panicked();
+                if panicked {
+                    self.dp_router.prefix_dir.clear_worker(dp_rank);
+                }
+                let snap = w.stats.telemetry.snapshot();
+                let active_kv_util = if snap.pools.kv.capacity > 0 {
+                    snap.pools.kv.active.unwrap_or(0) as f64 / snap.pools.kv.capacity as f64
+                } else {
+                    0.0
+                };
+                crate::dp_router::WorkerLoadSample {
+                    healthy: !panicked && !w.is_stopping(),
+                    active_requests: snap.requests.running as usize,
+                    waiting_requests: snap.requests.waiting as usize,
+                    router_inflight: 0,
+                    router_inflight_prefill_tokens: 0,
+                    max_num_seqs: self.max_num_seqs,
+                    kv_token_capacity: w.max_model_len(),
+                    active_kv_util,
+                }
+            })
+            .collect();
+        let mm_key = if !images.is_empty()
+            && let Some(vcfg) = self.worker.vision_config.as_ref()
+        {
+            Some(crate::vision::compute_multimodal_radix_key(
+                prompt_tokens,
+                images,
+                vcfg.image_token_id,
+                vcfg.spatial_merge_size,
+            ))
+        } else {
+            None
+        };
+        let routing_tokens = mm_key.as_deref().unwrap_or(prompt_tokens);
+        let Some((rank, guard)) =
+            self.dp_router
+                .select_and_acquire(samples, lora_id, routing_tokens, session_key)
+        else {
+            return Err(WorkerError::worker_stopped(
+                "all data-parallel workers are unavailable",
+            ));
+        };
+        Ok((rank, self.worker_at(rank), Some(guard)))
+    }
+
+    pub(super) fn bind_session_to_worker(&self, session_key: String, dp_rank: usize) {
+        if !self.extra_workers.is_empty() {
+            self.dp_router.bind_session(session_key, dp_rank);
+        }
+    }
+
+    pub async fn shutdown_all(&self) -> Result<(), String> {
+        let mut first_err: Option<String> = None;
+        for w in self.all_workers() {
+            if let Err(e) = w.shutdown().await
+                && first_err.is_none()
+            {
+                first_err = Some(e);
+            }
+        }
+        match first_err {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
     }
 
     pub fn resolve_request_lora(
@@ -219,10 +488,9 @@ pub(super) fn admission_error(err: tokio::sync::TryAcquireError) -> ApiError {
 }
 
 async fn health(State(s): State<Arc<OpenAiServerState>>) -> Response {
-    health_response(
-        s.worker.is_panicked(),
-        s.admission.is_closed() || s.worker.is_stopping(),
-    )
+    let all_panicked = s.all_workers().all(|w| w.is_panicked());
+    let all_stopping = s.admission.is_closed() || s.all_workers().all(|w| w.is_stopping());
+    health_response(all_panicked, all_stopping)
 }
 
 fn health_response(panicked: bool, stopping: bool) -> Response {
@@ -290,7 +558,7 @@ pub fn router(state: Arc<OpenAiServerState>) -> Router {
     .with_state(state)
 }
 async fn models(State(s): State<Arc<OpenAiServerState>>) -> Json<Value> {
-    let max_model_len = s.worker.max_model_len();
+    let max_model_len = s.max_healthy_model_len();
     let mut data = Vec::with_capacity(1 + s.worker.lora_registry.len());
     data.push(json!({
         "id": s.model_name,
@@ -310,18 +578,42 @@ async fn models(State(s): State<Arc<OpenAiServerState>>) -> Json<Value> {
     Json(json!({"object":"list","data":data}))
 }
 async fn metrics(State(s): State<Arc<OpenAiServerState>>) -> impl IntoResponse {
+    let mut body = s.snapshot_metrics().prometheus();
+    if let Some(pool) = &s.dp_prefix_pool {
+        use std::fmt::Write as _;
+        let st = pool.stats();
+        let _ = writeln!(
+            body,
+            "# HELP warp34_dp_l2_pool_entries Entries in the shared cross-replica DP L2 host-RAM prefix pool\n\
+             # TYPE warp34_dp_l2_pool_entries gauge\n\
+             warp34_dp_l2_pool_entries {}\n\
+             # HELP warp34_dp_l2_pool_used_bytes Host RAM bytes used by the shared DP L2 prefix pool\n\
+             # TYPE warp34_dp_l2_pool_used_bytes gauge\n\
+             warp34_dp_l2_pool_used_bytes {}\n\
+             # HELP warp34_dp_l2_pool_publishes_total Total prefixes published to the shared DP L2 prefix pool\n\
+             # TYPE warp34_dp_l2_pool_publishes_total counter\n\
+             warp34_dp_l2_pool_publishes_total {}\n\
+             # HELP warp34_dp_l2_pool_hits_total Total cross-replica L2 prefix hydrations\n\
+             # TYPE warp34_dp_l2_pool_hits_total counter\n\
+             warp34_dp_l2_pool_hits_total {}\n\
+             # HELP warp34_dp_l2_pool_hydrated_tokens_total Total prompt tokens hydrated across DP replicas from L2\n\
+             # TYPE warp34_dp_l2_pool_hydrated_tokens_total counter\n\
+             warp34_dp_l2_pool_hydrated_tokens_total {}",
+            st.entries, st.used_bytes, st.publishes, st.hits, st.hydrated_tokens
+        );
+    }
     (
         [(
             axum::http::header::CONTENT_TYPE,
             "text/plain; version=0.0.4",
         )],
-        s.metrics.snapshot().prometheus(),
+        body,
     )
 }
 async fn metrics_json(State(s): State<Arc<OpenAiServerState>>) -> impl IntoResponse {
     (
         [(axum::http::header::CACHE_CONTROL, "no-store")],
-        Json(s.metrics.snapshot()),
+        Json(s.snapshot_metrics()),
     )
 }
 fn is_inference_endpoint(method: &axum::http::Method, path: &str) -> bool {
@@ -488,6 +780,7 @@ enum PrepareMode {
     CountTokens,
 }
 
+#[cfg_attr(test, derive(Debug))]
 enum PrepareError {
     BadRequest(String),
     ContextLengthExceeded {
@@ -507,6 +800,22 @@ impl From<&str> for PrepareError {
     fn from(msg: &str) -> Self {
         Self::BadRequest(msg.to_owned())
     }
+}
+
+fn clamp_max_tokens_for_worker(
+    max_tokens: usize,
+    prompt_len: usize,
+    worker_max_len: usize,
+    param: &'static str,
+) -> Result<usize, PrepareError> {
+    if prompt_len >= worker_max_len {
+        return Err(PrepareError::ContextLengthExceeded {
+            prompt_tokens: prompt_len,
+            max_model_len: worker_max_len,
+            param,
+        });
+    }
+    Ok(max_tokens.min(worker_max_len - prompt_len))
 }
 
 fn prepare_openai_err(err: PrepareError) -> ApiError {
@@ -850,7 +1159,7 @@ fn prepare(
     }
     let mut soft_output_budget = false;
     if mode == PrepareMode::Generate {
-        let max_len = s.worker.max_model_len();
+        let max_len = s.max_healthy_model_len();
         if prompt.len() >= max_len {
             return Err(PrepareError::ContextLengthExceeded {
                 prompt_tokens: prompt.len(),
@@ -938,6 +1247,12 @@ async fn generate(
         .clone()
         .try_acquire_owned()
         .map_err(admission_error)?;
+    let session_key = request
+        .headers()
+        .get("x-session-id")
+        .and_then(|v| v.to_str().ok())
+        .filter(|s| !s.is_empty())
+        .map(|s| format!("sess:{s}"));
     let (json, body_len) = read_json_with_len(&s, request).await?;
     let prep_state = s.clone();
     let inline_fast = !chat
@@ -951,7 +1266,7 @@ async fn generate(
             crate::request_constraints::RequestConstraint::parse(&json),
             Ok(None)
         );
-    let prepared = if inline_fast {
+    let mut prepared = if inline_fast {
         prepare(&prep_state, json, chat, PrepareMode::Generate).map_err(prepare_openai_err)?
     } else {
         cpu_with(
@@ -969,11 +1284,27 @@ async fn generate(
     let mut log = prepared.turn_log(
         id.clone(),
         if chat { "chat" } else { "completions" },
-        s.worker.max_model_len(),
+        s.max_healthy_model_len(),
     );
     let prompt_len = prepared.prompt.len();
-    let generation = s
-        .worker
+    let (_dp_rank, target_worker, inflight_guard) = s
+        .select_worker(
+            prepared.lora_id,
+            &prepared.prompt,
+            &prepared.images,
+            session_key.as_deref(),
+        )
+        .inspect_err(|_| log.finish("error", false))
+        .map_err(worker_api_err)?;
+    prepared.params.max_tokens = clamp_max_tokens_for_worker(
+        prepared.params.max_tokens,
+        prompt_len,
+        target_worker.max_model_len(),
+        if chat { "messages" } else { "prompt" },
+    )
+    .inspect_err(|_| log.finish("error", false))
+    .map_err(prepare_openai_err)?;
+    let mut generation = target_worker
         .submit_with_images_lora_and_budget_mode(
             prepared.prompt,
             prepared.images,
@@ -984,6 +1315,7 @@ async fn generate(
         )
         .inspect_err(|_| log.finish("error", false))
         .map_err(worker_api_err)?;
+    generation.attach_inflight_guard(inflight_guard);
     log.track_cache(
         generation.cached_tokens.clone(),
         generation.cache_lookup.clone(),
@@ -1607,7 +1939,19 @@ async fn responses_create(
         .try_acquire_owned()
         .map_err(admission_error)?;
     let caller_scope = responses_caller_scope(&s, request.headers());
+    let header_session = request
+        .headers()
+        .get("x-session-id")
+        .and_then(|v| v.to_str().ok())
+        .filter(|s| !s.is_empty())
+        .map(|s| format!("sess:{s}"));
     let body = read_json(&s, request).await?;
+    let prev_resp_session = body
+        .get("previous_response_id")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .map(|s| format!("resp:{s}"));
+    let session_key = prev_resp_session.or(header_session);
     let request_id = s.next_request_id.fetch_add(1, Ordering::Relaxed) + 1;
     let (chat_req, mut meta) = crate::responses_api::translate_responses_to_chat(
         &body,
@@ -1618,7 +1962,7 @@ async fn responses_create(
     )
     .map_err(responses_api_err)?;
     let prep_state = s.clone();
-    let prepared = cpu_with(
+    let mut prepared = cpu_with(
         &s,
         move || prepare(&prep_state, chat_req, true, PrepareMode::Generate),
         prepare_responses_err,
@@ -1631,11 +1975,28 @@ async fn responses_create(
     let mut log = prepared.turn_log(
         meta.response_id.clone(),
         "responses",
-        s.worker.max_model_len(),
+        s.max_healthy_model_len(),
     );
     let prompt_len = prepared.prompt.len();
-    let generation = s
-        .worker
+    let (dp_rank, target_worker, inflight_guard) = s
+        .select_worker(
+            prepared.lora_id,
+            &prepared.prompt,
+            &prepared.images,
+            session_key.as_deref(),
+        )
+        .inspect_err(|_| log.finish("error", false))
+        .map_err(worker_api_err)?;
+    prepared.params.max_tokens = clamp_max_tokens_for_worker(
+        prepared.params.max_tokens,
+        prompt_len,
+        target_worker.max_model_len(),
+        "input",
+    )
+    .inspect_err(|_| log.finish("error", false))
+    .map_err(prepare_responses_err)?;
+    s.bind_session_to_worker(format!("resp:{}", meta.response_id), dp_rank);
+    let mut generation = target_worker
         .submit_with_images_lora_and_budget_mode(
             prepared.prompt,
             prepared.images,
@@ -1646,6 +2007,7 @@ async fn responses_create(
         )
         .inspect_err(|_| log.finish("error", false))
         .map_err(worker_api_err)?;
+    generation.attach_inflight_guard(inflight_guard);
     log.track_cache(
         generation.cached_tokens.clone(),
         generation.cache_lookup.clone(),
@@ -1924,13 +2286,19 @@ async fn anthropic_messages(
         .clone()
         .try_acquire_owned()
         .map_err(|err| to_anthropic_err(admission_error(err)))?;
+    let session_key = request
+        .headers()
+        .get("x-session-id")
+        .and_then(|v| v.to_str().ok())
+        .filter(|s| !s.is_empty())
+        .map(|s| format!("sess:{s}"));
     let body = read_json(&s, request).await.map_err(to_anthropic_err)?;
     let request_id = s.next_request_id.fetch_add(1, Ordering::Relaxed) + 1;
     let (chat_req, mut meta) =
         crate::anthropic_api::translate_anthropic_to_chat(&body, &s.model_name, request_id, true)
             .map_err(|e| anthropic_api_err(StatusCode::BAD_REQUEST, e))?;
     let prep_state = s.clone();
-    let prepared = cpu_with(
+    let mut prepared = cpu_with(
         &s,
         move || prepare(&prep_state, chat_req, true, PrepareMode::Generate),
         prepare_anthropic_err,
@@ -1940,11 +2308,27 @@ async fn anthropic_messages(
     let mut log = prepared.turn_log(
         meta.message_id.clone(),
         "anthropic",
-        s.worker.max_model_len(),
+        s.max_healthy_model_len(),
     );
     let prompt_len = prepared.prompt.len();
-    let generation = s
-        .worker
+    let (_dp_rank, target_worker, inflight_guard) = s
+        .select_worker(
+            prepared.lora_id,
+            &prepared.prompt,
+            &prepared.images,
+            session_key.as_deref(),
+        )
+        .inspect_err(|_| log.finish("error", false))
+        .map_err(worker_anthropic_err)?;
+    prepared.params.max_tokens = clamp_max_tokens_for_worker(
+        prepared.params.max_tokens,
+        prompt_len,
+        target_worker.max_model_len(),
+        "messages",
+    )
+    .inspect_err(|_| log.finish("error", false))
+    .map_err(prepare_anthropic_err)?;
+    let mut generation = target_worker
         .submit_with_images_lora_and_budget_mode(
             prepared.prompt,
             prepared.images,
@@ -1955,6 +2339,7 @@ async fn anthropic_messages(
         )
         .inspect_err(|_| log.finish("error", false))
         .map_err(worker_anthropic_err)?;
+    generation.attach_inflight_guard(inflight_guard);
     log.track_cache(
         generation.cached_tokens.clone(),
         generation.cache_lookup.clone(),
@@ -2273,16 +2658,14 @@ pub async fn serve(
     let drain_state = state.clone();
     let result =
         serve_with_graceful_shutdown(listener, router(state.clone()), shutdown, move || {
-            drain_state.metrics.set_status("stopping");
+            for w in drain_state.all_workers() {
+                w.stats.telemetry.set_status("stopping");
+            }
             drain_state.admission.close();
             drain_state.preprocessing.close();
         })
         .await;
-    state
-        .worker
-        .shutdown()
-        .await
-        .map_err(std::io::Error::other)?;
+    state.shutdown_all().await.map_err(std::io::Error::other)?;
     result
 }
 /// Format only deployment state, never credentials or user-supplied hostnames.
@@ -2315,11 +2698,7 @@ pub fn run_blocking_server(addr: &str, state: Arc<OpenAiServerState>) -> std::io
         let listener = match tokio::net::TcpListener::bind(addr).await {
             Ok(listener) => listener,
             Err(error) => {
-                state
-                    .worker
-                    .shutdown()
-                    .await
-                    .map_err(std::io::Error::other)?;
+                state.shutdown_all().await.map_err(std::io::Error::other)?;
                 return Err(error);
             }
         };
@@ -2558,5 +2937,25 @@ mod tests {
             joined_args,
             r#"{"path":"src/scene.js","content":"hello world"}"#
         );
+    }
+
+    #[test]
+    fn clamp_max_tokens_for_worker_rejects_prompt_at_or_above_worker_capacity() {
+        assert_eq!(
+            super::clamp_max_tokens_for_worker(4096, 12_000, 16_384, "messages").unwrap(),
+            4096
+        );
+        assert_eq!(
+            super::clamp_max_tokens_for_worker(8192, 12_000, 16_384, "messages").unwrap(),
+            4384
+        );
+        let err_eq =
+            super::clamp_max_tokens_for_worker(256, 16_384, 16_384, "messages").unwrap_err();
+        let (st, body) = super::prepare_openai_err(err_eq);
+        assert_eq!(st, StatusCode::BAD_REQUEST);
+        assert_eq!(body.0["error"]["code"], "context_length_exceeded");
+        let err_gt = super::clamp_max_tokens_for_worker(256, 20_000, 16_384, "input").unwrap_err();
+        let (rst, _) = super::prepare_responses_err(err_gt);
+        assert_eq!(rst, StatusCode::BAD_REQUEST);
     }
 }

@@ -433,6 +433,333 @@ impl Qwen3_5Engine {
         res
     }
 
+    /// Publishes a newly committed radix checkpoint (`node_id`) into the shared cross-replica
+    /// L2 Host-RAM prefix pool if not already present. Best-effort: skips silently on empty
+    /// pool, short prefixes, non-VRAM pages, or missing checkpoint pool on hybrid GDN models.
+    pub fn try_publish_radix_node_to_shared_pool(
+        &self,
+        radix: &MambaRadixCache,
+        node_id: crate::radix::RadixNodeId,
+        lora_id: i32,
+        raw_radix_tokens: &[i32],
+    ) {
+        self.try_publish_radix_node_to_shared_pool_with_features(
+            radix,
+            node_id,
+            lora_id,
+            raw_radix_tokens,
+            false,
+            || None,
+        );
+    }
+
+    /// Publishes a newly committed radix checkpoint (`node_id`) along with optional speculative
+    /// proposer features (`MTP` / `DFlash2`) into the shared cross-replica L2 Host-RAM prefix pool.
+    /// `make_features` is invoked lazily only after fast-path deduplication, stride throttling,
+    /// and base-size checks pass.
+    pub fn try_publish_radix_node_to_shared_pool_with_features<F>(
+        &self,
+        radix: &MambaRadixCache,
+        node_id: crate::radix::RadixNodeId,
+        lora_id: i32,
+        raw_radix_tokens: &[i32],
+        has_features_hint: bool,
+        make_features: F,
+    ) where
+        F: FnOnce() -> Option<Vec<u8>>,
+    {
+        let Some(pool) = &self.dp_prefix_pool else {
+            return;
+        };
+        if raw_radix_tokens.len() < crate::dp_prefix_pool::DP_L2_MIN_PREFIX_TOKENS {
+            return;
+        }
+        let is_hybrid_gdn = self.cfg.num_hidden_layers > self.cfg.num_full_attention_layers();
+        if is_hybrid_gdn && !self.has_checkpoint_pool() {
+            return;
+        }
+        let Some((num_tokens, kv_pages, mamba_slot)) = radix.node_kv_pages_and_mamba(node_id)
+        else {
+            return;
+        };
+        if num_tokens < crate::dp_prefix_pool::DP_L2_MIN_PREFIX_TOKENS
+            || num_tokens > raw_radix_tokens.len()
+        {
+            return;
+        }
+        let prefix_tokens = &raw_radix_tokens[..num_tokens];
+        if pool.contains_and_touch_with_features(lora_id, prefix_tokens, has_features_hint) {
+            return;
+        }
+        // Throttle redundant synchronous D2H publishes on every short turn of a long pinned
+        // agent trajectory: scale the refresh stride proportionally past 4K (4K at 8K–16K,
+        // 8K at 32K, 14K at 56K) so deep sessions halve D2H churn while keeping spillover fresh.
+        let refresh_stride = (num_tokens / 4).max(4096);
+        if num_tokens > 4096
+            && pool.has_recent_prefix_within_for_features(
+                lora_id,
+                prefix_tokens,
+                refresh_stride,
+                has_features_hint,
+            )
+        {
+            return;
+        }
+        // Guard against allocating oversized host buffers that `pool.insert` would immediately
+        // reject (> max_bytes / 2).
+        let est_kv_bytes: usize = self
+            .ranks
+            .iter()
+            .map(|r| r.kv_pool.page_bundle_bytes() * kv_pages.len())
+            .sum();
+        let uses_ple = self.cfg.uses_ple();
+        let est_ckpt_bytes: usize = if is_hybrid_gdn {
+            self.ranks
+                .iter()
+                .filter_map(|r| r.checkpoint_pool.as_ref().map(|c| c.layout.bundle_bytes))
+                .sum()
+        } else if uses_ple {
+            self.ranks
+                .iter()
+                .map(|r| r.state_pool.ple_conv_slot_bytes())
+                .sum()
+        } else {
+            0
+        };
+        let est_base = est_kv_bytes
+            .saturating_add(est_ckpt_bytes)
+            .saturating_add(std::mem::size_of_val(prefix_tokens));
+        if est_base == 0 || est_base > pool.max_bytes() / 2 {
+            return;
+        }
+        let proposer_features = make_features();
+        let est_feat_bytes = proposer_features.as_ref().map_or(0, Vec::len);
+        let est_total = est_base.saturating_add(est_feat_bytes);
+        if est_total > pool.max_bytes() / 2 {
+            return;
+        }
+        let has_ckpt_ranks = is_hybrid_gdn || uses_ple;
+        let kv_pages_ref = &kv_pages;
+        let exported = crate::coordinated::run_tp_closures(
+            self.tp_workers.as_deref(),
+            self.ranks.iter().map(|r| {
+                move || {
+                    let kv_bytes = r
+                        .kv_pool
+                        .export_pages_to_host_bytes(kv_pages_ref, &r.stream)
+                        .ok()?;
+                    let ckpt_entry = if is_hybrid_gdn {
+                        let ckpt = r.checkpoint_pool.as_ref()?;
+                        let (frame, ple_ngram_context) =
+                            ckpt.export_slot_to_host_bytes(mamba_slot, &r.stream).ok()?;
+                        Some(crate::dp_prefix_pool::SharedGdnCheckpoint {
+                            frame,
+                            ple_ngram_context,
+                        })
+                    } else if uses_ple {
+                        let idx = usize::try_from(mamba_slot).ok()?;
+                        let &ple_ngram_context = r.state_pool.ple_ngram_context.get(idx)?;
+                        let frame = r
+                            .state_pool
+                            .export_ple_conv_slot_to_host_bytes(mamba_slot, &r.stream)
+                            .ok()?;
+                        Some(crate::dp_prefix_pool::SharedGdnCheckpoint {
+                            frame,
+                            ple_ngram_context,
+                        })
+                    } else {
+                        None
+                    };
+                    Some((kv_bytes, ckpt_entry))
+                }
+            }),
+        );
+        let mut kv_ranks = Vec::with_capacity(self.ranks.len());
+        let mut ckpt_ranks = Vec::with_capacity(if has_ckpt_ranks { self.ranks.len() } else { 0 });
+        for item in exported {
+            let Some((kv_bytes, ckpt_opt)) = item else {
+                return;
+            };
+            kv_ranks.push(kv_bytes);
+            if let Some(c) = ckpt_opt {
+                ckpt_ranks.push(c);
+            }
+        }
+        let entry = crate::dp_prefix_pool::SharedPrefixEntry::new(
+            lora_id,
+            prefix_tokens.to_vec(),
+            kv_pages.len(),
+            kv_ranks,
+            ckpt_ranks,
+            proposer_features,
+            self.dp_rank,
+        );
+        let _ = pool.insert(entry);
+    }
+
+    /// Attempts to hydrate a longer matching prefix for a waiting request from the shared
+    /// cross-replica L2 Host-RAM prefix pool into this replica's L1 VRAM + `MambaRadixCache`.
+    /// Returns the number of tokens hydrated (`0` on local hit, miss, or insufficient VRAM).
+    pub fn try_hydrate_waiting_from_shared_pool(
+        &mut self,
+        radix: &mut MambaRadixCache,
+        lora_id: i32,
+        raw_radix_tokens: &[i32],
+    ) -> Option<std::sync::Arc<crate::dp_prefix_pool::SharedPrefixEntry>> {
+        let pool = self.dp_prefix_pool.clone()?;
+        if pool.is_empty()
+            || raw_radix_tokens.len() < crate::dp_prefix_pool::DP_L2_MIN_PREFIX_TOKENS
+        {
+            return None;
+        }
+        let is_hybrid_gdn = self.cfg.num_hidden_layers > self.cfg.num_full_attention_layers();
+        if is_hybrid_gdn && !self.has_checkpoint_pool() {
+            return None;
+        }
+        let prev_lora = radix.active_lora_id;
+        radix.active_lora_id = lora_id;
+        let local_matched = radix.peek_matched_tokens(raw_radix_tokens);
+        radix.active_lora_id = prev_lora;
+
+        // Require a meaningful net gain (>= 1024 tokens) before hydrating over a warm local
+        // prefix so we never reclaim/copy a full 48K-token entry just to gain +16 tokens.
+        let min_tokens = if local_matched > 0 {
+            local_matched.saturating_add(1024)
+        } else {
+            0
+        };
+        let uses_ple = self.cfg.uses_ple();
+        let has_ckpt_ranks = is_hybrid_gdn || uses_ple;
+        let entry = pool.lookup_longest_match(lora_id, raw_radix_tokens, min_tokens)?;
+        if entry.kv_ranks.len() != self.ranks.len()
+            || entry.ckpt_ranks.len() != if has_ckpt_ranks { self.ranks.len() } else { 0 }
+        {
+            return None;
+        }
+        let need_pages = entry.num_pages;
+        // Ensure enough free VRAM KV pages exist across every TP rank before allocating so we
+        // never starve active sequences or desynchronize TP peer PageBitmaps.
+        self.reclaim_vram_kv_pages_from(radix, need_pages.saturating_add(1));
+        if self
+            .ranks
+            .iter()
+            .any(|r| r.kv_pool.free_count() < need_pages)
+        {
+            return None;
+        }
+        let ckpt_slot = if is_hybrid_gdn {
+            self.alloc_checkpoint_slot_from(radix)?
+        } else {
+            self.alloc_state_slot_from(radix)?
+        };
+        let mut vram_pages = Vec::with_capacity(need_pages);
+        for _ in 0..need_pages {
+            let mut allocated_this_step: Vec<(usize, i32)> = Vec::with_capacity(self.ranks.len());
+            let Some(p0) = self.ranks[0].kv_pool.alloc_page() else {
+                self.free_kv_pages(&vram_pages);
+                self.free_state_slots(&[ckpt_slot]);
+                return None;
+            };
+            allocated_this_step.push((0, p0));
+            let mut peer_ok = true;
+            for (rank_idx, r) in self.ranks.iter_mut().enumerate().skip(1) {
+                match r.kv_pool.alloc_page() {
+                    Some(p_peer) if p_peer == p0 => allocated_this_step.push((rank_idx, p_peer)),
+                    Some(p_peer) => {
+                        allocated_this_step.push((rank_idx, p_peer));
+                        peer_ok = false;
+                        break;
+                    }
+                    None => {
+                        peer_ok = false;
+                        break;
+                    }
+                }
+            }
+            if !peer_ok {
+                for (rank_idx, pid) in allocated_this_step {
+                    self.ranks[rank_idx].kv_pool.free_page(pid);
+                }
+                self.free_kv_pages(&vram_pages);
+                self.free_state_slots(&[ckpt_slot]);
+                return None;
+            }
+            vram_pages.push(p0);
+        }
+
+        let vram_pages_ref = &vram_pages;
+        let entry_ref = entry.as_ref();
+        let pool_workers = self.tp_workers.clone();
+        let import_ok = crate::coordinated::run_tp_closures(
+            pool_workers.as_deref(),
+            self.ranks.iter_mut().enumerate().map(|(rank_idx, r)| {
+                move || -> bool {
+                    if r.kv_pool
+                        .import_pages_from_host_bytes(
+                            vram_pages_ref,
+                            &entry_ref.kv_ranks[rank_idx],
+                            &r.stream,
+                        )
+                        .is_err()
+                    {
+                        return false;
+                    }
+                    if is_hybrid_gdn {
+                        let Some(ckpt) = r.checkpoint_pool.as_mut() else {
+                            return false;
+                        };
+                        let c = &entry_ref.ckpt_ranks[rank_idx];
+                        if ckpt
+                            .import_host_bytes_to_slot(
+                                ckpt_slot,
+                                &c.frame,
+                                c.ple_ngram_context,
+                                &r.stream,
+                            )
+                            .is_err()
+                        {
+                            return false;
+                        }
+                    } else if uses_ple {
+                        let Ok(idx) = usize::try_from(ckpt_slot) else {
+                            return false;
+                        };
+                        let c = &entry_ref.ckpt_ranks[rank_idx];
+                        if r.state_pool
+                            .import_ple_conv_host_bytes_to_slot(ckpt_slot, &c.frame, &r.stream)
+                            .is_err()
+                        {
+                            return false;
+                        }
+                        let Some(dst) = r.state_pool.ple_ngram_context.get_mut(idx) else {
+                            return false;
+                        };
+                        *dst = c.ple_ngram_context;
+                    }
+                    true
+                }
+            }),
+        )
+        .into_iter()
+        .all(|ok| ok);
+        if !import_ok {
+            self.free_kv_pages(&vram_pages);
+            self.free_state_slots(&[ckpt_slot]);
+            return None;
+        }
+
+        let prev_lora = radix.active_lora_id;
+        radix.active_lora_id = lora_id;
+        let ins = radix.insert(&entry.token_ids, &vram_pages, &[], ckpt_slot, 0);
+        radix.active_lora_id = prev_lora;
+        self.free_kv_pages(&ins.freed_duplicate_kv_pages);
+        if ins.mamba_already_existed {
+            self.free_state_slots(&[ckpt_slot]);
+        }
+        pool.record_hydration(entry.token_ids.len());
+        Some(entry)
+    }
+
     pub fn donate_req_checkpoint(
         &mut self,
         radix: &mut MambaRadixCache,
@@ -886,6 +1213,8 @@ impl Qwen3_5Engine {
                     };
                     r.last_logits_ptr = logits_ptr;
                     r.last_logits_rows = bucket_b;
+                    r.last_mtp_hidden_ptr = 0;
+                    r.last_mtp_hidden_rows = 0;
                     Ok(())
                 }
             }
@@ -1034,6 +1363,8 @@ impl Qwen3_5Engine {
         };
         r0.last_logits_ptr = logits_ptr;
         r0.last_logits_rows = bucket_b;
+        r0.last_mtp_hidden_ptr = 0;
+        r0.last_mtp_hidden_rows = 0;
 
         if scatter_next_tokens_on_device {
             let ex0 = r0.stream.exec(0, 0);
@@ -1101,12 +1432,43 @@ impl Qwen3_5Engine {
             },
             "pipelined decode D2H output",
         )?;
+        let mtp_row_bytes = self
+            .speculative
+            .as_ref()
+            .filter(|p| p.is_mtp())
+            .map_or(0, |p| p.row_bytes());
+        let has_hidden = if mtp_row_bytes > 0
+            && let Some(hidden_buf) = r0.last_final_hidden_f16.as_ref()
+            && n.saturating_mul(mtp_row_bytes) <= hidden_buf.len_bytes
+        {
+            let hidden_addr = hidden_buf.addr();
+            let dst = r0
+                .batched_decode_io
+                .ensure_pipeline_hidden_slot_ptr(slot, mtp_row_bytes)?;
+            check_rc(
+                // SAFETY: n <= MAX_BATCHED_DECODE_REQS and n * mtp_row_bytes <= hidden_buf.len_bytes.
+                // Ordered on r0.stream strictly after graph.launch(t) and before pipeline_done_events[slot].
+                unsafe {
+                    ffi::warp34_memcpy_d2h_async(
+                        dst.cast(),
+                        hidden_addr as *const c_void,
+                        n * mtp_row_bytes,
+                        r0.stream.handle,
+                    )
+                },
+                "pipelined decode D2H MTP hidden",
+            )?;
+            true
+        } else {
+            false
+        };
         r0.batched_decode_io.pipeline_done_events[slot].record(&r0.stream)?;
 
         Ok(InFlightDecodeTicket {
             slot,
             num_reqs: n,
             fast_greedy: fast_greedy_inputs.is_some(),
+            has_hidden,
         })
     }
 

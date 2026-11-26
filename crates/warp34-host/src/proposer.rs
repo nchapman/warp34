@@ -63,6 +63,8 @@ pub struct NativeProposer {
     capacity: usize,
     total_capacity: usize,
     max_rows: usize,
+    mtp_prefill_max_rows: usize,
+    memo_budget: usize,
     row_bytes: usize,
     pub(crate) k: usize,
     max_k: usize,
@@ -70,7 +72,9 @@ pub struct NativeProposer {
     shifted: Vec<DeviceBuffer>,
     memos: Vec<PrefixMemo>,
     current: Option<PrefixMemo>,
+    plain_memos: std::collections::HashMap<u64, PrefixMemo>,
     memo_pinned_staging: Option<crate::cuda::MappedHostBuffer>,
+    pending_plain_tap_rows: usize,
     resident_tokens: Vec<i32>,
     resident_valid_from: usize,
     processed: usize,
@@ -85,6 +89,7 @@ pub struct NativeProposer {
     pub last_restored_tokens: usize,
 }
 const MEMO_BUDGET: usize = 4 * 1024 * 1024 * 1024;
+const MIN_DP_MEMO_BUDGET: usize = 512 * 1024 * 1024;
 const MAX_MEMO_ENTRIES: usize = 64;
 const MEMO_GROWTH_ROWS: usize = 512;
 const SERVING_PROPOSER_MAX_TAP_ROWS: usize = 2048;
@@ -95,16 +100,34 @@ const DFLASH_MEMO_MAX_TOKENS: usize = 4096;
 
 #[cfg(any(test, feature = "cuda"))]
 #[inline]
+pub(crate) fn plan_memo_budget(dp_size: usize) -> usize {
+    (MEMO_BUDGET / dp_size.max(1)).max(MIN_DP_MEMO_BUDGET)
+}
+
+#[cfg(any(test, feature = "cuda"))]
+#[inline]
+pub(crate) fn memo_fits_budget_limit(
+    kind: SpeculativeKind,
+    cur_tokens: usize,
+    add_tokens: usize,
+    row_bytes: usize,
+    budget: usize,
+) -> bool {
+    let total_tokens = cur_tokens.saturating_add(add_tokens);
+    let within_dflash_cap =
+        kind != SpeculativeKind::DFlash2 || total_tokens <= DFLASH_MEMO_MAX_TOKENS;
+    within_dflash_cap && total_tokens.saturating_mul(row_bytes) <= budget
+}
+
+#[cfg(test)]
+#[inline]
 pub(crate) fn memo_fits_budget(
     kind: SpeculativeKind,
     cur_tokens: usize,
     add_tokens: usize,
     row_bytes: usize,
 ) -> bool {
-    let total_tokens = cur_tokens.saturating_add(add_tokens);
-    let within_dflash_cap =
-        kind != SpeculativeKind::DFlash2 || total_tokens <= DFLASH_MEMO_MAX_TOKENS;
-    within_dflash_cap && total_tokens.saturating_mul(row_bytes) <= MEMO_BUDGET
+    memo_fits_budget_limit(kind, cur_tokens, add_tokens, row_bytes, MEMO_BUDGET)
 }
 
 fn grow_memo_features(buf: &mut Vec<u8>, new_len: usize, row_bytes: usize) {
@@ -164,7 +187,7 @@ pub(crate) fn dflash_slot_has_prefix_for_prompt(
     true
 }
 
-fn push_mtp_memo(memos: &mut Vec<PrefixMemo>, memo: PrefixMemo) {
+fn push_mtp_memo_with_budget(memos: &mut Vec<PrefixMemo>, memo: PrefixMemo, budget: usize) {
     if memo.tokens.is_empty() {
         return;
     }
@@ -182,14 +205,19 @@ fn push_mtp_memo(memos: &mut Vec<PrefixMemo>, memo: PrefixMemo) {
     let mut total_bytes: usize = memos.iter().map(|m| m.features.capacity()).sum();
     let incoming = memo.features.capacity();
     while !memos.is_empty()
-        && (memos.len() >= MAX_MEMO_ENTRIES || total_bytes.saturating_add(incoming) > MEMO_BUDGET)
+        && (memos.len() >= MAX_MEMO_ENTRIES || total_bytes.saturating_add(incoming) > budget)
     {
         let removed = memos.remove(0);
         total_bytes = total_bytes.saturating_sub(removed.features.capacity());
     }
-    if incoming <= MEMO_BUDGET {
+    if incoming <= budget {
         memos.push(memo);
     }
+}
+
+#[cfg(test)]
+fn push_mtp_memo(memos: &mut Vec<PrefixMemo>, memo: PrefixMemo) {
+    push_mtp_memo_with_budget(memos, memo, MEMO_BUDGET);
 }
 const MTP_STAGE_ROWS: usize = 256;
 const TIERED_MOE_MTP_MAX_TAP_ROWS: usize = 6144;
@@ -430,11 +458,26 @@ impl NativeProposer {
             .saturating_mul(row_bytes)
             .max(256 * 1024);
         let memo_pinned_staging = crate::cuda::MappedHostBuffer::alloc(pinned_stage_bytes).ok();
+        let mtp_prefill_max_rows = if config.kind == SpeculativeKind::Mtp
+            && !engine.cfg.uses_tiered_moe()
+            && !(num_pages >= 14336 && engine.tp_size == 1)
+        {
+            engine.ranks[0]
+                .ordinary_prefill_token_capacity(1)
+                .map_or(max_rows, |c| {
+                    ((c / 64) * 64).clamp(max_rows, SERVING_PROPOSER_MAX_TAP_ROWS)
+                })
+        } else {
+            max_rows
+        };
+        let memo_budget = plan_memo_budget(engine.dp_size);
         Ok(Self {
             ranks,
             capacity,
             total_capacity: capacity,
             max_rows,
+            mtp_prefill_max_rows,
+            memo_budget,
             row_bytes,
             k,
             max_k: k,
@@ -442,7 +485,9 @@ impl NativeProposer {
             shifted,
             memos: vec![],
             current: None,
+            plain_memos: std::collections::HashMap::new(),
             memo_pinned_staging,
+            pending_plain_tap_rows: 0,
             resident_tokens: vec![],
             resident_valid_from: 0,
             processed: 0,
@@ -465,6 +510,7 @@ impl NativeProposer {
         self.abort_scheduled();
         self.memos.clear();
         self.current = None;
+        self.plain_memos.clear();
         self.reset()
     }
     pub(crate) fn reset(&mut self) -> Result<()> {
@@ -494,7 +540,7 @@ impl NativeProposer {
         if memo.tokens.is_empty() {
             return;
         }
-        push_mtp_memo(&mut self.memos, memo);
+        push_mtp_memo_with_budget(&mut self.memos, memo, self.memo_budget);
     }
     pub(crate) fn can_restore_for_prompt(&self, tokens: &[i32], prompt_len: usize) -> bool {
         if tokens.is_empty() {
@@ -549,6 +595,7 @@ impl NativeProposer {
                 self.memos
                     .iter()
                     .chain(self.current.iter())
+                    .chain(self.plain_memos.values())
                     .chain(
                         self.mtp_batch_slots
                             .iter()
@@ -557,6 +604,379 @@ impl NativeProposer {
                     .any(|m| m.tokens.starts_with(tokens) && m.features.len() >= need_bytes)
             }
         }
+    }
+
+    pub(crate) fn row_bytes(&self) -> usize {
+        self.row_bytes
+    }
+
+    pub(crate) fn prefill_max_rows(&self) -> usize {
+        self.mtp_prefill_max_rows
+    }
+
+    /// Initializes a per-request MTP host memo for a request running in `step_plain`,
+    /// non-destructively copying any aligned prefix from `self.memos`, active slot memos,
+    /// or sibling `plain_memos` so concurrent requests sharing a long harness never steal
+    /// from each other.
+    pub(crate) fn init_plain_memo(&mut self, req_id: u64, prefix_tokens: &[i32]) {
+        if !self.is_mtp() || self.row_bytes == 0 || self.plain_memos.contains_key(&req_id) {
+            return;
+        }
+        if prefix_tokens.is_empty() {
+            self.plain_memos.insert(
+                req_id,
+                PrefixMemo {
+                    tokens: Vec::new(),
+                    features: Vec::new(),
+                },
+            );
+            return;
+        }
+        let Some(need_bytes) = prefix_tokens.len().checked_mul(self.row_bytes) else {
+            return;
+        };
+        if !memo_fits_budget_limit(
+            SpeculativeKind::Mtp,
+            0,
+            prefix_tokens.len(),
+            self.row_bytes,
+            self.memo_budget,
+        ) {
+            return;
+        }
+        let active_plain_bytes: usize = self
+            .plain_memos
+            .values()
+            .map(|m| m.features.capacity())
+            .sum();
+        if active_plain_bytes.saturating_add(need_bytes) > self.memo_budget {
+            return;
+        }
+        let donor_src: Option<&[u8]> = self
+            .memos
+            .iter()
+            .rev()
+            .chain(self.current.iter())
+            .chain(
+                self.mtp_batch_slots
+                    .iter()
+                    .filter_map(|s| s.current.as_ref()),
+            )
+            .chain(self.plain_memos.values())
+            .find(|m| m.tokens.starts_with(prefix_tokens) && m.features.len() >= need_bytes)
+            .map(|m| &m.features[..need_bytes]);
+        if let Some(src_bytes) = donor_src {
+            let mut features = Vec::new();
+            grow_memo_features(&mut features, need_bytes, self.row_bytes);
+            features.copy_from_slice(src_bytes);
+            self.plain_memos.insert(
+                req_id,
+                PrefixMemo {
+                    tokens: prefix_tokens.to_vec(),
+                    features,
+                },
+            );
+        }
+    }
+
+    pub(crate) fn has_plain_memo(&self, req_id: u64) -> bool {
+        self.plain_memos.contains_key(&req_id)
+    }
+
+    /// Appends committed `(tokens, raw_hidden_bytes)` rows captured from `step_plain` to a
+    /// request's in-flight MTP memo. Drops the memo cleanly if it would exceed `self.memo_budget`.
+    pub(crate) fn append_plain_memo_bytes(
+        &mut self,
+        req_id: u64,
+        tokens: &[i32],
+        raw_hidden_bytes: &[u8],
+    ) {
+        if !self.is_mtp() || tokens.is_empty() || self.row_bytes == 0 {
+            return;
+        }
+        if raw_hidden_bytes.len() != tokens.len().saturating_mul(self.row_bytes) {
+            self.plain_memos.remove(&req_id);
+            return;
+        }
+        let active_plain_bytes: usize = self
+            .plain_memos
+            .values()
+            .map(|m| m.features.capacity())
+            .sum();
+        let Some(memo) = self.plain_memos.get_mut(&req_id) else {
+            return;
+        };
+        let prev_cap = memo.features.capacity();
+        if !memo_fits_budget_limit(
+            SpeculativeKind::Mtp,
+            memo.tokens.len(),
+            tokens.len(),
+            self.row_bytes,
+            self.memo_budget,
+        ) || active_plain_bytes
+            .saturating_sub(prev_cap)
+            .saturating_add(memo.features.len().saturating_add(raw_hidden_bytes.len()))
+            > self.memo_budget
+        {
+            self.plain_memos.remove(&req_id);
+            return;
+        }
+        let old_len = memo.features.len();
+        grow_memo_features(
+            &mut memo.features,
+            old_len + raw_hidden_bytes.len(),
+            self.row_bytes,
+        );
+        memo.features[old_len..].copy_from_slice(raw_hidden_bytes);
+        memo.tokens.extend_from_slice(tokens);
+    }
+
+    /// Returns `true` when `total_rows` fits inside `memo_pinned_staging` so an asynchronous
+    /// D2H from `last_final_hidden_f16` can overlap with `run_gpu_sampler_rows` without an
+    /// extra `stream.synchronize()`.
+    pub(crate) fn can_stage_plain_tap_async(&self, total_rows: usize) -> bool {
+        let bytes = total_rows.saturating_mul(self.row_bytes);
+        bytes > 0
+            && self
+                .memo_pinned_staging
+                .as_ref()
+                .is_some_and(|s| s.len_bytes >= bytes)
+    }
+
+    /// Enqueues an asynchronous D2H copy of `total_rows` FP16 hidden rows from `dev_src` into
+    /// `memo_pinned_staging` on `stream` without synchronizing. Caller must ensure `stream`
+    /// synchronizes (e.g. via `run_gpu_sampler_rows` or an explicit `stream.synchronize()`)
+    /// before calling [`Self::commit_staged_plain_tap_slices`].
+    pub(crate) fn enqueue_plain_tap_hidden_d2h(
+        &mut self,
+        dev_src: u64,
+        total_rows: usize,
+        stream: &crate::cuda::CudaStream,
+    ) -> Result<()> {
+        self.pending_plain_tap_rows = 0;
+        let bytes = total_rows.saturating_mul(self.row_bytes);
+        let Some(stage) = self.memo_pinned_staging.as_ref() else {
+            return Err(loader_err("missing pinned staging buffer"));
+        };
+        if bytes == 0 || bytes > stage.len_bytes {
+            return Err(loader_err("plain tap D2H exceeds pinned staging buffer"));
+        }
+        check_rc(
+            // SAFETY: `stage.host_ptr` is pinned with `stage.len_bytes >= bytes`, and `dev_src`
+            // holds `bytes` valid FP16 hidden bytes on `stream`.
+            unsafe {
+                ffi::warp34_memcpy_d2h_async(
+                    stage.host_ptr,
+                    dev_src as *const std::ffi::c_void,
+                    bytes,
+                    stream.handle,
+                )
+            },
+            "plain MTP memo async pinned D2H",
+        )?;
+        self.pending_plain_tap_rows = total_rows;
+        Ok(())
+    }
+
+    /// Commits tracked `(req_id, row_offset, tokens)` slices from `memo_pinned_staging` after
+    /// `stream` has synchronized, avoiding any temporary `Vec<u8>` heap allocation.
+    pub(crate) fn commit_staged_plain_tap_slices(&mut self, slices: &[(u64, usize, &[i32])]) {
+        let staged_rows = std::mem::replace(&mut self.pending_plain_tap_rows, 0);
+        if staged_rows == 0 || self.row_bytes == 0 {
+            return;
+        }
+        let Some(stage_ptr) = self
+            .memo_pinned_staging
+            .as_ref()
+            .map(|s| s.host_ptr.cast::<u8>() as usize)
+        else {
+            return;
+        };
+        let row_bytes = self.row_bytes;
+        let max_bytes = staged_rows.saturating_mul(row_bytes);
+        for &(req_id, tok_off, tokens) in slices {
+            let byte_off = tok_off.saturating_mul(row_bytes);
+            let byte_len = tokens.len().saturating_mul(row_bytes);
+            if byte_len == 0 || byte_off.saturating_add(byte_len) > max_bytes {
+                self.plain_memos.remove(&req_id);
+                continue;
+            }
+            // SAFETY: `stage_ptr` belongs to `self.memo_pinned_staging` (unmodified during
+            // `append_plain_memo_bytes`), and `byte_off + byte_len <= max_bytes <= stage.len_bytes`
+            // after `stream` synchronized.
+            let slice_bytes = unsafe {
+                std::slice::from_raw_parts((stage_ptr + byte_off) as *const u8, byte_len)
+            };
+            self.append_plain_memo_bytes(req_id, tokens, slice_bytes);
+        }
+    }
+
+    /// Streams tracked `(req_id, row_offset, tokens)` slices directly from `dev_src` into each
+    /// request's `plain_memos` buffer in `memo_pinned_staging`-sized DMA chunks, avoiding both
+    /// temporary `Vec<u8>` allocations and unpinned pageable `cudaMemcpyAsync` fallbacks on
+    /// 2048-row prefill chunks.
+    pub(crate) fn append_plain_slices_chunked_d2h(
+        &mut self,
+        dev_src: u64,
+        slices: &[(u64, usize, &[i32])],
+        stream: &crate::cuda::CudaStream,
+    ) -> Result<()> {
+        if !self.is_mtp() || self.row_bytes == 0 || slices.is_empty() {
+            return Ok(());
+        }
+        let row_bytes = self.row_bytes;
+        let budget = self.memo_budget;
+        let stage_info = self
+            .memo_pinned_staging
+            .as_ref()
+            .filter(|s| s.len_bytes >= row_bytes)
+            .map(|s| (s.host_ptr.cast::<u8>(), s.len_bytes));
+        for &(req_id, tok_off, tokens) in slices {
+            if tokens.is_empty() {
+                continue;
+            }
+            let active_plain_bytes: usize = self
+                .plain_memos
+                .values()
+                .map(|m| m.features.capacity())
+                .sum();
+            let Some(memo) = self.plain_memos.get_mut(&req_id) else {
+                continue;
+            };
+            let copy_bytes = tokens.len().saturating_mul(row_bytes);
+            let prev_cap = memo.features.capacity();
+            if !memo_fits_budget_limit(
+                SpeculativeKind::Mtp,
+                memo.tokens.len(),
+                tokens.len(),
+                row_bytes,
+                budget,
+            ) || active_plain_bytes
+                .saturating_sub(prev_cap)
+                .saturating_add(memo.features.len().saturating_add(copy_bytes))
+                > budget
+            {
+                self.plain_memos.remove(&req_id);
+                continue;
+            }
+            let old_len = memo.features.len();
+            grow_memo_features(&mut memo.features, old_len + copy_bytes, row_bytes);
+            let dev_base = dev_src + (tok_off.saturating_mul(row_bytes)) as u64;
+            let copy_res: Result<()> = (|| {
+                if let Some((stage_ptr, stage_cap)) = stage_info {
+                    let mut off = 0usize;
+                    while off < copy_bytes {
+                        let take = (copy_bytes - off).min(stage_cap);
+                        check_rc(
+                            // SAFETY: `stage_ptr` is pinned with `take <= stage_cap`, and
+                            // `dev_base + off` spans valid FP16 hidden bytes on `stream`.
+                            unsafe {
+                                ffi::warp34_memcpy_d2h_async(
+                                    stage_ptr.cast(),
+                                    (dev_base + off as u64) as *const std::ffi::c_void,
+                                    take,
+                                    stream.handle,
+                                )
+                            },
+                            "plain MTP memo chunked pinned D2H",
+                        )?;
+                        stream.synchronize()?;
+                        // SAFETY: `stream.synchronize()` completed the D2H into `stage_ptr`,
+                        // and `memo.features` was resized to `old_len + copy_bytes`.
+                        unsafe {
+                            std::ptr::copy_nonoverlapping(
+                                stage_ptr,
+                                memo.features.as_mut_ptr().add(old_len + off),
+                                take,
+                            );
+                        }
+                        off += take;
+                    }
+                } else {
+                    check_rc(
+                        // SAFETY: `memo.features[old_len..]` has `copy_bytes` bytes and we
+                        // synchronize `stream` before returning.
+                        unsafe {
+                            ffi::warp34_memcpy_d2h_async(
+                                memo.features.as_mut_ptr().add(old_len).cast(),
+                                dev_base as *const std::ffi::c_void,
+                                copy_bytes,
+                                stream.handle,
+                            )
+                        },
+                        "plain MTP memo fallback D2H",
+                    )?;
+                    stream.synchronize()?;
+                }
+                Ok(())
+            })();
+            if let Err(e) = copy_res {
+                self.plain_memos.remove(&req_id);
+                return Err(e);
+            }
+            memo.tokens.extend_from_slice(tokens);
+        }
+        Ok(())
+    }
+
+    /// Commits a finished or cancelled `step_plain` request's memo into `self.memos` so
+    /// subsequent turns can immediately resume MTP-3 with 100% cache hit.
+    pub(crate) fn finish_plain_memo(&mut self, req_id: u64) {
+        if let Some(memo) = self.plain_memos.remove(&req_id) {
+            push_mtp_memo_with_budget(&mut self.memos, memo, self.memo_budget);
+        }
+    }
+
+    /// Discards an errored `step_plain` request's in-flight memo without polluting `self.memos`.
+    pub(crate) fn discard_plain_memo(&mut self, req_id: u64) {
+        self.plain_memos.remove(&req_id);
+    }
+
+    /// Clears all in-flight `step_plain` memos (e.g. on batch abort or worker shutdown).
+    pub(crate) fn clear_plain_memos(&mut self) {
+        self.pending_plain_tap_rows = 0;
+        self.plain_memos.clear();
+    }
+
+    /// Exports cached speculative proposer features for `prefix_tokens` (if present in host
+    /// memos) so another DP replica can hydrate both KV/GDN and the speculative memo together.
+    pub(crate) fn export_shared_memo_features(&self, prefix_tokens: &[i32]) -> Option<Vec<u8>> {
+        if prefix_tokens.is_empty() || self.row_bytes == 0 {
+            return None;
+        }
+        let need_bytes = prefix_tokens.len().checked_mul(self.row_bytes)?;
+        self.memos
+            .iter()
+            .chain(self.current.iter())
+            .chain(self.plain_memos.values())
+            .chain(
+                self.mtp_batch_slots
+                    .iter()
+                    .filter_map(|s| s.current.as_ref()),
+            )
+            .find(|m| m.tokens.starts_with(prefix_tokens) && m.features.len() >= need_bytes)
+            .map(|m| m.features[..need_bytes].to_vec())
+    }
+
+    /// Imports a shared speculative proposer prefix memo hydrated from [`crate::dp_prefix_pool::SharedDpPrefixPool`].
+    pub(crate) fn import_shared_memo_features(&mut self, prefix_tokens: &[i32], features: &[u8]) {
+        if prefix_tokens.is_empty()
+            || self.row_bytes == 0
+            || features.len() != prefix_tokens.len().saturating_mul(self.row_bytes)
+        {
+            return;
+        }
+        if self.can_restore_for_prompt(prefix_tokens, prefix_tokens.len().saturating_add(1)) {
+            return;
+        }
+        push_mtp_memo_with_budget(
+            &mut self.memos,
+            PrefixMemo {
+                tokens: prefix_tokens.to_vec(),
+                features: features.to_vec(),
+            },
+            self.memo_budget,
+        );
     }
 }
 
@@ -573,15 +993,17 @@ impl NativeProposer {
         feature0_ptr: u64,
         tokens: &[i32],
         row_bytes: usize,
+        memo_budget: usize,
     ) -> Result<StagedMemoAppend> {
         if let Some(memo) = current {
             let aligned = memo.features.len() == memo.tokens.len().saturating_mul(row_bytes);
             if !aligned
-                || !memo_fits_budget(
+                || !memo_fits_budget_limit(
                     SpeculativeKind::DFlash2,
                     memo.tokens.len(),
                     tokens.len(),
                     row_bytes,
+                    memo_budget,
                 )
             {
                 *current = None;
@@ -721,6 +1143,7 @@ impl NativeProposer {
         tokens: &[i32],
         need_bytes: usize,
         row_bytes: usize,
+        memo_budget: usize,
     ) -> PrefixMemo {
         let n = tokens.len();
         if let Some(idx) = memos
@@ -728,7 +1151,7 @@ impl NativeProposer {
             .rposition(|m| m.tokens.starts_with(tokens) && m.features.len() >= need_bytes)
         {
             let mut memo = memos.remove(idx);
-            if n > 2048 && memo.tokens.len().saturating_sub(n) <= 256 {
+            if n > 4096 && memo.tokens.len().saturating_sub(n) < 64 {
                 memo.tokens.truncate(n);
                 memo.features.truncate(need_bytes);
                 return memo;
@@ -736,7 +1159,7 @@ impl NativeProposer {
             let mut f = Vec::new();
             grow_memo_features(&mut f, need_bytes, row_bytes);
             f.copy_from_slice(&memo.features[..need_bytes]);
-            push_mtp_memo(memos, memo);
+            push_mtp_memo_with_budget(memos, memo, memo_budget);
             PrefixMemo {
                 tokens: tokens.to_vec(),
                 features: f,
@@ -763,17 +1186,19 @@ impl NativeProposer {
                 .mtp_batch_slots
                 .iter()
                 .filter_map(|s| s.current.as_ref())
+                .chain(self.plain_memos.values())
                 .find(|m| m.tokens.starts_with(tokens) && m.features.len() >= need_dflash_bytes)
         {
             let mut f = Vec::new();
             grow_memo_features(&mut f, need_dflash_bytes, self.row_bytes);
             f.copy_from_slice(&donor_memo.features[..need_dflash_bytes]);
-            push_mtp_memo(
+            push_mtp_memo_with_budget(
                 &mut self.memos,
                 PrefixMemo {
                     tokens: tokens.to_vec(),
                     features: f,
                 },
+                self.memo_budget,
             );
         }
         let ring_pages = rs.first().and_then(|r| r.ring_phys_pages_per_slot());
@@ -822,6 +1247,7 @@ impl NativeProposer {
                 tokens,
                 need_dflash_bytes,
                 self.row_bytes,
+                self.memo_budget,
             ));
         } else if let Some(se) = self_eff
             && se < n
@@ -836,6 +1262,7 @@ impl NativeProposer {
                 tokens,
                 need_dflash_bytes,
                 self.row_bytes,
+                self.memo_budget,
             ));
         } else if let Some(idx) = self
             .memos
@@ -857,14 +1284,14 @@ impl NativeProposer {
                 self.row_bytes,
                 self.max_rows,
             ) {
-                push_mtp_memo(&mut self.memos, memo);
+                push_mtp_memo_with_budget(&mut self.memos, memo, self.memo_budget);
                 let _ = self.reset();
                 return Err(e);
             }
             self.resident_tokens.clear();
             self.resident_tokens.extend_from_slice(tokens);
             self.resident_valid_from = start_tok;
-            if n > 2048 && memo.tokens.len().saturating_sub(n) <= 256 {
+            if n > 4096 && memo.tokens.len().saturating_sub(n) < 64 {
                 memo.tokens.truncate(n);
                 memo.features.truncate(need_dflash_bytes);
                 self.current = Some(memo);
@@ -872,7 +1299,7 @@ impl NativeProposer {
                 let mut f = Vec::new();
                 grow_memo_features(&mut f, need_dflash_bytes, self.row_bytes);
                 f.copy_from_slice(&memo.features[..need_dflash_bytes]);
-                push_mtp_memo(&mut self.memos, memo);
+                push_mtp_memo_with_budget(&mut self.memos, memo, self.memo_budget);
                 self.current = Some(PrefixMemo {
                     tokens: tokens.to_vec(),
                     features: f,
@@ -934,8 +1361,9 @@ impl NativeProposer {
                 self.resident_tokens.extend_from_slice(tokens);
             }
         }
-        // If the matching memo is currently held in another active slot's `current`,
-        // clone its `n`-token prefix into `self.memos` so restoration succeeds cleanly.
+        // If the matching memo is currently held in another active slot's `current` or an
+        // in-flight `step_plain` memo, clone its `n`-token prefix into `self.memos` so
+        // `restore()` is symmetric with `can_restore_for_prompt()`.
         if !self
             .memos
             .iter()
@@ -944,18 +1372,20 @@ impl NativeProposer {
                 .mtp_batch_slots
                 .iter()
                 .filter_map(|s| s.current.as_ref())
+                .chain(self.plain_memos.values())
                 .find(|m| m.tokens.starts_with(tokens) && m.features.len() >= need_mtp_bytes)
         {
             let n = tokens.len();
             let mut f = Vec::new();
             grow_memo_features(&mut f, n * self.row_bytes, self.row_bytes);
             f.copy_from_slice(&donor_memo.features[..n * self.row_bytes]);
-            push_mtp_memo(
+            push_mtp_memo_with_budget(
                 &mut self.memos,
                 PrefixMemo {
                     tokens: tokens.to_vec(),
                     features: f,
                 },
+                self.memo_budget,
             );
         }
         // Fast path: if the drafter's resident GPU KV cache already starts with `tokens`,
@@ -987,12 +1417,12 @@ impl NativeProposer {
             self.processed = n;
             self.last_accepted.clear();
             self.last_restored_tokens = n;
-            // For long session-specific prefixes (> 2048 tokens) where `memo` is this turn's
-            // frontier (`memo.tokens.len() - n <= 256`), move `memo` directly into `self.current`
-            // in O(1) without cloning or page-faulting a new buffer on the worker thread.
-            // If `memo` belongs to a further-ahead session (`memo.tokens.len() - n > 256`),
-            // keep the longer `memo` in `self.memos` so the leading session retains its suffix.
-            if n > 2048 && memo.tokens.len().saturating_sub(n) <= 256 {
+            // For long session-specific prefixes (> 4096 tokens) where `memo` is this turn's
+            // own Mamba-chunk frontier (`memo.tokens.len() - n < 64`), move `memo` directly into
+            // `self.current` in O(1) without cloning or page-faulting a new buffer. Shared
+            // harnesses (`<= 4096`) and further-ahead sibling sessions (`>= 64` suffix) keep
+            // `memo` intact in `self.memos` so no session's Turn-1 suffix is truncated.
+            if n > 4096 && memo.tokens.len().saturating_sub(n) < 64 {
                 memo.tokens.truncate(n);
                 if matches!(self.ranks, Ranks::Mtp(_)) {
                     memo.features.truncate(n * self.row_bytes);
@@ -1011,7 +1441,7 @@ impl NativeProposer {
                 } else {
                     vec![]
                 };
-                push_mtp_memo(&mut self.memos, memo);
+                push_mtp_memo_with_budget(&mut self.memos, memo, self.memo_budget);
                 self.current = Some(PrefixMemo {
                     tokens: tokens.to_vec(),
                     features,
@@ -1028,7 +1458,7 @@ impl NativeProposer {
         let start_tok = match self.prepare_mtp_partial_lcp_restore(engine, tokens, &memo.features) {
             Ok(reused) => reused,
             Err(e) => {
-                push_mtp_memo(&mut self.memos, memo);
+                push_mtp_memo_with_budget(&mut self.memos, memo, self.memo_budget);
                 return Err(e);
             }
         };
@@ -1054,8 +1484,8 @@ impl NativeProposer {
             let _ = self.reset();
         }
         if result.is_ok()
-            && tokens.len() > 2048
-            && memo.tokens.len().saturating_sub(tokens.len()) <= 256
+            && tokens.len() > 4096
+            && memo.tokens.len().saturating_sub(tokens.len()) < 64
         {
             memo.tokens.truncate(tokens.len());
             if matches!(self.ranks, Ranks::Mtp(_)) {
@@ -1074,7 +1504,7 @@ impl NativeProposer {
             } else {
                 None
             };
-            push_mtp_memo(&mut self.memos, memo);
+            push_mtp_memo_with_budget(&mut self.memos, memo, self.memo_budget);
             if let Some(features) = restored_features {
                 self.current = Some(PrefixMemo {
                     tokens: tokens.to_vec(),
@@ -1164,6 +1594,33 @@ impl NativeProposer {
             })
             .collect()
     }
+    pub(crate) fn captured_for_rows(
+        &self,
+        engine: &Qwen3_5Engine,
+        rows: usize,
+    ) -> Result<Vec<u64>> {
+        engine
+            .ranks
+            .iter()
+            .map(|t| {
+                match &self.ranks {
+                    Ranks::Mtp(_) => {
+                        if rows <= t.max_tap_rows {
+                            t.last_final_hidden_f16.as_ref().map(DeviceBuffer::addr)
+                        } else if t.last_mtp_hidden_ptr != 0 && t.last_mtp_hidden_rows >= rows {
+                            Some(t.last_mtp_hidden_ptr)
+                        } else {
+                            None
+                        }
+                    }
+                    Ranks::DFlash(_) => (rows <= t.max_tap_rows)
+                        .then(|| t.tap_aux_bf16.as_ref().map(DeviceBuffer::addr))
+                        .flatten(),
+                }
+                .ok_or_else(|| loader_err("missing target feature capture"))
+            })
+            .collect()
+    }
     pub(crate) fn ingest_for_prompt_len(
         &mut self,
         engine: &mut Qwen3_5Engine,
@@ -1200,11 +1657,12 @@ impl NativeProposer {
                 if let Some(memo) = &mut self.current {
                     let aligned =
                         memo.features.len() == memo.tokens.len().saturating_mul(self.row_bytes);
-                    let within_cap = memo_fits_budget(
+                    let within_cap = memo_fits_budget_limit(
                         SpeculativeKind::DFlash2,
                         memo.tokens.len(),
                         skip_rows,
                         self.row_bytes,
+                        self.memo_budget,
                     );
                     if aligned && within_cap {
                         let t0 = &engine.ranks[0];
@@ -1321,7 +1779,14 @@ impl NativeProposer {
                 Ranks::Mtp(_) => SpeculativeKind::Mtp,
             };
             let aligned = memo.features.len() == memo.tokens.len().saturating_mul(self.row_bytes);
-            if !aligned || !memo_fits_budget(kind, memo.tokens.len(), tokens.len(), self.row_bytes)
+            if !aligned
+                || !memo_fits_budget_limit(
+                    kind,
+                    memo.tokens.len(),
+                    tokens.len(),
+                    self.row_bytes,
+                    self.memo_budget,
+                )
             {
                 self.current = None;
             }
@@ -1522,6 +1987,7 @@ impl NativeProposer {
                     features[0],
                     tokens,
                     self.row_bytes,
+                    self.memo_budget,
                 )?;
                 let (memo_prev_lens, pending_pinned_memo_copy) =
                     (staged_memo.prev_lens, staged_memo.pending_pinned);
@@ -3046,5 +3512,85 @@ mod tests {
             65_536,
             mtp_27b_row_bytes
         ));
+    }
+
+    #[test]
+    fn dp_memo_budget_scales_per_replica_with_512m_floor() {
+        assert_eq!(plan_memo_budget(1), 4 * 1024 * 1024 * 1024);
+        assert_eq!(plan_memo_budget(2), 2 * 1024 * 1024 * 1024);
+        assert_eq!(plan_memo_budget(4), 1024 * 1024 * 1024);
+        assert_eq!(plan_memo_budget(8), 512 * 1024 * 1024);
+        assert_eq!(plan_memo_budget(16), 512 * 1024 * 1024);
+        assert!(!memo_fits_budget_limit(
+            SpeculativeKind::Mtp,
+            200_000,
+            100_000,
+            10_240,
+            plan_memo_budget(2),
+        ));
+        assert!(memo_fits_budget_limit(
+            SpeculativeKind::Mtp,
+            0,
+            65_536,
+            10_240,
+            plan_memo_budget(4),
+        ));
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn clone_aligned_memo_prefix_preserves_shared_4k_harness_sibling_suffixes() {
+        let row_bytes = 16;
+        let budget = plan_memo_budget(1);
+        // Agent A finished Turn 1 at 4,200 tokens (4,096 shared harness + 104 unique tokens).
+        let agent_a_tokens: Vec<i32> = (0..4200).collect();
+        let agent_a_feats = vec![0x5Au8; 4200 * row_bytes];
+        let mut memos = vec![PrefixMemo {
+            tokens: agent_a_tokens.clone(),
+            features: agent_a_feats.clone(),
+        }];
+
+        // New Agent B arrives restoring the 4,096-token shared harness (4200 - 4096 = 104 < 256).
+        // `clone_aligned_memo_prefix` MUST NOT truncate Agent A's 4,200-token memo in-place!
+        let harness = &agent_a_tokens[..4096];
+        let b_memo = NativeProposer::clone_aligned_memo_prefix(
+            &mut memos,
+            harness,
+            4096 * row_bytes,
+            row_bytes,
+            budget,
+        );
+        assert_eq!(b_memo.tokens.len(), 4096);
+        assert_eq!(b_memo.features.len(), 4096 * row_bytes);
+        assert_eq!(
+            memos.len(),
+            1,
+            "Agent A's memo must remain in memos for Turn 2"
+        );
+        assert_eq!(
+            memos[0].tokens.len(),
+            4200,
+            "Agent A's 104 unique Turn-1 tokens must not be truncated by a shared-harness peer"
+        );
+
+        // Now Agent A itself returns for Turn 2 at 5,120 tokens where its stored memo is 5,150
+        // (`n = 5120 > 4096` and `5150 - 5120 = 30 < 64` Mamba chunk tail) -> moves in O(1).
+        let long_a: Vec<i32> = (0..5150).collect();
+        memos = vec![PrefixMemo {
+            tokens: long_a.clone(),
+            features: vec![0x3Cu8; 5150 * row_bytes],
+        }];
+        let moved = NativeProposer::clone_aligned_memo_prefix(
+            &mut memos,
+            &long_a[..5120],
+            5120 * row_bytes,
+            row_bytes,
+            budget,
+        );
+        assert_eq!(moved.tokens.len(), 5120);
+        assert!(
+            memos.is_empty(),
+            "single-session Mamba chunk tail (<64 past >4K) should move in O(1)"
+        );
     }
 }

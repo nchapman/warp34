@@ -188,10 +188,11 @@ pub(super) fn run_loop(
     for id in &ids {
         release(engine, sched.cancel_request(*id));
     }
-    if !ids.is_empty()
-        && let Some(p) = &mut engine.speculative
-    {
-        p.abort_scheduled();
+    if let Some(p) = &mut engine.speculative {
+        p.clear_plain_memos();
+        if !ids.is_empty() {
+            p.abort_scheduled();
+        }
     }
     std::mem::swap(&mut engine.radix, &mut sched.radix);
     publish_pools(engine, &engine.radix, &stats.telemetry);
@@ -305,6 +306,9 @@ fn cancel_requests(
             }
         }
         finish_early(engine, sched, id);
+        if let Some(p) = engine.speculative.as_mut() {
+            p.finish_plain_memo(id);
+        }
         release(engine, sched.cancel_request(id));
         if let Some(mut r) = requests.remove(&id)
             && let Some(tap) = r.decision_tap.take()
@@ -337,6 +341,65 @@ fn is_waiting_mtp_batch_eligible<T>(
     !w.custom_prefill
         && is_batched_mtp_eligible(req)
         && proposer.fits_free_mtp_batch_slot(active, w.prompt_tokens.len())
+}
+
+/// Pure decision helper: returns `true` when a waiting request has a deep (`>= 2048` token)
+/// local or L2 radix prefix hit whose speculative proposer memo is unavailable, so running
+/// through `step_plain` avoids discarding thousands of cached KV+GDN tokens AND avoids
+/// head-of-line queue starvation behind an active MTP batch.
+fn unwarmed_long_radix_decision(
+    local_matched: usize,
+    local_can_restore: bool,
+    l2_probe: Option<(usize, bool)>,
+    l2_can_restore: bool,
+) -> bool {
+    if let Some((l2_len, l2_has_features)) = l2_probe
+        && l2_len >= 2048
+    {
+        return !l2_has_features && !l2_can_restore;
+    }
+    local_matched >= 2048 && !local_can_restore
+}
+
+fn waiting_needs_plain_for_unwarmed_long_radix(
+    engine: &Qwen3_5Engine,
+    proposer: &crate::proposer::NativeProposer,
+    radix: &mut crate::radix::MambaRadixCache,
+    w: &crate::scheduler::WaitingReq,
+) -> bool {
+    if w.radix_key_tokens.len() <= 1 {
+        return false;
+    }
+    let lookup = &w.radix_key_tokens[..w.radix_key_tokens.len() - 1];
+    let prev_lora = radix.active_lora_id;
+    radix.active_lora_id = w.lora_id;
+    let local_matched = radix.peek_matched_tokens(lookup);
+    radix.active_lora_id = prev_lora;
+
+    let local_can_restore = local_matched < 2048
+        || proposer
+            .can_restore_for_prompt(&w.radix_key_tokens[..local_matched], w.prompt_tokens.len());
+
+    let min_l2 = if local_matched > 0 {
+        local_matched.saturating_add(1024)
+    } else {
+        0
+    };
+    let l2_probe = if w.prefix_bidir_len.is_none() {
+        engine
+            .dp_prefix_pool
+            .as_ref()
+            .and_then(|pool| pool.peek_longest_match(w.lora_id, lookup, min_l2))
+    } else {
+        None
+    };
+    let l2_can_restore = l2_probe.is_none_or(|(l2_len, l2_has_features)| {
+        l2_len < 2048
+            || l2_has_features
+            || proposer.can_restore_for_prompt(&w.radix_key_tokens[..l2_len], w.prompt_tokens.len())
+    });
+
+    unwarmed_long_radix_decision(local_matched, local_can_restore, l2_probe, l2_can_restore)
 }
 
 fn admit_into_mtp_batch_slots(
@@ -390,6 +453,62 @@ fn admit_into_mtp_batch_slots(
         };
         let prev_reserved = requests[&id].reserved_pages;
         requests.get_mut(&id).unwrap().reserved_pages = need_pages;
+        if engine.dp_prefix_pool.is_some()
+            && w.prefix_bidir_len.is_none()
+            && w.radix_key_tokens.len() > 1
+        {
+            let lookup_len = w.radix_key_tokens.len() - 1;
+            let lora_id = w.lora_id;
+            let key_tokens = w.radix_key_tokens[..lookup_len].to_vec();
+            if let Some(entry) =
+                engine.try_hydrate_waiting_from_shared_pool(&mut sched.radix, lora_id, &key_tokens)
+                && let Some(feats) = &entry.proposer_features
+            {
+                proposer.import_shared_memo_features(&entry.token_ids, feats);
+            }
+        }
+        // Do not force speculative admission if the proposer lacks a memo for a deep warm
+        // radix hit (>= 2K tokens): throwing away thousands of cached KV+GDN tokens to run
+        // MTP causes multi-second re-prefill cliffs. Defer to plain admission instead.
+        if w.radix_key_tokens.len() > 1 {
+            let prev_lora = sched.radix.active_lora_id;
+            sched.radix.active_lora_id = w.lora_id;
+            let radix_matched = sched
+                .radix
+                .peek_matched_tokens(&w.radix_key_tokens[..w.radix_key_tokens.len() - 1]);
+            sched.radix.active_lora_id = prev_lora;
+            if radix_matched >= 2048
+                && !proposer.can_restore_batch_slot(
+                    slot_idx,
+                    &w.radix_key_tokens[..radix_matched],
+                    w.prompt_tokens.len(),
+                )
+            {
+                requests.get_mut(&id).unwrap().reserved_pages = prev_reserved;
+                // If active MTP slots are already prefill-complete, yield the MTP batch now so
+                // `admit_requests` immediately admits this request into `step_plain` instead of
+                // leaving it stranded at the head of `sched.waiting`.
+                let all_prefilled = mtp_batch_slots.iter().flatten().all(|(sid, _)| {
+                    sched
+                        .active
+                        .iter()
+                        .find(|s| s.req_id == *sid)
+                        .is_none_or(|s| s.is_prefill_complete())
+                });
+                if all_prefilled && mtp_batch_slots.iter().any(|s| s.is_some()) {
+                    for (s_idx, slot_entry) in mtp_batch_slots.iter_mut().enumerate() {
+                        if let Some((sid, mut pending)) = slot_entry.take() {
+                            let _ = proposer.finish_mtp_batch_slot(engine, s_idx, &mut pending);
+                            if let Some(seq) = sched.active.iter_mut().find(|s| s.req_id == sid) {
+                                seq.custom_prefill = false;
+                            }
+                        }
+                    }
+                    let _ = proposer.set_mtp_batch_mode(false);
+                }
+                break;
+            }
+        }
         let before = sched.active.len();
         sched.cfg.max_num_seqs = before + 1;
         sched.admit_waiting_with_filter(
@@ -517,6 +636,10 @@ fn yield_single_speculation(
                 p.fits_mtp_batch_slot(0, seq.prompt_tokens.len() + seq.generated_tokens.len())
                     && sched.waiting.iter().take(open_slots).all(|w| {
                         is_waiting_mtp_batch_eligible(p, &sim_active, w, &requests[&w.req_id])
+                    })
+                    && !(0..open_slots).any(|idx| {
+                        let w = &sched.waiting[idx];
+                        waiting_needs_plain_for_unwarmed_long_radix(engine, p, &mut sched.radix, w)
                     })
             })
             && (0..open_slots).all(|idx| {
@@ -677,20 +800,30 @@ fn extend_or_yield_mtp_batch(
         } else {
             sched.cfg.max_num_seqs.min(slot_limit)
         };
-        let desired_active = if engine.cfg.uses_tiered_moe() {
-            1
-        } else {
-            (active_mtp + sched.waiting.len()).min(sched.cfg.max_num_seqs)
-        };
-        let open_slots = active_cap.saturating_sub(active_mtp);
         let active_reserved: usize = sched
             .active
             .iter()
             .map(|seq| requests[&seq.req_id].reserved_pages)
             .sum();
-        let front_plain_fits = active_reserved + requests[&sched.waiting[0].req_id].reserved_pages
-            <= engine.ranks[0].kv_pool.num_pages;
-        let check_waiting = open_slots.min(sched.waiting.len());
+        let kv_cap = engine.ranks[0].kv_pool.num_pages;
+        let mut fit_pages = active_reserved;
+        let mut fit_waiting = 0usize;
+        for w in &sched.waiting {
+            let need = requests[&w.req_id].reserved_pages;
+            if fit_pages + need > kv_cap {
+                break;
+            }
+            fit_pages += need;
+            fit_waiting += 1;
+        }
+        let desired_active = if engine.cfg.uses_tiered_moe() {
+            1
+        } else {
+            (active_mtp + fit_waiting).min(sched.cfg.max_num_seqs)
+        };
+        let open_slots = active_cap.saturating_sub(active_mtp);
+        let front_plain_fits = fit_waiting > 0;
+        let check_waiting = open_slots.min(fit_waiting);
         let should_yield = front_plain_fits
             && (desired_active > slot_limit
                 || (check_waiting > 0
@@ -701,6 +834,14 @@ fn extend_or_yield_mtp_batch(
                                 mtp_batch_slots,
                                 w,
                                 &requests[&w.req_id],
+                            )
+                        }) && !(0..check_waiting).any(|idx| {
+                            let w = &sched.waiting[idx];
+                            waiting_needs_plain_for_unwarmed_long_radix(
+                                engine,
+                                p,
+                                &mut sched.radix,
+                                w,
                             )
                         })
                     }) || !(0..check_waiting).all(|idx| {
@@ -810,6 +951,10 @@ fn admit_requests(
                 && sched.waiting.iter().take(target_batch).all(|w| {
                     is_waiting_mtp_batch_eligible(p, mtp_batch_slots, w, &requests[&w.req_id])
                 })
+                && !(0..target_batch).any(|idx| {
+                    let w = &sched.waiting[idx];
+                    waiting_needs_plain_for_unwarmed_long_radix(engine, p, &mut sched.radix, w)
+                })
         }) && (0..target_batch).all(|idx| {
             let wid = sched.waiting[idx].req_id;
             requests
@@ -860,29 +1005,63 @@ fn admit_requests(
                 && init_need <= engine.ranks[0].kv_pool.num_pages
             {
                 requests.get_mut(&id).unwrap().reserved_pages = init_need;
-                let saved_max = sched.cfg.max_num_seqs;
-                sched.cfg.max_num_seqs = 1;
-                sched.admit_waiting_with_filter(
-                    |r| engine.alloc_three_state_slots_from(r),
-                    |_, prompt, matched| {
-                        proposer.can_restore_prefix(&prompt[..matched], prompt.len())
-                    },
-                );
-                sched.cfg.max_num_seqs = saved_max;
-                record_admissions(sched, requests);
-                if let Some(seq) = sched.active.first_mut() {
-                    match proposer
-                        .restore_prefix(engine, &seq.radix_key_tokens[..seq.cached_prefix_tokens])
+                if engine.dp_prefix_pool.is_some()
+                    && p.prefix_bidir_len.is_none()
+                    && p.radix_key_tokens.len() > 1
+                {
+                    let lookup_len = p.radix_key_tokens.len() - 1;
+                    let lora_id = p.lora_id;
+                    let key_tokens = p.radix_key_tokens[..lookup_len].to_vec();
+                    if let Some(entry) = engine.try_hydrate_waiting_from_shared_pool(
+                        &mut sched.radix,
+                        lora_id,
+                        &key_tokens,
+                    ) && let Some(feats) = &entry.proposer_features
                     {
-                        Ok(()) => {
-                            *speculative_id = Some(id);
-                            seq.custom_prefill = true;
-                        }
-                        Err(e) => {
-                            let r = requests.remove(&id).unwrap();
-                            notify_request_error(r, WorkerError::Cuda(e));
-                            release(engine, sched.cancel_request(id));
-                            proposer.abort_scheduled();
+                        proposer.import_shared_memo_features(&entry.token_ids, feats);
+                    }
+                }
+                let prev_lora = sched.radix.active_lora_id;
+                sched.radix.active_lora_id = p.lora_id;
+                let radix_matched = if p.radix_key_tokens.len() > 1 {
+                    sched
+                        .radix
+                        .peek_matched_tokens(&p.radix_key_tokens[..p.radix_key_tokens.len() - 1])
+                } else {
+                    0
+                };
+                sched.radix.active_lora_id = prev_lora;
+                let skip_spec_for_warm_radix = radix_matched >= 2048
+                    && !proposer.can_restore_prefix(
+                        &p.radix_key_tokens[..radix_matched],
+                        p.prompt_tokens.len(),
+                    );
+                if !skip_spec_for_warm_radix {
+                    let saved_max = sched.cfg.max_num_seqs;
+                    sched.cfg.max_num_seqs = 1;
+                    sched.admit_waiting_with_filter(
+                        |r| engine.alloc_three_state_slots_from(r),
+                        |_, prompt, matched| {
+                            proposer.can_restore_prefix(&prompt[..matched], prompt.len())
+                        },
+                    );
+                    sched.cfg.max_num_seqs = saved_max;
+                    record_admissions(sched, requests);
+                    if let Some(seq) = sched.active.first_mut() {
+                        match proposer.restore_prefix(
+                            engine,
+                            &seq.radix_key_tokens[..seq.cached_prefix_tokens],
+                        ) {
+                            Ok(()) => {
+                                *speculative_id = Some(id);
+                                seq.custom_prefill = true;
+                            }
+                            Err(e) => {
+                                let r = requests.remove(&id).unwrap();
+                                notify_request_error(r, WorkerError::Cuda(e));
+                                release(engine, sched.cancel_request(id));
+                                proposer.abort_scheduled();
+                            }
                         }
                     }
                 }
@@ -907,6 +1086,23 @@ fn admit_requests(
                 let pages = requests[&waiting.req_id].reserved_pages;
                 if reserved + pages > engine.ranks[0].kv_pool.num_pages {
                     break;
+                }
+                if engine.dp_prefix_pool.is_some()
+                    && waiting.prefix_bidir_len.is_none()
+                    && waiting.radix_key_tokens.len() > 1
+                {
+                    let lookup_len = waiting.radix_key_tokens.len() - 1;
+                    let lora_id = waiting.lora_id;
+                    let key_tokens = waiting.radix_key_tokens[..lookup_len].to_vec();
+                    if let Some(entry) = engine.try_hydrate_waiting_from_shared_pool(
+                        &mut sched.radix,
+                        lora_id,
+                        &key_tokens,
+                    ) && let Some(feats) = &entry.proposer_features
+                        && let Some(proposer) = engine.speculative.as_mut()
+                    {
+                        proposer.import_shared_memo_features(&entry.token_ids, feats);
+                    }
                 }
                 let before = sched.active.len();
                 // Admit exactly one request so its complete budget is reserved before
@@ -1001,23 +1197,15 @@ fn reserve_request_capacity(
             req.reserved_pages = req.reserved_pages.max(resident);
             sched.resolve_promoted_host_kv_pages();
         } else if is_prefill_done && generated_len > 0 {
-            requests[&id].hit_limit.store(true, Ordering::Release);
-            if *speculative_id == Some(id) {
-                if let Some(p) = &mut engine.speculative {
-                    p.abort_scheduled();
-                }
-                *speculative_id = None;
-                pending_ingest.clear();
-            }
-            for (slot_idx, slot_entry) in mtp_batch_slots.iter_mut().enumerate() {
-                if slot_entry.as_ref().is_some_and(|(sid, _)| *sid == id) {
-                    *slot_entry = None;
-                    if let Some(p) = &mut engine.speculative {
-                        let _ = p.reset_mtp_batch_slot(slot_idx);
-                    }
-                }
-            }
-            finish_early(engine, sched, id);
+            finish_soft_kv_limit(
+                engine,
+                sched,
+                requests,
+                speculative_id,
+                pending_ingest,
+                mtp_batch_slots,
+                id,
+            );
         } else {
             failed.push((id, WorkerError::overload("KV pool exhausted")));
         }
@@ -1057,9 +1245,64 @@ fn reserve_request_capacity(
             req.reserved_pages = req.reserved_pages.max(resident);
         }
     }
+    cancel_kv_exhausted_requests(
+        engine,
+        sched,
+        requests,
+        speculative_id,
+        pending_ingest,
+        mtp_batch_slots,
+        failed,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn finish_soft_kv_limit(
+    engine: &mut Qwen3_5Engine,
+    sched: &mut SchedulerV1,
+    requests: &HashMap<u64, Request>,
+    speculative_id: &mut Option<u64>,
+    pending_ingest: &mut Vec<i32>,
+    mtp_batch_slots: &mut MtpBatchSlots,
+    id: u64,
+) {
+    requests[&id].hit_limit.store(true, Ordering::Release);
+    if *speculative_id == Some(id) {
+        if let Some(p) = &mut engine.speculative {
+            p.abort_scheduled();
+        }
+        *speculative_id = None;
+        pending_ingest.clear();
+    }
+    for (slot_idx, slot_entry) in mtp_batch_slots.iter_mut().enumerate() {
+        if slot_entry.as_ref().is_some_and(|(sid, _)| *sid == id) {
+            *slot_entry = None;
+            if let Some(p) = &mut engine.speculative {
+                let _ = p.reset_mtp_batch_slot(slot_idx);
+            }
+        }
+    }
+    if let Some(p) = &mut engine.speculative {
+        p.finish_plain_memo(id);
+    }
+    finish_early(engine, sched, id);
+}
+
+fn cancel_kv_exhausted_requests(
+    engine: &mut Qwen3_5Engine,
+    sched: &mut SchedulerV1,
+    requests: &mut HashMap<u64, Request>,
+    speculative_id: &mut Option<u64>,
+    pending_ingest: &mut Vec<i32>,
+    mtp_batch_slots: &mut MtpBatchSlots,
+    failed: Vec<(u64, WorkerError)>,
+) {
     for (id, error) in failed {
         if let Some(r) = requests.remove(&id) {
             notify_request_error(r, error);
+        }
+        if let Some(p) = &mut engine.speculative {
+            p.discard_plain_memo(id);
         }
         release(engine, sched.cancel_request(id));
         if *speculative_id == Some(id) {
@@ -1213,7 +1456,7 @@ fn step_mtp_batch_prefill_chunk(
                     let _ = proposer.reset_mtp_batch_slot(slot_idx);
                 }
                 mtp_batch_slots[slot_idx] = None;
-                finish_early(engine, sched, id);
+                crate::engine_worker::finish_early_with_proposer(engine, sched, id, Some(proposer));
                 finish_res.map_err(WorkerError::Cuda)?;
             }
             Ok(still_prefilling)
@@ -1423,6 +1666,7 @@ fn abort_active_batch(
         release(engine, sched.cancel_request(id));
     }
     if let Some(p) = &mut engine.speculative {
+        p.clear_plain_memos();
         p.abort_scheduled();
         let _ = p.set_mtp_batch_mode(false);
     }
@@ -1473,6 +1717,8 @@ fn complete_tick(
 }
 
 pub(super) fn emit(request: &Request, id: i32, logprobs: Option<StepLogprobs>) {
+    // Prefill is complete as soon as the first generated token is produced.
+    request.prefill_release.mark_done();
     // Engine output exists even if the bounded delivery channel rejects it.
     if let Some(life) = &request.lifecycle {
         life.token();
@@ -1499,6 +1745,9 @@ pub(super) fn fail_request(
         }
         r.set_terminal(GenerationEvent::Error(error));
     }
+    if let Some(p) = engine.speculative.as_mut() {
+        p.discard_plain_memo(id);
+    }
     release(engine, sched.cancel_request(id));
 }
 
@@ -1514,5 +1763,36 @@ mod tests {
         assert_eq!(mtp_batch_pages_needed(16, 100, 5, 4), 5);
         // max_new=0 clamps to 1 token
         assert_eq!(mtp_batch_pages_needed(15, 0, 1, 4), 1);
+    }
+
+    #[test]
+    fn unwarmed_long_radix_decision_prevents_hol_starvation_while_preserving_l2_mtp_hits() {
+        // Short local prefix (< 2048) never forces a yield out of MTP.
+        assert!(!unwarmed_long_radix_decision(1024, false, None, true));
+
+        // Deep local radix hit (>= 2048) WITH a restorable proposer memo stays in MTP.
+        assert!(!unwarmed_long_radix_decision(4096, true, None, true));
+
+        // Deep local radix hit (>= 2048) WITHOUT a proposer memo MUST yield to `step_plain`
+        // so `admit_into_mtp_batch_slots` never strands the request at the head of `waiting`.
+        assert!(unwarmed_long_radix_decision(4096, false, None, true));
+
+        // Shared DP L2 pool hit (>= 2048) carrying `proposer_features = true` stays in MTP
+        // because `admit_into_mtp_batch_slots` hydrates KV+GDN and imports the memo together.
+        assert!(!unwarmed_long_radix_decision(
+            0,
+            true,
+            Some((4096, true)),
+            true,
+        ));
+
+        // Shared DP L2 pool hit (>= 2048) from a plain-mode run (`proposer_features = false`)
+        // without a local memo yields to `step_plain` so hydration + plain_memo capture run.
+        assert!(unwarmed_long_radix_decision(
+            0,
+            true,
+            Some((4096, false)),
+            false,
+        ));
     }
 }

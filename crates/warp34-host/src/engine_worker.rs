@@ -74,16 +74,53 @@ fn generation_channel(capacity: usize) -> (Sender<GenerationEvent>, GenerationEv
     )
 }
 
+#[derive(Default)]
+pub(super) struct PrefillReleaseSlot {
+    done: AtomicBool,
+    guard: OnceLock<Arc<crate::dp_router::PrefillTokenGuard>>,
+}
+
+impl PrefillReleaseSlot {
+    fn attach(&self, guard: Arc<crate::dp_router::PrefillTokenGuard>) {
+        let _ = self.guard.set(guard);
+        if self.done.load(Ordering::SeqCst)
+            && let Some(g) = self.guard.get()
+        {
+            g.release();
+        }
+    }
+
+    pub(super) fn mark_done(&self) {
+        self.done.store(true, Ordering::SeqCst);
+        if let Some(g) = self.guard.get() {
+            g.release();
+        }
+    }
+}
+
 pub struct GenerationStream {
     pub events: GenerationEvents,
     pub cached_tokens: Arc<AtomicU64>,
     pub cache_lookup: Arc<OnceLock<CacheLookup>>,
     pub hit_limit: Arc<AtomicBool>,
     cancelled: Arc<AtomicBool>,
+    prefill_release: Arc<PrefillReleaseSlot>,
+    pub(crate) inflight_guard: Option<crate::dp_router::InflightGuard>,
 }
 impl GenerationStream {
     pub fn cancel_handle(&self) -> Arc<AtomicBool> {
         self.cancelled.clone()
+    }
+
+    /// Attaches a DP router [`crate::dp_router::InflightGuard`] to this stream and wires
+    /// its prefill-token weight to release as soon as the worker finishes prefill.
+    pub(crate) fn attach_inflight_guard(&mut self, guard: Option<crate::dp_router::InflightGuard>) {
+        if let Some(ref g) = guard
+            && let Some(pg) = g.prefill_guard()
+        {
+            self.prefill_release.attach(pg);
+        }
+        self.inflight_guard = guard;
     }
 
     #[cfg(test)]
@@ -97,6 +134,8 @@ impl GenerationStream {
                 cache_lookup: Arc::default(),
                 hit_limit: Arc::new(AtomicBool::new(false)),
                 cancelled: Arc::new(AtomicBool::new(false)),
+                prefill_release: Arc::default(),
+                inflight_guard: None,
             },
         )
     }
@@ -161,6 +200,7 @@ struct Request {
     output: Sender<GenerationEvent>,
     terminal: Arc<OnceLock<GenerationEvent>>,
     cancelled: Arc<AtomicBool>,
+    prefill_release: Arc<PrefillReleaseSlot>,
     max_prefix_lookup_len: Option<usize>,
     mamba_branching_seqlen: Option<usize>,
     prefix_bidir_len: Option<usize>,
@@ -176,6 +216,7 @@ impl Request {
     }
 
     fn set_terminal(&self, event: GenerationEvent) {
+        self.prefill_release.mark_done();
         let outcome = match &event {
             GenerationEvent::Finished { .. } if self.cancelled.load(Ordering::Acquire) => {
                 Outcome::Cancelled
@@ -313,6 +354,7 @@ impl EngineWorker {
                     worker_stats.telemetry.initialize(
                         TelemetryConfig {
                             tp_size: engine.tp_size,
+                            dp_size: None,
                             kv_format: kv_format_name(&engine),
                             speculation: engine
                                 .speculative
@@ -627,6 +669,7 @@ impl EngineWorker {
         let cached_tokens = Arc::new(AtomicU64::new(0));
         let hit_limit = Arc::new(AtomicBool::new(false));
         let cancelled = Arc::new(AtomicBool::new(false));
+        let prefill_release = Arc::new(PrefillReleaseSlot::default());
         let sampler = SamplerV1::new(params, &prompt, constraint);
         self.enqueue_request(Request {
             lifecycle: None,
@@ -642,6 +685,7 @@ impl EngineWorker {
             output,
             terminal: events.terminal.clone(),
             cancelled: cancelled.clone(),
+            prefill_release: prefill_release.clone(),
             max_prefix_lookup_len: None,
             mamba_branching_seqlen: None,
             prefix_bidir_len: None,
@@ -654,6 +698,8 @@ impl EngineWorker {
             cache_lookup,
             cached_tokens,
             hit_limit,
+            prefill_release,
+            inflight_guard: None,
         })
     }
 
@@ -831,6 +877,7 @@ impl EngineWorker {
         let cached_tokens = Arc::new(AtomicU64::new(0));
         let hit_limit = Arc::new(AtomicBool::new(false));
         let cancelled = Arc::new(AtomicBool::new(false));
+        let prefill_release = Arc::new(PrefillReleaseSlot::default());
         let params = SamplingParams {
             temperature: 0.0,
             top_k: 1,
@@ -854,6 +901,7 @@ impl EngineWorker {
             output,
             terminal: events.terminal.clone(),
             cancelled: cancelled.clone(),
+            prefill_release: prefill_release.clone(),
             max_prefix_lookup_len,
             mamba_branching_seqlen,
             prefix_bidir_len,
@@ -866,6 +914,8 @@ impl EngineWorker {
             cache_lookup,
             cached_tokens,
             hit_limit,
+            prefill_release,
+            inflight_guard: None,
         })
     }
 }
@@ -962,6 +1012,7 @@ pub fn run_batch_in_place(
                     output,
                     terminal: events.terminal.clone(),
                     cancelled: cancelled.clone(),
+                    prefill_release: Arc::default(),
                     max_prefix_lookup_len: None,
                     mamba_branching_seqlen: None,
                     prefix_bidir_len: None,
@@ -1091,12 +1142,51 @@ fn release(engine: &mut Qwen3_5Engine, donation: Option<crate::radix::RadixDonat
 }
 
 fn finish_early(engine: &mut Qwen3_5Engine, sched: &mut SchedulerV1, req_id: u64) {
+    finish_early_with_proposer(engine, sched, req_id, None);
+}
+
+fn finish_early_with_proposer(
+    engine: &mut Qwen3_5Engine,
+    sched: &mut SchedulerV1,
+    req_id: u64,
+    proposer_override: Option<&crate::proposer::NativeProposer>,
+) {
+    let publish_info = engine
+        .dp_prefix_pool
+        .is_some()
+        .then(|| {
+            sched
+                .active
+                .iter()
+                .find(|s| s.req_id == req_id)
+                .and_then(|seq| {
+                    (seq.prefix_bidir_len.is_none() && seq.generated_tokens.len() <= 1)
+                        .then(|| (seq.lora_id, seq.radix_key_tokens.clone()))
+                })
+        })
+        .flatten();
     let out = if engine.has_checkpoint_pool() {
         sched.finish_request_early_with(req_id, |r| engine.alloc_checkpoint_slot_from(r))
     } else {
         sched.finish_request_early(req_id)
     };
+    let donated_node = out.as_ref().and_then(|o| o.donated_node);
     release(engine, out);
+    if let (Some((lora_id, radix_tokens)), Some(node_id)) = (publish_info, donated_node)
+        && let Some((num_tokens, _, _)) = sched.radix.node_kv_pages_and_mamba(node_id)
+        && num_tokens <= radix_tokens.len()
+    {
+        let prop = proposer_override.or(engine.speculative.as_ref());
+        let has_mtp = prop.is_some_and(|p| p.is_mtp());
+        engine.try_publish_radix_node_to_shared_pool_with_features(
+            &sched.radix,
+            node_id,
+            lora_id,
+            &radix_tokens,
+            has_mtp,
+            || prop.and_then(|p| p.export_shared_memo_features(&radix_tokens[..num_tokens])),
+        );
+    }
 }
 
 fn enqueue(

@@ -73,20 +73,29 @@ impl PinnedSlabPool {
         let mut try_layers = remaining_layers.clamp(1, self.max_slab_layers);
         while try_layers >= 1 {
             if let Some(slab_bytes) = layer_bytes.checked_mul(try_layers) {
-                let cur = TOTAL_PINNED_BYTES.load(std::sync::atomic::Ordering::Relaxed);
-                if cur.saturating_add(slab_bytes) <= MAX_PROCESS_PINNED_BYTES
-                    && let Ok(m) = MappedHostBuffer::alloc_unzeroed(slab_bytes)
-                {
-                    TOTAL_PINNED_BYTES.fetch_add(slab_bytes, std::sync::atomic::Ordering::Relaxed);
-                    let slab_arc = std::sync::Arc::new(SharedPinnedSlab(m));
-                    if try_layers > 1 {
-                        self.current = Some((slab_arc.clone(), layer_bytes));
+                let reserved = TOTAL_PINNED_BYTES
+                    .try_update(
+                        std::sync::atomic::Ordering::AcqRel,
+                        std::sync::atomic::Ordering::Acquire,
+                        |cur| {
+                            let next = cur.checked_add(slab_bytes)?;
+                            (next <= MAX_PROCESS_PINNED_BYTES).then_some(next)
+                        },
+                    )
+                    .is_ok();
+                if reserved {
+                    if let Ok(m) = MappedHostBuffer::alloc_unzeroed(slab_bytes) {
+                        let slab_arc = std::sync::Arc::new(SharedPinnedSlab(m));
+                        if try_layers > 1 {
+                            self.current = Some((slab_arc.clone(), layer_bytes));
+                        }
+                        return Ok(HostPackStorage::MappedSlice {
+                            slab: slab_arc,
+                            offset: 0,
+                            len: layer_bytes,
+                        });
                     }
-                    return Ok(HostPackStorage::MappedSlice {
-                        slab: slab_arc,
-                        offset: 0,
-                        len: layer_bytes,
-                    });
+                    TOTAL_PINNED_BYTES.fetch_sub(slab_bytes, std::sync::atomic::Ordering::Release);
                 }
             }
             if try_layers == 1 {

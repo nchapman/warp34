@@ -23,6 +23,8 @@ pub(super) struct PoolCapacity {
     pub(super) enable_checkpoint_pool: bool,
     pub(super) checkpoint_vram_slots: Option<usize>,
     pub(super) checkpoint_host_slots: Option<usize>,
+    /// Number of in-process data-parallel replicas (`>= 1`); divides per-rank host-RAM budgets.
+    pub(super) dp_size: usize,
 }
 
 /// Number of state slots allocated per active sequence in serving mode (three private

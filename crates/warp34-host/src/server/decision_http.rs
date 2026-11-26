@@ -87,15 +87,14 @@ async fn await_candidate_query(
 }
 
 async fn run_one_candidate_query(
-    s: Arc<OpenAiServerState>,
+    worker: &crate::engine_worker::EngineWorker,
     prompt: Vec<i32>,
     images: Vec<crate::vision::PreprocessedImage>,
     cands: Vec<i32>,
     branch_hint: Option<usize>,
     lora_id: i32,
 ) -> Result<(Vec<f64>, usize), ApiError> {
-    let sub = s
-        .worker
+    let sub = worker
         .submit_decision_candidate_logits_with_images_and_lora(
             prompt,
             images,
@@ -141,7 +140,7 @@ async fn await_hidden_query(
 
 #[allow(clippy::too_many_arguments)]
 async fn run_one_hidden_query(
-    s: Arc<OpenAiServerState>,
+    worker: &crate::engine_worker::EngineWorker,
     prompt: Vec<i32>,
     images: Vec<crate::vision::PreprocessedImage>,
     positions: Vec<usize>,
@@ -150,8 +149,7 @@ async fn run_one_hidden_query(
     branch_hint: Option<usize>,
     lora_id: i32,
 ) -> Result<(Vec<Vec<f32>>, usize), ApiError> {
-    let sub = s
-        .worker
+    let sub = worker
         .submit_decision_hidden_positions_with_images_and_lora(
             prompt,
             images,
@@ -174,20 +172,29 @@ async fn run_candidate_queries_radix_shared(
     if queries.is_empty() {
         return Ok(Vec::new());
     }
+    let longest_prompt = queries
+        .iter()
+        .map(|(p, _)| p.as_slice())
+        .max_by_key(|p| p.len())
+        .unwrap_or(&queries[0].0);
+    let (_dp_rank, target_worker, _inflight) = s
+        .select_worker(lora_id, longest_prompt, images, None)
+        .map_err(worker_api_err)?;
     let mut results = Vec::with_capacity(queries.len());
     let mut iter = queries.into_iter();
     // Run Query 0 first to donate the shared state prefix into MambaRadixCache.
     let (p0, c0) = iter.next().unwrap();
     let rest: Vec<_> = iter.collect();
     let branch0 = shared_mamba_branch_hint(&p0, rest.iter().map(|(p, _)| p.as_slice()), None);
-    results
-        .push(run_one_candidate_query(s.clone(), p0, images.to_vec(), c0, branch0, lora_id).await?);
+    results.push(
+        run_one_candidate_query(target_worker, p0, images.to_vec(), c0, branch0, lora_id).await?,
+    );
 
     for wave in rest.chunks(8) {
         let mut submitted = Vec::with_capacity(wave.len());
         for (p, c) in wave.iter().cloned() {
             submitted.push(
-                s.worker
+                target_worker
                     .submit_decision_candidate_logits_with_images_and_lora(
                         p,
                         images.to_vec(),
@@ -214,6 +221,14 @@ async fn run_code_readout_queries_raw(
     if queries.is_empty() {
         return Ok((Vec::new(), 0, 0));
     }
+    let longest_prompt = queries
+        .iter()
+        .map(|q| q.token_ids.as_slice())
+        .max_by_key(|p| p.len())
+        .unwrap_or(&queries[0].token_ids);
+    let (_dp_rank, target_worker, _inflight) = s
+        .select_worker(lora_id, longest_prompt, images, None)
+        .map_err(worker_api_err)?;
     let mut input_tokens = 0usize;
     let mut cached_tokens = 0usize;
     let mut total_positions = 0usize;
@@ -224,7 +239,7 @@ async fn run_code_readout_queries_raw(
 
     let mut raw_outs = Vec::with_capacity(queries.len());
     let all_bidir =
-        s.worker.unshareable_prefill || queries.iter().all(|q| q.prefix_bidir_len.is_some());
+        target_worker.unshareable_prefill || queries.iter().all(|q| q.prefix_bidir_len.is_some());
     if all_bidir {
         // Bidirectional or midloop models (`d3` `prefix_bidir = true` and `GLiDE`
         // `noncausal_full_attention` / `midloop`) do not donate into `MambaRadixCache`;
@@ -233,7 +248,7 @@ async fn run_code_readout_queries_raw(
             let mut submitted = Vec::with_capacity(wave.len());
             for q in wave.iter().cloned() {
                 submitted.push(
-                    s.worker
+                    target_worker
                         .submit_decision_hidden_positions_with_images_and_lora(
                             q.token_ids,
                             images.to_vec(),
@@ -265,7 +280,7 @@ async fn run_code_readout_queries_raw(
         };
         raw_outs.push(
             run_one_hidden_query(
-                s.clone(),
+                target_worker,
                 q0.token_ids,
                 images.to_vec(),
                 q0.positions,
@@ -280,7 +295,7 @@ async fn run_code_readout_queries_raw(
             let mut submitted = Vec::with_capacity(wave.len());
             for q in wave.iter().cloned() {
                 submitted.push(
-                    s.worker
+                    target_worker
                         .submit_decision_hidden_positions_with_images_and_lora(
                             q.token_ids,
                             images.to_vec(),

@@ -805,6 +805,190 @@ impl GdnCheckpointPool {
             }
         }
     }
+
+    /// Exports a populated checkpoint slot (`WHT128-Q8_0` frame + PLE n-gram context) into
+    /// an owned host byte buffer so another DP replica can hydrate it without re-prefilling.
+    pub fn export_slot_to_host_bytes(
+        &self,
+        src_ckpt_slot: i32,
+        stream: &CudaStream,
+    ) -> Result<(Vec<u8>, [i32; 2])> {
+        let logical_id = decode_checkpoint_pool_slot(src_ckpt_slot)
+            .filter(|&id| id < self.total_slots)
+            .ok_or_else(|| CudaError::new(-11, "invalid source checkpoint slot for export"))?;
+        let loc = self.locations[logical_id]
+            .ok_or_else(|| CudaError::new(-11, "exporting unpopulated checkpoint slot"))?;
+        let bytes = self.layout.bundle_bytes;
+        let ple_ngram = self.ple_ngram_context[logical_id];
+        let mut out = vec![0u8; bytes];
+        match loc {
+            CkptLocation::Host(h_idx) => {
+                match self.host_storage[h_idx]
+                    .as_ref()
+                    .ok_or_else(|| CudaError::new(-11, "missing host storage slot for export"))?
+                {
+                    HostCheckpointSlot::Pinned(pinned) => {
+                        // SAFETY: `pinned` holds `bytes` readable host memory.
+                        unsafe {
+                            core::ptr::copy_nonoverlapping(
+                                pinned.host_ptr as *const u8,
+                                out.as_mut_ptr(),
+                                bytes,
+                            );
+                        }
+                    }
+                    HostCheckpointSlot::Pageable(boxed) => {
+                        out.copy_from_slice(&boxed[..bytes]);
+                    }
+                }
+            }
+            CkptLocation::Vram(v_idx) => {
+                check_rc(
+                    // SAFETY: binds calling thread to `self.device_id` before D2H copy.
+                    unsafe { ffi::warp34_set_device(self.device_id) },
+                    "warp34_set_device",
+                )?;
+                let src_addr = self.vram_slot_addr(v_idx);
+                check_rc(
+                    // SAFETY: `out` and `src_addr` span `bytes`; synchronized before return.
+                    unsafe {
+                        ffi::warp34_memcpy_d2h_async(
+                            out.as_mut_ptr().cast(),
+                            src_addr as *const c_void,
+                            bytes,
+                            stream.handle,
+                        )
+                    },
+                    "export GDN checkpoint VRAM->host",
+                )?;
+                stream.synchronize()?;
+            }
+        }
+        Ok((out, ple_ngram))
+    }
+
+    /// Imports a previously exported `WHT128-Q8_0` checkpoint frame directly into
+    /// `dst_ckpt_slot` (L1 VRAM if available, spilling LRU to L2 Host, or L2 Host directly).
+    pub fn import_host_bytes_to_slot(
+        &mut self,
+        dst_ckpt_slot: i32,
+        bytes: &[u8],
+        ple_ngram: [i32; 2],
+        stream: &CudaStream,
+    ) -> Result<()> {
+        let logical_id = decode_checkpoint_pool_slot(dst_ckpt_slot)
+            .filter(|&id| id < self.total_slots)
+            .ok_or_else(|| CudaError::new(-11, "invalid destination checkpoint slot for import"))?;
+        if bytes.len() != self.layout.bundle_bytes {
+            return Err(CudaError::with_detail(
+                -11,
+                "GDN checkpoint import byte length mismatch",
+                format!(
+                    "got {} bytes, expected {}",
+                    bytes.len(),
+                    self.layout.bundle_bytes
+                ),
+            ));
+        }
+
+        let new_loc =
+            if self.vram_slots > 0 {
+                let target_v_idx = if let Some(v_idx) = self.free_vram_slots.pop() {
+                    v_idx
+                } else {
+                    let victim_logical = self.vram_lru.first().copied().ok_or_else(|| {
+                        CudaError::new(-11, "L1 VRAM LRU empty despite 0 free slots")
+                    })?;
+                    let CkptLocation::Vram(v_idx) =
+                        self.locations[victim_logical].expect("victim must be in VRAM")
+                    else {
+                        return Err(CudaError::new(-11, "corrupt L1 VRAM LRU entry"));
+                    };
+                    let h_idx = self
+                        .free_host_slots
+                        .pop()
+                        .ok_or_else(|| CudaError::new(-11, "no free L2 host slot for L1 spill"))?;
+                    if let Err(e) = self.copy_vram_to_host_slot(v_idx, h_idx, stream) {
+                        self.free_host_slots.push(h_idx);
+                        return Err(e);
+                    }
+                    self.vram_lru.remove(0);
+                    self.locations[victim_logical] = Some(CkptLocation::Host(h_idx));
+                    self.host_spills += 1;
+                    v_idx
+                };
+                let dst_addr = self.vram_slot_addr(target_v_idx);
+                let copy_res = (|| -> Result<()> {
+                    check_rc(
+                        // SAFETY: binds calling thread to `self.device_id` before H2D copy.
+                        unsafe { ffi::warp34_set_device(self.device_id) },
+                        "warp34_set_device",
+                    )?;
+                    check_rc(
+                        // SAFETY: `bytes` and `dst_addr` span `self.layout.bundle_bytes`; synced
+                        // before returning while `bytes` is live.
+                        unsafe {
+                            ffi::warp34_memcpy_h2d_async(
+                                dst_addr as *mut c_void,
+                                bytes.as_ptr().cast(),
+                                bytes.len(),
+                                stream.handle,
+                            )
+                        },
+                        "import GDN checkpoint host->VRAM",
+                    )?;
+                    stream.synchronize()
+                })();
+                if let Err(e) = copy_res {
+                    self.free_vram_slots.push(target_v_idx);
+                    return Err(e);
+                }
+                CkptLocation::Vram(target_v_idx)
+            } else {
+                let h_idx = self.free_host_slots.pop().ok_or_else(|| {
+                    CudaError::new(-11, "no free L2 host checkpoint slot for import")
+                })?;
+                self.ensure_host_slot(h_idx);
+                match self.host_storage[h_idx]
+                    .as_mut()
+                    .ok_or_else(|| CudaError::new(-11, "missing host storage slot for import"))?
+                {
+                    HostCheckpointSlot::Pinned(pinned) => {
+                        // SAFETY: `pinned` holds `self.layout.bundle_bytes` writable host memory.
+                        unsafe {
+                            core::ptr::copy_nonoverlapping(
+                                bytes.as_ptr(),
+                                pinned.host_ptr as *mut u8,
+                                bytes.len(),
+                            );
+                        }
+                    }
+                    HostCheckpointSlot::Pageable(boxed) => {
+                        boxed[..bytes.len()].copy_from_slice(bytes);
+                    }
+                }
+                CkptLocation::Host(h_idx)
+            };
+
+        // Only release any prior physical backing after the new slot is populated so errors
+        // never discard an existing live checkpoint.
+        if let Some(prev) = self.locations[logical_id].replace(new_loc) {
+            match prev {
+                CkptLocation::Vram(v) => {
+                    if let Some(pos) = self.vram_lru.iter().position(|&id| id == logical_id) {
+                        self.vram_lru.remove(pos);
+                    }
+                    self.free_vram_slots.push(v);
+                }
+                CkptLocation::Host(h) => self.free_host_slots.push(h),
+            }
+        }
+        self.ple_ngram_context[logical_id] = ple_ngram;
+        if matches!(new_loc, CkptLocation::Vram(_)) {
+            self.touch_vram_lru(logical_id);
+        }
+        Ok(())
+    }
 }
 
 #[cfg(feature = "cuda")]

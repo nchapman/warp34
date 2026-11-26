@@ -1516,6 +1516,33 @@ impl RankTieredMoe {
         stage_capacity: usize,
         stream: &crate::cuda::CudaStream,
     ) -> crate::cuda::Result<Self> {
+        Self::load_for_rank_with_dp(
+            archive,
+            cfg,
+            device_id,
+            ep_rank,
+            ep_size,
+            0,
+            1,
+            k_hot,
+            stage_capacity,
+            stream,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn load_for_rank_with_dp(
+        archive: &SafetensorsArchive,
+        cfg: &crate::loader::ModelConfig,
+        device_id: i32,
+        ep_rank: usize,
+        ep_size: usize,
+        dp_rank: usize,
+        dp_size: usize,
+        k_hot: usize,
+        stage_capacity: usize,
+        stream: &crate::cuda::CudaStream,
+    ) -> crate::cuda::Result<Self> {
         let min_group_size = (0..cfg.num_hidden_layers)
             .filter(|l| !cfg.mlp_only_layers.contains(l))
             .filter_map(|l| {
@@ -1642,10 +1669,17 @@ impl RankTieredMoe {
             caches.push(cache);
         }
         drop(slab_pool);
-        archive.drop_page_cache();
+        if dp_size <= 1 {
+            archive.drop_page_cache();
+        }
 
-        // Defer spinning up the CPU MoE bridge (`moe-responder` busy-polls CPU 0) until all
-        // 48 layers have finished `pread`ing and packing so loader threads never contend with it.
+        // Defer spinning up the CPU MoE bridge (`moe-responder` busy-polls its assigned CPU)
+        // until all layers have finished `pread`ing and packing so loader threads never contend.
+        // Under DP > 1, partition physical CPUs disjointly across `dp_size * ep_size` ranks so
+        // sibling replicas never collide on the same responder CPU.
+        let eff_dp = dp_size.max(1);
+        let global_cpu_rank = dp_rank.min(eff_dp - 1) * ep_size.max(1) + ep_rank;
+        let global_cpu_ranks = eff_dp * ep_size.max(1);
         if !fully_resident
             && k_hot >= TIERED_MOE_CPU_BRIDGE_MIN_HOT_EXPERTS
             && HotExpertCache::auto_cpu_bridge_preferred()
@@ -1663,7 +1697,9 @@ impl RankTieredMoe {
                 };
                 if bridge_runtime.is_none() {
                     bridge_runtime = Some(crate::moe_cpu_bridge::Runtime::new_for_ep(
-                        stream, ep_rank, ep_size,
+                        stream,
+                        global_cpu_rank,
+                        global_cpu_ranks,
                     )?);
                 }
                 cache.ep_size = ep_size;

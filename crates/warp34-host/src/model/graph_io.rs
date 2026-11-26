@@ -633,6 +633,7 @@ pub struct InFlightDecodeTicket {
     pub slot: usize,
     pub num_reqs: usize,
     pub fast_greedy: bool,
+    pub has_hidden: bool,
 }
 
 #[cfg(feature = "cuda")]
@@ -658,6 +659,8 @@ pub struct BatchedDecodeGraphIo {
     pub cached_fast_greedy_cfgs: std::sync::Mutex<Vec<u8>>,
     pub cached_fast_greedy_sparse: std::sync::Mutex<Vec<u8>>,
     pub pipeline_done_events: [crate::cuda::CudaEvent; 2],
+    pub pipeline_hidden_pinned: Option<crate::cuda::MappedHostBuffer>,
+    pub pipeline_hidden_slot_bytes: usize,
     pub max_blocks_per_req: usize,
 }
 
@@ -724,7 +727,56 @@ impl BatchedDecodeGraphIo {
             cached_fast_greedy_cfgs: std::sync::Mutex::new(Vec::new()),
             cached_fast_greedy_sparse: std::sync::Mutex::new(Vec::new()),
             pipeline_done_events,
+            pipeline_hidden_pinned: None,
+            pipeline_hidden_slot_bytes: 0,
             max_blocks_per_req: max_blocks,
+        })
+    }
+
+    /// Lazily allocates a double-buffered pinned host buffer (`2 * MAX_BATCHED_DECODE_REQS * row_bytes`)
+    /// so pipelined decode bursts can asynchronously D2H `last_final_hidden_f16` into `slot` before
+    /// `pipeline_done_events[slot]` without racing with the next overlapped graph launch.
+    pub fn ensure_pipeline_hidden_slot_ptr(
+        &mut self,
+        slot: usize,
+        row_bytes: usize,
+    ) -> Result<*mut u8> {
+        let slot_bytes = MAX_BATCHED_DECODE_REQS.saturating_mul(row_bytes);
+        if self.pipeline_hidden_pinned.is_none() || self.pipeline_hidden_slot_bytes < slot_bytes {
+            self.pipeline_hidden_pinned =
+                Some(crate::cuda::MappedHostBuffer::alloc(2 * slot_bytes)?);
+            self.pipeline_hidden_slot_bytes = slot_bytes;
+        }
+        let buf = self.pipeline_hidden_pinned.as_ref().unwrap();
+        // SAFETY: slot is 0 or 1 and buffer holds 2 * pipeline_hidden_slot_bytes.
+        Ok(unsafe {
+            buf.host_ptr
+                .cast::<u8>()
+                .add(slot * self.pipeline_hidden_slot_bytes)
+        })
+    }
+
+    /// Returns the completed hidden rows for `slot` (`num_reqs * row_bytes`) after
+    /// `pipeline_done_events[slot].synchronize()` has completed and before `slot` is re-enqueued.
+    pub fn pipeline_hidden_slot_slice(
+        &self,
+        slot: usize,
+        num_reqs: usize,
+        row_bytes: usize,
+    ) -> Option<&[u8]> {
+        let buf = self.pipeline_hidden_pinned.as_ref()?;
+        let bytes = num_reqs.checked_mul(row_bytes)?;
+        if slot >= 2 || bytes > self.pipeline_hidden_slot_bytes {
+            return None;
+        }
+        // SAFETY: caller synchronized `pipeline_done_events[slot]` and has not re-enqueued `slot`.
+        Some(unsafe {
+            std::slice::from_raw_parts(
+                buf.host_ptr
+                    .cast::<u8>()
+                    .add(slot * self.pipeline_hidden_slot_bytes),
+                bytes,
+            )
         })
     }
 

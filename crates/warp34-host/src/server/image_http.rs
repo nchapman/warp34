@@ -126,6 +126,7 @@ impl QwenImage21Worker {
             .map_err(|_| "image worker thread exited during initialization".to_string())??;
         let telemetry = Telemetry::new(TelemetryConfig {
             tp_size,
+            dp_size: None,
             kv_format: "fp16_dit_vae".to_string(),
             speculation: "flow_match_euler".to_string(),
             max_model_len: None,
@@ -220,9 +221,12 @@ pub struct QwenImage21ServerState {
     api_key: Option<crate::api_auth::ApiKey>,
     webui: bool,
     pub worker: QwenImage21Worker,
+    extra_workers: Vec<QwenImage21Worker>,
+    dp_router: Arc<crate::dp_router::DpRouterCore>,
     pub metrics: Arc<Telemetry>,
     pub allow_remote_images: bool,
     pub use_cuda_graph: bool,
+    max_num_seqs: usize,
     admission: Arc<Semaphore>,
     next_request_id: AtomicU64,
 }
@@ -235,21 +239,174 @@ impl QwenImage21ServerState {
         options: super::ServeOptions,
         loader: impl FnOnce() -> Result<QwenImage21PipelineEngine, String> + Send + 'static,
     ) -> Result<Arc<Self>, String> {
+        Self::from_loaders_with_options(
+            model_name,
+            allow_remote_images,
+            use_cuda_graph,
+            options,
+            vec![Box::new(loader)],
+        )
+    }
+
+    #[allow(clippy::type_complexity)]
+    pub fn from_loaders_with_options(
+        model_name: String,
+        allow_remote_images: bool,
+        use_cuda_graph: bool,
+        options: super::ServeOptions,
+        loaders: Vec<Box<dyn FnOnce() -> Result<QwenImage21PipelineEngine, String> + Send>>,
+    ) -> Result<Arc<Self>, String> {
         options.validate()?;
-        let worker = QwenImage21Worker::from_loader(&model_name, loader)?;
-        let metrics = worker.telemetry.clone();
+        if loaders.is_empty() {
+            return Err("from_loaders_with_options requires at least one loader".to_owned());
+        }
+        let dp_size = loaders.len();
+        let routing = match options.dp_routing {
+            crate::dp_router::DpRoutingPolicy::RoundRobin => {
+                crate::dp_router::DpRoutingPolicy::RoundRobin
+            }
+            _ => crate::dp_router::DpRoutingPolicy::LeastLoaded,
+        };
+        let dp_router = crate::dp_router::DpRouterCore::new(dp_size, routing);
+        let mut workers = if dp_size == 1 {
+            let loader = loaders.into_iter().next().unwrap();
+            vec![QwenImage21Worker::from_loader(&model_name, loader)?]
+        } else {
+            let results: Vec<Result<QwenImage21Worker, String>> = std::thread::scope(|s| {
+                let handles: Vec<_> = loaders
+                    .into_iter()
+                    .map(|loader| {
+                        let name = model_name.clone();
+                        s.spawn(move || QwenImage21Worker::from_loader(&name, loader))
+                    })
+                    .collect();
+                handles
+                    .into_iter()
+                    .map(|h| {
+                        h.join().unwrap_or_else(|_| {
+                            Err("DP image replica loader thread panicked".to_owned())
+                        })
+                    })
+                    .collect()
+            });
+            let mut ok_workers = Vec::with_capacity(dp_size);
+            let mut first_err: Option<String> = None;
+            for res in results {
+                match res {
+                    Ok(w) => ok_workers.push(w),
+                    Err(e) if first_err.is_none() => first_err = Some(e),
+                    Err(_) => {}
+                }
+            }
+            if let Some(err) = first_err {
+                return Err(err);
+            }
+            ok_workers
+        };
+        let primary = workers.remove(0);
+        let metrics = primary.telemetry.clone();
         metrics.set_model(model_name.clone());
+        for w in &workers {
+            w.telemetry.set_model(model_name.clone());
+        }
         Ok(Arc::new(Self {
             model_name,
             api_key: options.api_key,
             webui: options.webui,
-            worker,
+            worker: primary,
+            extra_workers: workers,
+            dp_router,
             metrics,
             allow_remote_images,
             use_cuda_graph,
-            admission: Arc::new(Semaphore::new(options.max_num_seqs.max(1))),
+            max_num_seqs: options.max_num_seqs,
+            admission: Arc::new(Semaphore::new(options.max_num_seqs.max(1) * dp_size)),
             next_request_id: AtomicU64::new(0),
         }))
+    }
+
+    #[inline]
+    pub fn dp_size(&self) -> usize {
+        1 + self.extra_workers.len()
+    }
+
+    pub fn all_workers(&self) -> impl Iterator<Item = &QwenImage21Worker> {
+        std::iter::once(&self.worker).chain(self.extra_workers.iter())
+    }
+
+    fn worker_at(&self, dp_rank: usize) -> &QwenImage21Worker {
+        if dp_rank == 0 {
+            &self.worker
+        } else {
+            &self.extra_workers[dp_rank - 1]
+        }
+    }
+
+    pub fn snapshot_metrics(&self) -> crate::telemetry::Snapshot {
+        if self.extra_workers.is_empty() {
+            return self.metrics.snapshot();
+        }
+        let snaps: Vec<crate::telemetry::Snapshot> = self
+            .all_workers()
+            .map(|w| {
+                let mut snap = w.telemetry.snapshot();
+                if w.is_panicked() || w.is_stopping() {
+                    snap.status = "unavailable";
+                }
+                snap
+            })
+            .collect();
+        crate::telemetry::Snapshot::aggregate(&snaps)
+    }
+
+    fn select_worker(
+        &self,
+    ) -> Result<(&QwenImage21Worker, Option<crate::dp_router::InflightGuard>), WorkerError> {
+        if self.extra_workers.is_empty() {
+            return Ok((&self.worker, None));
+        }
+        let samples: Vec<crate::dp_router::WorkerLoadSample> = self
+            .all_workers()
+            .map(|w| {
+                let snap = w.telemetry.snapshot();
+                let kv_util = if snap.pools.kv.capacity > 0 {
+                    snap.pools.kv.active.unwrap_or(0) as f64 / snap.pools.kv.capacity as f64
+                } else {
+                    0.0
+                };
+                crate::dp_router::WorkerLoadSample {
+                    healthy: !w.is_panicked() && !w.is_stopping(),
+                    active_requests: snap.requests.running as usize,
+                    waiting_requests: snap.requests.waiting as usize,
+                    router_inflight: 0,
+                    router_inflight_prefill_tokens: 0,
+                    max_num_seqs: self.max_num_seqs,
+                    kv_token_capacity: 0,
+                    active_kv_util: kv_util,
+                }
+            })
+            .collect();
+        let Some((rank, guard)) = self.dp_router.select_and_acquire(samples, -1, &[], None) else {
+            return Err(WorkerError::worker_stopped(
+                "all image data-parallel workers are unavailable",
+            ));
+        };
+        Ok((self.worker_at(rank), Some(guard)))
+    }
+
+    pub async fn shutdown_all(&self) -> Result<(), String> {
+        let mut first_err: Option<String> = None;
+        for w in self.all_workers() {
+            if let Err(e) = w.shutdown().await
+                && first_err.is_none()
+            {
+                first_err = Some(e);
+            }
+        }
+        match first_err {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
     }
 }
 
@@ -1093,7 +1250,7 @@ async fn handle_image_request(
     req: Request,
     require_images: bool,
 ) -> Result<Json<Value>, super::http::ApiError> {
-    if state.worker.is_panicked() {
+    if state.all_workers().all(|w| w.is_panicked()) {
         return Err(super::http::worker_api_err(WorkerError::worker_panicked(
             state
                 .worker
@@ -1156,7 +1313,14 @@ async fn handle_image_request(
             rgba_output: parsed.rgba_output,
             use_cuda_graph: state.use_cuda_graph,
         };
-        let res = match state.worker.generate(gen_req).await {
+        let (target_worker, _inflight) = match state.select_worker() {
+            Ok(selected) => selected,
+            Err(err) => {
+                turn_log.finish("error");
+                return Err(super::http::worker_api_err(err));
+            }
+        };
+        let res = match target_worker.generate(gen_req).await {
             Ok(res) => res,
             Err(err) => {
                 turn_log.finish("error");
@@ -1222,7 +1386,7 @@ async fn image_models(State(s): State<Arc<QwenImage21ServerState>>) -> Json<Valu
 }
 
 async fn image_health(State(s): State<Arc<QwenImage21ServerState>>) -> Response {
-    if s.worker.is_panicked() {
+    if s.all_workers().all(|w| w.is_panicked()) {
         let detail = s
             .worker
             .panic_reason()
@@ -1236,7 +1400,7 @@ async fn image_health(State(s): State<Arc<QwenImage21ServerState>>) -> Response 
         )
             .into_response();
     }
-    if s.admission.is_closed() || s.worker.is_stopping() {
+    if s.admission.is_closed() || s.all_workers().all(|w| w.is_stopping()) {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(json!({"status": "stopping"})),
@@ -1249,14 +1413,14 @@ async fn image_health(State(s): State<Arc<QwenImage21ServerState>>) -> Response 
 async fn image_metrics(State(s): State<Arc<QwenImage21ServerState>>) -> impl IntoResponse {
     (
         [(header::CONTENT_TYPE, "text/plain; version=0.0.4")],
-        s.metrics.snapshot().prometheus(),
+        s.snapshot_metrics().prometheus(),
     )
 }
 
 async fn image_metrics_json(State(s): State<Arc<QwenImage21ServerState>>) -> impl IntoResponse {
     (
         [(header::CACHE_CONTROL, "no-store")],
-        Json(s.metrics.snapshot()),
+        Json(s.snapshot_metrics()),
     )
 }
 
@@ -1325,11 +1489,7 @@ pub fn run_blocking_image_server(
         let listener = match tokio::net::TcpListener::bind(addr).await {
             Ok(listener) => listener,
             Err(error) => {
-                state
-                    .worker
-                    .shutdown()
-                    .await
-                    .map_err(std::io::Error::other)?;
+                state.shutdown_all().await.map_err(std::io::Error::other)?;
                 return Err(error);
             }
         };
@@ -1348,16 +1508,14 @@ pub fn run_blocking_image_server(
             app,
             super::http::shutdown_signal(),
             move || {
-                drain_state.metrics.set_status("stopping");
+                for w in drain_state.all_workers() {
+                    w.telemetry.set_status("stopping");
+                }
                 drain_state.admission.close();
             },
         )
         .await;
-        state
-            .worker
-            .shutdown()
-            .await
-            .map_err(std::io::Error::other)?;
+        state.shutdown_all().await.map_err(std::io::Error::other)?;
         res
     })
 }

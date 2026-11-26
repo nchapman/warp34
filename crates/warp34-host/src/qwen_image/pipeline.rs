@@ -573,6 +573,7 @@ pub struct QwenImage21PipelineEngine {
     transformer: Option<TransformerBackend>,
     vae: QwenImage21VaeEngine,
     tp_size: usize,
+    primary_device_id: i32,
     conditioning_cache: HashMap<u64, Qwen3VlConditioningOutput>,
 }
 
@@ -589,23 +590,6 @@ impl QwenImage21PipelineEngine {
     ///   or automatically swaps `text_encoder` and `transformer` on GPU 0 with an in-memory
     ///   conditioning cache on 24 GiB cards.
     pub fn load(model_dir: &Path, requested_tp: usize) -> Result<Self> {
-        let cfg = QwenImage21PipelineConfig::from_dir(model_dir).map_err(|e| {
-            CudaError::with_detail(-10, "load QwenImage21PipelineConfig", e.to_string())
-        })?;
-        let tok_path = cfg.tokenizer_path();
-        let tokenizer = Tokenizer::from_file(&tok_path).map_err(|e| {
-            CudaError::with_detail(
-                -10,
-                "load processor/tokenizer.json",
-                format!("{}: {e}", tok_path.display()),
-            )
-        })?;
-        let sys_prefix = format!("<|im_start|>system\n{SYS_PROMPT}<|im_end|>\n");
-        let sys_enc = tokenizer
-            .encode(sys_prefix, false)
-            .map_err(|e| CudaError::with_detail(-10, "tokenize system prefix", e.to_string()))?;
-        let drop_idx = sys_enc.get_ids().len();
-
         let num_gpus = CudaDevice::count()?.max(1) as usize;
         let tp_size = if requested_tp == 0 {
             if num_gpus >= 2 { 2 } else { 1 }
@@ -625,6 +609,49 @@ impl QwenImage21PipelineEngine {
                 "tp_size=2 requested but fewer than 2 CUDA devices are visible",
             ));
         }
+        let devices: Vec<i32> = (0..tp_size).map(|r| r as i32).collect();
+        let allow_split_te_gpu = tp_size == 1 && num_gpus >= 2;
+        Self::load_on_devices_inner(model_dir, &devices, allow_split_te_gpu)
+    }
+
+    /// Loads `QwenImage21PipelineEngine` strictly onto the explicit CUDA `devices` slice
+    /// (`len == 1` for single-GPU `DP` replicas, or `len == 2` for `TP=2` replicas on `[dev0, dev1]`).
+    pub fn load_with_devices(model_dir: &Path, devices: &[i32]) -> Result<Self> {
+        if devices.is_empty() || devices.len() > 2 {
+            return Err(CudaError::with_detail(
+                -10,
+                "QwenImage21PipelineEngine supports 1 or 2 devices",
+                devices.len().to_string(),
+            ));
+        }
+        Self::load_on_devices_inner(model_dir, devices, false)
+    }
+
+    fn load_on_devices_inner(
+        model_dir: &Path,
+        devices: &[i32],
+        allow_split_te_gpu: bool,
+    ) -> Result<Self> {
+        let cfg = QwenImage21PipelineConfig::from_dir(model_dir).map_err(|e| {
+            CudaError::with_detail(-10, "load QwenImage21PipelineConfig", e.to_string())
+        })?;
+        let tok_path = cfg.tokenizer_path();
+        let tokenizer = Tokenizer::from_file(&tok_path).map_err(|e| {
+            CudaError::with_detail(
+                -10,
+                "load processor/tokenizer.json",
+                format!("{}: {e}", tok_path.display()),
+            )
+        })?;
+        let sys_prefix = format!("<|im_start|>system\n{SYS_PROMPT}<|im_end|>\n");
+        let sys_enc = tokenizer
+            .encode(sys_prefix, false)
+            .map_err(|e| CudaError::with_detail(-10, "tokenize system prefix", e.to_string()))?;
+        let drop_idx = sys_enc.get_ids().len();
+
+        let tp_size = devices.len();
+        let dev0 = devices[0];
+        let dev1 = devices.get(1).copied().unwrap_or(dev0);
 
         let text_archive = Arc::new(SafetensorsArchive::open(&cfg.text_encoder_dir).map_err(
             |e| CudaError::with_detail(-10, "open text_encoder safetensors", e.to_string()),
@@ -637,8 +664,8 @@ impl QwenImage21PipelineEngine {
             .map_err(|e| CudaError::with_detail(-10, "open vae safetensors", e.to_string()))?;
 
         // Enable spatial tiling above 1536x1536 so <=1536px runs untiled single-pass while >=2048px avoids OOM.
-        // Keep the 64-ch RGBA VAE on GPU 0 so GPU 1 is reserved for `rank1` + `text_encoder` on `TP=2`.
-        let vae_dev = 0;
+        // Keep the 64-ch RGBA VAE on `dev0` so `dev1` is reserved for `rank1` + `text_encoder` on `TP=2`.
+        let vae_dev = dev0;
         let vae_weights =
             QwenImage21VaeWeightsGpu::from_archive(&vae_archive, &cfg.vae, "", vae_dev)?;
         let mut vae = QwenImage21VaeEngine::new(vae_weights)?;
@@ -653,19 +680,20 @@ impl QwenImage21PipelineEngine {
         let tf_quant = &cfg.transformer.quant;
         let te_quant = &cfg.text_encoder.quant;
         let (transformer, conditioning) = if tp_size == 2 {
-            let tf_tp2 = QwenImage21TransformerTp2Engine::load_with_prefix(
+            let tf_tp2 = QwenImage21TransformerTp2Engine::load_with_prefix_on_devices(
                 &transformer_archive,
                 &cfg.transformer,
                 tf_quant,
                 "",
                 16384,
+                [dev0, dev1],
             )?;
             let cond_caches = tf_tp2.new_kv_caches();
             let neg_caches = tf_tp2.new_kv_caches();
-            // Place the VLM conditioning encoder on GPU 1 (since GPU 0 holds the 64-ch RGBA VAE + im2col workspace).
-            // On 24 GB GPUs running unquantized FP16 (20B DiT + 8B VLM = 14.4 GiB), load the VLM on-demand on GPU 1
+            // Place the VLM conditioning encoder on `dev1` (since `dev0` holds the 64-ch RGBA VAE + im2col workspace).
+            // On 24 GB GPUs running unquantized FP16 (20B DiT + 8B VLM = 14.4 GiB), load the VLM on-demand on `dev1`
             // and release it before `denoise_loop` so both ranks retain ~16 GiB free for 1024x1024+ TI2I KV caches.
-            let gpu1_total_bytes = CudaDevice::set_current(1)
+            let gpu1_total_bytes = CudaDevice::set_current(dev1)
                 .and_then(|d| d.mem_info())
                 .map_or(0, |(_, total)| total);
             let need_ondemand_te = *tf_quant == crate::loader::QuantScheme::Unquantized
@@ -673,17 +701,17 @@ impl QwenImage21PipelineEngine {
                 && gpu1_total_bytes < (32usize << 30);
             let cond_backend = if need_ondemand_te {
                 ConditioningBackend::OnDemand {
-                    device_id: 1,
+                    device_id: dev1,
                     archive: text_archive,
                 }
             } else {
-                let te_stream = CudaStream::new(1)?;
+                let te_stream = CudaStream::new(dev1)?;
                 let te_cublas = CublasHandle::new(&te_stream)?;
                 match Qwen3VlConditioningEncoder::load(
                     Arc::clone(&text_archive),
                     &cfg.text_encoder,
                     te_quant,
-                    1,
+                    dev1,
                     &te_stream,
                 ) {
                     Ok(te_encoder) => ConditioningBackend::Resident {
@@ -692,7 +720,7 @@ impl QwenImage21PipelineEngine {
                         cublas: te_cublas,
                     },
                     Err(_) => ConditioningBackend::OnDemand {
-                        device_id: 1,
+                        device_id: dev1,
                         archive: text_archive,
                     },
                 }
@@ -705,14 +733,14 @@ impl QwenImage21PipelineEngine {
                 }),
                 cond_backend,
             )
-        } else if num_gpus >= 2 {
-            let tf_stream = CudaStream::new(0)?;
+        } else if allow_split_te_gpu {
+            let tf_stream = CudaStream::new(dev0)?;
             let tf_cublas = CublasHandle::new(&tf_stream)?;
             let tf_single = QwenImage21TransformerEngine::load(
                 &transformer_archive,
                 &cfg.transformer,
                 tf_quant,
-                0,
+                dev0,
                 &tf_stream,
             )?;
             let cond_cache = tf_single.new_kv_cache();
@@ -741,24 +769,24 @@ impl QwenImage21PipelineEngine {
                 },
             )
         } else {
-            let tf_stream = CudaStream::new(0)?;
+            let tf_stream = CudaStream::new(dev0)?;
             let tf_cublas = CublasHandle::new(&tf_stream)?;
             let tf_single = QwenImage21TransformerEngine::load(
                 &transformer_archive,
                 &cfg.transformer,
                 tf_quant,
-                0,
+                dev0,
                 &tf_stream,
             )?;
             let cond_cache = tf_single.new_kv_cache();
             let neg_cache = tf_single.new_kv_cache();
-            let te_stream = CudaStream::new(0)?;
+            let te_stream = CudaStream::new(dev0)?;
             let te_cublas = CublasHandle::new(&te_stream)?;
             match Qwen3VlConditioningEncoder::load(
                 Arc::clone(&text_archive),
                 &cfg.text_encoder,
                 te_quant,
-                0,
+                dev0,
                 &te_stream,
             ) {
                 Ok(te_encoder) => (
@@ -784,7 +812,7 @@ impl QwenImage21PipelineEngine {
                         neg_cache,
                     }),
                     ConditioningBackend::OnDemand {
-                        device_id: 0,
+                        device_id: dev0,
                         archive: text_archive,
                     },
                 ),
@@ -800,6 +828,7 @@ impl QwenImage21PipelineEngine {
             transformer,
             vae,
             tp_size,
+            primary_device_id: dev0,
             conditioning_cache: HashMap::new(),
         })
     }
@@ -960,13 +989,14 @@ impl QwenImage21PipelineEngine {
 
     fn ensure_transformer_loaded(&mut self) -> Result<()> {
         if self.transformer.is_none() {
-            let tf_stream = CudaStream::new(0)?;
+            let dev0 = self.primary_device_id;
+            let tf_stream = CudaStream::new(dev0)?;
             let tf_cublas = CublasHandle::new(&tf_stream)?;
             let tf_single = QwenImage21TransformerEngine::load(
                 &self.transformer_archive,
                 &self.cfg.transformer,
                 &self.cfg.transformer.quant,
-                0,
+                dev0,
                 &tf_stream,
             )?;
             let cond_cache = tf_single.new_kv_cache();

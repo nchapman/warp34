@@ -14,6 +14,8 @@ pub mod dashboard;
 pub mod decision;
 #[cfg(feature = "cuda")]
 pub mod dflash;
+pub mod dp_prefix_pool;
+pub mod dp_router;
 #[cfg(feature = "cuda")]
 pub mod engine_worker;
 pub mod hub;
