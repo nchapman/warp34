@@ -1346,15 +1346,22 @@ impl OpenAiServerState {
         };
 
         match &decision.target {
-            crate::arc_router::policy::RouteTarget::Cloud { wire, .. } => {
+            crate::arc_router::policy::RouteTarget::Cloud {
+                wire,
+                endpoint: Some(ep),
+                ..
+            } => {
                 if let Some(proxy) = router.proxy()
-                    && proxy.supports_protocol(protocol)
+                    && crate::arc_router::proxy::UpstreamProxy::supports_protocol(ep, protocol)
                 {
-                    let resp = proxy.forward(protocol, body.clone(), wire, &decision).await;
+                    let resp = proxy
+                        .forward(ep, protocol, body.clone(), wire, &decision)
+                        .await;
                     return Ok(Some(ArcRouteOutcome::Proxied(resp)));
                 }
             }
-            crate::arc_router::policy::RouteTarget::Local => {}
+            crate::arc_router::policy::RouteTarget::Cloud { endpoint: None, .. }
+            | crate::arc_router::policy::RouteTarget::Local => {}
         }
 
         // Local target: rewrite virtual `"auto"` / `"arc"` model aliases to the served local model

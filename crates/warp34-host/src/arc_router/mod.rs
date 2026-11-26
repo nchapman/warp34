@@ -12,6 +12,7 @@ pub mod heads;
 pub mod input;
 pub mod policy;
 pub mod proxy;
+pub mod registry;
 
 use std::sync::Arc;
 
@@ -20,10 +21,11 @@ use encoder::ArcEncoderWorker;
 use heads::ArcHeads;
 use input::{ApiProtocol, serialize_request};
 use policy::{
-    CloudCandidate, DecideInput, RouteTarget, RoutingBasis, RoutingDecision, RoutingPolicy,
-    UpstreamTarget, decide, infer_local_slot, resolve_cloud_candidates,
+    CloudCandidate, DecideInput, RouteTarget, RoutingBasis, RoutingDecision, RoutingPolicy, decide,
+    infer_local_slot, resolve_cloud_candidates_from_registry,
 };
 use proxy::UpstreamProxy;
+use registry::ModelsDevRegistry;
 use serde::Serialize;
 use serde_json::Value;
 use std::{
@@ -39,7 +41,10 @@ pub struct ArcRouterConfig {
     pub model_dir: PathBuf,
     pub device_id: i32,
     pub local_model_name: String,
-    pub upstream: Option<UpstreamTarget>,
+    /// Optional forced upstream provider (e.g. `openrouter`, `google`, `anthropic`, `deepseek`,
+    /// `https://...`). When `None` or `"auto"`, each cloud model auto-detects its provider and
+    /// API key from `models.dev` + environment variables.
+    pub upstream: Option<String>,
     pub upstream_api_key: Option<String>,
     pub cloud_model_filter: Vec<String>,
     pub policy: RoutingPolicy,
@@ -149,25 +154,33 @@ impl ArcRouter {
     pub fn load(cfg: ArcRouterConfig) -> Result<Self, String> {
         let heads = ArcHeads::load(&cfg.model_dir)?;
         let local_slot = infer_local_slot(&cfg.local_model_name, &heads.catalog);
-        let (cloud_candidates, proxy) = match cfg.upstream {
-            Some(target) => {
-                let candidates =
-                    resolve_cloud_candidates(&target, &heads.catalog, &cfg.cloud_model_filter)?;
-                let api_key = cfg
-                    .upstream_api_key
-                    .or_else(|| std::env::var(target.default_api_key_env()).ok())
-                    .filter(|s| !s.trim().is_empty());
-                if api_key.is_none() && !matches!(target, UpstreamTarget::Custom { .. }) {
-                    return Err(format!(
-                        "cloud upstream `{}` requires `{}` to be set in the environment",
-                        target.base_url(),
-                        target.default_api_key_env()
-                    ));
-                }
-                let proxy = UpstreamProxy::new(target, api_key)?;
-                (candidates, Some(proxy))
-            }
-            None => (Vec::new(), None),
+        let registry = ModelsDevRegistry::load_cached_or_fetch();
+        let wants_cloud = cfg.upstream.is_some() || !cfg.cloud_model_filter.is_empty();
+        let cloud_candidates = if wants_cloud {
+            resolve_cloud_candidates_from_registry(
+                &registry,
+                &heads.catalog,
+                cfg.upstream.as_deref(),
+                cfg.upstream_api_key.as_deref(),
+                &cfg.cloud_model_filter,
+                |var| std::env::var(var).ok(),
+            )?
+        } else {
+            // Even with bare `--router`, auto-enable cloud spillover if a known provider key exists.
+            resolve_cloud_candidates_from_registry(
+                &registry,
+                &heads.catalog,
+                None,
+                cfg.upstream_api_key.as_deref(),
+                &[],
+                |var| std::env::var(var).ok(),
+            )
+            .unwrap_or_default()
+        };
+        let proxy = if cloud_candidates.is_empty() {
+            None
+        } else {
+            Some(UpstreamProxy::new()?)
         };
         let encoder = ArcEncoderWorker::spawn(&cfg.model_dir, cfg.device_id)?;
         Ok(Self {
@@ -193,6 +206,29 @@ impl ArcRouter {
             .collect()
     }
 
+    pub fn cloud_summary(&self) -> String {
+        if self.cloud_candidates.is_empty() {
+            return "none (local adaptive effort)".to_string();
+        }
+        let items: Vec<String> = self
+            .cloud_candidates
+            .iter()
+            .map(|c| {
+                let prov = c
+                    .endpoint
+                    .as_ref()
+                    .map_or("cloud", |e| e.provider_id.as_str());
+                let price = c
+                    .price_override
+                    .or(self.heads.catalog.model_prices[c.slot])
+                    .map(|p| format!(" ${:.2}/${:.2}", p[0], p[3]))
+                    .unwrap_or_default();
+                format!("{prov}:{}{price}", c.wire)
+            })
+            .collect();
+        format!("[{}]", items.join(", "))
+    }
+
     pub fn metrics(&self) -> &RouterMetrics {
         &self.metrics
     }
@@ -215,14 +251,18 @@ impl ArcRouter {
                 .await
                 .map_err(|e| format!("ARC serialize join error: {e}"))?;
         let enc = self.encoder.encode_blocks(canonical.blocks).await?;
-        let cloud_supported = self
-            .proxy
-            .as_ref()
-            .is_some_and(|p| p.supports_protocol(protocol));
         let heads = Arc::clone(&self.heads);
         let local_slot = self.local_slot;
-        let cloud_candidates = if cloud_supported {
-            self.cloud_candidates.clone()
+        let cloud_candidates: Vec<CloudCandidate> = if self.proxy.is_some() {
+            self.cloud_candidates
+                .iter()
+                .filter(|c| {
+                    c.endpoint
+                        .as_ref()
+                        .is_some_and(|ep| UpstreamProxy::supports_protocol(ep, protocol))
+                })
+                .cloned()
+                .collect()
         } else {
             Vec::new()
         };

@@ -172,11 +172,11 @@ Serving Options (warp34 serve):
   --no-reasoning-effort-budget        Disable automatic OpenRouter % thinking caps (minimal=10%, low=20%,
                                       medium=50%, high=80%, xhigh/max=95% of min(max_tokens, 32k))
   --router [repo|dir]                 Enable native ARC-1.0 router (default: nchapman/ARC-1.0-W4A16-HGPTQ)
-  --router-upstream <provider|url>    Cloud spillover upstream: openrouter, anthropic, openai, or http(s)://...
+  --router-upstream <provider|url>    Cloud spillover upstream: auto (default via models.dev), openrouter, google, anthropic, openai, deepseek, ..., or http(s)://...
   --router-policy <policy>            Routing policy: prefer-local (default), sage, or swift
   --router-min-p-pass <0..1>          Min local P(pass) for prefer-local (default: 0.72)
   --router-value <usd>                Override utility task value V in USD (default: 4.5 prefer-local/sage, 0.1 swift)
-  --router-cloud-models <csv>         Optional comma-separated cloud model filter (default: all upstream models)
+  --router-cloud-models <csv>         Cloud models as provider/model or tier=provider/model (auto-detects API keys & pricing via models.dev)
   --router-pin-pii <csv|none>         PII classes pinned locally (default: credential,government_id,financial_account,payment_card)
 
 Generation & Chat Options (warp34 chat / generate):

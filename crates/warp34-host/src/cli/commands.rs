@@ -1707,10 +1707,8 @@ pub(crate) fn run_serve(
         })
         .collect();
     let router_spec = serve.router_model.clone().or_else(|| {
-        serve
-            .router_upstream
-            .as_ref()
-            .map(|_| crate::arc_router::DEFAULT_ARC_ROUTER_MODEL.to_string())
+        (serve.router_upstream.is_some() || !serve.router_cloud_models.is_empty())
+            .then(|| crate::arc_router::DEFAULT_ARC_ROUTER_MODEL.to_string())
     });
     if let Some(ref spec) = router_spec {
         let router_dir = crate::hub::resolve_model(
@@ -1719,11 +1717,6 @@ pub(crate) fn run_serve(
             crate::hub::ModelRole::Target,
         )
         .map_err(|e| format!("resolve ARC router model `{spec}`: {e}"))?;
-        let upstream = serve
-            .router_upstream
-            .as_deref()
-            .map(crate::arc_router::policy::UpstreamTarget::parse)
-            .transpose()?;
         let policy = crate::arc_router::policy::RoutingPolicy::from_args(
             serve.router_policy.as_deref().unwrap_or("prefer-local"),
             serve.router_min_p_pass.unwrap_or(0.72),
@@ -1753,24 +1746,17 @@ pub(crate) fn run_serve(
             model_dir: router_dir,
             device_id: 0,
             local_model_name: model.clone(),
-            upstream: upstream.clone(),
+            upstream: serve.router_upstream.clone(),
             upstream_api_key: None,
             cloud_model_filter: serve.router_cloud_models.clone(),
             policy,
             pin_pii_classes,
         })?;
-        let cloud_summary = match &upstream {
-            Some(u) => format!(
-                "{} ({} cloud models)",
-                u.base_url(),
-                router.cloud_model_names().len()
-            ),
-            None => "none (local adaptive effort)".to_string(),
-        };
         println!(
-            "[warp34 router] arc={spec} local_slot={} policy={} upstream={cloud_summary}",
+            "[warp34 router] arc={spec} local_slot={} policy={} cloud={}",
             router.local_slot_name(),
             serve.router_policy.as_deref().unwrap_or("prefer-local"),
+            router.cloud_summary(),
         );
         serve.options.arc_router = Some(std::sync::Arc::new(router));
     }

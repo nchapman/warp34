@@ -1,6 +1,9 @@
 //! Routing policy, local model slot auto-mapping, upstream presets, and decision logic.
 
-use super::heads::{ArcHeads, ArcRuntimeCatalog, LEGS, PiiSignalPrediction, StageOnePrediction};
+use super::{
+    heads::{ArcHeads, ArcRuntimeCatalog, LEGS, PiiSignalPrediction, StageOnePrediction},
+    registry::{ModelCapabilities, ModelsDevRegistry, ProviderEndpoint, infer_tier_from_prices},
+};
 use std::collections::HashSet;
 
 /// Built-in cloud upstream provider presets (zero config files required).
@@ -138,11 +141,100 @@ pub fn infer_local_slot(model_name: &str, catalog: &ArcRuntimeCatalog) -> usize 
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct CloudCandidate {
     pub slot: usize,
     pub name: String,
     pub wire: String,
+    /// Per-candidate upstream endpoint resolved via `models.dev` (None in pure unit tests).
+    pub endpoint: Option<ProviderEndpoint>,
+    /// Live USD/Mtok `[input, cache_read, cache_write, output]` from `models.dev` (overrides slot price).
+    pub price_override: Option<[f64; LEGS]>,
+    /// Model capabilities & valid reasoning effort levels from `models.dev`.
+    pub capabilities: ModelCapabilities,
+}
+
+fn find_native_arc_slot(catalog: &ArcRuntimeCatalog, id: &str) -> Option<usize> {
+    let wanted = id.trim().to_ascii_lowercase();
+    let dotted = wanted.replace('-', ".");
+    let dashed = wanted.replace('.', "-");
+    catalog.models.iter().enumerate().find_map(|(idx, m)| {
+        let name_lc = m.name.to_ascii_lowercase();
+        let wire_lc = m.wire.as_deref().map(str::to_ascii_lowercase);
+        let matches = name_lc == wanted
+            || name_lc == dotted
+            || name_lc == dashed
+            || wire_lc
+                .as_deref()
+                .is_some_and(|w| w == wanted || w == dotted || w == dashed);
+        matches.then_some(idx)
+    })
+}
+
+/// Resolves cloud candidates through the `models.dev` registry, auto-detecting provider base URLs,
+/// API keys from environment variables, live USD/Mtok pricing, and model capabilities.
+pub fn resolve_cloud_candidates_from_registry<F>(
+    registry: &ModelsDevRegistry,
+    catalog: &ArcRuntimeCatalog,
+    forced_upstream: Option<&str>,
+    cli_api_key: Option<&str>,
+    filter: &[String],
+    env_lookup: F,
+) -> Result<Vec<CloudCandidate>, String>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    let specs: Vec<String> = if filter.is_empty() {
+        registry.default_models_for_env(forced_upstream, &env_lookup)
+    } else {
+        filter
+            .iter()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect()
+    };
+    if specs.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut out = Vec::with_capacity(specs.len());
+    for raw in &specs {
+        let resolved = registry.resolve_spec(raw, forced_upstream, cli_api_key, &env_lookup)?;
+        let is_custom_url = resolved.endpoint.provider_id.starts_with("http://")
+            || resolved.endpoint.provider_id.starts_with("https://");
+        if resolved.endpoint.api_key.is_none() && !is_custom_url {
+            return Err(format!(
+                "cloud model `{raw}` resolved to provider `{}` ({}) which requires `{}` (or OPENROUTER_API_KEY) to be set",
+                resolved.endpoint.provider_id,
+                resolved.endpoint.base_url,
+                resolved.endpoint.env_hint,
+            ));
+        }
+
+        let slot = if let Some(tier) = resolved.explicit_tier.as_deref() {
+            resolve_tier_slot(tier, catalog)
+                .ok_or_else(|| format!("unknown tier `{tier}` in --router-cloud-models `{raw}`"))?
+        } else if let Some(native) = find_native_arc_slot(catalog, &resolved.canonical_id)
+            .or_else(|| find_native_arc_slot(catalog, &resolved.wire_model))
+        {
+            native
+        } else if let Some(prices) = resolved.prices {
+            let inferred = infer_tier_from_prices(prices);
+            resolve_tier_slot(inferred, catalog).unwrap_or(2)
+        } else {
+            resolve_tier_slot("medium", catalog).unwrap_or(2)
+        };
+
+        out.push(CloudCandidate {
+            slot,
+            name: resolved.canonical_id,
+            wire: resolved.wire_model,
+            endpoint: Some(resolved.endpoint),
+            price_override: resolved.prices,
+            capabilities: resolved.capabilities,
+        });
+    }
+    Ok(out)
 }
 
 fn resolve_tier_slot(token: &str, catalog: &ArcRuntimeCatalog) -> Option<usize> {
@@ -173,6 +265,9 @@ pub fn resolve_cloud_candidates(
                     slot,
                     name: m.name.clone(),
                     wire: m.wire.clone().unwrap_or_else(|| m.name.clone()),
+                    endpoint: None,
+                    price_override: None,
+                    capabilities: ModelCapabilities::default(),
                 }
             })
             .collect());
@@ -210,6 +305,9 @@ pub fn resolve_cloud_candidates(
                 slot,
                 name: wire.clone(),
                 wire,
+                endpoint: None,
+                price_override: None,
+                capabilities: ModelCapabilities::default(),
             });
         } else {
             let wanted = trimmed.to_ascii_lowercase();
@@ -234,6 +332,9 @@ pub fn resolve_cloud_candidates(
                 slot,
                 name: m.name.clone(),
                 wire: m.wire.clone().unwrap_or_else(|| m.name.clone()),
+                endpoint: None,
+                price_override: None,
+                capabilities: ModelCapabilities::default(),
             });
         }
     }
@@ -282,6 +383,7 @@ pub enum RouteTarget {
         slot: usize,
         name: String,
         wire: String,
+        endpoint: Option<ProviderEndpoint>,
     },
 }
 
@@ -538,10 +640,21 @@ pub fn decide(heads: &ArcHeads, input: &DecideInput<'_>) -> Result<RoutingDecisi
     }
 
     // Score cloud candidates by `V * P(pass) - expected_cost` (local cost = $0),
-    // indexing Stage-1 predictions through `stage_one_candidate_for_model`.
+    // indexing Stage-1 predictions through `stage_one_candidate_for_model`, filtering by
+    // `models.dev` capabilities (`tool_call`, `context_limit`), and using live prices if present.
     let local_utility = value_usd * local_p;
     let mut best_cloud: Option<(&CloudCandidate, f64, f64)> = None;
     for cand in input.cloud_candidates {
+        if input.has_tools && !cand.capabilities.tool_call {
+            continue;
+        }
+        if cand
+            .capabilities
+            .context_limit
+            .is_some_and(|lim| input.prompt_tokens > lim)
+        {
+            continue;
+        }
         let Some(cand_idx) = heads.catalog.stage_one_candidate_for_model(cand.slot) else {
             continue;
         };
@@ -551,7 +664,10 @@ pub fn decide(heads: &ArcHeads, input: &DecideInput<'_>) -> Result<RoutingDecisi
         if !pred.p_pass.is_finite() {
             continue;
         }
-        let rates = heads.catalog.model_prices[cand.slot].unwrap_or([0.0; LEGS]);
+        let rates = cand
+            .price_override
+            .or(heads.catalog.model_prices[cand.slot])
+            .unwrap_or([0.0; LEGS]);
         let cost = expected_cost_usd(&pred.usage, &rates);
         let util = value_usd * pred.p_pass - cost;
         if best_cloud.is_none_or(|(_, best_u, _)| util > best_u) {
@@ -584,12 +700,15 @@ pub fn decide(heads: &ArcHeads, input: &DecideInput<'_>) -> Result<RoutingDecisi
     }
 
     let (cand, _, cloud_p) = best_cloud.unwrap();
-    let effort = choose_effort_for_slot(heads, input.block_readouts, input.block_roles, cand.slot);
+    let raw_effort =
+        choose_effort_for_slot(heads, input.block_readouts, input.block_roles, cand.slot);
+    let effort = cand.capabilities.clamp_effort(&raw_effort);
     Ok(RoutingDecision {
         target: RouteTarget::Cloud {
             slot: cand.slot,
             name: cand.name.clone(),
             wire: cand.wire.clone(),
+            endpoint: cand.endpoint.clone(),
         },
         p_pass: cloud_p,
         local_p_pass: local_p,
