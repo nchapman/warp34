@@ -39,6 +39,8 @@ pub struct ServeOptions {
     pub reasoning_effort_budget: bool,
     /// Request routing policy when serving multiple data-parallel (`--dp > 1`) replicas.
     pub dp_routing: crate::dp_router::DpRoutingPolicy,
+    /// Optional native ARC-1.0 hybrid local/cloud router (`--router`).
+    pub arc_router: Option<std::sync::Arc<crate::arc_router::ArcRouter>>,
 }
 
 impl Default for ServeOptions {
@@ -53,6 +55,7 @@ impl Default for ServeOptions {
             reasoning_budget_message: None,
             reasoning_effort_budget: true,
             dp_routing: crate::dp_router::DpRoutingPolicy::Prefix,
+            arc_router: None,
         }
     }
 }

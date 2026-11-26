@@ -568,7 +568,11 @@ __global__ void fused_qk_rmsnorm_rope_gate_f16_kernel(
     int k_row_stride,
     float rope_theta,
     float rms_eps,
-    float weight_bias) {
+    float weight_bias,
+    float yarn_factor,
+    float yarn_low,
+    float yarn_inv_span,
+    float yarn_mscale) {
     const int tok = blockIdx.x;
     if (valid_token_mask != nullptr && valid_token_mask[tok] == 0) return;
 
@@ -677,10 +681,16 @@ __global__ void fused_qk_rmsnorm_rope_gate_f16_kernel(
         const float pos = (float)positions[(size_t)plane * pos_plane_stride + tok];
         // Native cache construction computes reciprocal(pow(theta, exponent)),
         // not pow(theta, -exponent); near sine zeros the difference is observable.
-        const float inv_freq = __fdiv_rn(1.0f, __nv_powf(rope_theta, (float)(2 * i) / (float)rotary_dim));
+        float inv_freq = __fdiv_rn(1.0f, __nv_powf(rope_theta, (float)(2 * i) / (float)rotary_dim));
+        if (yarn_factor > 1.0f) {
+            float ramp = ((float)i - yarn_low) * yarn_inv_span;
+            ramp = fminf(fmaxf(ramp, 0.0f), 1.0f);
+            const float extrap = 1.0f - ramp;
+            inv_freq = (inv_freq / yarn_factor) * (1.0f - extrap) + inv_freq * extrap;
+        }
         const float angle = pos * inv_freq;
-        float sin_a = __nv_sinf(angle);
-        float cos_a = __nv_cosf(angle);
+        float sin_a = __nv_sinf(angle) * yarn_mscale;
+        float cos_a = __nv_cosf(angle) * yarn_mscale;
         // Native target MRotaryEmbedding stores its cache in the query dtype
         // (FP16). Fused Triton loads those rounded coefficients into FP32.
         sin_a = __half2float(__float2half_rn(sin_a));
@@ -1551,6 +1561,58 @@ extern "C" int warp34_rms_norm_gated_silu_f16(const warp34_exec* ex, const void*
         num_v_heads * head_dim, eps);
 }
 
+extern "C" int warp34_fused_qk_rmsnorm_rope_gate_strided_yarn_f16(
+    const warp34_exec* ex,
+    const void* q_gate_in,
+    const void* k_in,
+    const void* q_norm_w,
+    const void* k_norm_w,
+    const int32_t* positions,
+    const uint8_t* valid_token_mask,
+    void* q_out,
+    void* k_out,
+    void* gate_out,
+    int num_tokens,
+    int pos_plane_stride,
+    int num_q_heads,
+    int num_kv_heads,
+    int head_dim,
+    int rotary_dim,
+    int mrope_s0,
+    int mrope_s1,
+    int mrope_s2,
+    int q_gate_row_stride,
+    int k_row_stride,
+    float rope_theta,
+    float rms_eps,
+    float yarn_factor,
+    float yarn_low,
+    float yarn_inv_span,
+    float yarn_mscale) {
+    if (ex == nullptr || q_gate_in == nullptr || k_in == nullptr || q_norm_w == nullptr ||
+        k_norm_w == nullptr || positions == nullptr || q_out == nullptr ||
+        k_out == nullptr || gate_out == nullptr) {
+        return (int)cudaErrorInvalidValue;
+    }
+    if (num_tokens <= 0) return 0;
+    if (q_gate_row_stride < num_q_heads * 2 * head_dim || k_row_stride < num_kv_heads * head_dim) {
+        return (int)cudaErrorInvalidValue;
+    }
+    dim3 grid((unsigned)num_tokens, (unsigned)(num_q_heads + num_kv_heads));
+    size_t smem = (32 + (size_t)head_dim) * sizeof(float);
+    warp34::fused_qk_rmsnorm_rope_gate_f16_kernel<<<grid, 128, smem, (cudaStream_t)ex->stream>>>(
+        (const __half*)q_gate_in, (const __half*)k_in,
+        (const __half*)q_norm_w, (const __half*)k_norm_w,
+        positions, valid_token_mask,
+        (__half*)q_out, (__half*)k_out, (__half*)gate_out,
+        pos_plane_stride, num_q_heads, num_kv_heads,
+        head_dim, rotary_dim, mrope_s0, mrope_s1, mrope_s2,
+        q_gate_row_stride, k_row_stride,
+        rope_theta, rms_eps, 1.0f,
+        yarn_factor, yarn_low, yarn_inv_span, yarn_mscale);
+    return (int)cudaGetLastError();
+}
+
 extern "C" int warp34_fused_qk_rmsnorm_rope_gate_strided_f16(
     const warp34_exec* ex,
     const void* q_gate_in,
@@ -1575,27 +1637,12 @@ extern "C" int warp34_fused_qk_rmsnorm_rope_gate_strided_f16(
     int k_row_stride,
     float rope_theta,
     float rms_eps) {
-    if (ex == nullptr || q_gate_in == nullptr || k_in == nullptr || q_norm_w == nullptr ||
-        k_norm_w == nullptr || positions == nullptr || q_out == nullptr ||
-        k_out == nullptr || gate_out == nullptr) {
-        return (int)cudaErrorInvalidValue;
-    }
-    if (num_tokens <= 0) return 0;
-    if (q_gate_row_stride < num_q_heads * 2 * head_dim || k_row_stride < num_kv_heads * head_dim) {
-        return (int)cudaErrorInvalidValue;
-    }
-    dim3 grid((unsigned)num_tokens, (unsigned)(num_q_heads + num_kv_heads));
-    size_t smem = (32 + (size_t)head_dim) * sizeof(float);
-    warp34::fused_qk_rmsnorm_rope_gate_f16_kernel<<<grid, 128, smem, (cudaStream_t)ex->stream>>>(
-        (const __half*)q_gate_in, (const __half*)k_in,
-        (const __half*)q_norm_w, (const __half*)k_norm_w,
-        positions, valid_token_mask,
-        (__half*)q_out, (__half*)k_out, (__half*)gate_out,
-        pos_plane_stride, num_q_heads, num_kv_heads,
+    return warp34_fused_qk_rmsnorm_rope_gate_strided_yarn_f16(
+        ex, q_gate_in, k_in, q_norm_w, k_norm_w, positions, valid_token_mask,
+        q_out, k_out, gate_out, num_tokens, pos_plane_stride, num_q_heads, num_kv_heads,
         head_dim, rotary_dim, mrope_s0, mrope_s1, mrope_s2,
-        q_gate_row_stride, k_row_stride,
-        rope_theta, rms_eps, 1.0f);
-    return (int)cudaGetLastError();
+        q_gate_row_stride, k_row_stride, rope_theta, rms_eps,
+        1.0f, 0.0f, 0.0f, 1.0f);
 }
 
 extern "C" int warp34_fused_qk_rmsnorm_rope_gate_f16(
@@ -1670,7 +1717,8 @@ extern "C" int warp34_fused_qk_rmsnorm_rope_f16(
         pos_plane_stride, num_q_heads, num_kv_heads,
         head_dim, rotary_dim, mrope_s0, mrope_s1, mrope_s2,
         num_q_heads * head_dim, num_kv_heads * head_dim,
-        rope_theta, rms_eps, weight_bias);
+        rope_theta, rms_eps, weight_bias,
+        1.0f, 0.0f, 0.0f, 1.0f);
     return (int)cudaGetLastError();
 }
 

@@ -259,6 +259,86 @@ impl Qwen3_5Engine {
             .collect())
     }
 
+    /// Runs a prefill-only forward pass over `tokens` (skipping `lm_head` logits) and returns
+    /// the final token's post-`GemmaRMSNorm` hidden vector `[hidden_size]` as `f32`.
+    pub fn encode_last_readout_f32(&mut self, tokens: &[i32]) -> Result<Vec<f32>> {
+        if tokens.is_empty() {
+            return Err(loader_err(
+                "encode_last_readout_f32 requires at least 1 token",
+            ));
+        }
+        const PAGE_SIZE: usize = 16;
+        let max_ctx = self.ranks[0].kv_pool.num_pages * PAGE_SIZE;
+        let slice = if tokens.len() > max_ctx {
+            &tokens[tokens.len() - max_ctx..]
+        } else {
+            tokens
+        };
+        let pages_needed = slice.len().div_ceil(PAGE_SIZE);
+        let block_table: Vec<i32> = (0..pages_needed as i32).collect();
+        let max_chunk = self
+            .ranks
+            .iter()
+            .map(|rank| rank.ordinary_prefill_token_capacity(1))
+            .collect::<Result<Vec<_>>>()?
+            .into_iter()
+            .min()
+            .ok_or_else(|| loader_err("no model ranks"))?
+            .max(1);
+        let mut offset = 0usize;
+        let mut last_chunk_len = 0usize;
+        while offset < slice.len() {
+            let end = (offset + max_chunk).min(slice.len());
+            let chunk = &slice[offset..end];
+            last_chunk_len = chunk.len();
+            let _ = self.step_batch_slices_for_sampler_filtered(
+                &[EngineBatchSlice {
+                    tokens: chunk,
+                    ctx_len_before: offset,
+                    block_table: &block_table,
+                    state_in_slot: 0,
+                    state_out_slot: 0,
+                    has_initial_state: offset > 0,
+                    spec_slots: &[],
+                    checkpoints: &[],
+                    emit_all_query_tokens: false,
+                }],
+                None,
+                Some(&[false]),
+                true,
+            )?;
+            offset = end;
+        }
+        self.read_norm_hidden_row_f32(last_chunk_len - 1)
+    }
+
+    /// Reads one pre-final-`GemmaRMSNorm` (`block_{N-1}`) hidden row `[hidden_size]` (`FP16 -> f32`)
+    /// from rank 0 (used by ARC-1.0's `final_layer_block_last_token` readout).
+    pub fn read_pre_norm_hidden_row_f32(&self, batch_token_row: usize) -> Result<Vec<f32>> {
+        let r0 = &self.ranks[0];
+        if r0.last_pre_norm_hidden_ptr == 0 || batch_token_row >= r0.last_norm_hidden_rows {
+            return Err(loader_err("pre-norm hidden row out of range"));
+        }
+        let h_dim = self.cfg.hidden_size;
+        r0.device.make_current()?;
+        let mut raw = vec![0u16; h_dim];
+        let src = r0.last_pre_norm_hidden_ptr + (batch_token_row * h_dim * 2) as u64;
+        check_rc(
+            // SAFETY: `batch_token_row` is bounds-checked and `raw` has `h_dim` `u16` elements.
+            unsafe {
+                ffi::warp34_memcpy_d2h_async(
+                    raw.as_mut_ptr().cast(),
+                    src as *const c_void,
+                    h_dim * 2,
+                    r0.stream.handle,
+                )
+            },
+            "read pre-norm hidden row f16",
+        )?;
+        r0.stream.synchronize()?;
+        Ok(raw.into_iter().map(crate::cuda::f16_to_f32).collect())
+    }
+
     pub fn set_decision_profile(
         &mut self,
         profile: crate::decision::DecisionModelProfile,

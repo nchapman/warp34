@@ -1085,6 +1085,7 @@ impl Qwen3_5ModelRank {
             final_hc_pre_normed,
         )?;
         self.last_norm_hidden_ptr = final_out;
+        self.last_pre_norm_hidden_ptr = s.residual;
         self.last_norm_hidden_rows = rows;
         self.last_mtp_hidden_ptr = match &self.final_residual {
             FinalResidual::SingleStream {
@@ -1148,7 +1149,7 @@ impl Qwen3_5ModelRank {
                     // SAFETY: packed QKV and separate Q/K/gate buffers match the local head geometry.
                     // Caller supplies position planes according to current_pos_plane_stride.
                     unsafe {
-                        ffi::warp34_fused_qk_rmsnorm_rope_gate_strided_f16(
+                        ffi::warp34_fused_qk_rmsnorm_rope_gate_strided_yarn_f16(
                             ex,
                             qkv as *const c_void,
                             (qkv + (qgd * 2) as u64) as *const c_void,
@@ -1172,9 +1173,13 @@ impl Qwen3_5ModelRank {
                             stride,
                             self.cfg.rope_theta,
                             eps,
+                            self.cfg.yarn_factor,
+                            self.cfg.yarn_low,
+                            self.cfg.yarn_inv_span,
+                            self.cfg.yarn_mscale,
                         )
                     },
-                    "warp34_fused_qk_rmsnorm_rope_gate_strided_f16",
+                    "warp34_fused_qk_rmsnorm_rope_gate_strided_yarn_f16",
                 )?;
                 let layout = &self.kv_pool.layers[fa.kv_layer_ordinal].layout;
                 check_rc(

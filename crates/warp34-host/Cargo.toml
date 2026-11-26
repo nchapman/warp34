@@ -46,6 +46,6 @@ image = { version = "0.25", default-features = false, features = ["png", "jpeg"]
 # Use the supported v3 API directly: the safe wrapper lacks memory/scan limits.
 # Bundled static libjpeg-turbo; no system library or Python runtime required.
 turbojpeg-sys = { version = "=1.2.0", default-features = false, features = ["cmake"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
 
 [dev-dependencies]
-reqwest = { version = "0.12", default-features = false, features = ["json"] }

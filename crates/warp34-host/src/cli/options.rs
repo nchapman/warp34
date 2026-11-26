@@ -171,6 +171,13 @@ Serving Options (warp34 serve):
   --reasoning-budget-message <text>   Transition text injected before </think> on budget exhaustion ("" for none)
   --no-reasoning-effort-budget        Disable automatic OpenRouter % thinking caps (minimal=10%, low=20%,
                                       medium=50%, high=80%, xhigh/max=95% of min(max_tokens, 32k))
+  --router [repo|dir]                 Enable native ARC-1.0 router (default: nchapman/ARC-1.0-W4A16-HGPTQ)
+  --router-upstream <provider|url>    Cloud spillover upstream: openrouter, anthropic, openai, or http(s)://...
+  --router-policy <policy>            Routing policy: prefer-local (default), sage, or swift
+  --router-min-p-pass <0..1>          Min local P(pass) for prefer-local (default: 0.72)
+  --router-value <usd>                Override utility task value V in USD (default: 4.5 prefer-local/sage, 0.1 swift)
+  --router-cloud-models <csv>         Optional comma-separated cloud model filter (default: all upstream models)
+  --router-pin-pii <csv|none>         PII classes pinned locally (default: credential,government_id,financial_account,payment_card,health,any)
 
 Generation & Chat Options (warp34 chat / generate):
   -p, --prompt <text>                 Prompt text (omit in terminal with `warp34 chat` for interactive REPL)
@@ -291,6 +298,13 @@ pub(crate) struct ServeCliConfig {
     pub(crate) model_name: Option<String>,
     pub(crate) api_key: Option<String>,
     pub(crate) api_key_env: Option<String>,
+    pub(crate) router_model: Option<String>,
+    pub(crate) router_upstream: Option<String>,
+    pub(crate) router_policy: Option<String>,
+    pub(crate) router_min_p_pass: Option<f64>,
+    pub(crate) router_value_usd: Option<f64>,
+    pub(crate) router_cloud_models: Vec<String>,
+    pub(crate) router_pin_pii: Option<String>,
     pub(crate) used: bool,
     pub(crate) rejected: Option<String>,
 }
@@ -376,6 +390,85 @@ impl ServeCliConfig {
                 .cloned()
                 .ok_or_else(|| "missing --reasoning-budget-message value".to_string())?;
             self.options.reasoning_budget_message = Some(value);
+            return Ok(true);
+        }
+        if flag == "--router" {
+            self.used = true;
+            if let Some(next) = args.get(*i + 1)
+                && !next.starts_with('-')
+            {
+                *i += 1;
+                self.router_model = Some(next.clone());
+            } else {
+                self.router_model = Some(crate::arc_router::DEFAULT_ARC_ROUTER_MODEL.to_string());
+            }
+            return Ok(true);
+        }
+        if flag == "--router-upstream" {
+            self.used = true;
+            *i += 1;
+            let value = args
+                .get(*i)
+                .cloned()
+                .ok_or_else(|| "missing --router-upstream value".to_string())?;
+            self.router_upstream = Some(value);
+            return Ok(true);
+        }
+        if flag == "--router-policy" {
+            self.used = true;
+            *i += 1;
+            let value = args
+                .get(*i)
+                .cloned()
+                .ok_or_else(|| "missing --router-policy value".to_string())?;
+            self.router_policy = Some(value);
+            return Ok(true);
+        }
+        if flag == "--router-min-p-pass" {
+            self.used = true;
+            *i += 1;
+            let raw = args
+                .get(*i)
+                .ok_or_else(|| "missing --router-min-p-pass value".to_string())?;
+            let val: f64 = raw
+                .parse()
+                .map_err(|_| format!("invalid --router-min-p-pass `{raw}`"))?;
+            self.router_min_p_pass = Some(val);
+            return Ok(true);
+        }
+        if flag == "--router-value" {
+            self.used = true;
+            *i += 1;
+            let raw = args
+                .get(*i)
+                .ok_or_else(|| "missing --router-value value".to_string())?;
+            let val: f64 = raw
+                .parse()
+                .map_err(|_| format!("invalid --router-value `{raw}`"))?;
+            self.router_value_usd = Some(val);
+            return Ok(true);
+        }
+        if flag == "--router-cloud-models" {
+            self.used = true;
+            *i += 1;
+            let raw = args
+                .get(*i)
+                .ok_or_else(|| "missing --router-cloud-models value".to_string())?;
+            self.router_cloud_models = raw
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+            return Ok(true);
+        }
+        if flag == "--router-pin-pii" {
+            self.used = true;
+            *i += 1;
+            let value = args
+                .get(*i)
+                .cloned()
+                .ok_or_else(|| "missing --router-pin-pii value".to_string())?;
+            self.router_pin_pii = Some(value);
             return Ok(true);
         }
         if !matches!(

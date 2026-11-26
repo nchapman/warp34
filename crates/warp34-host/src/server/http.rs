@@ -51,6 +51,7 @@ pub struct OpenAiServerState {
     extra_workers: Vec<EngineWorker>,
     dp_router: Arc<crate::dp_router::DpRouterCore>,
     dp_prefix_pool: Option<Arc<crate::dp_prefix_pool::SharedDpPrefixPool>>,
+    pub arc_router: Option<Arc<crate::arc_router::ArcRouter>>,
     pub metrics: Arc<crate::telemetry::Telemetry>,
     next_request_id: AtomicU64,
     pub allow_remote_images: bool,
@@ -203,6 +204,7 @@ impl OpenAiServerState {
         unshared.reasoning_effort_budget = options.reasoning_effort_budget;
         unshared.max_num_seqs = options.max_num_seqs;
         unshared.dp_prefix_pool = shared_l2_pool;
+        unshared.arc_router = options.arc_router;
         Ok(state)
     }
 
@@ -270,6 +272,7 @@ impl OpenAiServerState {
             extra_workers,
             dp_router,
             dp_prefix_pool: None,
+            arc_router: None,
             allow_remote_images,
             response_store: crate::responses_api::ResponseStore::default(),
             constraint_factory,
@@ -566,6 +569,16 @@ async fn models(State(s): State<Arc<OpenAiServerState>>) -> Json<Value> {
         "owned_by": "warp34",
         "max_model_len": max_model_len,
     }));
+    if let Some(router) = &s.arc_router {
+        data.push(json!({
+            "id": "auto",
+            "object": "model",
+            "owned_by": "warp34-arc",
+            "local_slot": router.local_slot_name(),
+            "cloud_models": router.cloud_model_names(),
+            "max_model_len": max_model_len,
+        }));
+    }
     for entry in s.worker.lora_registry.entries() {
         data.push(json!({
             "id": entry.name,
@@ -602,6 +615,37 @@ async fn metrics(State(s): State<Arc<OpenAiServerState>>) -> impl IntoResponse {
             st.entries, st.used_bytes, st.publishes, st.hits, st.hydrated_tokens
         );
     }
+    if let Some(router) = &s.arc_router {
+        use std::fmt::Write as _;
+        let rm = router.metrics().snapshot();
+        let _ = writeln!(
+            body,
+            "# HELP warp34_arc_router_requests_total Total requests routed by ARC-1.0\n\
+             # TYPE warp34_arc_router_requests_total counter\n\
+             warp34_arc_router_requests_total {}\n\
+             # HELP warp34_arc_router_local_total Requests routed locally by ARC-1.0\n\
+             # TYPE warp34_arc_router_local_total counter\n\
+             warp34_arc_router_local_total {}\n\
+             # HELP warp34_arc_router_cloud_total Requests spilled to cloud by ARC-1.0\n\
+             # TYPE warp34_arc_router_cloud_total counter\n\
+             warp34_arc_router_cloud_total {}\n\
+             # HELP warp34_arc_router_pii_pinned_total Requests pinned locally by ARC-1.0 PII signal\n\
+             # TYPE warp34_arc_router_pii_pinned_total counter\n\
+             warp34_arc_router_pii_pinned_total {}\n\
+             # HELP warp34_arc_router_warm_kv_local_total Requests kept local by warm KV prefix boundary\n\
+             # TYPE warp34_arc_router_warm_kv_local_total counter\n\
+             warp34_arc_router_warm_kv_local_total {}\n\
+             # HELP warp34_arc_router_latency_ms_mean Mean ARC-1.0 routing latency in milliseconds\n\
+             # TYPE warp34_arc_router_latency_ms_mean gauge\n\
+             warp34_arc_router_latency_ms_mean {:.3}",
+            rm.total_requests,
+            rm.local_requests,
+            rm.cloud_requests,
+            rm.pii_pinned_requests,
+            rm.warm_kv_stayed_local,
+            rm.mean_router_latency_ms
+        );
+    }
     (
         [(
             axum::http::header::CONTENT_TYPE,
@@ -611,10 +655,16 @@ async fn metrics(State(s): State<Arc<OpenAiServerState>>) -> impl IntoResponse {
     )
 }
 async fn metrics_json(State(s): State<Arc<OpenAiServerState>>) -> impl IntoResponse {
-    (
-        [(axum::http::header::CACHE_CONTROL, "no-store")],
-        Json(s.snapshot_metrics()),
-    )
+    let mut val = serde_json::to_value(s.snapshot_metrics()).unwrap_or_else(|_| json!({}));
+    if let Some(router) = &s.arc_router
+        && let Some(obj) = val.as_object_mut()
+    {
+        obj.insert(
+            "arc_router".to_string(),
+            serde_json::to_value(router.metrics().snapshot()).unwrap_or(Value::Null),
+        );
+    }
+    ([(axum::http::header::CACHE_CONTROL, "no-store")], Json(val))
 }
 fn is_inference_endpoint(method: &axum::http::Method, path: &str) -> bool {
     *method == axum::http::Method::POST
@@ -1236,6 +1286,133 @@ fn prepare(
         reasoning_effort: resolved_effort,
     })
 }
+enum ArcRouteOutcome {
+    Proxied(Response),
+    Local(crate::arc_router::policy::RoutingDecision),
+}
+
+fn attach_arc_headers(
+    mut resp: Response,
+    decision: Option<&crate::arc_router::policy::RoutingDecision>,
+) -> Response {
+    if let Some(d) = decision {
+        crate::arc_router::apply_routing_headers(resp.headers_mut(), d);
+    }
+    resp
+}
+
+impl OpenAiServerState {
+    async fn maybe_arc_route(
+        &self,
+        protocol: crate::arc_router::input::ApiProtocol,
+        bypass_header: bool,
+        session_key: Option<&str>,
+        body: &mut Value,
+    ) -> Result<Option<ArcRouteOutcome>, ApiError> {
+        let Some(router) = &self.arc_router else {
+            return Ok(None);
+        };
+        if bypass_header {
+            return Ok(None);
+        }
+        // Skip routing when caller explicitly targets a registered LoRA adapter.
+        if let Some(req_model) = body.get("model").and_then(Value::as_str)
+            && self.worker.lora_registry.resolve_name(req_model).is_some()
+        {
+            return Ok(None);
+        }
+        // KV-cache boundary awareness: if caller carries a warm session key bound to a local worker
+        // (or a continuing multi-turn thread with active local prefix cache), stay local to preserve KV.
+        let warm_session = session_key
+            .and_then(|k| self.dp_router.lookup_session(k))
+            .is_some();
+        let warm_local_kv = warm_session
+            || (self.metrics.snapshot().tokens.cached > 0
+                && body
+                    .get("messages")
+                    .and_then(Value::as_array)
+                    .is_some_and(|m| m.len() >= 3));
+
+        let decision = router
+            .route(protocol, body, warm_local_kv)
+            .await
+            .map_err(|e| {
+                error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("ARC router error: {e}"),
+                )
+            })?;
+
+        match &decision.target {
+            crate::arc_router::policy::RouteTarget::Cloud { wire, .. } => {
+                if let Some(proxy) = router.proxy()
+                    && proxy.supports_protocol(protocol)
+                {
+                    let resp = proxy.forward(protocol, body.clone(), wire, &decision).await;
+                    return Ok(Some(ArcRouteOutcome::Proxied(resp)));
+                }
+            }
+            crate::arc_router::policy::RouteTarget::Local => {}
+        }
+
+        // Local target: rewrite virtual `"auto"` / `"arc"` model aliases to the served local model
+        // and apply ARC Stage-2 reasoning effort when the caller didn't specify one explicitly.
+        let has_explicit_effort = body.get("reasoning_effort").is_some_and(|v| !v.is_null())
+            || body
+                .pointer("/reasoning/effort")
+                .is_some_and(|v| !v.is_null())
+            || body
+                .pointer("/output_config/effort")
+                .is_some_and(|v| !v.is_null())
+            || body.get("thinking").is_some_and(|v| !v.is_null())
+            || body
+                .pointer("/chat_template_kwargs/reasoning_effort")
+                .is_some_and(|v| !v.is_null())
+            || body
+                .pointer("/chat_template_kwargs/enable_thinking")
+                .is_some_and(|v| !v.is_null());
+        if let Some(obj) = body.as_object_mut() {
+            if let Some(m) = obj.get("model").and_then(Value::as_str)
+                && matches!(
+                    m.to_ascii_lowercase().as_str(),
+                    "auto" | "arc" | "arc-router"
+                )
+            {
+                obj.insert("model".to_string(), Value::String(self.model_name.clone()));
+            }
+            if !has_explicit_effort {
+                match protocol {
+                    crate::arc_router::input::ApiProtocol::OpenAiChat => {
+                        obj.insert(
+                            "reasoning_effort".to_string(),
+                            Value::String(decision.reasoning_effort.clone()),
+                        );
+                    }
+                    crate::arc_router::input::ApiProtocol::OpenAiResponses => {
+                        let reasoning = obj.entry("reasoning").or_insert_with(|| json!({}));
+                        if let Some(r_obj) = reasoning.as_object_mut() {
+                            r_obj.insert(
+                                "effort".to_string(),
+                                Value::String(decision.reasoning_effort.clone()),
+                            );
+                        }
+                    }
+                    crate::arc_router::input::ApiProtocol::AnthropicMessages => {
+                        let out_cfg = obj.entry("output_config").or_insert_with(|| json!({}));
+                        if let Some(o_obj) = out_cfg.as_object_mut() {
+                            o_obj.insert(
+                                "effort".to_string(),
+                                Value::String(decision.reasoning_effort.clone()),
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        Ok(Some(ArcRouteOutcome::Local(decision)))
+    }
+}
+
 async fn generate(
     s: Arc<OpenAiServerState>,
     request: Request,
@@ -1247,13 +1424,35 @@ async fn generate(
         .clone()
         .try_acquire_owned()
         .map_err(admission_error)?;
+    let bypass_router = request
+        .headers()
+        .get("x-warp34-bypass-router")
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true"));
     let session_key = request
         .headers()
         .get("x-session-id")
         .and_then(|v| v.to_str().ok())
         .filter(|s| !s.is_empty())
         .map(|s| format!("sess:{s}"));
-    let (json, body_len) = read_json_with_len(&s, request).await?;
+    let (mut json, body_len) = read_json_with_len(&s, request).await?;
+    let arc_decision = if chat {
+        match s
+            .maybe_arc_route(
+                crate::arc_router::input::ApiProtocol::OpenAiChat,
+                bypass_router,
+                session_key.as_deref(),
+                &mut json,
+            )
+            .await?
+        {
+            Some(ArcRouteOutcome::Proxied(resp)) => return Ok(resp),
+            Some(ArcRouteOutcome::Local(d)) => Some(d),
+            None => None,
+        }
+    } else {
+        None
+    };
     let prep_state = s.clone();
     let inline_fast = !chat
         && body_len <= 16 * 1024
@@ -1359,14 +1558,22 @@ async fn generate(
             }
             yield Ok(Event::default().data("[DONE]"));
         };
-        Ok(Sse::new(events)
-            .keep_alive(KeepAlive::new().interval(Duration::from_secs(15)))
-            .into_response())
+        Ok(attach_arc_headers(
+            Sse::new(events)
+                .keep_alive(KeepAlive::new().interval(Duration::from_secs(15)))
+                .into_response(),
+            arc_decision.as_ref(),
+        ))
     } else {
         let mut output = std::pin::pin!(output);
         while let Some(item) = output.next().await {
             match item {
-                Output::Complete(value) => return Ok(Json(value).into_response()),
+                Output::Complete(value) => {
+                    return Ok(attach_arc_headers(
+                        Json(value).into_response(),
+                        arc_decision.as_ref(),
+                    ));
+                }
                 Output::Error(err) => {
                     return Err(worker_api_err(err));
                 }
@@ -1939,19 +2146,37 @@ async fn responses_create(
         .try_acquire_owned()
         .map_err(admission_error)?;
     let caller_scope = responses_caller_scope(&s, request.headers());
+    let bypass_router = request
+        .headers()
+        .get("x-warp34-bypass-router")
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true"));
     let header_session = request
         .headers()
         .get("x-session-id")
         .and_then(|v| v.to_str().ok())
         .filter(|s| !s.is_empty())
         .map(|s| format!("sess:{s}"));
-    let body = read_json(&s, request).await?;
+    let mut body = read_json(&s, request).await?;
     let prev_resp_session = body
         .get("previous_response_id")
         .and_then(Value::as_str)
         .filter(|s| !s.is_empty())
         .map(|s| format!("resp:{s}"));
     let session_key = prev_resp_session.or(header_session);
+    let arc_decision = match s
+        .maybe_arc_route(
+            crate::arc_router::input::ApiProtocol::OpenAiResponses,
+            bypass_router,
+            session_key.as_deref(),
+            &mut body,
+        )
+        .await?
+    {
+        Some(ArcRouteOutcome::Proxied(resp)) => return Ok(resp),
+        Some(ArcRouteOutcome::Local(d)) => Some(d),
+        None => None,
+    };
     let request_id = s.next_request_id.fetch_add(1, Ordering::Relaxed) + 1;
     let (chat_req, mut meta) = crate::responses_api::translate_responses_to_chat(
         &body,
@@ -2146,9 +2371,12 @@ async fn responses_create(
             log.finish(finish, hit_limit);
             yield Ok(Event::default().event(ev_name).data(payload.to_string()));
         };
-        Ok(Sse::new(events)
-            .keep_alive(KeepAlive::new().interval(Duration::from_secs(15)))
-            .into_response())
+        Ok(attach_arc_headers(
+            Sse::new(events)
+                .keep_alive(KeepAlive::new().interval(Duration::from_secs(15)))
+                .into_response(),
+            arc_decision.as_ref(),
+        ))
     } else {
         let _admission = admission;
         let _active_guard = active_guard;
@@ -2273,7 +2501,10 @@ async fn responses_create(
             history,
         );
         log.finish(finish, hit_limit);
-        Ok(Json(resp).into_response())
+        Ok(attach_arc_headers(
+            Json(resp).into_response(),
+            arc_decision.as_ref(),
+        ))
     }
 }
 
@@ -2286,13 +2517,32 @@ async fn anthropic_messages(
         .clone()
         .try_acquire_owned()
         .map_err(|err| to_anthropic_err(admission_error(err)))?;
+    let bypass_router = request
+        .headers()
+        .get("x-warp34-bypass-router")
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true"));
     let session_key = request
         .headers()
         .get("x-session-id")
         .and_then(|v| v.to_str().ok())
         .filter(|s| !s.is_empty())
         .map(|s| format!("sess:{s}"));
-    let body = read_json(&s, request).await.map_err(to_anthropic_err)?;
+    let mut body = read_json(&s, request).await.map_err(to_anthropic_err)?;
+    let arc_decision = match s
+        .maybe_arc_route(
+            crate::arc_router::input::ApiProtocol::AnthropicMessages,
+            bypass_router,
+            session_key.as_deref(),
+            &mut body,
+        )
+        .await
+        .map_err(to_anthropic_err)?
+    {
+        Some(ArcRouteOutcome::Proxied(resp)) => return Ok(resp),
+        Some(ArcRouteOutcome::Local(d)) => Some(d),
+        None => None,
+    };
     let request_id = s.next_request_id.fetch_add(1, Ordering::Relaxed) + 1;
     let (chat_req, mut meta) =
         crate::anthropic_api::translate_anthropic_to_chat(&body, &s.model_name, request_id, true)
@@ -2472,9 +2722,12 @@ async fn anthropic_messages(
                 yield Ok(Event::default().event(ev_name).data(payload.to_string()));
             }
         };
-        Ok(Sse::new(events)
-            .keep_alive(KeepAlive::new().interval(Duration::from_secs(15)))
-            .into_response())
+        Ok(attach_arc_headers(
+            Sse::new(events)
+                .keep_alive(KeepAlive::new().interval(Duration::from_secs(15)))
+                .into_response(),
+            arc_decision.as_ref(),
+        ))
     } else {
         let _admission = admission;
         let tokenizer = s.worker.tokenizer.as_ref().unwrap();
@@ -2596,7 +2849,10 @@ async fn anthropic_messages(
         let (reason, _) =
             crate::anthropic_api::resolve_stop_reason(&turn, finish, matched_stop.as_deref());
         log.finish(reason, hit_limit);
-        Ok(Json(msg).into_response())
+        Ok(attach_arc_headers(
+            Json(msg).into_response(),
+            arc_decision.as_ref(),
+        ))
     }
 }
 

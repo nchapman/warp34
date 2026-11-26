@@ -1338,7 +1338,7 @@ pub(crate) fn run_serve(
 ) -> Result<ExitCode, String> {
     let CudaCliOptions {
         model: raw_model,
-        serve,
+        mut serve,
         resolved_model,
         tp,
         tp_auto,
@@ -1706,6 +1706,76 @@ pub(crate) fn run_serve(
             ) as crate::server::DpEngineLoader
         })
         .collect();
+    let router_spec = serve.router_model.clone().or_else(|| {
+        serve
+            .router_upstream
+            .as_ref()
+            .map(|_| crate::arc_router::DEFAULT_ARC_ROUTER_MODEL.to_string())
+    });
+    if let Some(ref spec) = router_spec {
+        let router_dir = crate::hub::resolve_model(
+            spec,
+            &crate::hub::HubOptions::default(),
+            crate::hub::ModelRole::Target,
+        )
+        .map_err(|e| format!("resolve ARC router model `{spec}`: {e}"))?;
+        let upstream = serve
+            .router_upstream
+            .as_deref()
+            .map(crate::arc_router::policy::UpstreamTarget::parse)
+            .transpose()?;
+        let policy = crate::arc_router::policy::RoutingPolicy::from_args(
+            serve.router_policy.as_deref().unwrap_or("prefer-local"),
+            serve.router_min_p_pass.unwrap_or(0.72),
+            serve.router_value_usd,
+        )?;
+        let pin_pii_classes: std::collections::HashSet<String> =
+            match serve.router_pin_pii.as_deref() {
+                Some(raw) if raw.eq_ignore_ascii_case("none") || raw.trim().is_empty() => {
+                    std::collections::HashSet::new()
+                }
+                Some(raw) => raw
+                    .split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect(),
+                None => [
+                    "credential",
+                    "government_id",
+                    "financial_account",
+                    "payment_card",
+                    "health",
+                    "any",
+                ]
+                .into_iter()
+                .map(String::from)
+                .collect(),
+            };
+        let router = crate::arc_router::ArcRouter::load(crate::arc_router::ArcRouterConfig {
+            model_dir: router_dir,
+            device_id: 0,
+            local_model_name: model.clone(),
+            upstream: upstream.clone(),
+            upstream_api_key: None,
+            cloud_model_filter: serve.router_cloud_models.clone(),
+            policy,
+            pin_pii_classes,
+        })?;
+        let cloud_summary = match &upstream {
+            Some(u) => format!(
+                "{} ({} cloud models)",
+                u.base_url(),
+                router.cloud_model_names().len()
+            ),
+            None => "none (local adaptive effort)".to_string(),
+        };
+        println!(
+            "[warp34 router] arc={spec} local_slot={} policy={} upstream={cloud_summary}",
+            router.local_slot_name(),
+            serve.router_policy.as_deref().unwrap_or("prefer-local"),
+        );
+        serve.options.arc_router = Some(std::sync::Arc::new(router));
+    }
     let state = crate::server::OpenAiServerState::from_loaders_with_options(
         model,
         allow_remote_images,
