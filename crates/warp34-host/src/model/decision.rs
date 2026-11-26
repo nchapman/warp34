@@ -3,6 +3,15 @@
 use super::*;
 
 #[cfg(feature = "cuda")]
+/// One sequence in a ragged ARC-1.0 encoder micro-batch.
+pub struct EncoderBatchItem<'a> {
+    pub tokens: &'a [i32],
+    pub start_offset: usize,
+    pub offsets: &'a [usize],
+    pub state_slot: usize,
+    pub block_table: &'a [i32],
+}
+
 impl Qwen3_5Engine {
     /// Reads FP16 logits for `token_ids` from `selected_row` across `TP=1` / `TP=2` ranks.
     pub fn read_selected_row_candidate_logits(
@@ -353,6 +362,142 @@ impl Qwen3_5Engine {
             }
             offset = end;
         }
+        Ok(results)
+    }
+
+    /// Runs a ragged prefill-only forward pass over a micro-batch of sequences (skipping `lm_head`
+    /// logits), reusing each sequence's KV/GDN state when `start_offset > 0`, and returns
+    /// post-`GemmaRMSNorm` hidden vectors at each sequence's requested `offsets`.
+    ///
+    /// When `items.len() == 1`, delegates directly to `encode_readouts_at_offsets_in_slot_f32`
+    /// with zero batching overhead.
+    pub fn encode_readouts_batch_in_slots_f32(
+        &mut self,
+        items: &[EncoderBatchItem<'_>],
+    ) -> Result<Vec<Vec<Vec<f32>>>> {
+        if items.is_empty() {
+            return Ok(Vec::new());
+        }
+        if items.len() == 1 {
+            let it = &items[0];
+            let rows = self.encode_readouts_at_offsets_in_slot_f32(
+                it.tokens,
+                it.start_offset,
+                it.offsets,
+                it.state_slot,
+                it.block_table,
+            )?;
+            return Ok(vec![rows]);
+        }
+
+        const PAGE_SIZE: usize = 16;
+        let mut results: Vec<Vec<Vec<f32>>> = Vec::with_capacity(items.len());
+        let mut cursors: Vec<usize> = Vec::with_capacity(items.len());
+        let mut pages_needed_per_item: Vec<usize> = Vec::with_capacity(items.len());
+
+        for it in items {
+            if it.tokens.is_empty() {
+                return Err(loader_err(
+                    "encode_readouts_batch_in_slots_f32 requires at least 1 token per item",
+                ));
+            }
+            let pages_needed = it.tokens.len().div_ceil(PAGE_SIZE);
+            if it.block_table.len() < pages_needed {
+                return Err(loader_err(
+                    "encode_readouts_batch_in_slots_f32: block_table too short",
+                ));
+            }
+            if it.start_offset > it.tokens.len() {
+                return Err(loader_err(
+                    "encode_readouts_batch_in_slots_f32: start_offset out of range",
+                ));
+            }
+            for &off in it.offsets {
+                if off < it.start_offset || off >= it.tokens.len() {
+                    return Err(loader_err(
+                        "encode_readouts_batch_in_slots_f32: readout offset out of range",
+                    ));
+                }
+            }
+            results.push(vec![Vec::new(); it.offsets.len()]);
+            cursors.push(it.start_offset);
+            pages_needed_per_item.push(pages_needed);
+        }
+
+        loop {
+            let active_count = items
+                .iter()
+                .enumerate()
+                .filter(|(i, it)| cursors[*i] < it.tokens.len())
+                .count();
+            if active_count == 0 {
+                break;
+            }
+            let max_chunk = self
+                .ranks
+                .iter()
+                .map(|rank| rank.ordinary_prefill_token_capacity(active_count))
+                .collect::<Result<Vec<_>>>()?
+                .into_iter()
+                .min()
+                .ok_or_else(|| loader_err("no model ranks"))?
+                .max(1);
+
+            let mut slices: Vec<EngineBatchSlice<'_>> = Vec::with_capacity(active_count);
+            let mut batch_targets: Vec<(usize, usize)> = Vec::new();
+            let mut batch_local_rows: Vec<usize> = Vec::new();
+            let mut token_budget = max_chunk;
+            let mut row_base = 0usize;
+
+            for (item_idx, it) in items.iter().enumerate() {
+                let start = cursors[item_idx];
+                if start >= it.tokens.len() {
+                    continue;
+                }
+                if token_budget == 0 {
+                    break;
+                }
+                let take = (it.tokens.len() - start).min(token_budget);
+                let end = start + take;
+                let mut has_row = false;
+                for (req_idx, &off) in it.offsets.iter().enumerate() {
+                    if off >= start && off < end {
+                        batch_targets.push((item_idx, req_idx));
+                        batch_local_rows.push(row_base + (off - start));
+                        has_row = true;
+                    }
+                }
+                slices.push(EngineBatchSlice {
+                    tokens: &it.tokens[start..end],
+                    ctx_len_before: start,
+                    block_table: &it.block_table[..pages_needed_per_item[item_idx]],
+                    state_in_slot: it.state_slot as i32,
+                    state_out_slot: it.state_slot as i32,
+                    has_initial_state: start > 0,
+                    spec_slots: &[],
+                    checkpoints: &[],
+                    emit_all_query_tokens: has_row,
+                });
+                cursors[item_idx] = end;
+                row_base += take;
+                token_budget -= take;
+            }
+
+            let sample_mask = vec![false; slices.len()];
+            let _ = self.step_batch_slices_for_sampler_filtered(
+                &slices,
+                None,
+                Some(&sample_mask),
+                true,
+            )?;
+            if !batch_local_rows.is_empty() {
+                let rows = self.read_norm_hidden_rows_f32(&batch_local_rows)?;
+                for ((item_idx, req_idx), row) in batch_targets.into_iter().zip(rows) {
+                    results[item_idx][req_idx] = row;
+                }
+            }
+        }
+
         Ok(results)
     }
 

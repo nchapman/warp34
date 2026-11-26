@@ -45,6 +45,7 @@ mod rank_runtime;
 mod sampling;
 pub(crate) mod weights;
 
+pub use decision::EncoderBatchItem;
 pub use engine::*;
 pub use graph_io::*;
 #[cfg(feature = "cuda")]

@@ -344,6 +344,251 @@ fn select_head_tail_blocks(
     (flat, offsets, roles)
 }
 
+#[cfg(feature = "cuda")]
+struct ClaimedEncodeJob {
+    reply: tokio::sync::oneshot::Sender<Result<EncodeResponse, String>>,
+    flat_tokens: Vec<i32>,
+    offsets: Vec<usize>,
+    roles: Vec<String>,
+    total_prompt_tokens: usize,
+    start_offset: usize,
+    missing_indices: Vec<usize>,
+    missing_offsets: Vec<usize>,
+    sess: ResidentSession,
+    tick: u64,
+}
+
+#[cfg(feature = "cuda")]
+struct PreparedJobTokens {
+    flat_tokens: Vec<i32>,
+    offsets: Vec<usize>,
+    roles: Vec<String>,
+    total_prompt_tokens: usize,
+}
+
+#[cfg(feature = "cuda")]
+fn prepare_job_tokens(
+    engine: &crate::model::Qwen3_5Engine,
+    memo: &mut BlockTokenMemo,
+    blocks: &[ArcRoleBlock],
+    max_ctx: usize,
+) -> Result<PreparedJobTokens, String> {
+    let mut tokenized_blocks = Vec::with_capacity(blocks.len());
+    let mut total_prompt_tokens = 0usize;
+    for block in blocks {
+        let toks = memo.tokenize(engine, block)?;
+        total_prompt_tokens += toks.len();
+        if !toks.is_empty() {
+            tokenized_blocks.push((block.role.clone(), toks));
+        }
+    }
+    if tokenized_blocks.is_empty() {
+        return Err("ARC encoder received empty token sequence".to_string());
+    }
+    let (flat_tokens, offsets, roles) = select_head_tail_blocks(tokenized_blocks, max_ctx);
+    if flat_tokens.is_empty() || offsets.is_empty() {
+        return Err("ARC encoder produced empty windowed tokens".to_string());
+    }
+    Ok(PreparedJobTokens {
+        flat_tokens,
+        offsets,
+        roles,
+        total_prompt_tokens,
+    })
+}
+
+#[cfg(feature = "cuda")]
+fn run_encoder_microbatch(
+    engine: &mut crate::model::Qwen3_5Engine,
+    memo: &mut BlockTokenMemo,
+    pool: &mut SessionPool,
+    max_ctx: usize,
+    jobs: Vec<EncodeJob>,
+) -> Vec<EncodeJob> {
+    let mut claimed: Vec<ClaimedEncodeJob> = Vec::with_capacity(jobs.len());
+    let mut deferred: Vec<EncodeJob> = Vec::new();
+
+    for job in jobs {
+        if job.reply.is_closed() {
+            continue;
+        }
+        let PreparedJobTokens {
+            flat_tokens,
+            offsets,
+            roles,
+            total_prompt_tokens,
+        } = match prepare_job_tokens(engine, memo, &job.blocks, max_ctx) {
+            Ok(v) => v,
+            Err(e) => {
+                let _ = job.reply.send(Err(e));
+                continue;
+            }
+        };
+
+        let pages_needed = flat_tokens.len().div_ceil(16);
+        let tick = pool.next_tick();
+
+        if let Some((sess_idx, is_exact)) = pool.find_best_prefix(&flat_tokens, &offsets) {
+            if is_exact {
+                let sess = &mut pool.sessions[sess_idx];
+                sess.last_used = tick;
+                let block_readouts = offsets.iter().map(|o| sess.readouts[o].clone()).collect();
+                let _ = job.reply.send(Ok(EncodeResponse {
+                    block_readouts,
+                    block_roles: roles,
+                    prompt_tokens: total_prompt_tokens,
+                }));
+                continue;
+            }
+
+            let mut sess = pool.sessions.swap_remove(sess_idx);
+            let extra_pages = pages_needed.saturating_sub(sess.kv_pages.len());
+            if extra_pages > 0 {
+                if !pool.ensure_free_pages(extra_pages) {
+                    if !claimed.is_empty() {
+                        pool.sessions.push(sess);
+                        deferred.push(job);
+                        continue;
+                    }
+                    pool.free_slots.push(sess.state_slot);
+                    pool.free_pages.extend(sess.kv_pages);
+                    let _ = job
+                        .reply
+                        .send(Err("ARC encoder KV pool exhausted".to_string()));
+                    continue;
+                }
+                let added = pool.allocate_pages(extra_pages);
+                sess.kv_pages.extend(added);
+            }
+
+            let prev_len = sess.tokens.len();
+            let mut missing_indices = Vec::new();
+            let mut missing_offsets = Vec::new();
+            for (i, &off) in offsets.iter().enumerate() {
+                if off >= prev_len {
+                    missing_indices.push(i);
+                    missing_offsets.push(off);
+                }
+            }
+            claimed.push(ClaimedEncodeJob {
+                reply: job.reply,
+                flat_tokens,
+                offsets,
+                roles,
+                total_prompt_tokens,
+                start_offset: prev_len,
+                missing_indices,
+                missing_offsets,
+                sess,
+                tick,
+            });
+            continue;
+        }
+
+        // Cold miss: allocate a fresh slot + KV pages (defer if earlier items in this batch
+        // are temporarily holding the remaining slots/pages).
+        if pool.free_slots.is_empty() && !pool.evict_lru() {
+            if !claimed.is_empty() {
+                deferred.push(job);
+            } else {
+                let _ = job
+                    .reply
+                    .send(Err("ARC encoder has no free state slots".to_string()));
+            }
+            continue;
+        }
+        if !pool.ensure_free_pages(pages_needed) {
+            if !claimed.is_empty() {
+                deferred.push(job);
+            } else {
+                let _ = job
+                    .reply
+                    .send(Err("ARC encoder KV pool exhausted".to_string()));
+            }
+            continue;
+        }
+        let Some(state_slot) = pool.free_slots.pop() else {
+            let _ = job
+                .reply
+                .send(Err("ARC encoder missing free state slot".to_string()));
+            continue;
+        };
+        let kv_pages = pool.allocate_pages(pages_needed);
+        let missing_indices = (0..offsets.len()).collect();
+        let missing_offsets = offsets.clone();
+        claimed.push(ClaimedEncodeJob {
+            reply: job.reply,
+            flat_tokens,
+            offsets,
+            roles,
+            total_prompt_tokens,
+            start_offset: 0,
+            missing_indices,
+            missing_offsets,
+            sess: ResidentSession {
+                state_slot,
+                kv_pages,
+                tokens: Vec::new(),
+                readouts: HashMap::new(),
+                last_used: tick,
+            },
+            tick,
+        });
+    }
+
+    if claimed.is_empty() {
+        return deferred;
+    }
+
+    let batch_items: Vec<crate::model::EncoderBatchItem<'_>> = claimed
+        .iter()
+        .map(|c| crate::model::EncoderBatchItem {
+            tokens: &c.flat_tokens,
+            start_offset: c.start_offset,
+            offsets: &c.missing_offsets,
+            state_slot: c.sess.state_slot,
+            block_table: &c.sess.kv_pages,
+        })
+        .collect();
+
+    match engine.encode_readouts_batch_in_slots_f32(&batch_items) {
+        Ok(batch_rows) => {
+            for (mut c, new_rows) in claimed.into_iter().zip(batch_rows) {
+                let mut block_readouts: Vec<Vec<f32>> = vec![Vec::new(); c.offsets.len()];
+                if c.start_offset > 0 {
+                    for (i, &off) in c.offsets.iter().enumerate() {
+                        if off < c.start_offset {
+                            block_readouts[i].clone_from(&c.sess.readouts[&off]);
+                        }
+                    }
+                }
+                for (idx, row) in c.missing_indices.into_iter().zip(new_rows) {
+                    c.sess.readouts.insert(c.offsets[idx], row.clone());
+                    block_readouts[idx] = row;
+                }
+                c.sess.tokens = c.flat_tokens;
+                c.sess.last_used = c.tick;
+                pool.sessions.push(c.sess);
+                let _ = c.reply.send(Ok(EncodeResponse {
+                    block_readouts,
+                    block_roles: c.roles,
+                    prompt_tokens: c.total_prompt_tokens,
+                }));
+            }
+        }
+        Err(e) => {
+            let msg = format!("ARC encode failed: {e}");
+            for c in claimed {
+                pool.free_slots.push(c.sess.state_slot);
+                pool.free_pages.extend(c.sess.kv_pages);
+                let _ = c.reply.send(Err(msg.clone()));
+            }
+        }
+    }
+
+    deferred
+}
+
 impl ArcEncoderWorker {
     /// Spawns a dedicated CUDA worker thread hosting the ARC-1.0 encoder on `device_id`.
     #[cfg(feature = "cuda")]
@@ -373,155 +618,26 @@ impl ArcEncoderWorker {
 
                 let mut memo = BlockTokenMemo::new();
                 let mut pool = SessionPool::new(total_pages, ENCODER_MAX_SESSIONS);
+                let mut pending: Vec<EncodeJob> = Vec::new();
 
-                while let Ok(job) = rx.recv() {
-                    if job.reply.is_closed() {
-                        continue;
+                loop {
+                    if pending.is_empty() {
+                        match rx.recv() {
+                            Ok(job) => pending.push(job),
+                            Err(_) => break,
+                        }
                     }
-                    let result = (|| -> Result<EncodeResponse, String> {
-                        let mut tokenized_blocks = Vec::with_capacity(job.blocks.len());
-                        let mut total_prompt_tokens = 0usize;
-                        for block in &job.blocks {
-                            let toks = memo.tokenize(&engine, block)?;
-                            total_prompt_tokens += toks.len();
-                            if !toks.is_empty() {
-                                tokenized_blocks.push((block.role.clone(), toks));
-                            }
+                    // Opportunistically drain already-queued jobs into one ragged micro-batch
+                    // without waiting (zero added latency when concurrency == 1).
+                    while pending.len() < ENCODER_MAX_SESSIONS {
+                        match rx.try_recv() {
+                            Ok(job) => pending.push(job),
+                            Err(_) => break,
                         }
-                        if tokenized_blocks.is_empty() {
-                            return Err("ARC encoder received empty token sequence".to_string());
-                        }
-                        let (flat_tokens, offsets, roles) =
-                            select_head_tail_blocks(tokenized_blocks, max_ctx);
-                        if flat_tokens.is_empty() || offsets.is_empty() {
-                            return Err("ARC encoder produced empty windowed tokens".to_string());
-                        }
-
-                        let pages_needed = flat_tokens.len().div_ceil(16);
-                        let tick = pool.next_tick();
-
-                        if let Some((sess_idx, is_exact)) =
-                            pool.find_best_prefix(&flat_tokens, &offsets)
-                        {
-                            if is_exact {
-                                let sess = &mut pool.sessions[sess_idx];
-                                sess.last_used = tick;
-                                let block_readouts =
-                                    offsets.iter().map(|o| sess.readouts[o].clone()).collect();
-                                return Ok(EncodeResponse {
-                                    block_readouts,
-                                    block_roles: roles,
-                                    prompt_tokens: total_prompt_tokens,
-                                });
-                            }
-
-                            // Strict prefix extension: take the session out of the pool so page
-                            // evictions cannot invalidate its index, grow its KV pages, and prefill
-                            // only the newly appended tail tokens.
-                            let mut sess = pool.sessions.swap_remove(sess_idx);
-                            let extra_pages = pages_needed.saturating_sub(sess.kv_pages.len());
-                            if extra_pages > 0 {
-                                if !pool.ensure_free_pages(extra_pages) {
-                                    pool.free_slots.push(sess.state_slot);
-                                    pool.free_pages.extend(sess.kv_pages);
-                                    return Err("ARC encoder KV pool exhausted".to_string());
-                                }
-                                let added = pool.allocate_pages(extra_pages);
-                                sess.kv_pages.extend(added);
-                            }
-
-                            let prev_len = sess.tokens.len();
-                            let mut missing_indices = Vec::new();
-                            let mut missing_offsets = Vec::new();
-                            for (i, &off) in offsets.iter().enumerate() {
-                                if off >= prev_len {
-                                    missing_indices.push(i);
-                                    missing_offsets.push(off);
-                                }
-                            }
-                            let new_rows = match engine.encode_readouts_at_offsets_in_slot_f32(
-                                &flat_tokens,
-                                prev_len,
-                                &missing_offsets,
-                                sess.state_slot,
-                                &sess.kv_pages,
-                            ) {
-                                Ok(rows) => rows,
-                                Err(e) => {
-                                    pool.free_slots.push(sess.state_slot);
-                                    pool.free_pages.extend(sess.kv_pages);
-                                    return Err(format!("ARC encode failed: {e}"));
-                                }
-                            };
-
-                            let mut block_readouts: Vec<Vec<f32>> = vec![Vec::new(); offsets.len()];
-                            for (i, &off) in offsets.iter().enumerate() {
-                                if off < prev_len {
-                                    block_readouts[i].clone_from(&sess.readouts[&off]);
-                                }
-                            }
-                            for (idx, row) in missing_indices.into_iter().zip(new_rows) {
-                                sess.readouts.insert(offsets[idx], row.clone());
-                                block_readouts[idx] = row;
-                            }
-                            sess.tokens = flat_tokens;
-                            sess.last_used = tick;
-                            pool.sessions.push(sess);
-
-                            return Ok(EncodeResponse {
-                                block_readouts,
-                                block_roles: roles,
-                                prompt_tokens: total_prompt_tokens,
-                            });
-                        }
-
-                        // Cold miss: allocate a fresh slot + KV pages (evicting LRU sessions as needed).
-                        if pool.free_slots.is_empty() && !pool.evict_lru() {
-                            return Err("ARC encoder has no free state slots".to_string());
-                        }
-                        if !pool.ensure_free_pages(pages_needed) {
-                            return Err("ARC encoder KV pool exhausted".to_string());
-                        }
-                        let state_slot = pool
-                            .free_slots
-                            .pop()
-                            .ok_or_else(|| "ARC encoder missing free state slot".to_string())?;
-                        let kv_pages = pool.allocate_pages(pages_needed);
-
-                        let rows = match engine.encode_readouts_at_offsets_in_slot_f32(
-                            &flat_tokens,
-                            0,
-                            &offsets,
-                            state_slot,
-                            &kv_pages,
-                        ) {
-                            Ok(rows) => rows,
-                            Err(e) => {
-                                pool.free_slots.push(state_slot);
-                                pool.free_pages.extend(kv_pages);
-                                return Err(format!("ARC encode failed: {e}"));
-                            }
-                        };
-
-                        let mut readouts = HashMap::with_capacity(offsets.len());
-                        for (&off, row) in offsets.iter().zip(&rows) {
-                            readouts.insert(off, row.clone());
-                        }
-                        pool.sessions.push(ResidentSession {
-                            state_slot,
-                            kv_pages,
-                            tokens: flat_tokens,
-                            readouts,
-                            last_used: tick,
-                        });
-
-                        Ok(EncodeResponse {
-                            block_readouts: rows,
-                            block_roles: roles,
-                            prompt_tokens: total_prompt_tokens,
-                        })
-                    })();
-                    let _ = job.reply.send(result);
+                    }
+                    let batch = std::mem::take(&mut pending);
+                    pending =
+                        run_encoder_microbatch(&mut engine, &mut memo, &mut pool, max_ctx, batch);
                 }
             })
             .map_err(|e| format!("failed to spawn ARC encoder thread: {e}"))?;
