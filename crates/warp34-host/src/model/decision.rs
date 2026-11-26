@@ -259,22 +259,49 @@ impl Qwen3_5Engine {
             .collect())
     }
 
-    /// Runs a prefill-only forward pass over `tokens` (skipping `lm_head` logits) and returns
-    /// the final token's post-`GemmaRMSNorm` hidden vector `[hidden_size]` as `f32`.
-    pub fn encode_last_readout_f32(&mut self, tokens: &[i32]) -> Result<Vec<f32>> {
+    /// Returns the maximum token context supported by this encoder's KV pool.
+    pub fn encoder_max_context(&self) -> usize {
+        self.ranks.first().map_or(0, |r| r.kv_pool.num_pages * 16)
+    }
+
+    /// Runs a prefill-only forward pass over `tokens[start_offset..]` (skipping `lm_head` logits),
+    /// reusing the existing slot-0 KV/GDN state when `start_offset > 0`, and returns the
+    /// post-`GemmaRMSNorm` hidden vectors `[hidden_size]` (`f32`) at each requested `offsets` index
+    /// (every offset must satisfy `start_offset <= off < tokens.len()`).
+    pub fn encode_readouts_at_offsets_f32(
+        &mut self,
+        tokens: &[i32],
+        start_offset: usize,
+        offsets: &[usize],
+    ) -> Result<Vec<Vec<f32>>> {
         if tokens.is_empty() {
             return Err(loader_err(
-                "encode_last_readout_f32 requires at least 1 token",
+                "encode_readouts_at_offsets_f32 requires at least 1 token",
             ));
         }
         const PAGE_SIZE: usize = 16;
         let max_ctx = self.ranks[0].kv_pool.num_pages * PAGE_SIZE;
-        let slice = if tokens.len() > max_ctx {
-            &tokens[tokens.len() - max_ctx..]
-        } else {
-            tokens
-        };
-        let pages_needed = slice.len().div_ceil(PAGE_SIZE);
+        if tokens.len() > max_ctx {
+            return Err(loader_err(
+                "encode_readouts_at_offsets_f32: tokens exceed encoder max_ctx",
+            ));
+        }
+        if start_offset > tokens.len() {
+            return Err(loader_err(
+                "encode_readouts_at_offsets_f32: start_offset out of range",
+            ));
+        }
+        for &off in offsets {
+            if off < start_offset || off >= tokens.len() {
+                return Err(loader_err(
+                    "encode_readouts_at_offsets_f32: readout offset out of range",
+                ));
+            }
+        }
+        if start_offset == tokens.len() {
+            return Ok(Vec::new());
+        }
+        let pages_needed = tokens.len().div_ceil(PAGE_SIZE);
         let block_table: Vec<i32> = (0..pages_needed as i32).collect();
         let max_chunk = self
             .ranks
@@ -285,12 +312,19 @@ impl Qwen3_5Engine {
             .min()
             .ok_or_else(|| loader_err("no model ranks"))?
             .max(1);
-        let mut offset = 0usize;
-        let mut last_chunk_len = 0usize;
-        while offset < slice.len() {
-            let end = (offset + max_chunk).min(slice.len());
-            let chunk = &slice[offset..end];
-            last_chunk_len = chunk.len();
+        let mut results: Vec<Vec<f32>> = vec![Vec::new(); offsets.len()];
+        let mut offset = start_offset;
+        while offset < tokens.len() {
+            let end = (offset + max_chunk).min(tokens.len());
+            let chunk = &tokens[offset..end];
+            let mut chunk_req_indices = Vec::new();
+            let mut chunk_local_rows = Vec::new();
+            for (req_idx, &off) in offsets.iter().enumerate() {
+                if off >= offset && off < end {
+                    chunk_req_indices.push(req_idx);
+                    chunk_local_rows.push(off - offset);
+                }
+            }
             let _ = self.step_batch_slices_for_sampler_filtered(
                 &[EngineBatchSlice {
                     tokens: chunk,
@@ -301,15 +335,40 @@ impl Qwen3_5Engine {
                     has_initial_state: offset > 0,
                     spec_slots: &[],
                     checkpoints: &[],
-                    emit_all_query_tokens: false,
+                    emit_all_query_tokens: !chunk_local_rows.is_empty(),
                 }],
                 None,
                 Some(&[false]),
                 true,
             )?;
+            if !chunk_local_rows.is_empty() {
+                let rows = self.read_norm_hidden_rows_f32(&chunk_local_rows)?;
+                for (req_idx, row) in chunk_req_indices.into_iter().zip(rows) {
+                    results[req_idx] = row;
+                }
+            }
             offset = end;
         }
-        self.read_norm_hidden_row_f32(last_chunk_len - 1)
+        Ok(results)
+    }
+
+    /// Runs a prefill-only forward pass over `tokens` (skipping `lm_head` logits) and returns
+    /// the final token's post-`GemmaRMSNorm` hidden vector `[hidden_size]` as `f32`.
+    pub fn encode_last_readout_f32(&mut self, tokens: &[i32]) -> Result<Vec<f32>> {
+        if tokens.is_empty() {
+            return Err(loader_err(
+                "encode_last_readout_f32 requires at least 1 token",
+            ));
+        }
+        let max_ctx = self.encoder_max_context();
+        let slice = if tokens.len() > max_ctx {
+            &tokens[tokens.len() - max_ctx..]
+        } else {
+            tokens
+        };
+        let last = slice.len() - 1;
+        let mut rows = self.encode_readouts_at_offsets_f32(slice, 0, &[last])?;
+        Ok(rows.pop().unwrap_or_default())
     }
 
     /// Reads one pre-final-`GemmaRMSNorm` (`block_{N-1}`) hidden row `[hidden_size]` (`FP16 -> f32`)

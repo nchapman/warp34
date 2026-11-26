@@ -320,11 +320,11 @@ fn map_arc_effort_to_warp34(effort: &str, level: Option<&str>) -> &'static str {
     }
 }
 
-/// Select the best Stage-2 reasoning effort for `model_slot`.
+/// Select the best Stage-2 reasoning effort for `model_slot` using multi-block pooled history.
 fn choose_effort_for_slot(
     heads: &ArcHeads,
-    readout: &[f32],
-    last_role: &str,
+    block_readouts: &[Vec<f32>],
+    block_roles: &[String],
     model_slot: usize,
     value_usd: f64,
 ) -> String {
@@ -341,7 +341,10 @@ fn choose_effort_for_slot(
         .iter()
         .flat_map(|a| a.arms.iter().copied())
         .collect();
-    let Ok(scored) = heads.stage_two.predict_arms(readout, last_role, &all_arms) else {
+    let Ok(scored) = heads
+        .stage_two
+        .predict_arms(block_readouts, block_roles, &[], &all_arms)
+    else {
         return "medium".to_string();
     };
     let score_map: std::collections::HashMap<usize, super::heads::ArmScore> =
@@ -379,8 +382,8 @@ fn choose_effort_for_slot(
 }
 
 pub struct DecideInput<'a> {
-    pub readout: &'a [f32],
-    pub last_role: &'a str,
+    pub block_readouts: &'a [Vec<f32>],
+    pub block_roles: &'a [String],
     pub prompt_tokens: usize,
     pub has_tools: bool,
     pub warm_local_kv: bool,
@@ -392,9 +395,14 @@ pub struct DecideInput<'a> {
 
 pub fn decide(heads: &ArcHeads, input: &DecideInput<'_>) -> Result<RoutingDecision, String> {
     let t0 = std::time::Instant::now();
+    let decision_readout = input
+        .block_readouts
+        .last()
+        .map(Vec::as_slice)
+        .ok_or_else(|| "ARC decide requires at least one block readout".to_string())?;
     // Regime 0 = tool-bearing coding/agentic, 1 = tool-free.
     let regime = usize::from(!input.has_tools);
-    let preds: Vec<StageOnePrediction> = heads.stage_one.predict(input.readout, regime)?;
+    let preds: Vec<StageOnePrediction> = heads.stage_one.predict(decision_readout, regime)?;
     let local_p = preds
         .get(input.local_slot)
         .map(|p| p.p_pass)
@@ -402,10 +410,11 @@ pub fn decide(heads: &ArcHeads, input: &DecideInput<'_>) -> Result<RoutingDecisi
         .unwrap_or(0.5);
 
     let pii_thresh = heads.catalog.pii_threshold_for_tokens(input.prompt_tokens);
-    let pii: PiiSignalPrediction =
-        heads
-            .pii
-            .predict(input.readout, pii_thresh, heads.catalog.pii_type_threshold)?;
+    let pii: PiiSignalPrediction = heads.pii.predict(
+        decision_readout,
+        pii_thresh,
+        heads.catalog.pii_type_threshold,
+    )?;
     let pii_pin = !input.pin_pii_classes.is_empty()
         && pii
             .triggered_classes
@@ -422,8 +431,8 @@ pub fn decide(heads: &ArcHeads, input: &DecideInput<'_>) -> Result<RoutingDecisi
     if input.cloud_candidates.is_empty() {
         let effort = choose_effort_for_slot(
             heads,
-            input.readout,
-            input.last_role,
+            input.block_readouts,
+            input.block_roles,
             input.local_slot,
             value_usd,
         );
@@ -442,8 +451,8 @@ pub fn decide(heads: &ArcHeads, input: &DecideInput<'_>) -> Result<RoutingDecisi
     if pii_pin {
         let effort = choose_effort_for_slot(
             heads,
-            input.readout,
-            input.last_role,
+            input.block_readouts,
+            input.block_roles,
             input.local_slot,
             value_usd,
         );
@@ -462,8 +471,8 @@ pub fn decide(heads: &ArcHeads, input: &DecideInput<'_>) -> Result<RoutingDecisi
     if input.warm_local_kv {
         let effort = choose_effort_for_slot(
             heads,
-            input.readout,
-            input.last_role,
+            input.block_readouts,
+            input.block_roles,
             input.local_slot,
             value_usd,
         );
@@ -484,8 +493,8 @@ pub fn decide(heads: &ArcHeads, input: &DecideInput<'_>) -> Result<RoutingDecisi
     {
         let effort = choose_effort_for_slot(
             heads,
-            input.readout,
-            input.last_role,
+            input.block_readouts,
+            input.block_roles,
             input.local_slot,
             value_usd,
         );
@@ -527,8 +536,8 @@ pub fn decide(heads: &ArcHeads, input: &DecideInput<'_>) -> Result<RoutingDecisi
     if stay_local {
         let effort = choose_effort_for_slot(
             heads,
-            input.readout,
-            input.last_role,
+            input.block_readouts,
+            input.block_roles,
             input.local_slot,
             value_usd,
         );
@@ -544,8 +553,13 @@ pub fn decide(heads: &ArcHeads, input: &DecideInput<'_>) -> Result<RoutingDecisi
     }
 
     let (cand, _, cloud_p) = best_cloud.unwrap();
-    let effort =
-        choose_effort_for_slot(heads, input.readout, input.last_role, cand.slot, value_usd);
+    let effort = choose_effort_for_slot(
+        heads,
+        input.block_readouts,
+        input.block_roles,
+        cand.slot,
+        value_usd,
+    );
     Ok(RoutingDecision {
         target: RouteTarget::Cloud {
             slot: cand.slot,

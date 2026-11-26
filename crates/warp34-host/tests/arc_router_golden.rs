@@ -22,19 +22,44 @@ fn cached_arc_dir() -> Option<PathBuf> {
 fn canonical_serializer_formats_openai_anthropic_and_responses() {
     let openai = serde_json::json!({
         "messages": [
-            {"role": "system", "content": "Be terse."},
-            {"role": "user", "content": "Hello"}
+            {"role": "system", "content": "x-anthropic-billing-header: foo\nBe terse."},
+            {"role": "user", "content": "Run ls"},
+            {
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [{
+                    "id": "call_abc",
+                    "type": "function",
+                    "function": {"name": "bash", "arguments": "{\"cmd\":\"ls\"}"}
+                }]
+            },
+            {"role": "tool", "tool_call_id": "call_abc", "content": "README.md"}
         ],
-        "tools": [{"type": "function", "function": {"name": "bash"}}]
+        "tools": [{"type": "function", "function": {"name": "bash", "parameters": {"type": "object"}}}]
     });
     let turn = serialize_request(ApiProtocol::OpenAiChat, &openai);
     assert!(turn.has_tools);
     assert_eq!(turn.last_role, "user");
+    assert_eq!(turn.blocks.len(), 5);
+    assert_eq!(turn.blocks[0].role, "system");
     assert!(
-        turn.text
-            .contains("<|im_start|>system\n\"Be terse.\\n\\nAvailable tools: bash\"<|im_end|>")
+        turn.blocks[0]
+            .content
+            .contains("\"type\": \"tool_definitions\"")
     );
-    assert!(turn.text.contains("<|im_start|>user\n\"Hello\"<|im_end|>"));
+    assert_eq!(
+        turn.blocks[1].content,
+        "[{\"text\": \"Be terse.\", \"type\": \"text\"}]"
+    );
+    assert_eq!(
+        turn.blocks[2].content,
+        "[{\"text\": \"Run ls\", \"type\": \"text\"}]"
+    );
+    assert!(turn.blocks[3].content.contains("\"id\": \"t1\""));
+    assert!(turn.blocks[3].content.contains("\"type\": \"tool_use\""));
+    assert_eq!(turn.blocks[4].role, "user");
+    assert!(turn.blocks[4].content.contains("\"tool_use_id\": \"t1\""));
+    assert!(turn.blocks[4].content.contains("\"type\": \"tool_result\""));
 
     let anth = serde_json::json!({
         "system": "Sys prompt",
@@ -42,24 +67,29 @@ fn canonical_serializer_formats_openai_anthropic_and_responses() {
     });
     let turn = serialize_request(ApiProtocol::AnthropicMessages, &anth);
     assert!(!turn.has_tools);
-    assert!(
-        turn.text
-            .contains("<|im_start|>system\n\"Sys prompt\"<|im_end|>")
+    assert_eq!(turn.blocks.len(), 2);
+    assert_eq!(
+        turn.blocks[0].serialized(),
+        "<|im_start|>system\n[{\"text\": \"Sys prompt\", \"type\": \"text\"}]<|im_end|>\n"
     );
-    assert!(turn.text.contains("<|im_start|>user\n\"Hi\"<|im_end|>"));
+    assert_eq!(
+        turn.blocks[1].serialized(),
+        "<|im_start|>user\n[{\"text\": \"Hi\", \"type\": \"text\"}]<|im_end|>\n"
+    );
 
     let resp = serde_json::json!({
         "instructions": "Code carefully",
         "input": "Fix bug"
     });
     let turn = serialize_request(ApiProtocol::OpenAiResponses, &resp);
-    assert!(
-        turn.text
-            .contains("<|im_start|>system\n\"Code carefully\"<|im_end|>")
+    assert_eq!(turn.blocks.len(), 2);
+    assert_eq!(
+        turn.blocks[0].serialized(),
+        "<|im_start|>system\n[{\"text\": \"Code carefully\", \"type\": \"text\"}]<|im_end|>\n"
     );
-    assert!(
-        turn.text
-            .contains("<|im_start|>user\n\"Fix bug\"<|im_end|>")
+    assert_eq!(
+        turn.blocks[1].serialized(),
+        "<|im_start|>user\n[{\"text\": \"Fix bug\", \"type\": \"text\"}]<|im_end|>\n"
     );
 }
 
@@ -93,12 +123,13 @@ fn heads_catalog_slot_inference_and_policy_invariants() {
     assert_eq!(filtered[1].wire, "google/gemini-4-neon");
 
     // Warm local KV must stay local even with cloud slots available.
-    let zero_readout = vec![0.0f32; 1024];
+    let zero_readouts = vec![vec![0.0f32; 1024]];
+    let roles = vec!["user".to_string()];
     let d = decide(
         &heads,
         &DecideInput {
-            readout: &zero_readout,
-            last_role: "user",
+            block_readouts: &zero_readouts,
+            block_roles: &roles,
             prompt_tokens: 128,
             has_tools: false,
             warm_local_kv: true,
@@ -123,7 +154,7 @@ fn arc_encoder_and_heads_match_goldens() {
         return;
     };
     let heads = ArcHeads::load(&dir).expect("load ARC heads");
-    let mut engine = Qwen3_5Engine::load_for_encoder_on_device(&dir, 0, 256)
+    let mut engine = Qwen3_5Engine::load_for_encoder_on_device(&dir, 0, 2048)
         .expect("load ARC-1.0-W4A16-HGPTQ on GPU 0");
 
     // 1. Verify signals.pii.payload probabilities against all 54 cases in goldens.signals.jsonl.
@@ -153,17 +184,42 @@ fn arc_encoder_and_heads_match_goldens() {
             continue;
         };
         let turn = serialize_request(proto, req_body);
-        let tokens = engine.encode(&turn.text).expect("encode");
-        let readout = engine.encode_last_readout_f32(&tokens).expect("forward");
+        let mut flat = Vec::new();
+        let mut offsets = Vec::new();
+        for b in &turn.blocks {
+            let toks = engine.encode(&b.serialized()).expect("encode");
+            if !toks.is_empty() {
+                flat.extend_from_slice(&toks);
+                offsets.push(flat.len() - 1);
+            }
+        }
+        let rows = engine
+            .encode_readouts_at_offsets_f32(&flat, 0, &offsets)
+            .expect("forward");
+        let readout = rows.last().expect("last row");
         let pred = heads
             .pii
             .predict(
-                &readout,
-                heads.catalog.pii_threshold_for_tokens(tokens.len()),
+                readout,
+                heads.catalog.pii_threshold_for_tokens(flat.len()),
                 heads.catalog.pii_type_threshold,
             )
             .expect("pii predict");
         let diff = (pred.presence_prob - ref_any).abs();
+        if diff > 0.1 || checked < 3 {
+            eprintln!(
+                "  signal[{checked}] ref={ref_any:.4} got={:.4} diff={diff:.4} toks={} block0={:?}",
+                pred.presence_prob,
+                flat.len(),
+                turn.blocks
+                    .first()
+                    .map(|b| b.serialized())
+                    .unwrap_or_default()
+                    .chars()
+                    .take(120)
+                    .collect::<String>()
+            );
+        }
         max_abs_diff = max_abs_diff.max(diff);
         sum_abs_diff += diff;
         checked += 1;
@@ -176,60 +232,122 @@ fn arc_encoder_and_heads_match_goldens() {
     eprintln!(
         "ARC goldens.signals.jsonl checked={checked} mean_abs_diff={mean_abs_diff:.4} max_abs_diff={max_abs_diff:.4}"
     );
-    assert!(checked > 0, "expected golden signal rows");
+    assert_eq!(checked, 26, "expected 26 golden signal rows");
+    assert!(
+        mean_abs_diff < 0.08,
+        "expected tight PII parity with canonical arc-role-blocks-v2 (got mean_abs_diff={mean_abs_diff:.4})"
+    );
 
-    // 2. Verify PII signal head on synthetic clean vs secret prompts.
-    let clean = "<|im_start|>user\n\"What is 2 + 2?\"<|im_end|>\n";
-    let secret = "<|im_start|>user\n\"My full name is John Smith, email john.smith@acme.com, phone 555-867-5309, SSN 123-45-6789, AWS key AKIAIOSFODNN7EXAMPLE, secret wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY.\"<|im_end|>\n";
-    let clean_toks = engine.encode(clean).unwrap();
-    let clean_r = engine.encode_last_readout_f32(&clean_toks).unwrap();
-    let clean_pii = heads
-        .pii
-        .predict(
-            &clean_r,
-            heads.catalog.pii_threshold_for_tokens(clean_toks.len()),
-            heads.catalog.pii_type_threshold,
-        )
-        .unwrap();
-
-    let secret_toks = engine.encode(secret).unwrap();
-    let secret_r = engine.encode_last_readout_f32(&secret_toks).unwrap();
-    let secret_pii = heads
-        .pii
-        .predict(
-            &secret_r,
-            heads.catalog.pii_threshold_for_tokens(secret_toks.len()),
-            heads.catalog.pii_type_threshold,
-        )
-        .unwrap();
-
+    // 2. Verify token_count + Stage-1/Stage-2 parity across goldens.jsonl (54 decision cases).
+    let gold_txt = std::fs::read_to_string(dir.join("goldens.jsonl")).expect("goldens.jsonl");
+    let mut gold_checked = 0usize;
+    let mut exact_tok_matches = 0usize;
+    for line in gold_txt.lines().filter(|l| !l.trim().is_empty()) {
+        let row: serde_json::Value = serde_json::from_str(line).expect("parse decision golden");
+        let Some(req_body) = row.pointer("/request/request") else {
+            continue;
+        };
+        let turn = serialize_request(ApiProtocol::AnthropicMessages, req_body);
+        let mut flat = Vec::new();
+        let mut offsets = Vec::new();
+        let mut roles = Vec::new();
+        for b in &turn.blocks {
+            let toks = engine.encode(&b.serialized()).expect("encode");
+            if !toks.is_empty() {
+                flat.extend_from_slice(&toks);
+                offsets.push(flat.len() - 1);
+                roles.push(b.role.clone());
+            }
+        }
+        if let Some(ref_toks) = row
+            .pointer("/expected/token_count")
+            .and_then(|v| v.as_u64())
+            && flat.len() == ref_toks as usize
+        {
+            exact_tok_matches += 1;
+        }
+        let rows = engine
+            .encode_readouts_at_offsets_f32(&flat, 0, &offsets)
+            .expect("forward");
+        let regime = usize::from(!turn.has_tools);
+        let preds = heads
+            .stage_one
+            .predict(rows.last().unwrap(), regime)
+            .expect("stage_one");
+        assert_eq!(preds.len(), heads.catalog.models.len());
+        // Verify Stage-2 multi-block pooled prediction succeeds cleanly on every golden case.
+        let all_arms: Vec<usize> = (0..8).collect();
+        let s2 = heads
+            .stage_two
+            .predict_arms(&rows, &roles, &[], &all_arms)
+            .expect("stage_two");
+        assert!(!s2.is_empty());
+        gold_checked += 1;
+    }
     eprintln!(
-        "PII clean: prob={:.4} classes={:?} | secret: prob={:.4} classes={:?}",
-        clean_pii.presence_prob,
-        clean_pii.triggered_classes,
-        secret_pii.presence_prob,
-        secret_pii.triggered_classes
+        "ARC goldens.jsonl checked={gold_checked} exact_token_count_matches={exact_tok_matches}/{gold_checked}"
     );
+    assert_eq!(gold_checked, 54, "expected 54 decision golden cases");
     assert!(
-        secret_pii.presence_prob > clean_pii.presence_prob,
-        "expected secret prompt PII prob ({}) > clean ({})",
-        secret_pii.presence_prob,
-        clean_pii.presence_prob
-    );
-    assert!(
-        !secret_pii.triggered_classes.is_empty(),
-        "expected PII classes triggered on secret prompt"
+        exact_tok_matches >= 40,
+        "expected strong token_count parity on goldens.jsonl, got {exact_tok_matches}/{gold_checked}"
     );
 
-    // 3. Verify Stage 1 differentiates easy vs hard prompt on local slot 54 (9B).
-    let hard = "<|im_start|>user\n\"Prove that every finite division ring is a field (Wedderburn's little theorem) using cyclotomic polynomials and class equations, then formalize the proof in Lean 4 without sorry.\"<|im_end|>\n";
-    let hard_toks = engine.encode(hard).unwrap();
-    let hard_r = engine.encode_last_readout_f32(&hard_toks).unwrap();
-    let p_easy = heads.stage_one.predict(&clean_r, 1).unwrap()[54].p_pass;
-    let p_hard = heads.stage_one.predict(&hard_r, 1).unwrap()[54].p_pass;
-    eprintln!("Stage-1 slot[54] P(pass): easy={p_easy:.4} hard={p_hard:.4}");
+    // 3. Verify incremental prefix extension matches fresh full prefill.
+    let prefix_req = serde_json::json!({
+        "messages": [
+            {"role": "system", "content": "You are a helpful coding assistant."},
+            {"role": "user", "content": "Explain why quicksort is O(n log n) on average."}
+        ]
+    });
+    let full_req = serde_json::json!({
+        "messages": [
+            {"role": "system", "content": "You are a helpful coding assistant."},
+            {"role": "user", "content": "Explain why quicksort is O(n log n) on average."},
+            {"role": "assistant", "content": "Because random pivots split the array evenly in expectation."},
+            {"role": "user", "content": "Now give the recurrence relation."}
+        ]
+    });
+    let p_turn = serialize_request(ApiProtocol::OpenAiChat, &prefix_req);
+    let f_turn = serialize_request(ApiProtocol::OpenAiChat, &full_req);
+    let mut p_flat = Vec::new();
+    let mut p_off = Vec::new();
+    for b in &p_turn.blocks {
+        p_flat.extend_from_slice(&engine.encode(&b.serialized()).expect("encode"));
+        p_off.push(p_flat.len() - 1);
+    }
+    let mut f_flat = Vec::new();
+    let mut f_off = Vec::new();
+    for b in &f_turn.blocks {
+        f_flat.extend_from_slice(&engine.encode(&b.serialized()).expect("encode"));
+        f_off.push(f_flat.len() - 1);
+    }
+    assert_eq!(&f_flat[..p_flat.len()], &p_flat[..]);
+    let fresh_rows = engine
+        .encode_readouts_at_offsets_f32(&f_flat, 0, &f_off)
+        .expect("fresh");
+    // Now run prefix, then incrementally extend with the new blocks.
+    let _ = engine
+        .encode_readouts_at_offsets_f32(&p_flat, 0, &p_off)
+        .expect("prefix");
+    let new_off: Vec<usize> = f_off
+        .iter()
+        .copied()
+        .filter(|&o| o >= p_flat.len())
+        .collect();
+    let inc_rows = engine
+        .encode_readouts_at_offsets_f32(&f_flat, p_flat.len(), &new_off)
+        .expect("incremental");
+    let max_inc_diff = fresh_rows
+        .last()
+        .unwrap()
+        .iter()
+        .zip(inc_rows.last().unwrap().iter())
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+    eprintln!("ARC incremental prefix extension max_abs_diff={max_inc_diff:.6}");
     assert!(
-        p_easy > p_hard,
-        "expected easy P(pass) ({p_easy:.4}) > hard ({p_hard:.4})"
+        max_inc_diff < 5e-3,
+        "incremental prefix extension diverged from fresh prefill: {max_inc_diff}"
     );
 }

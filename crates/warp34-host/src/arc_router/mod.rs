@@ -208,12 +208,12 @@ impl ArcRouter {
     ) -> Result<RoutingDecision, String> {
         let t0 = std::time::Instant::now();
         let canonical = serialize_request(protocol, body);
-        let enc = self.encoder.encode(canonical.text).await?;
+        let enc = self.encoder.encode_blocks(canonical.blocks).await?;
         let mut decision = decide(
             &self.heads,
             &DecideInput {
-                readout: &enc.readout,
-                last_role: canonical.last_role,
+                block_readouts: &enc.block_readouts,
+                block_roles: &enc.block_roles,
                 prompt_tokens: enc.prompt_tokens,
                 has_tools: canonical.has_tools,
                 warm_local_kv,

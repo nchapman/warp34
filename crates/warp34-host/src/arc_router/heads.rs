@@ -839,30 +839,67 @@ impl StageTwoHead {
         })
     }
 
-    /// Score a subset of arms (or all arms if `arm_indices` is empty) using the latest readout.
+    /// Score a subset of arms using multi-block pooled history (`rayline-arc-decide` parity).
     pub fn predict_arms(
         &self,
-        readout: &[f32],
-        role: &str,
+        block_readouts: &[Vec<f32>],
+        block_roles: &[String],
+        block_source_arms: &[Option<usize>],
         arm_indices: &[usize],
     ) -> Result<Vec<(usize, ArmScore)>, String> {
-        if readout.len() != self.dim {
+        let steps = block_readouts.len();
+        if steps == 0 || block_roles.len() != steps {
             return Err(format!(
-                "stage_two readout dim {} != {}",
-                readout.len(),
-                self.dim
+                "stage_two requires non-empty matching block_readouts ({steps}) and block_roles ({})",
+                block_roles.len()
             ));
         }
-        let role_idx = ROLES.iter().position(|&r| r == role).unwrap_or(1);
         let mut pooled = vec![0f32; self.dim + self.arm_dim + self.role_dim];
-        pooled[..self.dim].copy_from_slice(readout);
-        let role_emb = &self.roles[role_idx * self.role_dim..(role_idx + 1) * self.role_dim];
-        pooled[self.dim + self.arm_dim..].copy_from_slice(role_emb);
+        for (i, readout) in block_readouts.iter().enumerate() {
+            if readout.len() != self.dim {
+                return Err(format!(
+                    "stage_two readout[{i}] dim {} != {}",
+                    readout.len(),
+                    self.dim
+                ));
+            }
+            for (dst, &v) in pooled[..self.dim].iter_mut().zip(readout.iter()) {
+                *dst += v;
+            }
+            if let Some(src_arm) = block_source_arms.get(i).copied().flatten()
+                && src_arm < self.arms
+            {
+                let src_vec =
+                    &self.arm_vectors[src_arm * self.arm_dim..(src_arm + 1) * self.arm_dim];
+                for (dst, &v) in pooled[self.dim..self.dim + self.arm_dim]
+                    .iter_mut()
+                    .zip(src_vec.iter())
+                {
+                    *dst += v;
+                }
+            }
+            let role_idx = ROLES
+                .iter()
+                .position(|&r| r == block_roles[i].as_str())
+                .unwrap_or(1);
+            let role_emb = &self.roles[role_idx * self.role_dim..(role_idx + 1) * self.role_dim];
+            for (dst, &v) in pooled[self.dim + self.arm_dim..]
+                .iter_mut()
+                .zip(role_emb.iter())
+            {
+                *dst += v;
+            }
+        }
+        let inv_steps = 1.0f32 / (steps as f32);
+        for v in &mut pooled {
+            *v *= inv_steps;
+        }
+        let latest_readout = &block_readouts[steps - 1];
 
         let hidden = self.hidden;
         let mut shared = vec![0f32; 2 * hidden];
         let (semantic, state) = shared.split_at_mut(hidden);
-        self.context.apply(readout, 0, semantic, false);
+        self.context.apply(latest_readout, 0, semantic, false);
         self.history.apply(&pooled, 0, state, false);
         let mut base = vec![0f32; hidden];
         self.trunk_in.apply(&shared, 0, &mut base, false);
@@ -954,7 +991,7 @@ impl PiiPayloadHead {
             .iter()
             .zip(&self.mean)
             .zip(&self.scale)
-            .map(|((&x, &m), &s)| (x - m) * s)
+            .map(|((&x, &m), &s)| if s != 0.0 { (x - m) / s } else { 0.0 })
             .collect();
         let mut h = vec![0f32; self.fc0.rows];
         self.fc0.apply(&z, 0, &mut h, false);
