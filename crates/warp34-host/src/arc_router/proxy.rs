@@ -76,16 +76,6 @@ impl UpstreamProxy {
             obj.insert("model".to_string(), Value::String(wire_model.to_string()));
         }
 
-        // OpenRouter's Gemini `functionResponse` translator runs a broken `{...}` extractor on
-        // non-JSON `role: "tool"` strings (turning Python `.format()` `{}` into `[{},{},{},{}]`).
-        // Wrapping non-JSON-object tool strings in `{"result": s}` prevents output corruption.
-        if endpoint.dialect == WireDialect::OpenRouter
-            && protocol == ApiProtocol::OpenAiChat
-            && wire_model.starts_with("google/")
-        {
-            sanitize_openrouter_gemini_tool_messages(&mut body);
-        }
-
         let mut req = self.client.post(&url).json(&body);
         if endpoint.dialect == WireDialect::AnthropicNative {
             req = req.header("anthropic-version", "2023-06-01");
@@ -149,54 +139,5 @@ impl UpstreamProxy {
         }
         super::apply_routing_headers(resp.headers_mut(), decision);
         resp
-    }
-}
-
-/// Wraps non-JSON-object `role: "tool"` string contents in `{"result": s}` so OpenRouter's
-/// Gemini `functionResponse` adapter does not run its broken `{...}` JSON-salvage extractor
-/// over raw Python/bash tool outputs.
-pub fn sanitize_openrouter_gemini_tool_messages(body: &mut Value) {
-    let Some(msgs) = body.get_mut("messages").and_then(|v| v.as_array_mut()) else {
-        return;
-    };
-    for msg in msgs {
-        if msg.get("role").and_then(|v| v.as_str()) != Some("tool") {
-            continue;
-        }
-        let Some(content) = msg.get("content").and_then(|v| v.as_str()) else {
-            continue;
-        };
-        let is_json_object = serde_json::from_str::<Value>(content)
-            .ok()
-            .is_some_and(|v| v.is_object());
-        if !is_json_object {
-            let wrapped = serde_json::json!({ "result": content }).to_string();
-            if let Some(obj) = msg.as_object_mut() {
-                obj.insert("content".to_string(), Value::String(wrapped));
-            }
-        }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn openrouter_gemini_guard_wraps_plain_tool_output_and_preserves_json_objects() {
-        let mut body = serde_json::json!({
-            "model": "google/gemini-4-hydrogen",
-            "messages": [
-                {"role": "tool", "tool_call_id": "c1", "content": "n_inputs={}, n_outputs={}"},
-                {"role": "tool", "tool_call_id": "c2", "content": "{\"ok\":true}"},
-                {"role": "user", "content": "hi"}
-            ]
-        });
-        sanitize_openrouter_gemini_tool_messages(&mut body);
-        let c0 = body["messages"][0]["content"].as_str().unwrap();
-        let parsed: Value = serde_json::from_str(c0).expect("valid json");
-        assert_eq!(parsed["result"], "n_inputs={}, n_outputs={}");
-        assert_eq!(body["messages"][1]["content"], "{\"ok\":true}");
-        assert_eq!(body["messages"][2]["content"], "hi");
     }
 }
