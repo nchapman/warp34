@@ -88,6 +88,7 @@ struct PoolKey {
     hash: u64,
 }
 
+#[derive(Debug)]
 struct PoolState {
     entries: HashMap<PoolKey, Arc<SharedPrefixEntry>>,
     /// Distinct token lengths currently present in `entries` -> count of entries at that length.
@@ -99,6 +100,7 @@ struct PoolState {
 }
 
 /// Thread-safe, memory-bounded in-process L2 prefix cache shared across all DP replicas.
+#[derive(Debug)]
 pub struct SharedDpPrefixPool {
     max_bytes: usize,
     page_size: usize,
@@ -440,6 +442,51 @@ impl SharedDpPrefixPool {
                 }
                 st.lru.push_back(key);
                 return Some(cloned);
+            }
+        }
+        None
+    }
+
+    /// Non-mutating probe returning `(matched_tokens, has_proposer_features)` for the longest
+    /// cached prefix strictly longer than `min_tokens`, without touching LRU order or hit stats.
+    pub fn peek_longest_match(
+        &self,
+        lora_id: i32,
+        tokens: &[i32],
+        min_tokens: usize,
+    ) -> Option<(usize, bool)> {
+        let floor = min_tokens.max(DP_L2_MIN_PREFIX_TOKENS.saturating_sub(1));
+        if self.max_bytes == 0 || tokens.len() <= floor || self.is_empty() {
+            return None;
+        }
+        let st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let max_candidate = tokens.len();
+        let candidate_lens: Vec<usize> = st
+            .lengths
+            .range((floor + 1)..=max_candidate)
+            .map(|(&len, _)| len)
+            .collect();
+        if candidate_lens.is_empty() {
+            return None;
+        }
+
+        let mut h = seed_for_lora(lora_id);
+        let mut cursor = 0usize;
+        let mut hashed_candidates: Vec<(usize, u64)> = Vec::with_capacity(candidate_lens.len());
+        for len in candidate_lens {
+            for &t in &tokens[cursor..len] {
+                h = fnv_mix_i32(h, t);
+            }
+            cursor = len;
+            hashed_candidates.push((len, h));
+        }
+
+        for (len, hash) in hashed_candidates.into_iter().rev() {
+            let key = PoolKey { lora_id, len, hash };
+            if let Some(entry) = st.entries.get(&key)
+                && entry.token_ids.as_slice() == &tokens[..len]
+            {
+                return Some((len, entry.proposer_features.is_some()));
             }
         }
         None

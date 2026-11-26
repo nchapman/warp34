@@ -41,6 +41,7 @@ pub struct Qwen3_5Engine {
     pub slice_lora_ids: Vec<i32>,
     pub serving_fit: Option<ServingAutoFitPlan>,
     pub dp_rank: usize,
+    pub dp_size: usize,
     pub dp_prefix_pool: Option<std::sync::Arc<crate::dp_prefix_pool::SharedDpPrefixPool>>,
 }
 
@@ -741,6 +742,7 @@ impl Qwen3_5Engine {
             slice_lora_ids: Vec::new(),
             serving_fit: None,
             dp_rank: 0,
+            dp_size: rank_capacity.dp_size.max(1),
             dp_prefix_pool: None,
         })
     }

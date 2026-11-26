@@ -633,7 +633,7 @@ impl Snapshot {
             }
             out.push_str("# HELP warp34_dp_worker_healthy Health status (1=healthy, 0=unavailable) per data-parallel worker.\n# TYPE warp34_dp_worker_healthy gauge\n");
             for (rank, w) in self.workers.iter().enumerate() {
-                let healthy = i32::from(w.status == "ok");
+                let healthy = i32::from(matches!(w.status, "ready" | "ok"));
                 writeln!(
                     out,
                     "warp34_dp_worker_healthy{{dp_rank=\"{rank}\"}} {healthy}"
@@ -944,5 +944,15 @@ mod tests {
         assert!(prom.contains("warp34_dp_worker_kv_utilization{dp_rank=\"0\"} 0.200000"));
         assert!(prom.contains("warp34_dp_worker_kv_utilization{dp_rank=\"1\"} 0.400000"));
         assert!(prom.contains("warp34_dp_worker_kv_utilization{dp_rank=\"2\"} 0.050000"));
+        assert!(prom.contains("warp34_dp_worker_healthy{dp_rank=\"0\"} 1"));
+        assert!(prom.contains("warp34_dp_worker_healthy{dp_rank=\"1\"} 1"));
+        assert!(prom.contains("warp34_dp_worker_healthy{dp_rank=\"2\"} 1"));
+
+        t2.set_status("unavailable");
+        let degraded = Snapshot::aggregate(&[t0.snapshot(), t1.snapshot(), t2.snapshot()]);
+        assert_eq!(degraded.status, "ready");
+        let degraded_prom = degraded.prometheus();
+        assert!(degraded_prom.contains("warp34_dp_worker_healthy{dp_rank=\"0\"} 1"));
+        assert!(degraded_prom.contains("warp34_dp_worker_healthy{dp_rank=\"2\"} 0"));
     }
 }

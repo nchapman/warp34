@@ -108,7 +108,7 @@ impl NativeProposer {
         let start = seq.prefilled_tokens;
         let rem = seq.prompt_tokens.len() - start;
         let mamba_chunk = seq.radix_state.mamba_chunk_size.max(1);
-        let mut max_take = rem.min(chunk.max(1).min(self.max_rows));
+        let mut max_take = rem.min(chunk.max(1).min(self.prefill_max_rows()));
         if let Some(branch_end) = seq.mamba_branching_seqlen {
             let aligned_branch = (branch_end / mamba_chunk) * mamba_chunk;
             if aligned_branch > start && aligned_branch < seq.prompt_tokens.len() {
@@ -159,7 +159,7 @@ impl NativeProposer {
         } else {
             0
         };
-        let features = self.captured(engine)?;
+        let features = self.captured_for_rows(engine, take)?;
         self.ingest_for_prompt_len(engine, radix_tokens, &features, seq.prompt_tokens.len())?;
         seq.radix_state.commit_tokens(radix_tokens, &planned);
         seq.prefilled_tokens = end;
@@ -171,7 +171,8 @@ impl NativeProposer {
                     if engine.dp_prefix_pool.is_some()
                         && let Some((num_tokens, _, _)) =
                             radix.node_kv_pages_and_mamba(seq.radix_state.last_locked_node)
-                        && (num_tokens == 2048 || num_tokens == 4096)
+                        && num_tokens.is_multiple_of(2048)
+                        && num_tokens <= 8192
                         && num_tokens <= seq.radix_key_tokens.len()
                     {
                         engine.try_publish_radix_node_to_shared_pool_with_features(
@@ -203,6 +204,26 @@ impl NativeProposer {
                             .donate_committed_checkpoint(radix, rep, false);
                         engine.free_kv_pages(&don.freed_kv_pages);
                         engine.free_state_slots(&don.freed_mamba_slots);
+                        if engine.dp_prefix_pool.is_some()
+                            && let Some((num_tokens, _, _)) =
+                                radix.node_kv_pages_and_mamba(seq.radix_state.last_locked_node)
+                            && num_tokens.is_multiple_of(2048)
+                            && num_tokens <= 8192
+                            && num_tokens <= seq.radix_key_tokens.len()
+                        {
+                            engine.try_publish_radix_node_to_shared_pool_with_features(
+                                radix,
+                                seq.radix_state.last_locked_node,
+                                seq.lora_id,
+                                &seq.radix_key_tokens,
+                                true,
+                                || {
+                                    self.export_shared_memo_features(
+                                        &seq.radix_key_tokens[..num_tokens],
+                                    )
+                                },
+                            );
+                        }
                     }
                 }
             }
@@ -266,6 +287,24 @@ impl NativeProposer {
                         .donate_committed_checkpoint(radix, rep, false);
                     engine.free_kv_pages(&don.freed_kv_pages);
                     engine.free_state_slots(&don.freed_mamba_slots);
+                    if engine.dp_prefix_pool.is_some()
+                        && let Some((num_tokens, _, _)) =
+                            radix.node_kv_pages_and_mamba(seq.radix_state.last_locked_node)
+                        && num_tokens <= seq.radix_key_tokens.len()
+                    {
+                        engine.try_publish_radix_node_to_shared_pool_with_features(
+                            radix,
+                            seq.radix_state.last_locked_node,
+                            seq.lora_id,
+                            &seq.radix_key_tokens,
+                            true,
+                            || {
+                                self.export_shared_memo_features(
+                                    &seq.radix_key_tokens[..num_tokens],
+                                )
+                            },
+                        );
+                    }
                 }
             }
         }
@@ -537,7 +576,7 @@ impl NativeProposer {
         self.commit_current_memo();
         for slot in &mut self.mtp_batch_slots {
             if let Some(memo) = slot.current.take() {
-                super::push_mtp_memo(&mut self.memos, memo);
+                super::push_mtp_memo_with_budget(&mut self.memos, memo, self.memo_budget);
             }
         }
         // If exiting batch mode while a non-zero slot was active, swap slot 0's tail back in.
@@ -854,7 +893,7 @@ impl NativeProposer {
             self.mtp_batch_slots[src].last_used_tick = 0;
         } else if src == 0 {
             if let Some(memo) = self.mtp_batch_slots[dst].current.take() {
-                super::push_mtp_memo(&mut self.memos, memo);
+                super::push_mtp_memo_with_budget(&mut self.memos, memo, self.memo_budget);
             }
             std::mem::swap(&mut self.tail, &mut self.mtp_batch_slots[dst].tail);
             std::mem::swap(
@@ -880,7 +919,7 @@ impl NativeProposer {
             self.active_slot_last_used_tick = 0;
         } else {
             if let Some(memo) = self.mtp_batch_slots[dst].current.take() {
-                super::push_mtp_memo(&mut self.memos, memo);
+                super::push_mtp_memo_with_budget(&mut self.memos, memo, self.memo_budget);
             }
             self.mtp_batch_slots.swap(src, dst);
             self.mtp_batch_slots[src].resident_tokens.clear();

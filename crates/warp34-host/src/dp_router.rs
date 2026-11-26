@@ -37,6 +37,9 @@ const IDLE_CONTINUATION_MIN_MATCH_RATIO: f64 = 0.65;
 /// Maximum shallow shared-harness match (tokens) that should still spread across cold idle
 /// workers when multiple workers are idle.
 const SHALLOW_HARNESS_MAX_TOKENS: usize = 2048;
+/// Maximum concurrent sequences stacked onto a busy worker while another worker is completely
+/// idle (`4` = `MAX_MTP_BATCH_SLOTS`, avoiding pushing a speculative worker into 1-tok/step plain decode).
+const IDLE_SPREAD_MAX_BUSY_STACK: usize = 4;
 /// Minimum unique prefix-match advantage (tokens) required to award a non-zero prefix bonus.
 const MIN_PREFIX_BONUS_DELTA_TOKENS: usize = 256;
 /// Quadratic length-bonus scale `(delta_matched / scale)^2`.
@@ -442,6 +445,20 @@ pub struct DpRouteContext<'a> {
 ///
 /// Returns `None` only when zero workers are healthy.
 pub fn select_dp_worker(workers: &[WorkerLoadSample], ctx: &DpRouteContext<'_>) -> Option<usize> {
+    select_dp_worker_with_l2(workers, ctx, 0)
+}
+
+/// Worker selection with optional shared L2 Host-RAM prefix pool match length (`l2_matched_tokens`).
+///
+/// When `l2_matched_tokens > 0`, any idle replica can hydrate `l2_matched_tokens` in ~2 ms over
+/// PCIe DMA, so shared harnesses (`> 4096` tokens) spread across idle GPUs instead of piling
+/// onto GPU 0, while genuine single-session multi-turn continuations (`> effective_idle_match + 256`)
+/// remain pinned on their warm replica up to `MAX_MTP_BATCH_SLOTS`.
+pub fn select_dp_worker_with_l2(
+    workers: &[WorkerLoadSample],
+    ctx: &DpRouteContext<'_>,
+    l2_matched_tokens: usize,
+) -> Option<usize> {
     let n = workers.len();
     if n == 0 {
         return None;
@@ -454,32 +471,45 @@ pub fn select_dp_worker(workers: &[WorkerLoadSample], ctx: &DpRouteContext<'_>) 
         return Some(healthy[0]);
     }
 
-    if ctx.policy == DpRoutingPolicy::RoundRobin {
-        let start = ctx.tie_break_cursor % n;
-        for offset in 0..n {
-            let idx = (start + offset) % n;
-            if workers[idx].healthy {
-                return Some(idx);
-            }
-        }
-        return Some(healthy[0]);
-    }
-
     // Hard capacity + admission filter: exclude workers whose KV capacity cannot fit the
-    // prompt (heterogeneous VRAM) or that are KV/queue-saturated, if any other healthy
-    // worker remains available.
-    let fits_prompt: Vec<usize> = healthy
+    // prompt + at least 1 generated token (heterogeneous VRAM) or that are KV/queue-saturated,
+    // if any other healthy worker remains available.
+    let fits_generation: Vec<usize> = healthy
         .iter()
         .copied()
         .filter(|&i| {
-            workers[i].kv_token_capacity == 0 || workers[i].kv_token_capacity >= ctx.prompt_tokens
+            workers[i].kv_token_capacity == 0 || workers[i].kv_token_capacity > ctx.prompt_tokens
         })
         .collect();
+    let fits_prompt: Vec<usize> = if fits_generation.is_empty() {
+        healthy
+            .iter()
+            .copied()
+            .filter(|&i| {
+                workers[i].kv_token_capacity == 0
+                    || workers[i].kv_token_capacity >= ctx.prompt_tokens
+            })
+            .collect()
+    } else {
+        fits_generation
+    };
     let cap_pool = if fits_prompt.is_empty() {
         &healthy
     } else {
         &fits_prompt
     };
+
+    if ctx.policy == DpRoutingPolicy::RoundRobin {
+        let start = ctx.tie_break_cursor % n;
+        for offset in 0..n {
+            let idx = (start + offset) % n;
+            if cap_pool.contains(&idx) {
+                return Some(idx);
+            }
+        }
+        return Some(cap_pool[0]);
+    }
+
     let admitted: Vec<usize> = cap_pool
         .iter()
         .copied()
@@ -523,6 +553,7 @@ pub fn select_dp_worker(workers: &[WorkerLoadSample], ctx: &DpRouteContext<'_>) 
             .map(|&i| matched(i))
             .max()
             .unwrap_or(0);
+        let effective_idle_match = best_idle_match.max(l2_matched_tokens);
         let best_busy_continuation = candidates
             .iter()
             .copied()
@@ -531,29 +562,33 @@ pub fn select_dp_worker(workers: &[WorkerLoadSample], ctx: &DpRouteContext<'_>) 
                 let w = workers[i];
                 let m = matched(i);
                 let ratio = m as f64 / prompt_len as f64;
-                let light_load = w.router_inflight_prefill_tokens < 4096
-                    && w.total_load() < (w.max_num_seqs / 2).max(1);
-                let deep_continuation =
-                    m >= IDLE_SPREAD_MIN_MATCHED_TOKENS && ratio >= IDLE_SPREAD_MIN_MATCH_RATIO;
-                let unique_past_harness = best_idle_match > 0
-                    && m >= best_idle_match.saturating_add(MIN_PREFIX_BONUS_DELTA_TOKENS)
+                let max_busy_stack = (w.max_num_seqs / 2).clamp(1, IDLE_SPREAD_MAX_BUSY_STACK);
+                let light_load =
+                    w.router_inflight_prefill_tokens < 4096 && w.total_load() < max_busy_stack;
+                let deep_continuation = m >= IDLE_SPREAD_MIN_MATCHED_TOKENS
+                    && ratio >= IDLE_SPREAD_MIN_MATCH_RATIO
+                    && m > effective_idle_match.saturating_add(DP_PREFIX_BLOCK_TOKENS);
+                let unique_past_harness = effective_idle_match > 0
+                    && m >= effective_idle_match.saturating_add(MIN_PREFIX_BONUS_DELTA_TOKENS)
                     && ratio >= IDLE_CONTINUATION_MIN_MATCH_RATIO;
                 light_load && (deep_continuation || unique_past_harness)
             })
             .max_by_key(|&i| matched(i));
 
         if let Some(best_busy) = best_busy_continuation
-            && matched(best_busy) > best_idle_match.saturating_add(DP_PREFIX_BLOCK_TOKENS)
+            && matched(best_busy) > effective_idle_match.saturating_add(DP_PREFIX_BLOCK_TOKENS)
         {
             return Some(best_busy);
         }
 
-        // Among multiple idle workers, if the best match is only a shallow shared harness
-        // (<= 2K tokens, < 85% of the prompt) and another idle worker is completely cold
-        // (0 matched tokens), warm the cold idle worker so staggered agents spread evenly.
+        // Among multiple idle workers, if the best match is only a shared harness
+        // (<= 2K tokens or already backed by L2, and < 85% of the prompt) and another idle
+        // worker is completely cold (0 matched tokens), warm the cold idle worker so staggered
+        // agents spread evenly.
         if idle_candidates.len() > 1
             && best_idle_match > 0
-            && best_idle_match <= SHALLOW_HARNESS_MAX_TOKENS
+            && (best_idle_match <= SHALLOW_HARNESS_MAX_TOKENS
+                || l2_matched_tokens >= best_idle_match)
             && (best_idle_match as f64 / prompt_len as f64) < 0.85
         {
             let cold_idle: Vec<usize> = idle_candidates
@@ -674,6 +709,7 @@ impl SessionAffinityMap {
 pub struct DpRouterCore {
     pub policy: DpRoutingPolicy,
     pub prefix_dir: Arc<DpPrefixDirectory>,
+    l2_pool: Option<Arc<crate::dp_prefix_pool::SharedDpPrefixPool>>,
     inflight: Vec<AtomicUsize>,
     inflight_prefill_tokens: Vec<AtomicUsize>,
     /// Short critical section serializing load read -> `select_dp_worker` -> atomic increment
@@ -749,11 +785,20 @@ impl Drop for InflightGuard {
 
 impl DpRouterCore {
     pub fn new(num_workers: usize, policy: DpRoutingPolicy) -> Arc<Self> {
+        Self::with_l2_pool(num_workers, policy, None)
+    }
+
+    pub fn with_l2_pool(
+        num_workers: usize,
+        policy: DpRoutingPolicy,
+        l2_pool: Option<Arc<crate::dp_prefix_pool::SharedDpPrefixPool>>,
+    ) -> Arc<Self> {
         let inflight = (0..num_workers).map(|_| AtomicUsize::new(0)).collect();
         let inflight_prefill_tokens = (0..num_workers).map(|_| AtomicUsize::new(0)).collect();
         Arc::new(Self {
             policy,
             prefix_dir: Arc::new(DpPrefixDirectory::new()),
+            l2_pool,
             inflight,
             inflight_prefill_tokens,
             select_lock: Mutex::new(()),
@@ -806,6 +851,15 @@ impl DpRouterCore {
         } else {
             Vec::new()
         };
+        let l2_matched_tokens =
+            if self.policy == DpRoutingPolicy::Prefix && !prompt_tokens.is_empty() {
+                self.l2_pool
+                    .as_ref()
+                    .and_then(|pool| pool.peek_longest_match(lora_id, prompt_tokens, 0))
+                    .map_or(0, |(len, _)| len)
+            } else {
+                0
+            };
         let pinned_worker = session_key.and_then(|k| self.lookup_session(k));
 
         let (chosen, uncached_prompt_tokens) = {
@@ -815,7 +869,7 @@ impl DpRouterCore {
                 sample.router_inflight_prefill_tokens = self.inflight_prefill_tokens(i);
             }
             let cursor = self.cursor.fetch_add(1, Ordering::Relaxed);
-            let chosen = select_dp_worker(
+            let chosen = select_dp_worker_with_l2(
                 &samples,
                 &DpRouteContext {
                     policy: self.policy,
@@ -824,8 +878,13 @@ impl DpRouterCore {
                     pinned_worker,
                     tie_break_cursor: cursor,
                 },
+                l2_matched_tokens,
             )?;
-            let matched_on_chosen = matched.get(chosen).copied().unwrap_or(0);
+            let matched_on_chosen = matched
+                .get(chosen)
+                .copied()
+                .unwrap_or(0)
+                .max(l2_matched_tokens);
             let uncached_prompt_tokens = prompt_tokens.len().saturating_sub(matched_on_chosen);
             self.inflight[chosen].fetch_add(1, Ordering::AcqRel);
             if uncached_prompt_tokens > 0 {
@@ -1325,5 +1384,104 @@ mod tests {
             },
         );
         assert_eq!(chosen, Some(1));
+
+        // Boundary & RoundRobin capacity filter: prompt == 16_384 leaves 0 generation room on
+        // `small`, so both RoundRobin and Prefix must pick `large`.
+        for policy in [DpRoutingPolicy::RoundRobin, DpRoutingPolicy::Prefix] {
+            assert_eq!(
+                select_dp_worker(
+                    &[small, large],
+                    &DpRouteContext {
+                        policy,
+                        prompt_tokens: 16_384,
+                        matched_tokens: &[16_384, 0],
+                        pinned_worker: None,
+                        tie_break_cursor: 0,
+                    },
+                ),
+                Some(1)
+            );
+        }
+    }
+
+    #[test]
+    fn l2_backed_6k_shared_harness_spreads_to_idle_gpu_and_caps_mtp_busy_stack() {
+        let base = crate::lora::BASE_MODEL_LORA_ID;
+        let l2 = Arc::new(crate::dp_prefix_pool::SharedDpPrefixPool::new(
+            64 * 1024 * 1024,
+            16,
+        ));
+        let harness_6k: Vec<i32> = (1..=6144).collect();
+        assert!(l2.insert(crate::dp_prefix_pool::SharedPrefixEntry::new(
+            base,
+            harness_6k.clone(),
+            harness_6k.len() / 16,
+            vec![vec![0x11; 1024]],
+            vec![],
+            Some(vec![0x22; 1024]),
+            0,
+        )));
+
+        let router = DpRouterCore::with_l2_pool(2, DpRoutingPolicy::Prefix, Some(Arc::clone(&l2)));
+        router.prefix_dir.record_insert(0, base, &harness_6k);
+
+        // Agent B arrives with the 6K shared harness + 512 unique tokens (6,656 total, >92% match
+        // on GPU 0) while GPU 0 is busy (1 active) and GPU 1 is idle (cold L1, warm L2).
+        // Because L2 holds all 6,144 harness tokens, GPU 1 must be chosen and charged only
+        // 512 uncached prefill tokens!
+        let mut agent_b = harness_6k.clone();
+        agent_b.extend(90_000..90_512);
+        let (chosen_b, guard_b) = router
+            .select_and_acquire(
+                vec![busy_worker(1, 0, 0.10), idle_worker()],
+                base,
+                &agent_b,
+                None,
+            )
+            .expect("worker");
+        assert_eq!(
+            chosen_b, 1,
+            "6K shared harness backed by L2 must spread to idle GPU 1 instead of stacking on GPU 0"
+        );
+        assert_eq!(
+            router.inflight_prefill_tokens(1),
+            512,
+            "L2 hydration leaves only the 512-token unique suffix as uncached prefill load"
+        );
+        drop(guard_b);
+
+        // Genuine Turn-2 continuation of Agent A on GPU 0 (6K harness + 2K unique Turn 1 = 8,192
+        // cached on GPU 0 vs 6,144 in L2) stays pinned on GPU 0 when load < 4!
+        let mut agent_a_t1 = harness_6k.clone();
+        agent_a_t1.extend(50_000..52_048);
+        router.prefix_dir.record_insert(0, base, &agent_a_t1);
+        let mut agent_a_t2 = agent_a_t1.clone();
+        agent_a_t2.extend(52_048..52_560);
+        let (chosen_a2, guard_a2) = router
+            .select_and_acquire(
+                vec![busy_worker(2, 0, 0.15), idle_worker()],
+                base,
+                &agent_a_t2,
+                None,
+            )
+            .expect("worker");
+        assert_eq!(
+            chosen_a2, 0,
+            "genuine multi-turn continuation (> L2 harness + 256) must stay pinned on GPU 0"
+        );
+        drop(guard_a2);
+
+        // Once GPU 0 already has 4 active MTP slots (`IDLE_SPREAD_MAX_BUSY_STACK = 4`) while GPU 1
+        // is completely idle, a 5th request spills to idle GPU 1 rather than knocking GPU 0 out
+        // of 4-slot MTP-3 into 1-tok/step plain decode.
+        let (chosen_fifth, _guard5) = router
+            .select_and_acquire(
+                vec![busy_worker(4, 0, 0.25), idle_worker()],
+                base,
+                &agent_a_t2,
+                None,
+            )
+            .expect("worker");
+        assert_eq!(chosen_fifth, 1);
     }
 }

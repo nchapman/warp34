@@ -1520,6 +1520,7 @@ pub struct PlannedCheckpoint {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct RadixDonationOutcome {
     pub donated_seq_len: usize,
+    pub donated_node: Option<RadixNodeId>,
     pub freed_kv_pages: Vec<i32>,
     pub freed_draft_pages: Vec<i32>,
     pub freed_mamba_slots: Vec<i32>,
@@ -1795,6 +1796,7 @@ impl ReqRadixState {
                 radix.mark_node_decode_tail(ins.terminal_node);
             }
             outcome.donated_seq_len = cache_len;
+            outcome.donated_node = Some(ins.terminal_node);
             outcome
                 .freed_kv_pages
                 .extend_from_slice(&ins.freed_duplicate_kv_pages);

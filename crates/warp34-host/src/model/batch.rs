@@ -492,8 +492,12 @@ impl Qwen3_5Engine {
             return;
         }
         // Throttle redundant synchronous D2H publishes on every short turn of a long pinned
-        // agent trajectory: once a checkpoint > 4K is in the pool, only refresh every ~4K tokens.
-        if num_tokens > 4096 && pool.has_recent_prefix_within(lora_id, prefix_tokens, 4096) {
+        // agent trajectory: scale the refresh stride proportionally past 4K (4K at 8K–16K,
+        // 8K at 32K, 14K at 56K) so deep sessions halve D2H churn while keeping spillover fresh.
+        let refresh_stride = (num_tokens / 4).max(4096);
+        if num_tokens > 4096
+            && pool.has_recent_prefix_within(lora_id, prefix_tokens, refresh_stride)
+        {
             return;
         }
         // Guard against allocating oversized host buffers that `pool.insert` would immediately
@@ -541,26 +545,48 @@ impl Qwen3_5Engine {
         if est_total > pool.max_bytes() / 2 {
             return;
         }
+        let uses_ple = self.cfg.uses_ple();
+        let has_ckpt_ranks = is_hybrid_gdn || uses_ple;
+        let kv_pages_ref = &kv_pages;
+        let exported = crate::coordinated::run_tp_closures(
+            self.tp_workers.as_deref(),
+            self.ranks.iter().map(|r| {
+                move || {
+                    let kv_bytes = r
+                        .kv_pool
+                        .export_pages_to_host_bytes(kv_pages_ref, &r.stream)
+                        .ok()?;
+                    let ckpt_entry = if is_hybrid_gdn {
+                        let ckpt = r.checkpoint_pool.as_ref()?;
+                        let (frame, ple_ngram_context) =
+                            ckpt.export_slot_to_host_bytes(mamba_slot, &r.stream).ok()?;
+                        Some(crate::dp_prefix_pool::SharedGdnCheckpoint {
+                            frame,
+                            ple_ngram_context,
+                        })
+                    } else if uses_ple {
+                        let idx = usize::try_from(mamba_slot).ok()?;
+                        let &ple_ngram_context = r.state_pool.ple_ngram_context.get(idx)?;
+                        Some(crate::dp_prefix_pool::SharedGdnCheckpoint {
+                            frame: Vec::new(),
+                            ple_ngram_context,
+                        })
+                    } else {
+                        None
+                    };
+                    Some((kv_bytes, ckpt_entry))
+                }
+            }),
+        );
         let mut kv_ranks = Vec::with_capacity(self.ranks.len());
-        let mut ckpt_ranks = Vec::with_capacity(if is_hybrid_gdn { self.ranks.len() } else { 0 });
-        for r in &self.ranks {
-            let Ok(kv_bytes) = r.kv_pool.export_pages_to_host_bytes(&kv_pages, &r.stream) else {
+        let mut ckpt_ranks = Vec::with_capacity(if has_ckpt_ranks { self.ranks.len() } else { 0 });
+        for item in exported {
+            let Some((kv_bytes, ckpt_opt)) = item else {
                 return;
             };
             kv_ranks.push(kv_bytes);
-            if is_hybrid_gdn {
-                let Some(ckpt) = r.checkpoint_pool.as_ref() else {
-                    return;
-                };
-                let Ok((frame, ple_ngram_context)) =
-                    ckpt.export_slot_to_host_bytes(mamba_slot, &r.stream)
-                else {
-                    return;
-                };
-                ckpt_ranks.push(crate::dp_prefix_pool::SharedGdnCheckpoint {
-                    frame,
-                    ple_ngram_context,
-                });
+            if let Some(c) = ckpt_opt {
+                ckpt_ranks.push(c);
             }
         }
         let entry = crate::dp_prefix_pool::SharedPrefixEntry::new(
@@ -606,9 +632,11 @@ impl Qwen3_5Engine {
         } else {
             0
         };
+        let uses_ple = self.cfg.uses_ple();
+        let has_ckpt_ranks = is_hybrid_gdn || uses_ple;
         let entry = pool.lookup_longest_match(lora_id, raw_radix_tokens, min_tokens)?;
         if entry.kv_ranks.len() != self.ranks.len()
-            || entry.ckpt_ranks.len() != if is_hybrid_gdn { self.ranks.len() } else { 0 }
+            || entry.ckpt_ranks.len() != if has_ckpt_ranks { self.ranks.len() } else { 0 }
         {
             return None;
         }
@@ -626,16 +654,14 @@ impl Qwen3_5Engine {
         let ckpt_slot = if is_hybrid_gdn {
             self.alloc_checkpoint_slot_from(radix)?
         } else {
-            0
+            self.alloc_state_slot_from(radix)?
         };
         let mut vram_pages = Vec::with_capacity(need_pages);
         for _ in 0..need_pages {
             let mut allocated_this_step: Vec<(usize, i32)> = Vec::with_capacity(self.ranks.len());
             let Some(p0) = self.ranks[0].kv_pool.alloc_page() else {
                 self.free_kv_pages(&vram_pages);
-                if is_hybrid_gdn {
-                    self.free_state_slots(&[ckpt_slot]);
-                }
+                self.free_state_slots(&[ckpt_slot]);
                 return None;
             };
             allocated_this_step.push((0, p0));
@@ -659,43 +685,63 @@ impl Qwen3_5Engine {
                     self.ranks[rank_idx].kv_pool.free_page(pid);
                 }
                 self.free_kv_pages(&vram_pages);
-                if is_hybrid_gdn {
-                    self.free_state_slots(&[ckpt_slot]);
-                }
+                self.free_state_slots(&[ckpt_slot]);
                 return None;
             }
             vram_pages.push(p0);
         }
 
-        let mut import_ok = true;
-        for (rank_idx, r) in self.ranks.iter_mut().enumerate() {
-            if r.kv_pool
-                .import_pages_from_host_bytes(&vram_pages, &entry.kv_ranks[rank_idx], &r.stream)
-                .is_err()
-            {
-                import_ok = false;
-                break;
-            }
-            if is_hybrid_gdn {
-                let Some(ckpt) = r.checkpoint_pool.as_mut() else {
-                    import_ok = false;
-                    break;
-                };
-                let c = &entry.ckpt_ranks[rank_idx];
-                if ckpt
-                    .import_host_bytes_to_slot(ckpt_slot, &c.frame, c.ple_ngram_context, &r.stream)
-                    .is_err()
-                {
-                    import_ok = false;
-                    break;
+        let vram_pages_ref = &vram_pages;
+        let entry_ref = entry.as_ref();
+        let pool_workers = self.tp_workers.clone();
+        let import_ok = crate::coordinated::run_tp_closures(
+            pool_workers.as_deref(),
+            self.ranks.iter_mut().enumerate().map(|(rank_idx, r)| {
+                move || -> bool {
+                    if r.kv_pool
+                        .import_pages_from_host_bytes(
+                            vram_pages_ref,
+                            &entry_ref.kv_ranks[rank_idx],
+                            &r.stream,
+                        )
+                        .is_err()
+                    {
+                        return false;
+                    }
+                    if is_hybrid_gdn {
+                        let Some(ckpt) = r.checkpoint_pool.as_mut() else {
+                            return false;
+                        };
+                        let c = &entry_ref.ckpt_ranks[rank_idx];
+                        if ckpt
+                            .import_host_bytes_to_slot(
+                                ckpt_slot,
+                                &c.frame,
+                                c.ple_ngram_context,
+                                &r.stream,
+                            )
+                            .is_err()
+                        {
+                            return false;
+                        }
+                    } else if uses_ple {
+                        let Ok(idx) = usize::try_from(ckpt_slot) else {
+                            return false;
+                        };
+                        let Some(dst) = r.state_pool.ple_ngram_context.get_mut(idx) else {
+                            return false;
+                        };
+                        *dst = entry_ref.ckpt_ranks[rank_idx].ple_ngram_context;
+                    }
+                    true
                 }
-            }
-        }
+            }),
+        )
+        .into_iter()
+        .all(|ok| ok);
         if !import_ok {
             self.free_kv_pages(&vram_pages);
-            if is_hybrid_gdn {
-                self.free_state_slots(&[ckpt_slot]);
-            }
+            self.free_state_slots(&[ckpt_slot]);
             return None;
         }
 
@@ -704,7 +750,7 @@ impl Qwen3_5Engine {
         let ins = radix.insert(&entry.token_ids, &vram_pages, &[], ckpt_slot, 0);
         radix.active_lora_id = prev_lora;
         self.free_kv_pages(&ins.freed_duplicate_kv_pages);
-        if ins.mamba_already_existed && is_hybrid_gdn {
+        if ins.mamba_already_existed {
             self.free_state_slots(&[ckpt_slot]);
         }
         pool.record_hydration(entry.token_ids.len());
@@ -1164,6 +1210,8 @@ impl Qwen3_5Engine {
                     };
                     r.last_logits_ptr = logits_ptr;
                     r.last_logits_rows = bucket_b;
+                    r.last_mtp_hidden_ptr = 0;
+                    r.last_mtp_hidden_rows = 0;
                     Ok(())
                 }
             }
@@ -1312,6 +1360,8 @@ impl Qwen3_5Engine {
         };
         r0.last_logits_ptr = logits_ptr;
         r0.last_logits_rows = bucket_b;
+        r0.last_mtp_hidden_ptr = 0;
+        r0.last_mtp_hidden_rows = 0;
 
         if scatter_next_tokens_on_device {
             let ex0 = r0.stream.exec(0, 0);

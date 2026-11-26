@@ -115,12 +115,20 @@ impl OpenAiServerState {
             return Err("from_loaders_with_options requires at least one loader".to_owned());
         }
         let dp_size = loaders.len();
-        let dp_router = crate::dp_router::DpRouterCore::new(dp_size, options.dp_routing);
+        let shared_l2_pool = if dp_size > 1 {
+            crate::dp_prefix_pool::SharedDpPrefixPool::auto_sized(16)
+        } else {
+            None
+        };
+        let dp_router = crate::dp_router::DpRouterCore::with_l2_pool(
+            dp_size,
+            options.dp_routing,
+            shared_l2_pool.clone(),
+        );
         let config = SchedulerConfig {
             max_num_seqs: options.max_num_seqs,
             ..SchedulerConfig::default()
         };
-        let mut shared_l2_pool: Option<Arc<crate::dp_prefix_pool::SharedDpPrefixPool>> = None;
         let mut workers = if dp_size == 1 {
             let loader = loaders.into_iter().next().unwrap();
             let dir = Arc::clone(&dp_router.prefix_dir);
@@ -129,7 +137,6 @@ impl OpenAiServerState {
             vec![w]
         } else {
             let max_model_len = options.max_model_len;
-            shared_l2_pool = crate::dp_prefix_pool::SharedDpPrefixPool::auto_sized(16);
             if let Some(pool) = &shared_l2_pool {
                 eprintln!(
                     "[warp34] DP shared L2 host-RAM prefix pool enabled ({:.2} GiB cap across {dp_size} replicas)",
@@ -312,6 +319,15 @@ impl OpenAiServerState {
     /// Selects a DP worker using the configured [`crate::dp_router::DpRoutingPolicy`],
     /// returning `(dp_rank, worker, Option<InflightGuard>)`.
     ///
+    /// Maximum serving context length across healthy DP workers (supporting heterogeneous VRAM).
+    pub fn max_healthy_model_len(&self) -> usize {
+        self.all_workers()
+            .filter(|w| !w.is_panicked() && !w.is_stopping())
+            .map(EngineWorker::max_model_len)
+            .max()
+            .unwrap_or_else(|| self.worker.max_model_len())
+    }
+
     /// When `images` is non-empty and the model has a vision encoder, hashes the
     /// content-hashed multimodal radix key (`vision::compute_multimodal_radix_key`) so
     /// multi-turn VLM prompts match the exact keys stored in `MambaRadixCache`.
@@ -542,7 +558,7 @@ pub fn router(state: Arc<OpenAiServerState>) -> Router {
     .with_state(state)
 }
 async fn models(State(s): State<Arc<OpenAiServerState>>) -> Json<Value> {
-    let max_model_len = s.worker.max_model_len();
+    let max_model_len = s.max_healthy_model_len();
     let mut data = Vec::with_capacity(1 + s.worker.lora_registry.len());
     data.push(json!({
         "id": s.model_name,
@@ -764,6 +780,7 @@ enum PrepareMode {
     CountTokens,
 }
 
+#[cfg_attr(test, derive(Debug))]
 enum PrepareError {
     BadRequest(String),
     ContextLengthExceeded {
@@ -783,6 +800,22 @@ impl From<&str> for PrepareError {
     fn from(msg: &str) -> Self {
         Self::BadRequest(msg.to_owned())
     }
+}
+
+fn clamp_max_tokens_for_worker(
+    max_tokens: usize,
+    prompt_len: usize,
+    worker_max_len: usize,
+    param: &'static str,
+) -> Result<usize, PrepareError> {
+    if prompt_len >= worker_max_len {
+        return Err(PrepareError::ContextLengthExceeded {
+            prompt_tokens: prompt_len,
+            max_model_len: worker_max_len,
+            param,
+        });
+    }
+    Ok(max_tokens.min(worker_max_len - prompt_len))
 }
 
 fn prepare_openai_err(err: PrepareError) -> ApiError {
@@ -1126,7 +1159,7 @@ fn prepare(
     }
     let mut soft_output_budget = false;
     if mode == PrepareMode::Generate {
-        let max_len = s.worker.max_model_len();
+        let max_len = s.max_healthy_model_len();
         if prompt.len() >= max_len {
             return Err(PrepareError::ContextLengthExceeded {
                 prompt_tokens: prompt.len(),
@@ -1233,7 +1266,7 @@ async fn generate(
             crate::request_constraints::RequestConstraint::parse(&json),
             Ok(None)
         );
-    let prepared = if inline_fast {
+    let mut prepared = if inline_fast {
         prepare(&prep_state, json, chat, PrepareMode::Generate).map_err(prepare_openai_err)?
     } else {
         cpu_with(
@@ -1251,7 +1284,7 @@ async fn generate(
     let mut log = prepared.turn_log(
         id.clone(),
         if chat { "chat" } else { "completions" },
-        s.worker.max_model_len(),
+        s.max_healthy_model_len(),
     );
     let prompt_len = prepared.prompt.len();
     let (_dp_rank, target_worker, inflight_guard) = s
@@ -1263,6 +1296,14 @@ async fn generate(
         )
         .inspect_err(|_| log.finish("error", false))
         .map_err(worker_api_err)?;
+    prepared.params.max_tokens = clamp_max_tokens_for_worker(
+        prepared.params.max_tokens,
+        prompt_len,
+        target_worker.max_model_len(),
+        if chat { "messages" } else { "prompt" },
+    )
+    .inspect_err(|_| log.finish("error", false))
+    .map_err(prepare_openai_err)?;
     let mut generation = target_worker
         .submit_with_images_lora_and_budget_mode(
             prepared.prompt,
@@ -1921,7 +1962,7 @@ async fn responses_create(
     )
     .map_err(responses_api_err)?;
     let prep_state = s.clone();
-    let prepared = cpu_with(
+    let mut prepared = cpu_with(
         &s,
         move || prepare(&prep_state, chat_req, true, PrepareMode::Generate),
         prepare_responses_err,
@@ -1934,7 +1975,7 @@ async fn responses_create(
     let mut log = prepared.turn_log(
         meta.response_id.clone(),
         "responses",
-        s.worker.max_model_len(),
+        s.max_healthy_model_len(),
     );
     let prompt_len = prepared.prompt.len();
     let (dp_rank, target_worker, inflight_guard) = s
@@ -1946,6 +1987,14 @@ async fn responses_create(
         )
         .inspect_err(|_| log.finish("error", false))
         .map_err(worker_api_err)?;
+    prepared.params.max_tokens = clamp_max_tokens_for_worker(
+        prepared.params.max_tokens,
+        prompt_len,
+        target_worker.max_model_len(),
+        "input",
+    )
+    .inspect_err(|_| log.finish("error", false))
+    .map_err(prepare_responses_err)?;
     s.bind_session_to_worker(format!("resp:{}", meta.response_id), dp_rank);
     let mut generation = target_worker
         .submit_with_images_lora_and_budget_mode(
@@ -2249,7 +2298,7 @@ async fn anthropic_messages(
         crate::anthropic_api::translate_anthropic_to_chat(&body, &s.model_name, request_id, true)
             .map_err(|e| anthropic_api_err(StatusCode::BAD_REQUEST, e))?;
     let prep_state = s.clone();
-    let prepared = cpu_with(
+    let mut prepared = cpu_with(
         &s,
         move || prepare(&prep_state, chat_req, true, PrepareMode::Generate),
         prepare_anthropic_err,
@@ -2259,7 +2308,7 @@ async fn anthropic_messages(
     let mut log = prepared.turn_log(
         meta.message_id.clone(),
         "anthropic",
-        s.worker.max_model_len(),
+        s.max_healthy_model_len(),
     );
     let prompt_len = prepared.prompt.len();
     let (_dp_rank, target_worker, inflight_guard) = s
@@ -2271,6 +2320,14 @@ async fn anthropic_messages(
         )
         .inspect_err(|_| log.finish("error", false))
         .map_err(worker_anthropic_err)?;
+    prepared.params.max_tokens = clamp_max_tokens_for_worker(
+        prepared.params.max_tokens,
+        prompt_len,
+        target_worker.max_model_len(),
+        "messages",
+    )
+    .inspect_err(|_| log.finish("error", false))
+    .map_err(prepare_anthropic_err)?;
     let mut generation = target_worker
         .submit_with_images_lora_and_budget_mode(
             prepared.prompt,
@@ -2880,5 +2937,25 @@ mod tests {
             joined_args,
             r#"{"path":"src/scene.js","content":"hello world"}"#
         );
+    }
+
+    #[test]
+    fn clamp_max_tokens_for_worker_rejects_prompt_at_or_above_worker_capacity() {
+        assert_eq!(
+            super::clamp_max_tokens_for_worker(4096, 12_000, 16_384, "messages").unwrap(),
+            4096
+        );
+        assert_eq!(
+            super::clamp_max_tokens_for_worker(8192, 12_000, 16_384, "messages").unwrap(),
+            4384
+        );
+        let err_eq =
+            super::clamp_max_tokens_for_worker(256, 16_384, 16_384, "messages").unwrap_err();
+        let (st, body) = super::prepare_openai_err(err_eq);
+        assert_eq!(st, StatusCode::BAD_REQUEST);
+        assert_eq!(body.0["error"]["code"], "context_length_exceeded");
+        let err_gt = super::clamp_max_tokens_for_worker(256, 20_000, 16_384, "input").unwrap_err();
+        let (rst, _) = super::prepare_responses_err(err_gt);
+        assert_eq!(rst, StatusCode::BAD_REQUEST);
     }
 }

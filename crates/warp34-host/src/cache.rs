@@ -267,12 +267,16 @@ impl PageBitmap {
 }
 
 #[cfg(feature = "cuda")]
+const KV_DMA_STAGING_BYTES: usize = 8 * 1024 * 1024;
+
+#[cfg(feature = "cuda")]
 pub struct KvPool {
     pub device_id: i32,
     pub num_pages: usize,
     pub block_size: usize,
     pub layers: Vec<KvLayerBuffer>,
     pub host_swap: Option<HostKvSwapPool>,
+    dma_staging: std::sync::Mutex<Option<Option<crate::cuda::MappedHostBuffer>>>,
     free_pages: PageBitmap,
 }
 
@@ -351,6 +355,7 @@ impl KvPool {
             block_size,
             layers,
             host_swap: None,
+            dma_staging: std::sync::Mutex::new(None),
             free_pages,
         })
     }
@@ -560,6 +565,37 @@ impl KvPool {
             i += len;
         }
 
+        let mut stage_guard = self.dma_staging.lock().unwrap();
+        let stage_opt = stage_guard
+            .get_or_insert_with(|| crate::cuda::MappedHostBuffer::alloc(KV_DMA_STAGING_BYTES).ok())
+            .as_ref();
+        let mut stage_used = 0usize;
+        let mut pending: Vec<(usize, usize, usize)> = Vec::new();
+        let flush_d2h = |stage: &crate::cuda::MappedHostBuffer,
+                         pending: &mut Vec<(usize, usize, usize)>,
+                         stage_used: &mut usize,
+                         out: &mut [u8]|
+         -> Result<()> {
+            if pending.is_empty() {
+                return Ok(());
+            }
+            stream.synchronize()?;
+            for &(stage_off, dst_off, len) in pending.iter() {
+                // SAFETY: `stage_off + len <= stage.len_bytes` and `dst_off + len <= out.len()`,
+                // and `stream.synchronize()` completed all queued D2H DMA writes into `stage`.
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        (stage.host_ptr as *const u8).add(stage_off),
+                        out.as_mut_ptr().add(dst_off),
+                        len,
+                    );
+                }
+            }
+            pending.clear();
+            *stage_used = 0;
+            Ok(())
+        };
+
         let mut cursor = 0usize;
         for layer in &self.layers {
             let k_stride = layer.k_buf.len_bytes / self.num_pages;
@@ -581,19 +617,47 @@ impl KvPool {
                     let bytes = run_len * stride;
                     let dst_off = cursor + page_idx * stride;
                     let src = dev_addr + (vram_start * stride) as u64;
-                    crate::cuda::check_rc(
-                        // SAFETY: `out` is sized to `total_bytes` covering every layer and
-                        // page; `src` is bounds-checked within `0..self.num_pages`.
-                        unsafe {
-                            warp34_kernels::ffi::warp34_memcpy_d2h_async(
-                                out.as_mut_ptr().add(dst_off).cast(),
-                                src as *const core::ffi::c_void,
-                                bytes,
-                                stream.handle,
-                            )
-                        },
-                        label,
-                    )?;
+                    if let Some(stage) = stage_opt
+                        && stage.len_bytes > 0
+                    {
+                        let mut off = 0usize;
+                        while off < bytes {
+                            let take = (bytes - off).min(stage.len_bytes);
+                            if stage_used + take > stage.len_bytes {
+                                flush_d2h(stage, &mut pending, &mut stage_used, &mut out)?;
+                            }
+                            crate::cuda::check_rc(
+                                // SAFETY: `stage_used + take <= stage.len_bytes` in pinned host
+                                // memory; `src + off` is bounds-checked within `0..self.num_pages`.
+                                unsafe {
+                                    warp34_kernels::ffi::warp34_memcpy_d2h_async(
+                                        (stage.host_ptr as *mut u8).add(stage_used).cast(),
+                                        (src + off as u64) as *const core::ffi::c_void,
+                                        take,
+                                        stream.handle,
+                                    )
+                                },
+                                label,
+                            )?;
+                            pending.push((stage_used, dst_off + off, take));
+                            stage_used += take;
+                            off += take;
+                        }
+                    } else {
+                        crate::cuda::check_rc(
+                            // SAFETY: `out` is sized to `total_bytes` covering every layer and
+                            // page; `src` is bounds-checked within `0..self.num_pages`.
+                            unsafe {
+                                warp34_kernels::ffi::warp34_memcpy_d2h_async(
+                                    out.as_mut_ptr().add(dst_off).cast(),
+                                    src as *const core::ffi::c_void,
+                                    bytes,
+                                    stream.handle,
+                                )
+                            },
+                            label,
+                        )?;
+                    }
                 }
                 cursor += n * stride;
                 Ok(())
@@ -608,7 +672,13 @@ impl KvPool {
                 copy_buf(comp.addr(), comp_stride, "KvPool export QSA comp K D2H")?;
             }
         }
-        stream.synchronize()?;
+        if let Some(stage) = stage_opt
+            && stage.len_bytes > 0
+        {
+            flush_d2h(stage, &mut pending, &mut stage_used, &mut out)?;
+        } else {
+            stream.synchronize()?;
+        }
         Ok(out)
     }
 
@@ -675,6 +745,12 @@ impl KvPool {
             i += len;
         }
 
+        let mut stage_guard = self.dma_staging.lock().unwrap();
+        let stage_opt = stage_guard
+            .get_or_insert_with(|| crate::cuda::MappedHostBuffer::alloc(KV_DMA_STAGING_BYTES).ok())
+            .as_ref();
+        let mut stage_used = 0usize;
+
         let mut cursor = 0usize;
         for layer in &self.layers {
             let k_stride = layer.k_buf.len_bytes / self.num_pages;
@@ -696,19 +772,55 @@ impl KvPool {
                     let copy_bytes = run_len * stride;
                     let src_off = cursor + page_idx * stride;
                     let dst = dev_addr + (vram_start * stride) as u64;
-                    crate::cuda::check_rc(
-                        // SAFETY: `bytes.len() == expected_bytes`; `dst` is bounds-checked
-                        // within `0..self.num_pages`, and we sync before returning.
-                        unsafe {
-                            warp34_kernels::ffi::warp34_memcpy_h2d_async(
-                                dst as *mut core::ffi::c_void,
-                                bytes.as_ptr().add(src_off).cast(),
-                                copy_bytes,
-                                stream.handle,
-                            )
-                        },
-                        label,
-                    )?;
+                    if let Some(stage) = stage_opt
+                        && stage.len_bytes > 0
+                    {
+                        let mut off = 0usize;
+                        while off < copy_bytes {
+                            let take = (copy_bytes - off).min(stage.len_bytes);
+                            if stage_used + take > stage.len_bytes {
+                                stream.synchronize()?;
+                                stage_used = 0;
+                            }
+                            // SAFETY: `stage_used + take <= stage.len_bytes` and `src_off + off + take <= bytes.len()`.
+                            unsafe {
+                                std::ptr::copy_nonoverlapping(
+                                    bytes.as_ptr().add(src_off + off),
+                                    (stage.host_ptr as *mut u8).add(stage_used),
+                                    take,
+                                );
+                            }
+                            crate::cuda::check_rc(
+                                // SAFETY: `stage` stays untouched until `stream.synchronize()` before
+                                // resetting `stage_used` or returning; `dst` is within `0..self.num_pages`.
+                                unsafe {
+                                    warp34_kernels::ffi::warp34_memcpy_h2d_async(
+                                        (dst + off as u64) as *mut core::ffi::c_void,
+                                        (stage.host_ptr as *const u8).add(stage_used).cast(),
+                                        take,
+                                        stream.handle,
+                                    )
+                                },
+                                label,
+                            )?;
+                            stage_used += take;
+                            off += take;
+                        }
+                    } else {
+                        crate::cuda::check_rc(
+                            // SAFETY: `bytes.len() == expected_bytes`; `dst` is bounds-checked
+                            // within `0..self.num_pages`, and we sync before returning.
+                            unsafe {
+                                warp34_kernels::ffi::warp34_memcpy_h2d_async(
+                                    dst as *mut core::ffi::c_void,
+                                    bytes.as_ptr().add(src_off).cast(),
+                                    copy_bytes,
+                                    stream.handle,
+                                )
+                            },
+                            label,
+                        )?;
+                    }
                 }
                 cursor += n * stride;
                 Ok(())
@@ -723,7 +835,9 @@ impl KvPool {
                 copy_buf(comp.addr(), comp_stride, "KvPool import QSA comp K H2D")?;
             }
         }
-        stream.synchronize()?;
+        if stage_opt.is_none_or(|s| s.len_bytes == 0) || stage_used > 0 {
+            stream.synchronize()?;
+        }
         Ok(())
     }
 
@@ -911,7 +1025,21 @@ impl StateBundlePool {
     }
 
     pub fn alloc_slot(&mut self) -> Option<i32> {
-        self.free_slots.pop()
+        if let Some(slot) = self.free_slots.pop() {
+            return Some(slot);
+        }
+        if self.layers.is_empty()
+            && self.ple_conv_state.is_none()
+            && self.ple_ngram_context.is_empty()
+        {
+            let slot = i32::try_from(self.total_slots).ok()?;
+            if is_checkpoint_pool_slot(slot) {
+                return None;
+            }
+            self.total_slots += 1;
+            return Some(slot);
+        }
+        None
     }
 
     pub fn free_slot(&mut self, slot: i32) {
@@ -1132,5 +1260,19 @@ mod tests {
         bm.reset();
         assert_eq!(bm.free_count(), 130);
         assert_eq!(bm.alloc(), Some(0));
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn stateless_state_bundle_pool_mints_unique_slots_when_initial_pool_empty() {
+        let mut pool = StateBundlePool::new(0, &[], 0, 0, 4, 0, 0, 0).unwrap();
+        assert_eq!(pool.total_slots, 0);
+        assert_eq!(pool.alloc_slot(), Some(0));
+        assert_eq!(pool.alloc_slot(), Some(1));
+        assert_eq!(pool.total_slots, 2);
+        pool.free_slot(0);
+        assert_eq!(pool.alloc_slot(), Some(0));
+        assert_eq!(pool.alloc_slot(), Some(2));
+        assert_eq!(pool.total_slots, 3);
     }
 }

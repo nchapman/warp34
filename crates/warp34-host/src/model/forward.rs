@@ -1086,6 +1086,18 @@ impl Qwen3_5ModelRank {
         )?;
         self.last_norm_hidden_ptr = final_out;
         self.last_norm_hidden_rows = rows;
+        self.last_mtp_hidden_ptr = match &self.final_residual {
+            FinalResidual::SingleStream {
+                norm_has_folded_signs: true,
+                ..
+            } => final_hc_ctx.residual_buf,
+            FinalResidual::HyperConnection { .. } => final_hc_ctx.hc_residual_buf,
+            FinalResidual::SingleStream {
+                norm_has_folded_signs: false,
+                ..
+            } => final_out,
+        };
+        self.last_mtp_hidden_rows = rows;
         if let Some(dump) = dump_out
             && self.rank == 0
         {

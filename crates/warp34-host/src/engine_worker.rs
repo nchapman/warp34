@@ -1142,12 +1142,51 @@ fn release(engine: &mut Qwen3_5Engine, donation: Option<crate::radix::RadixDonat
 }
 
 fn finish_early(engine: &mut Qwen3_5Engine, sched: &mut SchedulerV1, req_id: u64) {
+    finish_early_with_proposer(engine, sched, req_id, None);
+}
+
+fn finish_early_with_proposer(
+    engine: &mut Qwen3_5Engine,
+    sched: &mut SchedulerV1,
+    req_id: u64,
+    proposer_override: Option<&crate::proposer::NativeProposer>,
+) {
+    let publish_info = engine
+        .dp_prefix_pool
+        .is_some()
+        .then(|| {
+            sched
+                .active
+                .iter()
+                .find(|s| s.req_id == req_id)
+                .and_then(|seq| {
+                    (seq.prefix_bidir_len.is_none() && seq.generated_tokens.len() <= 1)
+                        .then(|| (seq.lora_id, seq.radix_key_tokens.clone()))
+                })
+        })
+        .flatten();
     let out = if engine.has_checkpoint_pool() {
         sched.finish_request_early_with(req_id, |r| engine.alloc_checkpoint_slot_from(r))
     } else {
         sched.finish_request_early(req_id)
     };
+    let donated_node = out.as_ref().and_then(|o| o.donated_node);
     release(engine, out);
+    if let (Some((lora_id, radix_tokens)), Some(node_id)) = (publish_info, donated_node)
+        && let Some((num_tokens, _, _)) = sched.radix.node_kv_pages_and_mamba(node_id)
+        && num_tokens <= radix_tokens.len()
+    {
+        let prop = proposer_override.or(engine.speculative.as_ref());
+        let has_mtp = prop.is_some_and(|p| p.is_mtp());
+        engine.try_publish_radix_node_to_shared_pool_with_features(
+            &sched.radix,
+            node_id,
+            lora_id,
+            &radix_tokens,
+            has_mtp,
+            || prop.and_then(|p| p.export_shared_memo_features(&radix_tokens[..num_tokens])),
+        );
+    }
 }
 
 fn enqueue(
