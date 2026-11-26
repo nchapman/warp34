@@ -1744,8 +1744,6 @@ pub(crate) fn run_serve(
                     "government_id",
                     "financial_account",
                     "payment_card",
-                    "health",
-                    "any",
                 ]
                 .into_iter()
                 .map(String::from)

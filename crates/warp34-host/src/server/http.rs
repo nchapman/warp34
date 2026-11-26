@@ -1321,17 +1321,11 @@ impl OpenAiServerState {
         {
             return Ok(None);
         }
-        // KV-cache boundary awareness: if caller carries a warm session key bound to a local worker
-        // (or a continuing multi-turn thread with active local prefix cache), stay local to preserve KV.
-        let warm_session = session_key
+        // KV-cache boundary awareness: if caller carries a warm session key bound to a local worker,
+        // stay local to preserve the resident KV prefix cache.
+        let warm_local_kv = session_key
             .and_then(|k| self.dp_router.lookup_session(k))
             .is_some();
-        let warm_local_kv = warm_session
-            || (self.metrics.snapshot().tokens.cached > 0
-                && body
-                    .get("messages")
-                    .and_then(Value::as_array)
-                    .is_some_and(|m| m.len() >= 3));
 
         let decision = router
             .route(protocol, body, warm_local_kv)
