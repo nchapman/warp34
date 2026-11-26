@@ -694,15 +694,26 @@ fn load_35b_tp1_or_skip_low_vram(model: &str) -> Option<Qwen3_5Engine> {
 #[test]
 fn real_weight_sparse_moe_m4_m8_m16_and_actual_tp1_tp2() {
     let _guard = GPU_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let model = "nchapman/Qwen3.6-35B-A3B-W4A16-HGPTQ";
-    if common::require_or_skip_cached_model(
-        model,
+    let model_id = "nchapman/Qwen3.6-35B-A3B-W4A16-HGPTQ";
+    let Some(cached_dir) = common::require_or_skip_cached_model(
+        model_id,
         "real_weight_sparse_moe_m4_m8_m16_and_actual_tp1_tp2",
-    )
-    .is_none()
-    {
+    ) else {
         return;
-    }
+    };
+    // Prefer the exact pinned snapshot revision matching `tools/oracle/goldens/vllm_moe_layer0_m8.json`
+    // so newer `refs/main` downloads in the shared HF cache cannot drift `config.json` SHA-256.
+    const PINNED_35B_REV: &str = "4f5de21c886d79e17af5b8a4bfc625e226703fb6";
+    let pinned_dir = cached_dir
+        .parent()
+        .map(|snapshots_dir| snapshots_dir.join(PINNED_35B_REV))
+        .filter(|dir| dir.join("config.json").is_file());
+    let model_owned = pinned_dir
+        .as_ref()
+        .and_then(|d| d.to_str())
+        .unwrap_or(model_id)
+        .to_string();
+    let model = model_owned.as_str();
 
     // 1. Validate real layer-0 MoE weights (including live router, shared expert, and shared gate)
     // across M = 4 (vec4), M = 8 & 16 & 64 (sparse MMA), and M = 306 (3-chunk Grouped MMA in 8 MiB scratch).
