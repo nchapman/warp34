@@ -522,7 +522,15 @@ pub(super) fn step_plain(
             .materialize_pending_checkpoint(&mut seq.radix_state)
             .map_err(WorkerError::Cuda)?;
     }
+    let prev_batched_cap = sched.cfg.max_num_batched_tokens;
+    if engine.speculative.as_ref().is_some_and(|p| p.is_dflash()) {
+        let tap_cap = engine.ranks[0].max_tap_rows;
+        if tap_cap > 0 && tap_cap < prev_batched_cap {
+            sched.cfg.max_num_batched_tokens = tap_cap;
+        }
+    }
     let slices = sched.schedule_step();
+    sched.cfg.max_num_batched_tokens = prev_batched_cap;
     if slices.is_empty() {
         return Ok(());
     }

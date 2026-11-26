@@ -2851,6 +2851,7 @@ impl NativeProposer {
             || pending_ingests.len() != b_reqs
             || anchors.len() != b_reqs
             || k_budgets.len() != b_reqs
+            || k_budgets.iter().all(|&k| k == 0)
         {
             return Ok(None);
         }

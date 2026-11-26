@@ -402,6 +402,18 @@ fn waiting_needs_plain_for_unwarmed_long_radix(
     unwarmed_long_radix_decision(local_matched, local_can_restore, l2_probe, l2_can_restore)
 }
 
+fn effective_spec_batch_limit(
+    max_num_seqs: usize,
+    proposer: &crate::proposer::NativeProposer,
+) -> usize {
+    let kind_cap = if proposer.is_dflash() {
+        crate::dflash::MAX_DFLASH_DRAFT_BATCH
+    } else {
+        crate::mtp::MAX_MTP_BATCH_SLOTS
+    };
+    max_num_seqs.min(proposer.batch_slot_count()).min(kind_cap)
+}
+
 fn admit_into_mtp_batch_slots(
     engine: &mut Qwen3_5Engine,
     proposer: &mut crate::proposer::NativeProposer,
@@ -413,7 +425,7 @@ fn admit_into_mtp_batch_slots(
     let slot_limit = if engine.cfg.uses_tiered_moe() {
         1
     } else {
-        saved_max.min(proposer.batch_slot_count())
+        effective_spec_batch_limit(saved_max, proposer)
     };
     let mut active_reserved: usize = sched
         .active
@@ -616,7 +628,7 @@ fn yield_single_speculation(
         let slot_limit = engine
             .speculative
             .as_ref()
-            .map_or(0, |p| p.batch_slot_count());
+            .map_or(0, |p| effective_spec_batch_limit(sched.cfg.max_num_seqs, p));
         let w0_need = mtp_batch_pages_needed(
             w0.prompt_tokens.len(),
             w0.max_new_tokens,
@@ -794,11 +806,11 @@ fn extend_or_yield_mtp_batch(
         let slot_limit = engine
             .speculative
             .as_ref()
-            .map_or(0, |p| p.batch_slot_count());
+            .map_or(0, |p| effective_spec_batch_limit(sched.cfg.max_num_seqs, p));
         let active_cap = if engine.cfg.uses_tiered_moe() {
             1
         } else {
-            sched.cfg.max_num_seqs.min(slot_limit)
+            slot_limit
         };
         let active_reserved: usize = sched
             .active
@@ -897,16 +909,7 @@ fn try_promote_plain_active_to_mtp_batch(
     let Some(mut proposer) = engine.speculative.take() else {
         return;
     };
-    let slot_limit =
-        sched
-            .cfg
-            .max_num_seqs
-            .min(proposer.batch_slot_count())
-            .min(if proposer.is_dflash() {
-                crate::dflash::MAX_DFLASH_DRAFT_BATCH
-            } else {
-                crate::mtp::MAX_MTP_BATCH_SLOTS
-            });
+    let slot_limit = effective_spec_batch_limit(sched.cfg.max_num_seqs, &proposer);
     let active_count = sched.active.len();
     if active_count == 0 || active_count > slot_limit {
         engine.speculative = Some(proposer);
@@ -1091,7 +1094,7 @@ fn admit_requests(
         let batch_slot_limit = engine
             .speculative
             .as_ref()
-            .map_or(0, |p| p.batch_slot_count());
+            .map_or(0, |p| effective_spec_batch_limit(sched.cfg.max_num_seqs, p));
         // Use multi-slot speculation by default whenever the server allows concurrent slots
         // (`max_num_seqs >= 2`), even for `target_batch == 1`, so alternating sequential
         // sessions (e.g. Claude Code main turns + background classifier calls) stay warm in

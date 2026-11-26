@@ -1982,29 +1982,49 @@ fn dflash2_projected_ctx_plain_recovery_and_batched_draft_parity() {
     plain_logprobs.logprobs = true;
     plain_logprobs.top_logprobs = 2;
 
-    rt.block_on(async {
+    let (t3_prompt, out3, t4a_prompt, out4a, t4b_prompt, out4b) = rt.block_on(async {
         // Turn 1: initial DFlash2 speculative turn.
+        let r0 = worker.stats.telemetry.snapshot().speculation.rounds;
         let mut st1 = worker.submit(t1_prompt.clone(), greedy.clone(), None).unwrap();
         let (out1, _) = tokio::time::timeout(Duration::from_secs(120), collect_with_cached(&mut st1, 32))
             .await
             .unwrap()
             .unwrap();
         assert!(!out1.is_empty());
+        let r1 = worker.stats.telemetry.snapshot().speculation.rounds;
+        assert!(r1 > r0, "Turn 1 should execute DFlash2 speculative rounds (r0={r0}, r1={r1})");
 
-        // Turn 2: logprobs forces `step_plain`, recording projected `ctx` into `plain_memos`.
+        // Turn 2: two concurrent `logprobs=true` requests force genuine `step_plain`
+        // (batched speculation rejects `logprobs`, unlike a lone single-slot request),
+        // recording projected `ctx` into `plain_memos` with zero speculative rounds.
         let mut t2_prompt = t1_prompt.clone();
         t2_prompt.extend_from_slice(&out1);
         t2_prompt.extend_from_slice(&t2_suffix);
+        let mut t2_peer = t1_prompt.clone();
+        t2_peer.extend_from_slice(&encode(" Peer plain request with logprobs."));
         let mut st2 = worker
             .submit(t2_prompt.clone(), plain_logprobs.clone(), None)
             .unwrap();
-        let (out2, cached2) =
-            tokio::time::timeout(Duration::from_secs(120), collect_with_cached(&mut st2, 32))
-                .await
-                .unwrap()
-                .unwrap();
-        assert!(!out2.is_empty());
+        let mut st2_peer = worker
+            .submit(t2_peer, plain_logprobs.clone(), None)
+            .unwrap();
+        let (res2, res2_peer) = tokio::time::timeout(Duration::from_secs(120), async {
+            tokio::join!(
+                collect_with_cached(&mut st2, 32),
+                collect_with_cached(&mut st2_peer, 32),
+            )
+        })
+        .await
+        .unwrap();
+        let (out2, cached2) = res2.unwrap();
+        let (out2_peer, _) = res2_peer.unwrap();
+        assert!(!out2.is_empty() && !out2_peer.is_empty());
         assert!(cached2 > 0, "Turn 2 should reuse warm radix prefix from Turn 1");
+        let r2 = worker.stats.telemetry.snapshot().speculation.rounds;
+        assert_eq!(
+            r2, r1,
+            "Turn 2 concurrent logprobs should run in step_plain without speculative rounds (r1={r1}, r2={r2})"
+        );
 
         // Turn 3: greedy continuation MUST recover DFlash2 from projected `ctx` `plain_memos`
         // while preserving the warm radix prefix from Turn 2.
@@ -2023,6 +2043,11 @@ fn dflash2_projected_ctx_plain_recovery_and_batched_draft_parity() {
             "Turn 3 should hit warm radix prefix after step_plain recovery (cached={cached3}, t2_len={})",
             t2_prompt.len()
         );
+        let r3 = worker.stats.telemetry.snapshot().speculation.rounds;
+        assert!(
+            r3 > r2,
+            "Turn 3 should recover DFlash2 speculation from projected ctx plain_memos (r2={r2}, r3={r3})"
+        );
 
         // Turn 4: concurrent B=2 greedy continuations exercise batched DFlash2 drafting
         // (`try_ingest_and_propose_dflash_batch` + `batched_select_greedy_graphs`).
@@ -2033,8 +2058,8 @@ fn dflash2_projected_ctx_plain_recovery_and_batched_draft_parity() {
         t4b_prompt.extend_from_slice(&out3);
         t4b_prompt.extend_from_slice(&t4b_suffix);
 
-        let mut st4a = worker.submit(t4a_prompt, greedy.clone(), None).unwrap();
-        let mut st4b = worker.submit(t4b_prompt, greedy.clone(), None).unwrap();
+        let mut st4a = worker.submit(t4a_prompt.clone(), greedy.clone(), None).unwrap();
+        let mut st4b = worker.submit(t4b_prompt.clone(), greedy.clone(), None).unwrap();
         let (res4a, res4b) = tokio::time::timeout(
             Duration::from_secs(120),
             async {
@@ -2051,7 +2076,55 @@ fn dflash2_projected_ctx_plain_recovery_and_batched_draft_parity() {
         assert!(!out4a.is_empty());
         assert!(!out4b.is_empty());
         assert!(cached4a > 0 && cached4b > 0, "B=2 DFlash2 turns should reuse warm radix prefix");
+        let r4 = worker.stats.telemetry.snapshot().speculation.rounds;
+        assert!(
+            r4 > r3,
+            "Turn 4 B=2 continuations should advance DFlash2 speculative rounds (r3={r3}, r4={r4})"
+        );
+
+        (t3_prompt, out3, t4a_prompt, out4a, t4b_prompt, out4b)
     });
 
     drop(worker);
+
+    // Verify lossless greedy parity against a non-speculative baseline for Turn 3 (recovered
+    // from `plain_memos`) and Turn 4A/4B (batched DFlash2 drafting).
+    let plain_worker = EngineWorker::from_loader(
+        move || {
+            Qwen3_5Engine::load_for_serving_with_speculative(
+                target_model,
+                1,
+                KvFormatPolicy::Tq4,
+                Some(2048),
+                true,
+                4,
+                None,
+            )
+            .map_err(|e| e.to_string())
+        },
+        SchedulerConfig {
+            max_num_seqs: 4,
+            ..SchedulerConfig::default()
+        },
+    )
+    .unwrap();
+    rt.block_on(async {
+        for (label, prompt, expected) in [
+            ("Turn 3 recovered", t3_prompt, out3),
+            ("Turn 4A batched", t4a_prompt, out4a),
+            ("Turn 4B batched", t4b_prompt, out4b),
+        ] {
+            let mut st = plain_worker.submit(prompt, greedy.clone(), None).unwrap();
+            let (plain_out, _) =
+                tokio::time::timeout(Duration::from_secs(120), collect_with_cached(&mut st, 32))
+                    .await
+                    .unwrap()
+                    .unwrap();
+            assert_eq!(
+                expected, plain_out,
+                "{label} DFlash2 tokens must match non-speculative greedy baseline"
+            );
+        }
+    });
+    drop(plain_worker);
 }
