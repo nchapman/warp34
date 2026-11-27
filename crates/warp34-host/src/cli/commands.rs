@@ -1061,6 +1061,7 @@ pub(crate) struct ServeBootSummary {
     pub(crate) default_reasoning_budget: Option<usize>,
     pub(crate) default_reasoning_budget_message: Option<String>,
     pub(crate) vision_banner: Option<String>,
+    pub(crate) router_banner: Option<String>,
     pub(crate) lora_adapters: Vec<String>,
 }
 
@@ -1240,6 +1241,11 @@ pub(crate) fn format_serve_boot_banner(s: &ServeBootSummary) -> String {
         .as_deref()
         .map(|v| format!("  Vision       : {v}\n"))
         .unwrap_or_default();
+    let router_line = s
+        .router_banner
+        .as_deref()
+        .map(|r| format!("  Router       : {r}\n"))
+        .unwrap_or_default();
     let total_gpus = s.tp_size.saturating_mul(s.dp_size.max(1));
     let topology_tag = if s.dp_size > 1 {
         format!(
@@ -1276,6 +1282,7 @@ pub(crate) fn format_serve_boot_banner(s: &ServeBootSummary) -> String {
             "  Template     : {} (preserve_thinking={})\n",
             "  Thinking     : {}\n",
             "{}",
+            "{}",
             "  KV Cache     : {} {}\n",
             "  Context      : {} tokens ({} pages, {:.2} GiB/rank) {}\n",
             "  GDN States   : {} slots ({:.2} GiB/rank, max_num_seqs={}){} [auto-sized]\n",
@@ -1297,6 +1304,7 @@ pub(crate) fn format_serve_boot_banner(s: &ServeBootSummary) -> String {
         s.preserve_thinking,
         thinking_line,
         vision_line,
+        router_line,
         kv_desc,
         kv_mode_tag,
         s.context_limit,
@@ -1338,7 +1346,7 @@ pub(crate) fn run_serve(
 ) -> Result<ExitCode, String> {
     let CudaCliOptions {
         model: raw_model,
-        serve,
+        mut serve,
         resolved_model,
         tp,
         tp_auto,
@@ -1355,6 +1363,7 @@ pub(crate) fn run_serve(
         use_cuda_graph,
         lora_modules,
         speculative_choice,
+        offline,
         ..
     } = options;
     let checkpoint_label = raw_model.clone();
@@ -1693,6 +1702,7 @@ pub(crate) fn run_serve(
                                     vp.max_pixels,
                                 )
                             }),
+                            router_banner: None,
                             lora_adapters: engine
                                 .lora_registry
                                 .entries()
@@ -1706,6 +1716,70 @@ pub(crate) fn run_serve(
             ) as crate::server::DpEngineLoader
         })
         .collect();
+    let router_spec = serve.router_model.clone().or_else(|| {
+        (!serve.router_cloud_models.is_empty())
+            .then(|| crate::arc_router::DEFAULT_ARC_ROUTER_MODEL.to_string())
+    });
+    let mut router_banner: Option<String> = None;
+    if let Some(ref spec) = router_spec {
+        let router_dir = crate::hub::resolve_model(
+            spec,
+            &crate::hub::HubOptions {
+                revision: None,
+                offline,
+            },
+            crate::hub::ModelRole::Target,
+        )
+        .map_err(|e| format!("resolve ARC router model `{spec}`: {e}"))?;
+        let policy_label = serve.router_policy.as_deref().unwrap_or("prefer-local");
+        let min_p = serve.router_min_p_pass.unwrap_or(0.55);
+        let policy = crate::arc_router::policy::RoutingPolicy::from_args(
+            policy_label,
+            min_p,
+            serve.router_value_usd,
+        )?;
+        let pin_pii_classes: std::collections::HashSet<String> =
+            match serve.router_pin_pii.as_deref() {
+                Some(raw) if raw.eq_ignore_ascii_case("none") || raw.trim().is_empty() => {
+                    std::collections::HashSet::new()
+                }
+                Some(raw) => raw
+                    .split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect(),
+                None => [
+                    "credential",
+                    "government_id",
+                    "financial_account",
+                    "payment_card",
+                ]
+                .into_iter()
+                .map(String::from)
+                .collect(),
+            };
+        let pii_count = pin_pii_classes.len();
+        let router = crate::arc_router::ArcRouter::load(crate::arc_router::ArcRouterConfig {
+            model_dir: router_dir,
+            device_id: 0,
+            local_model_name: model.clone(),
+            cloud_model_filter: serve.router_cloud_models.clone(),
+            policy,
+            pin_pii_classes,
+            offline,
+        })?;
+        let pii_label = if pii_count == 0 {
+            "off".to_string()
+        } else {
+            format!("{pii_count} classes")
+        };
+        router_banner = Some(format!(
+            "model=\"router\", policy={policy_label}, local_slot={}, cloud={}, pin_pii={pii_label}",
+            router.local_slot_name(),
+            router.cloud_summary(),
+        ));
+        serve.options.arc_router = Some(std::sync::Arc::new(router));
+    }
     let state = crate::server::OpenAiServerState::from_loaders_with_options(
         model,
         allow_remote_images,
@@ -1725,6 +1799,7 @@ pub(crate) fn run_serve(
         summary
             .default_reasoning_budget_message
             .clone_from(&state.default_reasoning_budget_message);
+        summary.router_banner = router_banner;
         print!("{}", format_serve_boot_banner(&summary));
     }
     println!(

@@ -141,6 +141,37 @@ pub fn compute_chained_prefix_hashes(lora_id: i32, tokens: &[i32]) -> Vec<u64> {
     hashes
 }
 
+/// Computes the terminal 64-token chained prefix block hash without allocating a `Vec`.
+/// Returns `None` when `tokens.len() < DP_PREFIX_BLOCK_TOKENS`.
+pub fn compute_last_prefix_hash(lora_id: i32, tokens: &[i32]) -> Option<u64> {
+    let blocks = tokens.as_chunks::<DP_PREFIX_BLOCK_TOKENS>().0;
+    if blocks.is_empty() {
+        return None;
+    }
+    let first_tok = if lora_id < 0 {
+        tokens[0]
+    } else {
+        let mut s = [tokens[0]];
+        crate::lora::salt_radix_key_in_place(&mut s, lora_id);
+        s[0]
+    };
+    let mut state = mix64(0x9e37_79b9_7f4a_7c15u64);
+    for (block_idx, block) in blocks.iter().enumerate() {
+        let mut h = state;
+        for (i, &raw_tok) in block.iter().enumerate() {
+            let tok = if block_idx == 0 && i == 0 {
+                first_tok
+            } else {
+                raw_tok
+            };
+            h ^= (tok as u32) as u64;
+            h = h.wrapping_mul(0x1000_0000_01b3);
+        }
+        state = mix64(h);
+    }
+    Some(state)
+}
+
 #[inline]
 fn mix64(mut z: u64) -> u64 {
     z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
@@ -206,6 +237,16 @@ impl DpPrefixDirectory {
     #[inline]
     fn rank_bit(dp_rank: usize) -> Option<u64> {
         (dp_rank < MAX_DP_WORKERS).then_some(1u64 << dp_rank)
+    }
+
+    /// Returns true if `hash` is currently both KV-resident and backed by a live Mamba/GDN
+    /// checkpoint on `dp_rank` (returns false after eviction, tombstoning, or worker reset).
+    pub fn is_checkpoint_live(&self, dp_rank: usize, hash: u64) -> bool {
+        let Some(bit) = Self::rank_bit(dp_rank) else {
+            return false;
+        };
+        let entry = self.lookup_entry(hash);
+        (entry.kv_mask & bit) != 0 && (entry.ckpt_mask & bit) != 0
     }
 
     /// Marks every complete 64-token block in `tokens` (for `lora_id`) as resident and
@@ -668,26 +709,46 @@ fn pick_lowest_score(
     best_idx
 }
 
-/// Bounded LRU session-affinity map (`session_key -> dp_rank`).
+/// Bounded LRU session-affinity map (`session_key -> (dp_rank, last_prefix_block_hash)`).
 #[derive(Debug, Default)]
 pub struct SessionAffinityMap {
-    map: HashMap<String, usize>,
+    map: HashMap<String, (usize, Option<u64>)>,
     order: VecDeque<String>,
 }
 
 impl SessionAffinityMap {
     pub fn get(&mut self, key: &str) -> Option<usize> {
-        let rank = self.map.get(key).copied()?;
+        self.get_with_prefix(key).map(|(rank, _)| rank)
+    }
+
+    pub fn get_with_prefix(&mut self, key: &str) -> Option<(usize, Option<u64>)> {
+        let entry = self.map.get(key).copied()?;
         if let Some(pos) = self.order.iter().position(|k| k == key)
             && let Some(item) = self.order.remove(pos)
         {
             self.order.push_back(item);
         }
-        Some(rank)
+        Some(entry)
     }
 
     pub fn bind(&mut self, key: String, dp_rank: usize) {
-        if self.map.insert(key.clone(), dp_rank).is_some() {
+        self.bind_with_prefix(key, dp_rank, None);
+    }
+
+    pub fn bind_with_prefix(&mut self, key: String, dp_rank: usize, prefix_hash: Option<u64>) {
+        // Preserve a previously recorded prefix block hash when re-binding to the SAME worker
+        // with `None` (e.g. a `<64`-token short turn); clear it if migrating to another worker.
+        let effective_hash = prefix_hash.or_else(|| {
+            self.map
+                .get(&key)
+                .filter(|&&(prev_rank, _)| prev_rank == dp_rank)
+                .and_then(|&(_, prev_h)| prev_h)
+        });
+        if self
+            .map
+            .insert(key.clone(), (dp_rank, effective_hash))
+            .is_some()
+        {
             if let Some(pos) = self.order.iter().position(|k| k == &key) {
                 self.order.remove(pos);
             }
@@ -835,6 +896,32 @@ impl DpRouterCore {
             .bind(session_key, dp_rank);
     }
 
+    pub fn bind_session_with_prefix(
+        &self,
+        session_key: String,
+        dp_rank: usize,
+        prefix_hash: Option<u64>,
+    ) {
+        self.sessions
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .bind_with_prefix(session_key, dp_rank, prefix_hash);
+    }
+
+    /// Returns true only when `session_key` has a bound worker whose last recorded prefix block
+    /// is still KV-resident and backed by a live Mamba/GDN checkpoint in `prefix_dir`.
+    pub fn has_warm_local_kv(&self, session_key: &str) -> bool {
+        let entry = self
+            .sessions
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get_with_prefix(session_key);
+        let Some((rank, Some(prefix_hash))) = entry else {
+            return false;
+        };
+        self.prefix_dir.is_checkpoint_live(rank, prefix_hash)
+    }
+
     /// Selects a worker and atomically acquires an [`InflightGuard`] on it.
     pub fn select_and_acquire(
         self: &Arc<Self>,
@@ -908,7 +995,8 @@ impl DpRouterCore {
             let keep_existing = pinned_worker
                 .is_some_and(|p| p != chosen && samples.get(p).is_some_and(|s| s.healthy));
             if !keep_existing {
-                self.bind_session(k.to_owned(), chosen);
+                let prefix_hash = compute_last_prefix_hash(lora_id, prompt_tokens);
+                self.bind_session_with_prefix(k.to_owned(), chosen, prefix_hash);
             }
         }
 
@@ -1491,5 +1579,115 @@ mod tests {
             )
             .expect("worker");
         assert_eq!(chosen_fifth, 1);
+    }
+
+    #[test]
+    fn has_warm_local_kv_tracks_live_kv_and_gdn_checkpoint_residency() {
+        let router = DpRouterCore::new(2, DpRoutingPolicy::Prefix);
+        let prompt: Vec<i32> = (100..228).collect(); // 2 full 64-token blocks
+        let hashes = compute_chained_prefix_hashes(0, &prompt);
+        let last_hash = *hashes.last().unwrap();
+
+        // Bound session without resident radix block is NOT warm.
+        router.bind_session_with_prefix("sess-1".to_string(), 0, Some(last_hash));
+        assert!(!router.has_warm_local_kv("sess-1"));
+
+        // Inserting KV + GDN checkpoint on rank 0 makes it warm.
+        router.prefix_dir.record_insert(0, 0, &prompt);
+        assert!(router.has_warm_local_kv("sess-1"));
+
+        // Tombstoning the GDN checkpoint immediately clears warm status even if KV remains.
+        router.prefix_dir.record_tombstone_hash(0, last_hash);
+        assert!(!router.has_warm_local_kv("sess-1"));
+
+        // Re-inserting then clearing the worker (reset) also clears warm status.
+        router.prefix_dir.record_insert(0, 0, &prompt);
+        assert!(router.has_warm_local_kv("sess-1"));
+        router.prefix_dir.clear_worker(0);
+        assert!(!router.has_warm_local_kv("sess-1"));
+    }
+
+    #[test]
+    fn compute_last_prefix_hash_matches_chained_and_session_affinity_preserves_prefix() {
+        for lora_id in [-1, 0, 3] {
+            assert_eq!(compute_last_prefix_hash(lora_id, &[1, 2, 3]), None);
+            for len in [64usize, 128, 192, 205] {
+                let toks: Vec<i32> = (0..len as i32).map(|i| i * 7 + 11).collect();
+                assert_eq!(
+                    compute_last_prefix_hash(lora_id, &toks),
+                    compute_chained_prefix_hashes(lora_id, &toks)
+                        .last()
+                        .copied()
+                );
+            }
+        }
+
+        let router = DpRouterCore::new(2, DpRoutingPolicy::Prefix);
+        let turn0: Vec<i32> = (10..150).collect(); // 2 complete 64-token blocks
+        let (r0, g0) = router
+            .select_and_acquire(
+                vec![idle_worker(), idle_worker()],
+                -1,
+                &turn0,
+                Some("sess:a"),
+            )
+            .expect("turn0");
+        drop(g0);
+        router.prefix_dir.record_insert(r0, -1, &turn0);
+        assert!(router.has_warm_local_kv("sess:a"));
+
+        // Short `<64`-token follow-up on the SAME worker preserves the prior prefix hash.
+        let short_turn: Vec<i32> = (1..20).collect();
+        let (r1, g1) = router
+            .select_and_acquire(
+                vec![idle_worker(), idle_worker()],
+                -1,
+                &short_turn,
+                Some("sess:a"),
+            )
+            .expect("short turn");
+        assert_eq!(r1, r0);
+        drop(g1);
+        assert!(
+            router.has_warm_local_kv("sess:a"),
+            "short turn on same worker must not wipe existing prefix hash"
+        );
+
+        // Transient saturation spillover onto the healthy peer preserves `(r0, prefix_hash)`.
+        let mut sat = idle_worker();
+        sat.waiting_requests = sat.max_num_seqs;
+        let samples = if r0 == 0 {
+            vec![sat, idle_worker()]
+        } else {
+            vec![idle_worker(), sat]
+        };
+        let other_turn: Vec<i32> = (500..650).collect();
+        let (r_spill, g_spill) = router
+            .select_and_acquire(samples, -1, &other_turn, Some("sess:a"))
+            .expect("spillover");
+        assert_ne!(r_spill, r0);
+        drop(g_spill);
+        assert_eq!(router.lookup_session("sess:a"), Some(r0));
+        assert!(
+            router.has_warm_local_kv("sess:a"),
+            "transient saturation spillover must preserve healthy home worker + prefix hash"
+        );
+
+        // Unhealthy home worker failover onto peer with `<64`-token prompt clears stale hash.
+        let mut dead = idle_worker();
+        dead.healthy = false;
+        let dead_samples = if r0 == 0 {
+            vec![dead, idle_worker()]
+        } else {
+            vec![idle_worker(), dead]
+        };
+        let (r_failover, _g_fail) = router
+            .select_and_acquire(dead_samples, -1, &short_turn, Some("sess:a"))
+            .expect("failover");
+        assert_ne!(r_failover, r0);
+        assert!(
+            !router.has_warm_local_kv("sess:a"),
+            "failover to another worker without a resident block must clear stale prefix hash"
+        );
     }
 }

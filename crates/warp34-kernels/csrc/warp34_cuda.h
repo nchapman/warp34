@@ -298,6 +298,35 @@ int warp34_fused_qk_rmsnorm_rope_gate_strided_f16(
     float rope_theta,
     float rms_eps);
 
+int warp34_fused_qk_rmsnorm_rope_gate_strided_yarn_f16(
+    const warp34_exec* ex,
+    const void* q_gate_in,
+    const void* k_in,
+    const void* q_norm_w,
+    const void* k_norm_w,
+    const int32_t* positions,
+    const uint8_t* valid_token_mask,
+    void* q_out,
+    void* k_out,
+    void* gate_out,
+    int num_tokens,
+    int pos_plane_stride,
+    int num_q_heads,
+    int num_kv_heads,
+    int head_dim,
+    int rotary_dim,
+    int mrope_s0,
+    int mrope_s1,
+    int mrope_s2,
+    int q_gate_row_stride,
+    int k_row_stride,
+    float rope_theta,
+    float rms_eps,
+    float yarn_factor,
+    float yarn_low,
+    float yarn_inv_span,
+    float yarn_mscale);
+
 int warp34_silu_and_mul_f16(const warp34_exec* ex, const void* gate_up, void* out,
                          const uint8_t* valid_token_mask,
                          int num_tokens, int intermediate_size);

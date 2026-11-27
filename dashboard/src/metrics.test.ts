@@ -143,4 +143,50 @@ describe("shared metric derivations", () => {
       { time: 140, value: 1 },
     ]);
   });
+  it("validates optional arc_router snapshots", () => {
+    const withRouter = snapshot({
+      arc_router: {
+        total_requests: 104,
+        local_requests: 33,
+        cloud_requests: 71,
+        pii_pinned_requests: 2,
+        warm_kv_stayed_local: 14,
+        effort_none: 8,
+        effort_low: 22,
+        effort_medium: 50,
+        effort_high: 24,
+        router_fallbacks: 0,
+        cloud_upstream_errors: 0,
+        mean_router_latency_ms: 14.6,
+        total_spend_usd: 1.68,
+        models: [
+          {
+            model: "local",
+            is_local: true,
+            requests: 33,
+            prompt_tokens: 0,
+            completion_tokens: 0,
+            cached_tokens: 0,
+            spend_usd: 0,
+          },
+          {
+            model: "anthropic/claude-sonnet-4.6",
+            is_local: false,
+            requests: 42,
+            prompt_tokens: 180000,
+            completion_tokens: 14200,
+            cached_tokens: 95000,
+            spend_usd: 0.42,
+          },
+        ],
+      },
+    });
+    expect(parseSnapshot(withRouter).arc_router?.total_spend_usd).toBe(1.68);
+    expect(() =>
+      parseSnapshot({
+        ...withRouter,
+        arc_router: { ...withRouter.arc_router, total_spend_usd: -1 },
+      }),
+    ).toThrow();
+  });
 });

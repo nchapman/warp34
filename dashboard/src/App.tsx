@@ -34,6 +34,7 @@ import { Chart, type Point } from "./LazyChart";
 import { Playground } from "./Playground";
 import { isImageModel as isQwenImageModel } from "./playground";
 import {
+  compactTokens,
   counterRate,
   duration,
   histogramDelta,
@@ -43,6 +44,8 @@ import {
   ratio,
   recentHistogram,
   uptime,
+  usd,
+  type ArcRouterMetrics,
   type Pool,
   type Snapshot,
 } from "./metrics";
@@ -60,6 +63,188 @@ const formatContextTokens = (tokens: number): string =>
     : tokens >= 1000
       ? `${(tokens / 1000).toFixed(tokens >= 10_000 ? 0 : 1)}k`
       : `${tokens}`;
+
+const ROUTER_CLOUD_PALETTE = [
+  "var(--brand)",
+  "var(--indigo)",
+  "#f59e0b",
+  "#ec4899",
+  "#22c55e",
+  "#38bdf8",
+];
+
+function ArcRouterCard({
+  router,
+  localModel,
+}: {
+  router: ArcRouterMetrics;
+  localModel: string;
+}) {
+  const total = router.total_requests;
+  const localShare = ratio(router.local_requests, total);
+  const avgCloudCost =
+    router.cloud_requests > 0
+      ? router.total_spend_usd / router.cloud_requests
+      : null;
+
+  let cloudColorIdx = 0;
+  const rows = router.models.map((m) => {
+    const color = m.is_local
+      ? "var(--aqua)"
+      : ROUTER_CLOUD_PALETTE[cloudColorIdx++ % ROUTER_CLOUD_PALETTE.length];
+    return {
+      ...m,
+      displayName: m.is_local ? localModel : m.model,
+      share: ratio(m.requests, total),
+      color,
+    };
+  });
+
+  return (
+    <Card
+      role="region"
+      className="router-card min-w-0 gap-4"
+      aria-labelledby="router-title"
+    >
+      <CardHeader className="flex flex-row items-center justify-between gap-2">
+        <CardTitle>
+          <h2 id="router-title">Router</h2>
+        </CardTitle>
+        <span className="muted numeric">
+          {total > 0
+            ? `${router.mean_router_latency_ms.toFixed(1)} ms avg · ${number(total)} routed`
+            : "Idle · 0 routed"}
+        </span>
+      </CardHeader>
+      <CardContent>
+        <div className="router-summary">
+          <div className="router-kpi">
+            <span className="router-kpi-label">Local share</span>
+            <strong className="numeric">{percent(localShare)}</strong>
+            <span className="router-kpi-sub">
+              {number(router.local_requests)} local ·{" "}
+              {number(router.cloud_requests)} cloud
+            </span>
+          </div>
+          <div className="router-kpi">
+            <span className="router-kpi-label">Cloud spend</span>
+            <strong className="numeric">{usd(router.total_spend_usd)}</strong>
+            <span className="router-kpi-sub">
+              {avgCloudCost !== null
+                ? `${(avgCloudCost * 100).toFixed(2)}¢ / cloud req`
+                : "No cloud turns"}
+            </span>
+          </div>
+          <div className="router-kpi">
+            <span className="router-kpi-label">Local guardrails</span>
+            <strong className="numeric">
+              {number(router.pii_pinned_requests + router.warm_kv_stayed_local)}
+            </strong>
+            <span className="router-kpi-sub">
+              {number(router.pii_pinned_requests)} PII ·{" "}
+              {number(router.warm_kv_stayed_local)} warm KV
+            </span>
+          </div>
+          <div className="router-kpi">
+            <span className="router-kpi-label">Effort mix</span>
+            <strong className="numeric">
+              {number(router.effort_none + router.effort_low)} /{" "}
+              {number(router.effort_medium + router.effort_high)}
+            </strong>
+            <span className="router-kpi-sub">
+              {number(router.effort_none)} none · {number(router.effort_low)}{" "}
+              low · {number(router.effort_medium)} med ·{" "}
+              {number(router.effort_high)} high
+            </span>
+          </div>
+        </div>
+
+        <div
+          className="router-split-track"
+          role="img"
+          aria-label={
+            total > 0
+              ? rows
+                  .map((r) => `${r.displayName} ${percent(r.share)}`)
+                  .join(", ")
+              : "No routed requests yet"
+          }
+        >
+          {rows.map((r) =>
+            r.requests > 0 ? (
+              <span
+                key={r.model}
+                className="router-split-seg"
+                style={{
+                  width: `${(r.requests / Math.max(1, total)) * 100}%`,
+                  background: r.color,
+                }}
+                title={`${r.displayName}: ${r.requests} (${percent(r.share)})`}
+              />
+            ) : null,
+          )}
+        </div>
+
+        {rows.length > 0 ? (
+          <table className="router-table">
+            <thead>
+              <tr>
+                <th>Model</th>
+                <th className="align-right">Requests</th>
+                <th className="align-right">Share</th>
+                <th className="align-right">In / Out tokens</th>
+                <th className="align-right">Spend</th>
+              </tr>
+            </thead>
+            <tbody>
+              {rows.map((r) => (
+                <tr key={r.model}>
+                  <td>
+                    <span className="router-model-cell">
+                      <i
+                        className="router-dot"
+                        style={{ background: r.color }}
+                      />
+                      <span className="router-model-name" title={r.displayName}>
+                        {r.displayName}
+                      </span>
+                      <span
+                        className={`router-badge${r.is_local ? " router-badge-local" : ""}`}
+                      >
+                        {r.is_local ? "local" : "cloud"}
+                      </span>
+                    </span>
+                  </td>
+                  <td className="align-right">{number(r.requests)}</td>
+                  <td className="align-right">{percent(r.share)}</td>
+                  <td className="align-right">
+                    {r.is_local
+                      ? "—"
+                      : `${compactTokens(r.prompt_tokens)} / ${compactTokens(r.completion_tokens)}`}
+                  </td>
+                  <td className="align-right">
+                    {r.is_local ? "$0.00" : usd(r.spend_usd)}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        ) : (
+          <p className="metric-caption">
+            Waiting for routed traffic on <code>model: &quot;router&quot;</code>
+            .
+          </p>
+        )}
+
+        <p className="footnote">
+          Actual upstream usage × live models.dev pricing · since startup.
+          {(router.router_fallbacks > 0 || router.cloud_upstream_errors > 0) &&
+            ` · ${number(router.router_fallbacks)} fallbacks · ${number(router.cloud_upstream_errors)} cloud errors.`}
+        </p>
+      </CardContent>
+    </Card>
+  );
+}
 
 function PoolBar({
   name,
@@ -573,6 +758,9 @@ function Overview({ state }: { state: MetricsState }) {
           </CardContent>
         </Card>
       </div>
+      {latest?.arc_router && (
+        <ArcRouterCard router={latest.arc_router} localModel={latest.model} />
+      )}
       <div className="bottom-line">
         <span>
           HTTP responses <b>{number(latest?.http_responses.client_error)}</b>{" "}

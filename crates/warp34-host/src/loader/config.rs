@@ -298,6 +298,11 @@ pub struct ModelConfig {
     pub rope_theta: f32,
     pub rotary_dim: usize,
     pub mrope_section: [usize; 3],
+    /// YaRN RoPE scaling (`1.0` = disabled / standard RoPE).
+    pub yarn_factor: f32,
+    pub yarn_low: f32,
+    pub yarn_inv_span: f32,
+    pub yarn_mscale: f32,
     pub tie_word_embeddings: bool,
     pub attn_output_gate: bool,
     pub linear_num_key_heads: usize,
@@ -755,11 +760,11 @@ impl ModelConfig {
                 .or_else(|| rs.get("rope_type"))
                 .and_then(|v| v.as_str())
                 .unwrap_or("unknown");
-            if !rtype.eq_ignore_ascii_case("default") {
+            if !rtype.eq_ignore_ascii_case("default") && !rtype.eq_ignore_ascii_case("yarn") {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     format!(
-                        "unsupported rope_scaling type='{}' (only standard unscaled RoPE is supported)",
+                        "unsupported rope_scaling type='{}' (only default and yarn RoPE are supported)",
                         sanitize_diag(rtype)
                     ),
                 ));
@@ -774,11 +779,12 @@ impl ModelConfig {
             .and_then(|v| v.as_str());
         if let Some(rt) = rope_type
             && !rt.eq_ignore_ascii_case("default")
+            && !rt.eq_ignore_ascii_case("yarn")
         {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!(
-                    "unsupported rope_type='{}' (only standard unscaled RoPE is supported)",
+                    "unsupported rope_type='{}' (only default and yarn RoPE are supported)",
                     sanitize_diag(rt)
                 ),
             ));
@@ -821,6 +827,67 @@ impl ModelConfig {
             .and_then(|v| v.as_f64())
             .unwrap_or(default_partial_rotary);
         let rotary_dim = ((head_dim as f64) * partial_rotary_factor).round() as usize;
+
+        let yarn_rope_type = rope_type
+            .or_else(|| {
+                rope_scaling.and_then(|rs| {
+                    rs.get("rope_type")
+                        .or_else(|| rs.get("type"))
+                        .and_then(|v| v.as_str())
+                })
+            })
+            .unwrap_or("");
+        let (yarn_factor, yarn_low, yarn_inv_span, yarn_mscale) =
+            if yarn_rope_type.eq_ignore_ascii_case("yarn") {
+                let factor = rope_params
+                    .and_then(|rp| rp.get("factor"))
+                    .or_else(|| rope_scaling.and_then(|rs| rs.get("factor")))
+                    .and_then(|v| v.as_f64())
+                    .unwrap_or(1.0);
+                if factor > 1.0 && rotary_dim > 0 {
+                    let orig_max_pos = rope_params
+                        .and_then(|rp| rp.get("original_max_position_embeddings"))
+                        .or_else(|| {
+                            rope_scaling.and_then(|rs| rs.get("original_max_position_embeddings"))
+                        })
+                        .or_else(|| tc.get("max_position_embeddings"))
+                        .and_then(|v| v.as_f64())
+                        .unwrap_or(262144.0);
+                    let beta_fast = rope_params
+                        .and_then(|rp| rp.get("beta_fast"))
+                        .or_else(|| rope_scaling.and_then(|rs| rs.get("beta_fast")))
+                        .and_then(|v| v.as_f64())
+                        .unwrap_or(32.0);
+                    let beta_slow = rope_params
+                        .and_then(|rp| rp.get("beta_slow"))
+                        .or_else(|| rope_scaling.and_then(|rs| rs.get("beta_slow")))
+                        .and_then(|v| v.as_f64())
+                        .unwrap_or(1.0);
+                    let find_corr = |num_rot: f64| -> f64 {
+                        (rotary_dim as f64)
+                            * (orig_max_pos / (num_rot * 2.0 * std::f64::consts::PI)).ln()
+                            / (2.0 * (rope_theta as f64).ln())
+                    };
+                    let low = find_corr(beta_fast).floor().max(0.0);
+                    let high = find_corr(beta_slow).ceil().min((rotary_dim - 1) as f64);
+                    let span = (high - low).max(1e-3);
+                    let mscale = rope_params
+                        .and_then(|rp| rp.get("attention_factor"))
+                        .or_else(|| rope_scaling.and_then(|rs| rs.get("attention_factor")))
+                        .and_then(|v| v.as_f64())
+                        .unwrap_or_else(|| 0.1 * factor.ln() + 1.0);
+                    (
+                        factor as f32,
+                        low as f32,
+                        (1.0 / span) as f32,
+                        mscale as f32,
+                    )
+                } else {
+                    (1.0, 0.0, 0.0, 1.0)
+                }
+            } else {
+                (1.0, 0.0, 0.0, 1.0)
+            };
 
         let max_position_embeddings = tc
             .get("max_position_embeddings")
@@ -1184,6 +1251,10 @@ impl ModelConfig {
             rope_theta,
             rotary_dim,
             mrope_section,
+            yarn_factor,
+            yarn_low,
+            yarn_inv_span,
+            yarn_mscale,
             tie_word_embeddings,
             attn_output_gate,
             linear_num_key_heads,

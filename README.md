@@ -8,7 +8,7 @@ A [fast](#performance) single-binary inference engine for **Qwen 3.5–3.8 Flash
 [![CUDA](https://img.shields.io/badge/CUDA-sm__86%20%7C%20sm__89-76b900.svg)](docs/HARDWARE.md)
 [![Models on HF](https://img.shields.io/badge/Hugging%20Face-nchapman%2Fmodels-ffd21e.svg)](https://huggingface.co/nchapman/models)
 
-[Quickstart](#quickstart) · [Models](#pick-a-model-for-your-gpu) · [Images](#image-generation--editing) · [Performance](#performance) · [APIs & Agents](#apis--coding-agents) · [Docs](#documentation)
+[Quickstart](#quickstart) · [Models](#pick-a-model-for-your-gpu) · [Images](#image-generation--editing) · [Performance](#performance) · [APIs & Agents](#apis--coding-agents) · [Hybrid Routing](#hybrid-localcloud-routing---router) · [Docs](#documentation)
 
 Written in Rust and CUDA with zero Python and zero NCCL. Built specifically for Qwen's hybrid Gated DeltaNet + full-attention LLMs and `Qwen-Image-2.1` diffusion on RTX 30-series (`sm_86`) and RTX 40-series (`sm_89`) GPUs.
 
@@ -189,6 +189,21 @@ claude --model "nchapman/Qwen3.8-27B-W4A16-HGPTQ"
 ```
 
 Common flags (`--tp 2`, `--draft-model`, `--lora-modules`, `--api-key-env`, `--offline`, Docker non-root/multi-GPU) and terminal chat (`warp34 chat`) are documented in [`docs/SERVING.md`](docs/SERVING.md).
+
+### Hybrid Local/Cloud Routing (`--router`)
+
+`warp34 serve` includes an optional in-process hybrid router powered by [Rayline's ARC-1.0](https://huggingface.co/rayline-ai/ARC-1.0) ([technical report](https://static.rayline.ai/rayline/reports/arc/latest)), quantized to `W4A16-HGPTQ` (`~300 MiB` VRAM, ~8–15 ms). It keeps easy, warm-KV, or PII-bearing turns on your local GPU, selects adaptive reasoning effort, and spills hard turns to cloud models using live pricing and endpoints auto-detected via [`models.dev`](https://models.dev/):
+
+```sh
+OPENROUTER_API_KEY=... \
+warp34 serve nchapman/Ternary-Bonsai-2.5-27B-warp34 --router \
+  --router-cloud-models openrouter/anthropic/claude-sonnet-4.6,openrouter/anthropic/claude-opus-4.6
+```
+
+Point any client at `"model": "router"` and track per-model splits and live cloud spend on the `/` dashboard. Bare `--router` (without `--router-cloud-models`) defaults to local-only adaptive reasoning effort so no cloud spend occurs unless you explicitly configure cloud models (or pass `--router-cloud-models auto`).
+
+- **Best fit:** Multi-turn coding agents (DeepSWE, Terminal-Bench, SWE-bench), STEM reasoning QA (GPQA Diamond), multimodal vision QA (MMMU-Pro), and PII-sensitive local pinning.
+- **Limitations:** ARC-1.0 is trained primarily on agent trajectories and tasks with verifiable outcomes—per Rayline's evaluations it is weaker on stateful non-coding tool-use (e.g. Tau3 Banking) and does not target open-ended creative writing or general chat. Cloud spillover currently forwards same-protocol requests (`/v1/chat/completions`, `/v1/responses`, `/v1/messages`) without cross-protocol translation.
 
 ---
 

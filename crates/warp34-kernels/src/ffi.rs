@@ -565,6 +565,36 @@ unsafe extern "C" {
         rms_eps: f32,
     ) -> i32;
 
+    pub fn warp34_fused_qk_rmsnorm_rope_gate_strided_yarn_f16(
+        ex: *const Warp34Exec,
+        q_gate_in: *const c_void,
+        k_in: *const c_void,
+        q_norm_w: *const c_void,
+        k_norm_w: *const c_void,
+        positions: *const i32,
+        valid_token_mask: *const u8,
+        q_out: *mut c_void,
+        k_out: *mut c_void,
+        gate_out: *mut c_void,
+        num_tokens: i32,
+        pos_plane_stride: i32,
+        num_q_heads: i32,
+        num_kv_heads: i32,
+        head_dim: i32,
+        rotary_dim: i32,
+        mrope_s0: i32,
+        mrope_s1: i32,
+        mrope_s2: i32,
+        q_gate_row_stride: i32,
+        k_row_stride: i32,
+        rope_theta: f32,
+        rms_eps: f32,
+        yarn_factor: f32,
+        yarn_low: f32,
+        yarn_inv_span: f32,
+        yarn_mscale: f32,
+    ) -> i32;
+
     pub fn warp34_fused_qk_rmsnorm_rope_gate_strided_f16(
         ex: *const Warp34Exec,
         q_gate_in: *const c_void,

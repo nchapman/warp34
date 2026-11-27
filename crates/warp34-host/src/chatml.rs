@@ -140,6 +140,7 @@ pub struct ChatTemplate {
     source_name: String,
     bos_token: String,
     eos_token: String,
+    strict_xhigh_effort: bool,
 }
 
 impl std::fmt::Debug for ChatTemplate {
@@ -199,11 +200,13 @@ impl ChatTemplate {
         );
         env.add_template_owned("chat".to_string(), source.to_string())
             .map_err(|e| format!("failed to compile chat template '{name}': {e}"))?;
+        let strict_xhigh_effort = source.contains("not in ('xhigh', 'medium', 'low')");
         Ok(Self {
             env: Arc::new(env),
             source_name: name.to_string(),
             bos_token,
             eos_token,
+            strict_xhigh_effort,
         })
     }
 
@@ -291,6 +294,15 @@ impl ChatTemplate {
         kwargs: &Map<String, Value>,
     ) -> Result<String, String> {
         let mut ctx = kwargs.clone();
+        if self.strict_xhigh_effort
+            && let Some(Value::String(eff)) = ctx.get_mut("reasoning_effort")
+        {
+            match eff.to_ascii_lowercase().as_str() {
+                "high" | "max" => *eff = "xhigh".to_string(),
+                "minimal" | "none" | "off" => *eff = "low".to_string(),
+                _ => {}
+            }
+        }
         ctx.insert(
             "messages".into(),
             serde_json::to_value(messages).map_err(|e| e.to_string())?,

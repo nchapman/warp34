@@ -32,6 +32,8 @@ const METADATA: &[&str] = &[
     "runtime/static_hot_cache_rankings.json",
     "runtime/mtp-int4-g32/config.json",
     "runtime/mtp-int4-g32/model.safetensors.index.json",
+    "runtime/arc-runtime.json",
+    "runtime/prices.json",
 ];
 
 pub(super) const PIPELINE_SUBDIRS: &[&str] = &[
@@ -179,6 +181,10 @@ pub(super) fn weight_files(dir: &Path, files: &BTreeSet<String>) -> io::Result<V
     // Decision readout heads are loaded separately from the backbone archive.
     if files.contains("readout.safetensors") {
         selected.insert("readout.safetensors".into());
+    }
+    // ARC-1.0 router heads (Stage-1/Stage-2/PII) live under `runtime/heads.safetensors`.
+    if files.contains("runtime/heads.safetensors") {
+        selected.insert("runtime/heads.safetensors".into());
     }
     // Embedded Qwen4 MTP INT4 draft checkpoint shards (when published inside the target repo).
     if files.contains("runtime/mtp-int4-g32/model.safetensors.index.json") {
@@ -334,6 +340,17 @@ pub(super) fn validate_checkpoint(
     crate::loader::SafetensorsArchive::open(dir)?;
     if names.contains("readout.safetensors") {
         crate::loader::SafetensorsArchive::open(&dir.join("readout.safetensors"))?;
+    }
+    if names.contains("runtime/heads.safetensors") {
+        validate_files(
+            dir,
+            &[
+                "runtime/arc-runtime.json".into(),
+                "runtime/prices.json".into(),
+                "runtime/heads.safetensors".into(),
+            ],
+        )?;
+        crate::loader::SafetensorsArchive::open(&dir.join("runtime/heads.safetensors"))?;
     }
     Ok(())
 }

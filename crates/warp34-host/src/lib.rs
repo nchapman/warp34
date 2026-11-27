@@ -2,6 +2,7 @@
 
 pub mod anthropic_api;
 pub mod api_auth;
+pub mod arc_router;
 pub mod cache;
 pub mod chatml;
 pub mod cli;

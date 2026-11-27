@@ -3,6 +3,15 @@
 use super::*;
 
 #[cfg(feature = "cuda")]
+/// One sequence in a ragged ARC-1.0 encoder micro-batch.
+pub struct EncoderBatchItem<'a> {
+    pub tokens: &'a [i32],
+    pub start_offset: usize,
+    pub offsets: &'a [usize],
+    pub state_slot: usize,
+    pub block_table: &'a [i32],
+}
+
 impl Qwen3_5Engine {
     /// Reads FP16 logits for `token_ids` from `selected_row` across `TP=1` / `TP=2` ranks.
     pub fn read_selected_row_candidate_logits(
@@ -257,6 +266,276 @@ impl Qwen3_5Engine {
             .chunks_exact(h_dim)
             .map(|chunk| chunk.iter().copied().map(crate::cuda::f16_to_f32).collect())
             .collect())
+    }
+
+    /// Returns the total number of KV pages allocated in this encoder's KV pool.
+    pub fn encoder_kv_pages(&self) -> usize {
+        self.ranks.first().map_or(0, |r| r.kv_pool.num_pages)
+    }
+
+    /// Returns the maximum token context supported by this encoder's KV pool.
+    pub fn encoder_max_context(&self) -> usize {
+        self.encoder_kv_pages() * 16
+    }
+
+    /// Runs a prefill-only forward pass over `tokens[start_offset..]` (skipping `lm_head` logits)
+    /// in `state_slot` using caller-managed `block_table`, reusing existing KV/GDN state when
+    /// `start_offset > 0`, and returns post-`GemmaRMSNorm` hidden vectors at `offsets`.
+    pub fn encode_readouts_at_offsets_in_slot_f32(
+        &mut self,
+        tokens: &[i32],
+        start_offset: usize,
+        offsets: &[usize],
+        state_slot: usize,
+        block_table: &[i32],
+    ) -> Result<Vec<Vec<f32>>> {
+        if tokens.is_empty() {
+            return Err(loader_err(
+                "encode_readouts_at_offsets_in_slot_f32 requires at least 1 token",
+            ));
+        }
+        const PAGE_SIZE: usize = 16;
+        let pages_needed = tokens.len().div_ceil(PAGE_SIZE);
+        if block_table.len() < pages_needed {
+            return Err(loader_err(
+                "encode_readouts_at_offsets_in_slot_f32: block_table too short",
+            ));
+        }
+        if start_offset > tokens.len() {
+            return Err(loader_err(
+                "encode_readouts_at_offsets_in_slot_f32: start_offset out of range",
+            ));
+        }
+        for &off in offsets {
+            if off < start_offset || off >= tokens.len() {
+                return Err(loader_err(
+                    "encode_readouts_at_offsets_in_slot_f32: readout offset out of range",
+                ));
+            }
+        }
+        if start_offset == tokens.len() {
+            return Ok(Vec::new());
+        }
+        let max_chunk = self
+            .ranks
+            .iter()
+            .map(|rank| rank.ordinary_prefill_token_capacity(1))
+            .collect::<Result<Vec<_>>>()?
+            .into_iter()
+            .min()
+            .ok_or_else(|| loader_err("no model ranks"))?
+            .max(1);
+        let mut results: Vec<Vec<f32>> = vec![Vec::new(); offsets.len()];
+        let mut offset = start_offset;
+        while offset < tokens.len() {
+            let end = (offset + max_chunk).min(tokens.len());
+            let chunk = &tokens[offset..end];
+            let mut chunk_req_indices = Vec::new();
+            let mut chunk_local_rows = Vec::new();
+            for (req_idx, &off) in offsets.iter().enumerate() {
+                if off >= offset && off < end {
+                    chunk_req_indices.push(req_idx);
+                    chunk_local_rows.push(off - offset);
+                }
+            }
+            let _ = self.step_batch_slices_for_sampler_filtered(
+                &[EngineBatchSlice {
+                    tokens: chunk,
+                    ctx_len_before: offset,
+                    block_table: &block_table[..pages_needed],
+                    state_in_slot: state_slot as i32,
+                    state_out_slot: state_slot as i32,
+                    has_initial_state: offset > 0,
+                    spec_slots: &[],
+                    checkpoints: &[],
+                    emit_all_query_tokens: !chunk_local_rows.is_empty(),
+                }],
+                None,
+                Some(&[false]),
+                true,
+            )?;
+            if !chunk_local_rows.is_empty() {
+                let rows = self.read_norm_hidden_rows_f32(&chunk_local_rows)?;
+                for (req_idx, row) in chunk_req_indices.into_iter().zip(rows) {
+                    results[req_idx] = row;
+                }
+            }
+            offset = end;
+        }
+        Ok(results)
+    }
+
+    /// Runs a ragged prefill-only forward pass over a micro-batch of sequences (skipping `lm_head`
+    /// logits), reusing each sequence's KV/GDN state when `start_offset > 0`, and returns
+    /// post-`GemmaRMSNorm` hidden vectors at each sequence's requested `offsets`.
+    ///
+    /// When `items.len() == 1`, delegates directly to `encode_readouts_at_offsets_in_slot_f32`
+    /// with zero batching overhead.
+    pub fn encode_readouts_batch_in_slots_f32(
+        &mut self,
+        items: &[EncoderBatchItem<'_>],
+    ) -> Result<Vec<Vec<Vec<f32>>>> {
+        if items.is_empty() {
+            return Ok(Vec::new());
+        }
+        if items.len() == 1 {
+            let it = &items[0];
+            let rows = self.encode_readouts_at_offsets_in_slot_f32(
+                it.tokens,
+                it.start_offset,
+                it.offsets,
+                it.state_slot,
+                it.block_table,
+            )?;
+            return Ok(vec![rows]);
+        }
+
+        const PAGE_SIZE: usize = 16;
+        let mut results: Vec<Vec<Vec<f32>>> = Vec::with_capacity(items.len());
+        let mut cursors: Vec<usize> = Vec::with_capacity(items.len());
+        let mut pages_needed_per_item: Vec<usize> = Vec::with_capacity(items.len());
+
+        for it in items {
+            if it.tokens.is_empty() {
+                return Err(loader_err(
+                    "encode_readouts_batch_in_slots_f32 requires at least 1 token per item",
+                ));
+            }
+            let pages_needed = it.tokens.len().div_ceil(PAGE_SIZE);
+            if it.block_table.len() < pages_needed {
+                return Err(loader_err(
+                    "encode_readouts_batch_in_slots_f32: block_table too short",
+                ));
+            }
+            if it.start_offset > it.tokens.len() {
+                return Err(loader_err(
+                    "encode_readouts_batch_in_slots_f32: start_offset out of range",
+                ));
+            }
+            for &off in it.offsets {
+                if off < it.start_offset || off >= it.tokens.len() {
+                    return Err(loader_err(
+                        "encode_readouts_batch_in_slots_f32: readout offset out of range",
+                    ));
+                }
+            }
+            results.push(vec![Vec::new(); it.offsets.len()]);
+            cursors.push(it.start_offset);
+            pages_needed_per_item.push(pages_needed);
+        }
+
+        loop {
+            let active_count = items
+                .iter()
+                .enumerate()
+                .filter(|(i, it)| cursors[*i] < it.tokens.len())
+                .count();
+            if active_count == 0 {
+                break;
+            }
+            let max_chunk = self
+                .ranks
+                .iter()
+                .map(|rank| rank.ordinary_prefill_token_capacity(active_count))
+                .collect::<Result<Vec<_>>>()?
+                .into_iter()
+                .min()
+                .ok_or_else(|| loader_err("no model ranks"))?
+                .max(1);
+
+            let mut slices: Vec<EngineBatchSlice<'_>> = Vec::with_capacity(active_count);
+            let mut batch_targets: Vec<(usize, usize)> = Vec::new();
+            let mut batch_local_rows: Vec<usize> = Vec::new();
+            let mut token_budget = max_chunk;
+            let mut row_base = 0usize;
+
+            for (item_idx, it) in items.iter().enumerate() {
+                let start = cursors[item_idx];
+                if start >= it.tokens.len() {
+                    continue;
+                }
+                if token_budget == 0 {
+                    break;
+                }
+                let take = (it.tokens.len() - start).min(token_budget);
+                let end = start + take;
+                let mut has_row = false;
+                for (req_idx, &off) in it.offsets.iter().enumerate() {
+                    if off >= start && off < end {
+                        batch_targets.push((item_idx, req_idx));
+                        batch_local_rows.push(row_base + (off - start));
+                        has_row = true;
+                    }
+                }
+                slices.push(EngineBatchSlice {
+                    tokens: &it.tokens[start..end],
+                    ctx_len_before: start,
+                    block_table: &it.block_table[..pages_needed_per_item[item_idx]],
+                    state_in_slot: it.state_slot as i32,
+                    state_out_slot: it.state_slot as i32,
+                    has_initial_state: start > 0,
+                    spec_slots: &[],
+                    checkpoints: &[],
+                    emit_all_query_tokens: has_row,
+                });
+                cursors[item_idx] = end;
+                row_base += take;
+                token_budget -= take;
+            }
+
+            let sample_mask = vec![false; slices.len()];
+            let _ = self.step_batch_slices_for_sampler_filtered(
+                &slices,
+                None,
+                Some(&sample_mask),
+                true,
+            )?;
+            if !batch_local_rows.is_empty() {
+                let rows = self.read_norm_hidden_rows_f32(&batch_local_rows)?;
+                for ((item_idx, req_idx), row) in batch_targets.into_iter().zip(rows) {
+                    results[item_idx][req_idx] = row;
+                }
+            }
+        }
+
+        Ok(results)
+    }
+
+    /// Convenience wrapper running `encode_readouts_at_offsets_in_slot_f32` in slot 0 with
+    /// contiguous KV pages `0..pages_needed`.
+    pub fn encode_readouts_at_offsets_f32(
+        &mut self,
+        tokens: &[i32],
+        start_offset: usize,
+        offsets: &[usize],
+    ) -> Result<Vec<Vec<f32>>> {
+        let pages_needed = tokens.len().div_ceil(16);
+        if pages_needed > self.encoder_kv_pages() {
+            return Err(loader_err(
+                "encode_readouts_at_offsets_f32: tokens exceed encoder max_ctx",
+            ));
+        }
+        let block_table: Vec<i32> = (0..pages_needed as i32).collect();
+        self.encode_readouts_at_offsets_in_slot_f32(tokens, start_offset, offsets, 0, &block_table)
+    }
+
+    /// Runs a prefill-only forward pass over `tokens` (skipping `lm_head` logits) and returns
+    /// the final token's post-`GemmaRMSNorm` hidden vector `[hidden_size]` as `f32`.
+    pub fn encode_last_readout_f32(&mut self, tokens: &[i32]) -> Result<Vec<f32>> {
+        if tokens.is_empty() {
+            return Err(loader_err(
+                "encode_last_readout_f32 requires at least 1 token",
+            ));
+        }
+        let max_ctx = self.encoder_max_context();
+        let slice = if tokens.len() > max_ctx {
+            &tokens[tokens.len() - max_ctx..]
+        } else {
+            tokens
+        };
+        let last = slice.len() - 1;
+        let mut rows = self.encode_readouts_at_offsets_f32(slice, 0, &[last])?;
+        Ok(rows.pop().unwrap_or_default())
     }
 
     pub fn set_decision_profile(
