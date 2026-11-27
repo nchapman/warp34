@@ -64,9 +64,9 @@ pub fn infer_local_slot(_model_name: &str, catalog: &ArcRuntimeCatalog) -> usize
 /// Human-readable archetype label for a resolved remote cloud slot.
 pub fn remote_tier_label(slot: usize) -> &'static str {
     if slot == REMOTE_OPUS_SLOT {
-        "opus"
+        "frontier"
     } else {
-        "sonnet"
+        "standard"
     }
 }
 
@@ -83,25 +83,26 @@ pub struct CloudCandidate {
     pub capabilities: ModelCapabilities,
 }
 
-/// Resolves an explicit remote tier prefix (`sonnet=`, `opus=`, or legacy aliases) to one of the
-/// two canonical remote ARC-1.0 archetypes (`REMOTE_SONNET_SLOT` or `REMOTE_OPUS_SLOT`).
+/// Resolves an explicit remote tier prefix (`standard=`/`sonnet=` or `frontier=`/`opus=`) to one
+/// of the two canonical remote ARC-1.0 archetypes (`REMOTE_SONNET_SLOT` or `REMOTE_OPUS_SLOT`).
 pub fn resolve_remote_tier_slot(token: &str, catalog: &ArcRuntimeCatalog) -> Option<usize> {
     let idx = match token.trim().to_ascii_lowercase().as_str() {
-        "sonnet" | "medium" | "mid" | "fast" | "cheap" | "small" => REMOTE_SONNET_SLOT,
-        "opus" | "frontier" | "strong" | "big" => REMOTE_OPUS_SLOT,
+        "standard" | "sonnet" => REMOTE_SONNET_SLOT,
+        "frontier" | "opus" => REMOTE_OPUS_SLOT,
         _ => return None,
     };
     (idx < catalog.models.len()).then_some(idx)
 }
 
 /// Maps any swappable cloud model to the generalized two-tier remote ARC-1.0 archetypes:
-/// `REMOTE_SONNET_SLOT` (`claude-sonnet-5.5`) or `REMOTE_OPUS_SLOT` (`claude-opus-5.5`).
+/// `REMOTE_SONNET_SLOT` (`claude-sonnet-5.5`, `standard`) or `REMOTE_OPUS_SLOT`
+/// (`claude-opus-5.5`, `frontier`).
 ///
 /// Precedence:
-/// 1. Explicit tier prefix (`sonnet=...`, `opus=...`, or legacy aliases).
-/// 2. Explicit archetype cue in the model ID (`"opus"` vs `"sonnet"`).
-/// 3. Live `models.dev` output pricing (`> $15/M` -> `opus`, `<= $15/M` -> `sonnet`).
-/// 4. Default fallback: `sonnet`.
+/// 1. Explicit tier prefix (`standard=`/`sonnet=` or `frontier=`/`opus=`).
+/// 2. Explicit archetype token in the model ID (`"opus"` vs `"sonnet"`).
+/// 3. Live `models.dev` output pricing (`> $15/M` -> `frontier`, `<= $15/M` -> `standard`).
+/// 4. Default fallback: `standard`.
 pub fn infer_remote_slot(
     explicit_tier: Option<&str>,
     canonical_id: &str,
@@ -118,13 +119,13 @@ pub fn infer_remote_slot(
             .any(|tok| tok.eq_ignore_ascii_case(needle))
     };
     let tier = if has_token(canonical_id, "opus") || has_token(wire_model, "opus") {
-        "opus"
+        "frontier"
     } else if has_token(canonical_id, "sonnet") || has_token(wire_model, "sonnet") {
-        "sonnet"
+        "standard"
     } else if let Some(p) = prices {
         infer_tier_from_prices(p)
     } else {
-        "sonnet"
+        "standard"
     };
     Ok(resolve_remote_tier_slot(tier, catalog)
         .unwrap_or_else(|| REMOTE_SONNET_SLOT.min(catalog.models.len().saturating_sub(1))))
@@ -654,20 +655,22 @@ mod tests {
             assert_eq!(infer_local_slot(local_name, &catalog), DEFAULT_LOCAL_SLOT);
         }
 
-        // Explicit tier prefixes (canonical `sonnet`/`opus` + legacy aliases).
-        for tok in ["sonnet", "medium", "mid", "fast", "cheap", "small"] {
+        // Explicit tier prefixes: vendor-neutral (`standard`/`frontier`) + Claude (`sonnet`/`opus`).
+        for tok in ["standard", "sonnet"] {
             assert_eq!(
                 infer_remote_slot(Some(tok), "x/y", "y", None, &catalog).unwrap(),
                 REMOTE_SONNET_SLOT
             );
         }
-        for tok in ["opus", "frontier", "strong", "big"] {
+        for tok in ["frontier", "opus"] {
             assert_eq!(
                 infer_remote_slot(Some(tok), "x/y", "y", None, &catalog).unwrap(),
                 REMOTE_OPUS_SLOT
             );
         }
-        assert!(infer_remote_slot(Some("bogus"), "x/y", "y", None, &catalog).is_err());
+        for removed in ["fast", "medium", "mid", "strong", "bogus"] {
+            assert!(infer_remote_slot(Some(removed), "x/y", "y", None, &catalog).is_err());
+        }
 
         // Name cues for swappable Sonnet/Opus models (including dash/dot variants).
         assert_eq!(
@@ -719,8 +722,8 @@ mod tests {
             infer_remote_slot(None, "custom/unknown", "unknown", None, &catalog).unwrap(),
             REMOTE_SONNET_SLOT
         );
-        assert_eq!(remote_tier_label(REMOTE_SONNET_SLOT), "sonnet");
-        assert_eq!(remote_tier_label(REMOTE_OPUS_SLOT), "opus");
+        assert_eq!(remote_tier_label(REMOTE_SONNET_SLOT), "standard");
+        assert_eq!(remote_tier_label(REMOTE_OPUS_SLOT), "frontier");
         assert!((DEFAULT_PREFER_LOCAL_MIN_P_PASS - 0.65).abs() < 1e-12);
     }
 

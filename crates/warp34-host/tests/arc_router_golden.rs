@@ -190,8 +190,8 @@ fn heads_catalog_slot_inference_and_policy_invariants() {
         &registry,
         &heads.catalog,
         &[
-            "sonnet=openrouter/meta/muse-spark-1.3-contributor".to_string(),
-            "opus=openrouter/google/gemini-4-neon".to_string(),
+            "standard=openrouter/meta/muse-spark-1.3-contributor".to_string(),
+            "frontier=openrouter/google/gemini-4-neon".to_string(),
         ],
         |k| (k == "OPENROUTER_API_KEY").then(|| "test-key".to_string()),
     )
@@ -367,8 +367,10 @@ fn arc_encoder_and_heads_match_goldens() {
             Some([30.0, 3.0, 0.0, 180.0]),
             1usize,
         ),
-        (Some("sonnet"), "custom/model-a", None, 2usize),
-        (Some("opus"), "custom/model-b", None, 1usize),
+        (Some("standard"), "custom/model-a", None, 2usize),
+        (Some("sonnet"), "custom/model-b", None, 2usize),
+        (Some("frontier"), "custom/model-c", None, 1usize),
+        (Some("opus"), "custom/model-d", None, 1usize),
     ] {
         assert_eq!(
             warp34_host::arc_router::policy::infer_remote_slot(

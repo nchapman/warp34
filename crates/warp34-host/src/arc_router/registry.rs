@@ -361,8 +361,9 @@ impl ModelsDevRegistry {
     }
 
     /// Resolves a single `--router-cloud-models` spec (e.g. `google/gemini-4-hydrogen`,
-    /// `openrouter/anthropic/claude-sonnet-4-6`, `medium=deepseek/deepseek-chat`, or
-    /// `https://gateway.example.com/v1#my-model`) using `env_lookup` for API keys.
+    /// `openrouter/anthropic/claude-sonnet-4-6`, `standard=deepseek/deepseek-chat`,
+    /// `frontier=openai/gpt-5.4-pro`, or `https://gateway.example.com/v1#my-model`) using
+    /// `env_lookup` for API keys.
     pub fn resolve_spec<F>(
         &self,
         raw_spec: &str,
@@ -374,19 +375,7 @@ impl ModelsDevRegistry {
         let trimmed = raw_spec.trim();
         let (explicit_tier, rest) = if let Some((lhs, rhs)) = trimmed.split_once('=') {
             let tier = lhs.trim().to_ascii_lowercase();
-            if matches!(
-                tier.as_str(),
-                "sonnet"
-                    | "opus"
-                    | "fast"
-                    | "cheap"
-                    | "small"
-                    | "medium"
-                    | "mid"
-                    | "strong"
-                    | "big"
-                    | "frontier"
-            ) {
+            if matches!(tier.as_str(), "standard" | "sonnet" | "frontier" | "opus") {
                 (Some(tier), rhs.trim())
             } else {
                 (None, trimmed)
@@ -550,14 +539,14 @@ impl ModelsDevRegistry {
             specs.push("anthropic/claude-opus-5.5".to_string());
         }
         if has_key("google") {
-            specs.push("sonnet=google/gemini-4-hydrogen".to_string());
-            specs.push("opus=google/gemini-4-argon".to_string());
+            specs.push("standard=google/gemini-4-hydrogen".to_string());
+            specs.push("frontier=google/gemini-4-argon".to_string());
         }
         if has_key("openai") {
-            specs.push("sonnet=openai/gpt-5.6-terra".to_string());
+            specs.push("standard=openai/gpt-5.6-terra".to_string());
         }
         if has_key("deepseek") {
-            specs.push("sonnet=deepseek/deepseek-v4-pro".to_string());
+            specs.push("standard=deepseek/deepseek-v4-pro".to_string());
         }
         specs
     }
@@ -610,11 +599,15 @@ impl ModelsDevRegistry {
     }
 }
 
-/// Infers the generalized remote ARC-1.0 archetype (`"sonnet"` or `"opus"`) from live
-/// `models.dev` USD/Mtok output pricing when no explicit `sonnet=` / `opus=` prefix or name cue
-/// was supplied.
+/// Infers the generalized remote ARC-1.0 archetype (`"standard"` or `"frontier"`) from live
+/// `models.dev` USD/Mtok output pricing when no explicit `standard=`/`sonnet=` or
+/// `frontier=`/`opus=` prefix or model name token was supplied.
 pub fn infer_tier_from_prices(prices: [f64; 4]) -> &'static str {
-    if prices[3] > 15.0 { "opus" } else { "sonnet" }
+    if prices[3] > 15.0 {
+        "frontier"
+    } else {
+        "standard"
+    }
 }
 
 fn provider_defaults(provider_id: &str, npm: Option<&str>) -> (Option<&'static str>, WireDialect) {
@@ -869,8 +862,8 @@ mod tests {
         assert_eq!(ds.capabilities.clamp_effort("medium"), "low");
         // Toggle-capable models preserve `"none"` instead of clamping to `"low"`.
         assert_eq!(ds.capabilities.clamp_effort("none"), "none");
-        assert_eq!(infer_tier_from_prices(ds.prices.unwrap()), "sonnet");
-        assert_eq!(infer_tier_from_prices([4.0, 0.2, 5.0, 20.0]), "opus");
+        assert_eq!(infer_tier_from_prices(ds.prices.unwrap()), "standard");
+        assert_eq!(infer_tier_from_prices([4.0, 0.2, 5.0, 20.0]), "frontier");
 
         // Non-toggle models without `"none"` in `effort_values` clamp `"none"` to `"low"`.
         let gm = reg
@@ -891,7 +884,7 @@ mod tests {
         // Reject empty model suffix on explicit provider prefixes or tier= prefixes.
         assert!(reg.resolve_spec("google/", |_| None).is_err());
         assert!(reg.resolve_spec("deepseek:", |_| None).is_err());
-        assert!(reg.resolve_spec("fast=", |_| None).is_err());
+        assert!(reg.resolve_spec("standard=", |_| None).is_err());
 
         assert_eq!(
             reg.default_models_for_env(|k| (k == "OPENROUTER_API_KEY").then(|| "k".to_string())),
