@@ -5,9 +5,10 @@ use warp34_host::arc_router::{
     heads::ArcHeads,
     input::{ApiProtocol, serialize_request},
     policy::{
-        DecideInput, RouteTarget, RoutingBasis, RoutingPolicy, UpstreamTarget, decide,
-        infer_local_slot, resolve_cloud_candidates,
+        DecideInput, RouteTarget, RoutingBasis, RoutingPolicy, decide, infer_local_slot,
+        resolve_cloud_candidates_from_registry,
     },
+    registry::ModelsDevRegistry,
 };
 
 fn cached_arc_dir() -> Option<PathBuf> {
@@ -155,16 +156,33 @@ fn heads_catalog_slot_inference_and_policy_invariants() {
     assert_eq!(infer_local_slot("Qwen3.5-9B", &heads.catalog), 54);
     assert_eq!(infer_local_slot("Qwen3.5-4B", &heads.catalog), 54);
 
-    let or_slots = resolve_cloud_candidates(&UpstreamTarget::OpenRouter, &heads.catalog, &[])
-        .expect("openrouter");
-    assert_eq!(or_slots.len(), 11);
-    let filtered = resolve_cloud_candidates(
-        &UpstreamTarget::OpenRouter,
+    let registry = ModelsDevRegistry::builtin_fallback();
+    // Default (empty filter) resolves to local-only (no surprise cloud spend).
+    let default_slots =
+        resolve_cloud_candidates_from_registry(&registry, &heads.catalog, &[], |k| {
+            (k == "OPENROUTER_API_KEY").then(|| "test-key".to_string())
+        })
+        .expect("default local-only");
+    assert!(default_slots.is_empty());
+
+    // Explicit `auto` detects env keys; explicit specs with tier overrides resolve cleanly.
+    let auto_slots = resolve_cloud_candidates_from_registry(
+        &registry,
+        &heads.catalog,
+        &["auto".to_string()],
+        |k| (k == "OPENROUTER_API_KEY").then(|| "test-key".to_string()),
+    )
+    .expect("auto openrouter");
+    assert!(!auto_slots.is_empty());
+
+    let filtered = resolve_cloud_candidates_from_registry(
+        &registry,
         &heads.catalog,
         &[
-            "medium=meta/muse-spark-1.3-contributor".to_string(),
-            "strong=google/gemini-4-neon".to_string(),
+            "medium=openrouter/meta/muse-spark-1.3-contributor".to_string(),
+            "strong=openrouter/google/gemini-4-neon".to_string(),
         ],
+        |k| (k == "OPENROUTER_API_KEY").then(|| "test-key".to_string()),
     )
     .expect("filtered");
     assert_eq!(filtered.len(), 2);
@@ -184,7 +202,7 @@ fn heads_catalog_slot_inference_and_policy_invariants() {
             has_images: false,
             warm_local_kv: true,
             local_slot: 54,
-            cloud_candidates: &or_slots,
+            cloud_candidates: &auto_slots,
             policy: RoutingPolicy::Utility { value_usd: 4.5 },
             pin_pii_classes: &HashSet::new(),
         },

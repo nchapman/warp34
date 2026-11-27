@@ -344,7 +344,6 @@ impl ModelsDevRegistry {
     pub fn resolve_spec<F>(
         &self,
         raw_spec: &str,
-        cli_api_key: Option<&str>,
         env_lookup: F,
     ) -> Result<ResolvedCloudSpec, String>
     where
@@ -366,9 +365,6 @@ impl ModelsDevRegistry {
         };
 
         let pick_key = |env_vars: &[String]| -> Option<String> {
-            if let Some(k) = cli_api_key.filter(|s| !s.is_empty()) {
-                return Some(k.to_string());
-            }
             for var in env_vars {
                 if let Some(val) = env_lookup(var).filter(|s| !s.is_empty()) {
                     return Some(val);
@@ -777,7 +773,7 @@ mod tests {
 
         // Direct GEMINI_API_KEY set -> hits Google OpenAI-compat directly!
         let direct = reg
-            .resolve_spec("google/gemini-4-argon", None, |k| {
+            .resolve_spec("google/gemini-4-argon", |k| {
                 (k == "GEMINI_API_KEY").then(|| "gm-key".to_string())
             })
             .expect("resolve direct google");
@@ -793,7 +789,7 @@ mod tests {
 
         // No GEMINI_API_KEY, but OPENROUTER_API_KEY set -> auto-falls back to OpenRouter!
         let via_or = reg
-            .resolve_spec("google/gemini-4-hydrogen", None, |k| {
+            .resolve_spec("google/gemini-4-hydrogen", |k| {
                 (k == "OPENROUTER_API_KEY").then(|| "or-key".to_string())
             })
             .expect("resolve via openrouter");
@@ -804,7 +800,7 @@ mod tests {
 
         // Explicit `openrouter/<vendor>/<model>` forces OpenRouter even if GEMINI_API_KEY is set.
         let forced = reg
-            .resolve_spec("openrouter/google/gemini-4-argon", None, |k| {
+            .resolve_spec("openrouter/google/gemini-4-argon", |k| {
                 Some(format!("{k}-val"))
             })
             .expect("explicit openrouter prefix");
@@ -820,7 +816,7 @@ mod tests {
     fn capabilities_and_tier_inference_match_models_dev_metadata() {
         let reg = sample_registry();
         let ds = reg
-            .resolve_spec("deepseek/deepseek-v4-pro", None, |k| {
+            .resolve_spec("deepseek/deepseek-v4-pro", |k| {
                 (k == "DEEPSEEK_API_KEY").then(|| "ds-key".to_string())
             })
             .expect("resolve deepseek");
@@ -840,11 +836,9 @@ mod tests {
 
         // Inline custom gateway URL preserves case-sensitive path segments.
         let custom = reg
-            .resolve_spec(
-                "https://Gateway.Example.com/CustomPath/v1#my-model",
-                None,
-                |_| None,
-            )
+            .resolve_spec("https://Gateway.Example.com/CustomPath/v1#my-model", |_| {
+                None
+            })
             .expect("custom url");
         assert_eq!(
             custom.endpoint.base_url,

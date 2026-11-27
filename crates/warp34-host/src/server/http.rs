@@ -1393,41 +1393,36 @@ impl OpenAiServerState {
             }
         };
 
-        match &decision.target {
-            crate::arc_router::policy::RouteTarget::Cloud {
-                slot,
-                name,
-                wire,
-                endpoint: Some(ep),
-            } => {
-                if let Some(proxy) = router.proxy()
-                    && crate::arc_router::proxy::UpstreamProxy::supports_protocol(ep, protocol)
-                {
-                    let taken_body = std::mem::take(body);
-                    let prices = router.prices_for_cloud_model(name, *slot);
-                    let caps = router.capabilities_for_cloud_model(name);
-                    let (resp, is_err) = proxy
-                        .forward(
-                            ep,
-                            protocol,
-                            taken_body,
-                            wire,
-                            name,
-                            prices,
-                            caps,
-                            router.metrics_arc(),
-                            &decision,
-                            anthropic_beta,
-                        )
-                        .await;
-                    if is_err {
-                        router.metrics().record_cloud_error();
-                    }
-                    return Ok(Some(ArcRouteOutcome::Proxied(resp)));
-                }
+        if let crate::arc_router::policy::RouteTarget::Cloud {
+            slot,
+            name,
+            wire,
+            endpoint: ep,
+        } = &decision.target
+            && let Some(proxy) = router.proxy()
+            && crate::arc_router::proxy::UpstreamProxy::supports_protocol(ep, protocol)
+        {
+            let taken_body = std::mem::take(body);
+            let prices = router.prices_for_cloud_model(name, *slot);
+            let caps = router.capabilities_for_cloud_model(name);
+            let (resp, is_err) = proxy
+                .forward(
+                    ep,
+                    protocol,
+                    taken_body,
+                    wire,
+                    name,
+                    prices,
+                    caps,
+                    router.metrics_arc(),
+                    &decision,
+                    anthropic_beta,
+                )
+                .await;
+            if is_err {
+                router.metrics().record_cloud_error();
             }
-            crate::arc_router::policy::RouteTarget::Cloud { endpoint: None, .. }
-            | crate::arc_router::policy::RouteTarget::Local => {}
+            return Ok(Some(ArcRouteOutcome::Proxied(resp)));
         }
 
         // Local target: rewrite virtual `"router"` / `"auto"` model aliases to the served local

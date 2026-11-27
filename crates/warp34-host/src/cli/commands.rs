@@ -1759,7 +1759,6 @@ pub(crate) fn run_serve(
             model_dir: router_dir,
             device_id: 0,
             local_model_name: model.clone(),
-            upstream_api_key: None,
             cloud_model_filter: serve.router_cloud_models.clone(),
             policy,
             pin_pii_classes,

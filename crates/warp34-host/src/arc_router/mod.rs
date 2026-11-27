@@ -42,8 +42,6 @@ pub struct ArcRouterConfig {
     pub model_dir: PathBuf,
     pub device_id: i32,
     pub local_model_name: String,
-    /// Optional fallback API key (normally auto-detected per provider from `models.dev` env vars).
-    pub upstream_api_key: Option<String>,
     pub cloud_model_filter: Vec<String>,
     pub policy: RoutingPolicy,
     pub pin_pii_classes: HashSet<String>,
@@ -258,25 +256,12 @@ impl ArcRouter {
         let heads = ArcHeads::load(&cfg.model_dir)?;
         let local_slot = infer_local_slot(&cfg.local_model_name, &heads.catalog);
         let registry = ModelsDevRegistry::load_cached_or_fetch();
-        let cloud_candidates = if !cfg.cloud_model_filter.is_empty() {
-            resolve_cloud_candidates_from_registry(
-                &registry,
-                &heads.catalog,
-                cfg.upstream_api_key.as_deref(),
-                &cfg.cloud_model_filter,
-                |var| std::env::var(var).ok(),
-            )?
-        } else {
-            // Even with bare `--router`, auto-enable cloud spillover if a known provider key exists.
-            resolve_cloud_candidates_from_registry(
-                &registry,
-                &heads.catalog,
-                cfg.upstream_api_key.as_deref(),
-                &[],
-                |var| std::env::var(var).ok(),
-            )
-            .unwrap_or_default()
-        };
+        let cloud_candidates = resolve_cloud_candidates_from_registry(
+            &registry,
+            &heads.catalog,
+            &cfg.cloud_model_filter,
+            |var| std::env::var(var).ok(),
+        )?;
         let proxy = if cloud_candidates.is_empty() {
             None
         } else {
@@ -343,10 +328,7 @@ impl ArcRouter {
             .cloud_candidates
             .iter()
             .map(|c| {
-                let prov = c
-                    .endpoint
-                    .as_ref()
-                    .map_or("cloud", |e| e.provider_id.as_str());
+                let prov = c.endpoint.provider_id.as_str();
                 let price = c
                     .price_override
                     .or(self.heads.catalog.model_prices[c.slot])
@@ -385,11 +367,7 @@ impl ArcRouter {
         let cloud_candidates: Vec<CloudCandidate> = if self.proxy.is_some() {
             self.cloud_candidates
                 .iter()
-                .filter(|c| {
-                    c.endpoint
-                        .as_ref()
-                        .is_some_and(|ep| UpstreamProxy::supports_protocol(ep, protocol))
-                })
+                .filter(|c| UpstreamProxy::supports_protocol(&c.endpoint, protocol))
                 .cloned()
                 .collect()
         } else {

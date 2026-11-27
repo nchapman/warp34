@@ -1,83 +1,10 @@
-//! Routing policy, local model slot auto-mapping, upstream presets, and decision logic.
+//! Routing policy, local model slot auto-mapping, and ARC-1.0 Stage 1/2/PII decision logic.
 
 use super::{
     heads::{ArcHeads, ArcRuntimeCatalog, LEGS, PiiSignalPrediction, StageOnePrediction},
     registry::{ModelCapabilities, ModelsDevRegistry, ProviderEndpoint, infer_tier_from_prices},
 };
 use std::collections::HashSet;
-
-/// Built-in cloud upstream provider presets (zero config files required).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum UpstreamTarget {
-    /// OpenRouter (`https://openrouter.ai/api/v1`, `OPENROUTER_API_KEY`), all 11 live ARC slots `[0..10]`.
-    OpenRouter,
-    /// Anthropic Messages API (`https://api.anthropic.com`, `ANTHROPIC_API_KEY`), Claude slots `[0..=2]`.
-    Anthropic,
-    /// OpenAI API (`https://api.openai.com/v1`, `OPENAI_API_KEY`), GPT slots `[6..=9]`.
-    OpenAi,
-    /// Custom OpenAI-compatible base URL (e.g. `https://gateway.internal/v1`).
-    Custom { base_url: String },
-}
-
-impl UpstreamTarget {
-    pub fn parse(spec: &str) -> Result<Self, String> {
-        let trimmed = spec.trim();
-        if trimmed.eq_ignore_ascii_case("openrouter") {
-            Ok(Self::OpenRouter)
-        } else if trimmed.eq_ignore_ascii_case("anthropic") {
-            Ok(Self::Anthropic)
-        } else if trimmed.eq_ignore_ascii_case("openai") {
-            Ok(Self::OpenAi)
-        } else if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
-            Ok(Self::Custom {
-                base_url: trimmed.trim_end_matches('/').to_string(),
-            })
-        } else {
-            Err(format!(
-                "invalid --router-upstream `{spec}` (expected openrouter, anthropic, openai, or http(s)://...)"
-            ))
-        }
-    }
-
-    pub fn base_url(&self) -> &str {
-        match self {
-            Self::OpenRouter => "https://openrouter.ai/api/v1",
-            Self::Anthropic => "https://api.anthropic.com",
-            Self::OpenAi => "https://api.openai.com/v1",
-            Self::Custom { base_url } => base_url.as_str(),
-        }
-    }
-
-    pub fn default_api_key_env(&self) -> &'static str {
-        match self {
-            Self::OpenRouter => "OPENROUTER_API_KEY",
-            Self::Anthropic => "ANTHROPIC_API_KEY",
-            Self::OpenAi => "OPENAI_API_KEY",
-            Self::Custom { .. } => "WARP34_ROUTER_API_KEY",
-        }
-    }
-
-    /// Which ARC cloud model slots are eligible by default for this upstream.
-    pub fn default_cloud_slots(&self, catalog: &ArcRuntimeCatalog) -> Vec<usize> {
-        catalog
-            .models
-            .iter()
-            .enumerate()
-            .filter_map(|(idx, m)| {
-                let wire = m.wire.as_deref()?;
-                if wire.starts_with("qwen/") || m.name.starts_with("withheld-") {
-                    return None;
-                }
-                let ok = match self {
-                    Self::OpenRouter | Self::Custom { .. } => catalog.model_prices[idx].is_some(),
-                    Self::Anthropic => wire.starts_with("anthropic/"),
-                    Self::OpenAi => wire.starts_with("openai/"),
-                };
-                ok.then_some(idx)
-            })
-            .collect()
-    }
-}
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum RoutingPolicy {
@@ -146,8 +73,8 @@ pub struct CloudCandidate {
     pub slot: usize,
     pub name: String,
     pub wire: String,
-    /// Per-candidate upstream endpoint resolved via `models.dev` (None in pure unit tests).
-    pub endpoint: Option<ProviderEndpoint>,
+    /// Per-candidate upstream endpoint resolved via `models.dev`.
+    pub endpoint: ProviderEndpoint,
     /// Live USD/Mtok `[input, cache_read, cache_write, output]` from `models.dev` (overrides slot price).
     pub price_override: Option<[f64; LEGS]>,
     /// Model capabilities & valid reasoning effort levels from `models.dev`.
@@ -176,7 +103,6 @@ fn find_native_arc_slot(catalog: &ArcRuntimeCatalog, id: &str) -> Option<usize> 
 pub fn resolve_cloud_candidates_from_registry<F>(
     registry: &ModelsDevRegistry,
     catalog: &ArcRuntimeCatalog,
-    cli_api_key: Option<&str>,
     filter: &[String],
     env_lookup: F,
 ) -> Result<Vec<CloudCandidate>, String>
@@ -207,7 +133,7 @@ where
 
     let mut out = Vec::with_capacity(specs.len());
     for raw in &specs {
-        let resolved = registry.resolve_spec(raw, cli_api_key, &env_lookup)?;
+        let resolved = registry.resolve_spec(raw, &env_lookup)?;
         let is_custom_url = resolved.endpoint.provider_id.starts_with("http://")
             || resolved.endpoint.provider_id.starts_with("https://");
         if resolved.endpoint.api_key.is_none() && !is_custom_url {
@@ -237,7 +163,7 @@ where
             slot,
             name: resolved.canonical_id,
             wire: resolved.wire_model,
-            endpoint: Some(resolved.endpoint),
+            endpoint: resolved.endpoint,
             price_override: resolved.prices,
             capabilities: resolved.capabilities,
         });
@@ -254,105 +180,6 @@ fn resolve_tier_slot(token: &str, catalog: &ArcRuntimeCatalog) -> Option<usize> 
         _ => return None,
     };
     (idx < catalog.models.len()).then_some(idx)
-}
-
-/// Filter cloud candidate slots by optional user-supplied model names, wire IDs, or `tier=wire`
-/// overrides (e.g. `medium=meta/muse-spark-1.3-contributor,strong=google/gemini-4-neon`).
-pub fn resolve_cloud_candidates(
-    upstream: &UpstreamTarget,
-    catalog: &ArcRuntimeCatalog,
-    filter: &[String],
-) -> Result<Vec<CloudCandidate>, String> {
-    let base = upstream.default_cloud_slots(catalog);
-    if filter.is_empty() {
-        return Ok(base
-            .into_iter()
-            .map(|slot| {
-                let m = &catalog.models[slot];
-                CloudCandidate {
-                    slot,
-                    name: m.name.clone(),
-                    wire: m.wire.clone().unwrap_or_else(|| m.name.clone()),
-                    endpoint: None,
-                    price_override: None,
-                    capabilities: ModelCapabilities::default(),
-                }
-            })
-            .collect());
-    }
-    let mut matched = Vec::new();
-    for raw in filter {
-        let trimmed = raw.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        if let Some((lhs, rhs)) = trimmed.split_once('=') {
-            let lhs_l = lhs.trim().to_ascii_lowercase();
-            let wire = rhs.trim().to_string();
-            if wire.is_empty() {
-                return Err(format!(
-                    "invalid --router-cloud-models override `{trimmed}`"
-                ));
-            }
-            let slot = resolve_tier_slot(&lhs_l, catalog)
-                .or_else(|| {
-                    base.iter().copied().find(|&idx| {
-                        let m = &catalog.models[idx];
-                        m.name.eq_ignore_ascii_case(&lhs_l)
-                            || m.wire
-                                .as_deref()
-                                .is_some_and(|w| w.eq_ignore_ascii_case(&lhs_l))
-                    })
-                })
-                .ok_or_else(|| {
-                    format!(
-                        "unknown tier/slot `{lhs}` in --router-cloud-models `{trimmed}` (use fast, medium, strong, or a built-in ARC model name)"
-                    )
-                })?;
-            matched.push(CloudCandidate {
-                slot,
-                name: wire.clone(),
-                wire,
-                endpoint: None,
-                price_override: None,
-                capabilities: ModelCapabilities::default(),
-            });
-        } else {
-            let wanted = trimmed.to_ascii_lowercase();
-            let slot = base
-                .iter()
-                .copied()
-                .find(|&idx| {
-                    let m = &catalog.models[idx];
-                    m.name.eq_ignore_ascii_case(&wanted)
-                        || m.wire
-                            .as_deref()
-                            .is_some_and(|w| w.eq_ignore_ascii_case(&wanted))
-                })
-                .ok_or_else(|| {
-                    format!(
-                        "--router-cloud-models `{trimmed}` matched no eligible models for upstream {}",
-                        upstream.base_url()
-                    )
-                })?;
-            let m = &catalog.models[slot];
-            matched.push(CloudCandidate {
-                slot,
-                name: m.name.clone(),
-                wire: m.wire.clone().unwrap_or_else(|| m.name.clone()),
-                endpoint: None,
-                price_override: None,
-                capabilities: ModelCapabilities::default(),
-            });
-        }
-    }
-    if matched.is_empty() {
-        return Err(format!(
-            "--router-cloud-models {filter:?} matched no eligible models for upstream {}",
-            upstream.base_url()
-        ));
-    }
-    Ok(matched)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -391,7 +218,7 @@ pub enum RouteTarget {
         slot: usize,
         name: String,
         wire: String,
-        endpoint: Option<ProviderEndpoint>,
+        endpoint: ProviderEndpoint,
     },
 }
 
