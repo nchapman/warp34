@@ -715,12 +715,16 @@ pub fn decide(heads: &ArcHeads, input: &DecideInput<'_>) -> Result<RoutingDecisi
             input.local_slot,
             None,
         );
+        let basis = match input.policy {
+            RoutingPolicy::PreferLocal { .. } => RoutingBasis::PreferLocal,
+            RoutingPolicy::Utility { .. } => RoutingBasis::UtilityLocal,
+        };
         return Ok(RoutingDecision {
             target: RouteTarget::Local,
             p_pass: local_p,
             local_p_pass: local_p,
             reasoning_effort: effort,
-            basis: RoutingBasis::UtilityLocal,
+            basis,
             pii_triggered: pii.triggered_classes,
             latency_ms: t0.elapsed().as_secs_f64() * 1000.0,
         });

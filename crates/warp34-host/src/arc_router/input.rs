@@ -620,9 +620,12 @@ pub fn serialize_request(protocol: ApiProtocol, raw: &Value) -> SerializedArcInp
     renumber_tool_ids(&mut canonical);
 
     let has_images = canonical.iter().any(|m| {
-        m.parts
-            .iter()
-            .any(|p| p.get("type").and_then(Value::as_str) == Some("image"))
+        m.parts.iter().any(|p| {
+            matches!(
+                p.get("type").and_then(Value::as_str),
+                Some("image" | "video" | "document" | "audio")
+            )
+        })
     });
     let mut blocks: Vec<ArcRoleBlock> = canonical
         .into_iter()
