@@ -173,7 +173,7 @@ Serving Options (warp34 serve):
                                       medium=50%, high=80%, xhigh/max=95% of min(max_tokens, 32k))
   --router [repo|dir]                 Enable native ARC-1.0 router (default: nchapman/ARC-1.0-W4A16-HGPTQ)
   --router-policy <policy>            Routing policy: prefer-local (default), sage, or swift
-  --router-min-p-pass <0..1>          Min local P(pass) for prefer-local (default: 0.55)
+  --router-min-p-pass <0..1>          Min local P(pass) for prefer-local (default: 0.65)
   --router-value <usd>                Override utility task value V in USD (default: 1.5 prefer-local, 4.5 sage, 0.1 swift)
   --router-cloud-models <csv|auto|none> Cloud models as provider/model, openrouter/vendor/model, https://host/v1#model, or tier=... (default: none = local-only; auto = detect from env keys)
   --router-pin-pii <csv|none>         PII classes pinned locally (default: credential,government_id,financial_account,payment_card)

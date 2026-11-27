@@ -1069,6 +1069,12 @@ fn build_thinking_budget_config(
         s.default_reasoning_budget,
         s.default_reasoning_budget_message.as_deref(),
     )?;
+    let budget_effort = resolved_effort.or_else(|| {
+        s.worker
+            .chat_template
+            .requires_thinking()
+            .then_some("xhigh")
+    });
     let (effective_budget, is_effort_derived) = match budget_kind {
         super::ResolvedReasoningBudget::PerRequestExplicit(n) => (Some(n), false),
         super::ResolvedReasoningBudget::Unlimited => (None, false),
@@ -1076,13 +1082,13 @@ fn build_thinking_budget_config(
             if per_request_effort.is_some() && s.reasoning_effort_budget =>
         {
             (
-                super::compute_effort_reasoning_budget(resolved_effort, max_tokens),
+                super::compute_effort_reasoning_budget(budget_effort, max_tokens),
                 true,
             )
         }
         super::ResolvedReasoningBudget::ServerDefault(n) => (Some(n), false),
         super::ResolvedReasoningBudget::Default if s.reasoning_effort_budget => (
-            super::compute_effort_reasoning_budget(resolved_effort, max_tokens),
+            super::compute_effort_reasoning_budget(budget_effort, max_tokens),
             true,
         ),
         super::ResolvedReasoningBudget::Default => (None, false),
@@ -1226,7 +1232,11 @@ fn prepare(
         None
     };
     let (thinking, resolved_effort) = if chat {
-        super::resolve_chat_reasoning_config(&request, s.default_reasoning_effort.as_deref())?
+        super::resolve_chat_reasoning_config_for_template(
+            &request,
+            s.default_reasoning_effort.as_deref(),
+            s.worker.chat_template.requires_thinking(),
+        )?
     } else {
         (false, None)
     };
@@ -1543,9 +1553,22 @@ impl OpenAiServerState {
 
         // Local target: rewrite virtual `"router"` / `"auto"` model aliases to the served local
         // model and apply Stage-2 reasoning effort when the caller didn't specify one explicitly.
+        self.apply_local_arc_decision_to_body(protocol, body, &decision);
+        Ok((Some(ArcRouteOutcome::Local(decision)), affinity))
+    }
+
+    fn apply_local_arc_decision_to_body(
+        &self,
+        protocol: crate::arc_router::input::ApiProtocol,
+        body: &mut Value,
+        decision: &crate::arc_router::policy::RoutingDecision,
+    ) {
         let has_explicit_effort = body.get("reasoning_effort").is_some_and(|v| !v.is_null())
             || body
                 .pointer("/reasoning/effort")
+                .is_some_and(|v| !v.is_null())
+            || body
+                .pointer("/reasoning/max_tokens")
                 .is_some_and(|v| !v.is_null())
             || body
                 .pointer("/output_config/effort")
@@ -1557,68 +1580,93 @@ impl OpenAiServerState {
             || body
                 .pointer("/chat_template_kwargs/enable_thinking")
                 .is_some_and(|v| !v.is_null());
-        if let Some(obj) = body.as_object_mut() {
-            if let Some(m) = obj.get("model").and_then(Value::as_str)
-                && matches!(
-                    m.to_ascii_lowercase().as_str(),
-                    "router" | "auto" | "arc" | "arc-router"
-                )
-            {
-                obj.insert("model".to_string(), Value::String(self.model_name.clone()));
-            }
-            if !has_explicit_effort {
-                match protocol {
-                    crate::arc_router::input::ApiProtocol::OpenAiChat => {
-                        obj.insert(
-                            "reasoning_effort".to_string(),
-                            Value::String(decision.reasoning_effort.clone()),
-                        );
-                    }
-                    crate::arc_router::input::ApiProtocol::OpenAiResponses => {
-                        let reasoning = obj.entry("reasoning").or_insert_with(|| json!({}));
-                        if reasoning.is_null() {
-                            *reasoning = json!({});
-                        }
-                        if let Some(r_obj) = reasoning.as_object_mut() {
-                            r_obj.insert(
-                                "effort".to_string(),
-                                Value::String(decision.reasoning_effort.clone()),
-                            );
-                        }
-                    }
-                    crate::arc_router::input::ApiProtocol::AnthropicMessages => {
-                        // Per Anthropic's Messages spec, omitting `thinking` explicitly disables
-                        // thinking — do not override an omitted `thinking` field into enabled.
-                    }
+        let is_forced_anthropic_tool = protocol
+            == crate::arc_router::input::ApiProtocol::AnthropicMessages
+            && body
+                .pointer("/tool_choice/type")
+                .and_then(Value::as_str)
+                .is_some_and(|t| matches!(t, "any" | "tool"));
+        let requires_thinking = self.worker.chat_template.requires_thinking();
+        let Some(obj) = body.as_object_mut() else {
+            return;
+        };
+        if let Some(m) = obj.get("model").and_then(Value::as_str)
+            && matches!(
+                m.to_ascii_lowercase().as_str(),
+                "router" | "auto" | "arc" | "arc-router"
+            )
+        {
+            obj.insert("model".to_string(), Value::String(self.model_name.clone()));
+        }
+        if !has_explicit_effort {
+            match protocol {
+                crate::arc_router::input::ApiProtocol::OpenAiChat => {
+                    obj.insert(
+                        "reasoning_effort".to_string(),
+                        Value::String(decision.reasoning_effort.clone()),
+                    );
                 }
-            } else if protocol == crate::arc_router::input::ApiProtocol::AnthropicMessages
-                && obj
-                    .get("thinking")
-                    .and_then(|v| v.get("type"))
-                    .and_then(Value::as_str)
-                    == Some("adaptive")
-                && obj
-                    .get("output_config")
-                    .and_then(|v| v.get("effort"))
-                    .is_none_or(Value::is_null)
-            {
-                if decision.reasoning_effort == "none" {
-                    obj.insert("thinking".to_string(), json!({ "type": "disabled" }));
-                } else {
-                    let out_cfg = obj.entry("output_config").or_insert_with(|| json!({}));
-                    if out_cfg.is_null() {
-                        *out_cfg = json!({});
+                crate::arc_router::input::ApiProtocol::OpenAiResponses => {
+                    let reasoning = obj.entry("reasoning").or_insert_with(|| json!({}));
+                    if !reasoning.is_object() {
+                        *reasoning = json!({});
                     }
-                    if let Some(o_obj) = out_cfg.as_object_mut() {
-                        o_obj.insert(
+                    if let Some(r_obj) = reasoning.as_object_mut() {
+                        r_obj.insert(
                             "effort".to_string(),
                             Value::String(decision.reasoning_effort.clone()),
                         );
                     }
                 }
+                crate::arc_router::input::ApiProtocol::AnthropicMessages => {
+                    // Per Anthropic's Messages spec, omitting `thinking` disables thinking on
+                    // hybrid models; on mandatory-thinking local models (`requires_thinking`),
+                    // forward ARC's Stage-2 effort via `output_config.effort` unless `tool_choice`
+                    // forces immediate tool use (`"any"` / `"tool"`).
+                    if requires_thinking && !is_forced_anthropic_tool {
+                        let eff = crate::chatml::ChatTemplate::clamp_mandatory_effort(
+                            &decision.reasoning_effort,
+                        );
+                        let out_cfg = obj.entry("output_config").or_insert_with(|| json!({}));
+                        if !out_cfg.is_object() {
+                            *out_cfg = json!({});
+                        }
+                        if let Some(o_obj) = out_cfg.as_object_mut() {
+                            o_obj.insert("effort".to_string(), Value::String(eff.to_string()));
+                        }
+                    }
+                }
+            }
+        } else if protocol == crate::arc_router::input::ApiProtocol::AnthropicMessages
+            && !is_forced_anthropic_tool
+            && obj
+                .get("thinking")
+                .and_then(|v| v.get("type"))
+                .and_then(Value::as_str)
+                == Some("adaptive")
+            && obj
+                .get("output_config")
+                .and_then(|v| v.get("effort"))
+                .is_none_or(Value::is_null)
+        {
+            if decision.reasoning_effort == "none" && !requires_thinking {
+                obj.insert("thinking".to_string(), json!({ "type": "disabled" }));
+            } else {
+                let eff = if requires_thinking {
+                    crate::chatml::ChatTemplate::clamp_mandatory_effort(&decision.reasoning_effort)
+                        .to_string()
+                } else {
+                    decision.reasoning_effort.clone()
+                };
+                let out_cfg = obj.entry("output_config").or_insert_with(|| json!({}));
+                if !out_cfg.is_object() {
+                    *out_cfg = json!({});
+                }
+                if let Some(o_obj) = out_cfg.as_object_mut() {
+                    o_obj.insert("effort".to_string(), Value::String(eff));
+                }
             }
         }
-        Ok((Some(ArcRouteOutcome::Local(decision)), affinity))
     }
 }
 
@@ -2182,12 +2230,13 @@ async fn responses_input_tokens(
         obj.remove("max_tokens");
         obj.remove("min_tokens");
     }
-    let (chat_req, _) = crate::responses_api::translate_responses_to_chat(
+    let (chat_req, _) = crate::responses_api::translate_responses_to_chat_with_thinking(
         &body,
         &s.model_name,
         &s.response_store,
         caller_scope.as_deref(),
         0,
+        s.worker.chat_template.requires_thinking(),
     )
     .map_err(responses_api_err)?;
     let prep_state = s.clone();
@@ -2215,9 +2264,14 @@ async fn anthropic_count_tokens(
         .try_acquire_owned()
         .map_err(|err| to_anthropic_err(admission_error(err)))?;
     let body = read_json(&s, req).await.map_err(to_anthropic_err)?;
-    let (mut chat_req, _) =
-        crate::anthropic_api::translate_anthropic_to_chat(&body, &s.model_name, 0, false)
-            .map_err(|e| anthropic_api_err(StatusCode::BAD_REQUEST, e))?;
+    let (mut chat_req, _) = crate::anthropic_api::translate_anthropic_to_chat_with_thinking(
+        &body,
+        &s.model_name,
+        0,
+        false,
+        s.worker.chat_template.requires_thinking(),
+    )
+    .map_err(|e| anthropic_api_err(StatusCode::BAD_REQUEST, e))?;
     if let Some(obj) = chat_req.as_object_mut() {
         obj.insert("max_tokens".into(), json!(256));
         obj.remove("min_tokens");
@@ -2418,12 +2472,13 @@ async fn responses_create(
         .try_acquire_owned()
         .map_err(admission_error)?;
     let request_id = s.next_request_id.fetch_add(1, Ordering::Relaxed) + 1;
-    let (chat_req, mut meta) = crate::responses_api::translate_responses_to_chat(
+    let (chat_req, mut meta) = crate::responses_api::translate_responses_to_chat_with_thinking(
         &body,
         &s.model_name,
         &s.response_store,
         caller_scope.as_deref(),
         request_id,
+        s.worker.chat_template.requires_thinking(),
     )
     .map_err(responses_api_err)?;
     let prep_state = s.clone();
@@ -2798,9 +2853,14 @@ async fn anthropic_messages(
         .try_acquire_owned()
         .map_err(|err| to_anthropic_err(admission_error(err)))?;
     let request_id = s.next_request_id.fetch_add(1, Ordering::Relaxed) + 1;
-    let (chat_req, mut meta) =
-        crate::anthropic_api::translate_anthropic_to_chat(&body, &s.model_name, request_id, true)
-            .map_err(|e| anthropic_api_err(StatusCode::BAD_REQUEST, e))?;
+    let (chat_req, mut meta) = crate::anthropic_api::translate_anthropic_to_chat_with_thinking(
+        &body,
+        &s.model_name,
+        request_id,
+        true,
+        s.worker.chat_template.requires_thinking(),
+    )
+    .map_err(|e| anthropic_api_err(StatusCode::BAD_REQUEST, e))?;
     let prep_state = s.clone();
     let mut prepared = cpu_with(
         &s,
@@ -3468,5 +3528,351 @@ mod tests {
         let err_gt = super::clamp_max_tokens_for_worker(256, 20_000, 16_384, "input").unwrap_err();
         let (rst, _) = super::prepare_responses_err(err_gt);
         assert_eq!(rst, StatusCode::BAD_REQUEST);
+    }
+
+    fn ascii_chatml_tokenizer() -> tokenizers::Tokenizer {
+        use tokenizers::{
+            AddedToken, Tokenizer,
+            models::bpe::{BPE, Vocab},
+        };
+        let mut vocab = Vocab::default();
+        vocab.insert("[UNK]".to_owned(), 0);
+        for (next_id, ch) in (1u32..).zip(
+            ['\t', '\n', '\r']
+                .into_iter()
+                .chain((0x20u8..=0x7eu8).map(|b| b as char)),
+        ) {
+            vocab.insert(ch.to_string(), next_id);
+        }
+        let bpe = BPE::builder()
+            .vocab_and_merges(vocab, Vec::new())
+            .unk_token("[UNK]".to_owned())
+            .build()
+            .unwrap();
+        let mut tok = Tokenizer::new(bpe);
+        let added: Vec<AddedToken> = [
+            "<|endoftext|>",
+            "<|im_start|>",
+            "<|im_end|>",
+            "<think>",
+            "</think>",
+            "<tool_call>",
+            "</tool_call>",
+        ]
+        .into_iter()
+        .map(|s| AddedToken::from(s, true))
+        .collect();
+        tok.add_special_tokens(&added);
+        tok
+    }
+
+    fn bonsai_test_template() -> crate::chatml::ChatTemplate {
+        crate::chatml::ChatTemplate::from_source(
+            concat!(
+                "{%- set reasoning_instructions = '' %}\n",
+                "{%- if enable_thinking is undefined or enable_thinking is true %}\n",
+                "    {%- set resolved_reasoning_effort = reasoning_effort|default('xhigh') %}\n",
+                "    {%- if resolved_reasoning_effort not in ('xhigh', 'medium', 'low') %}\n",
+                "        {{- raise_exception('Unexpected reasoning effort ' ~ reasoning_effort) }}\n",
+                "    {%- endif %}\n",
+                "    {%- if resolved_reasoning_effort == 'xhigh' %}\n",
+                "        {%- set reasoning_instructions = 'Reasoning effort is set to xhigh.' %}\n",
+                "    {%- elif resolved_reasoning_effort == 'low' %}\n",
+                "        {%- set reasoning_instructions = 'Reasoning effort is set to low.' %}\n",
+                "    {%- endif %}\n",
+                "{%- endif %}\n",
+                "{%- if reasoning_instructions %}<|im_start|>system\n{{ reasoning_instructions }}<|im_end|>\n{%- endif %}",
+                "{%- for m in messages %}<|im_start|>{{ m.role }}\n{{ m.content }}<|im_end|>\n{%- endfor %}",
+                "{%- if add_generation_prompt %}<|im_start|>assistant\n{% if enable_thinking is defined and enable_thinking is false %}<think>\n\n</think>\n\n{% else %}<think>\n{% endif %}{%- endif %}"
+            ),
+            "bonsai-test",
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn prepare_preserves_mandatory_thinking_across_chat_responses_and_anthropic() {
+        use crate::responses_api::ResponseStore;
+        use serde_json::json;
+
+        let tok = ascii_chatml_tokenizer();
+        let bonsai_state = super::OpenAiServerState::with_worker(
+            "bonsai-27b".into(),
+            crate::engine_worker::EngineWorker::for_test(tok.clone(), bonsai_test_template()),
+            false,
+        );
+        let hybrid_state = super::OpenAiServerState::with_worker(
+            "qwen-27b".into(),
+            crate::engine_worker::EngineWorker::for_test(
+                tok.clone(),
+                crate::chatml::ChatTemplate::default_qwen(),
+            ),
+            false,
+        );
+        let decode_prompt = |ids: &[i32]| -> String {
+            ids.iter()
+                .map(|&x| tok.id_to_token(x as u32).unwrap_or_default())
+                .collect()
+        };
+
+        // 1. OpenAI Chat on mandatory-thinking Bonsai:
+        //    - omitted effort -> open <think> + xhigh instructions + 95% budget (3800 on max=4000)
+        //    - "none" / "minimal" / "low" -> open <think> + low instructions + 20% budget (800)
+        //    - "medium" -> open <think> + unsteered + 50% budget (2000)
+        //    - "high" -> open <think> + xhigh instructions + 95% budget (3800)
+        let omitted = super::prepare(
+            &bonsai_state,
+            json!({"max_tokens": 4000, "messages": [{"role": "user", "content": "hi"}]}),
+            true,
+            super::PrepareMode::Generate,
+        )
+        .unwrap();
+        assert_eq!(omitted.enable_thinking, Some(true));
+        assert_eq!(omitted.reasoning_effort, None);
+        assert_eq!(
+            omitted.params.thinking_budget.as_ref().unwrap().budget,
+            3800
+        );
+        let omitted_text = decode_prompt(&omitted.prompt);
+        assert!(omitted_text.contains("Reasoning effort is set to xhigh."));
+        assert!(omitted_text.ends_with("<|im_start|>assistant\n<think>\n"));
+
+        for (eff, expected_eff, expected_budget, expected_instr) in [
+            (
+                "none",
+                "low",
+                800usize,
+                Some("Reasoning effort is set to low."),
+            ),
+            (
+                "minimal",
+                "low",
+                800,
+                Some("Reasoning effort is set to low."),
+            ),
+            ("low", "low", 800, Some("Reasoning effort is set to low.")),
+            ("medium", "medium", 2000, None),
+            (
+                "high",
+                "xhigh",
+                3800,
+                Some("Reasoning effort is set to xhigh."),
+            ),
+        ] {
+            let p = super::prepare(
+                &bonsai_state,
+                json!({
+                    "max_tokens": 4000,
+                    "reasoning_effort": eff,
+                    "messages": [{"role": "user", "content": "hi"}]
+                }),
+                true,
+                super::PrepareMode::Generate,
+            )
+            .unwrap();
+            assert_eq!(p.enable_thinking, Some(true), "effort={eff}");
+            assert_eq!(
+                p.reasoning_effort.as_deref(),
+                Some(expected_eff),
+                "effort={eff}"
+            );
+            assert_eq!(
+                p.params.thinking_budget.as_ref().unwrap().budget,
+                expected_budget,
+                "effort={eff}"
+            );
+            let txt = decode_prompt(&p.prompt);
+            assert!(
+                txt.ends_with("<|im_start|>assistant\n<think>\n"),
+                "effort={eff} rendered closed think: {txt}"
+            );
+            assert!(!txt.contains("<think>\n\n</think>"));
+            match expected_instr {
+                Some(instr) => assert!(txt.contains(instr), "effort={eff}: {txt}"),
+                None => assert!(
+                    !txt.contains("Reasoning effort is set to"),
+                    "effort={eff}: {txt}"
+                ),
+            }
+        }
+
+        // Contrast: hybrid Qwen model still disables thinking on `reasoning_effort: "none"`.
+        let hybrid_none = super::prepare(
+            &hybrid_state,
+            json!({
+                "max_tokens": 4000,
+                "reasoning_effort": "none",
+                "messages": [{"role": "user", "content": "hi"}]
+            }),
+            true,
+            super::PrepareMode::Generate,
+        )
+        .unwrap();
+        assert_eq!(hybrid_none.enable_thinking, Some(false));
+        assert!(hybrid_none.params.thinking_budget.is_none());
+
+        // 2. OpenAI Responses + Anthropic Messages end-to-end into `prepare()` on Bonsai vs Hybrid.
+        let store = ResponseStore::default();
+        let (resp_chat_bonsai, _) =
+            crate::responses_api::translate_responses_to_chat_with_thinking(
+                &json!({"input": "hi", "max_output_tokens": 4000, "reasoning": {"effort": "none"}}),
+                "bonsai-27b",
+                &store,
+                None,
+                1,
+                bonsai_state.worker.chat_template.requires_thinking(),
+            )
+            .unwrap();
+        let resp_prep = super::prepare(
+            &bonsai_state,
+            resp_chat_bonsai,
+            true,
+            super::PrepareMode::Generate,
+        )
+        .unwrap();
+        assert_eq!(resp_prep.enable_thinking, Some(true));
+        assert_eq!(resp_prep.reasoning_effort.as_deref(), Some("low"));
+        assert_eq!(
+            resp_prep.params.thinking_budget.as_ref().unwrap().budget,
+            800
+        );
+
+        let (anth_chat_bonsai, _) =
+            crate::anthropic_api::translate_anthropic_to_chat_with_thinking(
+                &json!({"max_tokens": 4000, "messages": [{"role": "user", "content": "hi"}]}),
+                "bonsai-27b",
+                1,
+                true,
+                bonsai_state.worker.chat_template.requires_thinking(),
+            )
+            .unwrap();
+        let anth_prep = super::prepare(
+            &bonsai_state,
+            anth_chat_bonsai,
+            true,
+            super::PrepareMode::Generate,
+        )
+        .unwrap();
+        assert_eq!(anth_prep.enable_thinking, Some(true));
+        assert_eq!(anth_prep.reasoning_effort.as_deref(), Some("low"));
+        assert_eq!(
+            anth_prep.params.thinking_budget.as_ref().unwrap().budget,
+            800
+        );
+    }
+
+    #[test]
+    fn apply_local_arc_decision_preserves_thinking_and_protocol_contracts() {
+        use crate::arc_router::{
+            input::ApiProtocol,
+            policy::{RouteTarget, RoutingBasis, RoutingDecision},
+        };
+        use serde_json::json;
+
+        let tok = ascii_chatml_tokenizer();
+        let bonsai_state = super::OpenAiServerState::with_worker(
+            "bonsai-27b".into(),
+            crate::engine_worker::EngineWorker::for_test(tok.clone(), bonsai_test_template()),
+            false,
+        );
+        let hybrid_state = super::OpenAiServerState::with_worker(
+            "qwen-27b".into(),
+            crate::engine_worker::EngineWorker::for_test(
+                tok,
+                crate::chatml::ChatTemplate::default_qwen(),
+            ),
+            false,
+        );
+
+        let make_decision = |effort: &str| RoutingDecision {
+            target: RouteTarget::Local,
+            p_pass: 0.72,
+            local_p_pass: 0.72,
+            reasoning_effort: effort.to_string(),
+            basis: RoutingBasis::PreferLocal,
+            pii_triggered: Vec::new(),
+            latency_ms: 1.5,
+        };
+
+        let mut resp_body = json!({
+            "model": "router",
+            "input": "solve",
+            "reasoning": {"summary": "auto"}
+        });
+        bonsai_state.apply_local_arc_decision_to_body(
+            ApiProtocol::OpenAiResponses,
+            &mut resp_body,
+            &make_decision("medium"),
+        );
+        assert_eq!(resp_body["model"], "bonsai-27b");
+        assert_eq!(resp_body["reasoning"]["summary"], "auto");
+        assert_eq!(resp_body["reasoning"]["effort"], "medium");
+
+        // Anthropic without `thinking`: hybrid keeps omitted (disabled), Bonsai receives clamped effort.
+        let mut anth_omitted_hybrid = json!({
+            "model": "router",
+            "max_tokens": 2048,
+            "messages": [{"role": "user", "content": "solve"}]
+        });
+        hybrid_state.apply_local_arc_decision_to_body(
+            ApiProtocol::AnthropicMessages,
+            &mut anth_omitted_hybrid,
+            &make_decision("high"),
+        );
+        assert!(anth_omitted_hybrid.get("output_config").is_none());
+
+        let mut anth_omitted_bonsai = json!({
+            "model": "router",
+            "max_tokens": 2048,
+            "messages": [{"role": "user", "content": "solve"}]
+        });
+        bonsai_state.apply_local_arc_decision_to_body(
+            ApiProtocol::AnthropicMessages,
+            &mut anth_omitted_bonsai,
+            &make_decision("high"),
+        );
+        assert_eq!(anth_omitted_bonsai["output_config"]["effort"], "xhigh");
+
+        // Forced tool choice on Anthropic must not inject `output_config.effort` even on Bonsai.
+        let mut anth_forced_bonsai = json!({
+            "model": "router",
+            "max_tokens": 2048,
+            "tool_choice": {"type": "any"},
+            "messages": [{"role": "user", "content": "call tool"}]
+        });
+        bonsai_state.apply_local_arc_decision_to_body(
+            ApiProtocol::AnthropicMessages,
+            &mut anth_forced_bonsai,
+            &make_decision("high"),
+        );
+        assert!(anth_forced_bonsai.get("output_config").is_none());
+
+        // Adaptive Anthropic with `"none"` decision: hybrid disables, Bonsai clamps to `"low"`.
+        let mut anth_adapt_hybrid = json!({
+            "model": "router",
+            "max_tokens": 2048,
+            "thinking": {"type": "adaptive"},
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+        hybrid_state.apply_local_arc_decision_to_body(
+            ApiProtocol::AnthropicMessages,
+            &mut anth_adapt_hybrid,
+            &make_decision("none"),
+        );
+        assert_eq!(anth_adapt_hybrid["thinking"]["type"], "disabled");
+
+        let mut anth_adapt_bonsai = json!({
+            "model": "router",
+            "max_tokens": 2048,
+            "thinking": {"type": "adaptive"},
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+        bonsai_state.apply_local_arc_decision_to_body(
+            ApiProtocol::AnthropicMessages,
+            &mut anth_adapt_bonsai,
+            &make_decision("none"),
+        );
+        assert_eq!(anth_adapt_bonsai["thinking"]["type"], "adaptive");
+        assert_eq!(anth_adapt_bonsai["output_config"]["effort"], "low");
     }
 }

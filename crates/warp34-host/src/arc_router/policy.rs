@@ -6,6 +6,9 @@ use super::{
 };
 use std::collections::HashSet;
 
+/// Default `prefer-local` threshold on the local model's `P(pass)` (`rayline-arc-decide` parity).
+pub const DEFAULT_PREFER_LOCAL_MIN_P_PASS: f64 = 0.65;
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum RoutingPolicy {
     /// Stay local whenever the local model clears `min_p_pass`; otherwise pick the best
@@ -81,19 +84,18 @@ pub struct CloudCandidate {
     pub capabilities: ModelCapabilities,
 }
 
-fn find_native_arc_slot(catalog: &ArcRuntimeCatalog, id: &str) -> Option<usize> {
+pub fn find_native_arc_slot(catalog: &ArcRuntimeCatalog, id: &str) -> Option<usize> {
     let wanted = id.trim().to_ascii_lowercase();
-    let dotted = wanted.replace('-', ".");
-    let dashed = wanted.replace('.', "-");
+    let wanted_canon = wanted.replace('.', "-");
     catalog.models.iter().enumerate().find_map(|(idx, m)| {
         let name_lc = m.name.to_ascii_lowercase();
+        let name_canon = name_lc.replace('.', "-");
         let wire_lc = m.wire.as_deref().map(str::to_ascii_lowercase);
         let matches = name_lc == wanted
-            || name_lc == dotted
-            || name_lc == dashed
+            || name_canon == wanted_canon
             || wire_lc
                 .as_deref()
-                .is_some_and(|w| w == wanted || w == dotted || w == dashed);
+                .is_some_and(|w| w == wanted || w.replace('.', "-") == wanted_canon);
         matches.then_some(idx)
     })
 }
@@ -255,17 +257,27 @@ fn expected_cost_usd(usage: &[f64; LEGS], rates: &[f64; LEGS]) -> f64 {
 }
 
 /// Map ARC Stage-2 `(effort, level)` action fields to `warp34`'s canonical reasoning effort.
-/// ARC-1.0 encodes no-thinking as `level == Some("none")` (e.g. `("default", Some("none"))`).
+///
+/// In `ARC-1.0` (`rayline-arc-decide` `release.rs` / `rayline-arc-routes` `shape.rs`), every
+/// Stage-2 action runs with `thinking.mode = "on"`: `effort` is the base model effort
+/// (`"default"`, `"medium"`, `"high"`) and `level` (`Thinking::steering_level`) is a
+/// `-1 / 0 / +1` steering delta (`"down"`, `"none"` / `None`, `"up"`). `level == Some("none")`
+/// means *unsteered* baseline thinking, not disabled thinking.
 pub(crate) fn map_arc_effort_to_warp34(effort: &str, level: Option<&str>) -> &'static str {
     match (effort, level) {
-        ("none", _) | (_, Some("none")) => "none",
-        ("high", Some("up")) => "high",
-        ("high", Some("down")) => "low",
-        ("high", _) => "high",
+        ("none" | "off", _) => "none",
+        ("minimal", Some("up")) => "low",
+        ("minimal", _) => "minimal",
+        ("low", Some("up")) => "medium",
         ("low", _) => "low",
-        ("medium", _) => "medium",
-        ("default", Some("down")) => "low",
-        ("default", Some("up")) => "high",
+        ("default" | "medium", Some("down")) => "low",
+        ("default" | "medium", Some("up")) => "high",
+        ("default" | "medium", _) => "medium",
+        ("high", Some("down")) => "medium",
+        ("high", Some("up")) => "xhigh",
+        ("high", _) => "high",
+        ("xhigh" | "max", Some("down")) => "high",
+        ("xhigh" | "max", _) => "xhigh",
         _ => "medium",
     }
 }
@@ -572,14 +584,75 @@ mod tests {
     use super::*;
 
     #[test]
-    fn stage_two_level_none_maps_to_none_effort() {
-        assert_eq!(map_arc_effort_to_warp34("default", Some("none")), "none");
-        assert_eq!(map_arc_effort_to_warp34("high", Some("none")), "none");
-        assert_eq!(map_arc_effort_to_warp34("none", None), "none");
+    fn stage_two_steering_levels_preserve_thinking_mode() {
+        // In ARC-1.0 (`rayline-arc-decide` `release.rs` / `rayline-arc-routes` `shape.rs`),
+        // `level: Some("none")` means unsteered baseline thinking (`thinking.mode = "on"`),
+        // NOT disabled thinking.
+        assert_eq!(map_arc_effort_to_warp34("default", Some("none")), "medium");
+        assert_eq!(map_arc_effort_to_warp34("default", None), "medium");
         assert_eq!(map_arc_effort_to_warp34("default", Some("down")), "low");
         assert_eq!(map_arc_effort_to_warp34("default", Some("up")), "high");
-        assert_eq!(map_arc_effort_to_warp34("high", Some("down")), "low");
+        assert_eq!(map_arc_effort_to_warp34("high", Some("none")), "high");
+        assert_eq!(map_arc_effort_to_warp34("high", None), "high");
+        assert_eq!(map_arc_effort_to_warp34("high", Some("down")), "medium");
+        assert_eq!(map_arc_effort_to_warp34("high", Some("up")), "xhigh");
+        assert_eq!(map_arc_effort_to_warp34("low", Some("up")), "medium");
+        assert_eq!(map_arc_effort_to_warp34("low", None), "low");
         assert_eq!(map_arc_effort_to_warp34("medium", None), "medium");
+        assert_eq!(map_arc_effort_to_warp34("none", None), "none");
+    }
+
+    #[test]
+    fn find_native_arc_slot_matches_mixed_dash_and_dot_version_ids() {
+        use super::super::heads::{ArcModelEntry, ArcRuntimeCatalog};
+        let catalog = ArcRuntimeCatalog {
+            models: vec![
+                ArcModelEntry {
+                    name: "claude-haiku-5.5".to_string(),
+                    wire: Some("anthropic/claude-haiku-5.5".to_string()),
+                },
+                ArcModelEntry {
+                    name: "claude-opus-5.5".to_string(),
+                    wire: Some("anthropic/claude-opus-5.5".to_string()),
+                },
+                ArcModelEntry {
+                    name: "claude-sonnet-5.5".to_string(),
+                    wire: Some("anthropic/claude-sonnet-5.5".to_string()),
+                },
+                ArcModelEntry {
+                    name: "deepseek-v4.1-flash".to_string(),
+                    wire: Some("deepseek/deepseek-v4.1-flash".to_string()),
+                },
+            ],
+            actions: Vec::new(),
+            fallback_action: 0,
+            model_to_candidate: vec![Some(0), Some(1), Some(2), Some(3)],
+            candidate_latency_factor: vec![None; 4],
+            stage_one_regime: 0,
+            stage_one_cost_weight: 0.3,
+            stage_one_latency_weight: 0.0,
+            stage_two_cost_weight: 0.3,
+            stage_two_support_columns: Vec::new(),
+            model_prices: vec![None; 4],
+            pii_classes: Vec::new(),
+            pii_presence_threshold: 0.5,
+            pii_type_threshold: 0.5,
+            pii_length_buckets: Vec::new(),
+        };
+        assert_eq!(find_native_arc_slot(&catalog, "claude-haiku-5-5"), Some(0));
+        assert_eq!(find_native_arc_slot(&catalog, "claude-opus-5-5"), Some(1));
+        assert_eq!(find_native_arc_slot(&catalog, "claude-sonnet-5-5"), Some(2));
+        assert_eq!(
+            find_native_arc_slot(&catalog, "anthropic/claude-sonnet-5-5"),
+            Some(2)
+        );
+        assert_eq!(
+            find_native_arc_slot(&catalog, "deepseek-v4-1-flash"),
+            Some(3)
+        );
+        assert_eq!(find_native_arc_slot(&catalog, "Claude-Opus-5-5"), Some(1));
+        assert_eq!(find_native_arc_slot(&catalog, "unknown-model-99"), None);
+        assert!((DEFAULT_PREFER_LOCAL_MIN_P_PASS - 0.65).abs() < 1e-12);
     }
 
     #[test]

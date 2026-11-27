@@ -543,6 +543,21 @@ pub fn resolve_chat_reasoning_config(
     req: &serde_json::Value,
     default_effort: Option<&str>,
 ) -> Result<(bool, Option<String>), String> {
+    resolve_chat_reasoning_config_for_template(req, default_effort, false)
+}
+
+/// Template-aware variant of [`resolve_chat_reasoning_config`].
+///
+/// When `requires_thinking` is `true` (mandatory-thinking templates such as `Ternary-Bonsai-2.5`
+/// whose Jinja only supports `('xhigh', 'medium', 'low')`), `"none"` / `"minimal"` efforts clamp
+/// to `(true, Some("low"))` and `"high"` / `"max"` normalize to `Some("xhigh")` instead of
+/// prefilling an empty `<think>\n\n</think>\n\n` block. Explicit
+/// `chat_template_kwargs.enable_thinking = false` remains available as a raw template escape hatch.
+pub fn resolve_chat_reasoning_config_for_template(
+    req: &serde_json::Value,
+    default_effort: Option<&str>,
+    requires_thinking: bool,
+) -> Result<(bool, Option<String>), String> {
     let mut raw_effort =
         request_explicit_reasoning_effort(req)?.or_else(|| default_effort.map(str::to_owned));
 
@@ -550,15 +565,28 @@ pub fn resolve_chat_reasoning_config(
         validate_reasoning_effort(eff)?;
     }
 
-    let enable_thinking = if let Some(kw) = req
+    let explicit_kw_thinking = match req
         .pointer("/chat_template_kwargs/enable_thinking")
         .filter(|v| !v.is_null())
     {
-        kw.as_bool()
-            .ok_or_else(|| "invalid chat_template_kwargs.enable_thinking".to_string())?
-    } else {
-        raw_effort.as_deref() != Some("none")
+        Some(kw) => Some(
+            kw.as_bool()
+                .ok_or_else(|| "invalid chat_template_kwargs.enable_thinking".to_string())?,
+        ),
+        None => None,
     };
+
+    if requires_thinking {
+        if explicit_kw_thinking == Some(false) {
+            return Ok((false, None));
+        }
+        let clamped = raw_effort
+            .as_deref()
+            .map(|e| crate::chatml::ChatTemplate::clamp_mandatory_effort(e).to_owned());
+        return Ok((true, clamped));
+    }
+
+    let enable_thinking = explicit_kw_thinking.unwrap_or(raw_effort.as_deref() != Some("none"));
 
     if (enable_thinking && raw_effort.as_deref() == Some("none"))
         || (!enable_thinking && raw_effort.as_deref() != Some("none"))
@@ -933,6 +961,69 @@ mod tests {
         assert!(
             resolve_chat_enable_thinking(&serde_json::json!({"reasoning_effort": "bogus"}))
                 .is_err()
+        );
+
+        // Mandatory-thinking templates (`requires_thinking == true`, e.g. Ternary-Bonsai-2.5)
+        // clamp disabled/minimal efforts onto `"low"` and `"high"`/`"max"` onto `"xhigh"` instead
+        // of setting `enable_thinking = false`.
+        assert_eq!(
+            resolve_chat_reasoning_config_for_template(&serde_json::json!({}), None, true).unwrap(),
+            (true, None)
+        );
+        for (req_eff, expected_eff) in [
+            ("none", "low"),
+            ("minimal", "low"),
+            ("low", "low"),
+            ("medium", "medium"),
+            ("high", "xhigh"),
+            ("xhigh", "xhigh"),
+            ("max", "xhigh"),
+        ] {
+            assert_eq!(
+                resolve_chat_reasoning_config_for_template(
+                    &serde_json::json!({"reasoning_effort": req_eff}),
+                    None,
+                    true,
+                )
+                .unwrap(),
+                (true, Some(expected_eff.to_string())),
+                "mandatory-thinking clamp failed for effort={req_eff}"
+            );
+        }
+        assert_eq!(
+            resolve_chat_reasoning_config_for_template(
+                &serde_json::json!({"reasoning": {"effort": "none"}}),
+                None,
+                true,
+            )
+            .unwrap(),
+            (true, Some("low".to_string()))
+        );
+        assert_eq!(
+            resolve_chat_reasoning_config_for_template(&serde_json::json!({}), Some("none"), true,)
+                .unwrap(),
+            (true, Some("low".to_string()))
+        );
+        // Raw template escape hatch (`chat_template_kwargs.enable_thinking = false`) is honored.
+        assert_eq!(
+            resolve_chat_reasoning_config_for_template(
+                &serde_json::json!({
+                    "reasoning_effort": "high",
+                    "chat_template_kwargs": {"enable_thinking": false}
+                }),
+                None,
+                true,
+            )
+            .unwrap(),
+            (false, None)
+        );
+        assert!(
+            resolve_chat_reasoning_config_for_template(
+                &serde_json::json!({"reasoning_effort": "bogus"}),
+                None,
+                true,
+            )
+            .is_err()
         );
 
         let (msgs, _) = parse_openai_messages_multimodal(&serde_json::json!([

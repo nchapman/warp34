@@ -306,6 +306,38 @@ impl EngineWorker {
         Self::from_loader(move || Ok(engine), config).expect("infallible engine transfer")
     }
 
+    #[cfg(test)]
+    pub(crate) fn for_test(
+        tokenizer: tokenizers::Tokenizer,
+        chat_template: crate::chatml::ChatTemplate,
+    ) -> Self {
+        let vocab_size = tokenizer.get_vocab_size(true).max(16);
+        Self {
+            sender: Mutex::new(None),
+            thread: Mutex::new(None),
+            shutdown: Arc::new(AtomicBool::new(false)),
+            panicked: Arc::new(AtomicBool::new(false)),
+            panic_reason: Arc::new(Mutex::new(None)),
+            stats: Arc::new(WorkerStats::default()),
+            tokenizer: Some(tokenizer),
+            eos_token_ids: vec![0],
+            vocab_size,
+            default_preserve_thinking: true,
+            chat_template,
+            default_sampling_params: SamplingParams::default(),
+            decision_profile: crate::decision::DecisionModelProfile::CausalLm { temperature: 1.0 },
+            vision_config: None,
+            vision_preprocessor: crate::vision::VisionPreprocessorConfig::default(),
+            has_vision_weights: false,
+            hidden_size: 64,
+            kv_token_capacity: 32_768,
+            max_position_embeddings: Some(32_768),
+            unshareable_prefill: false,
+            lora_registry: crate::lora::LoraAdapterRegistry::default(),
+            max_model_len: Some(32_768),
+        }
+    }
+
     /// Returns whether the background `warp34-cuda` worker thread terminated due to a panic.
     #[inline]
     pub fn is_panicked(&self) -> bool {

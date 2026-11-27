@@ -307,7 +307,45 @@ fn arc_encoder_and_heads_match_goldens() {
         "expected tight PII parity with canonical arc-role-blocks-v2 (got mean_abs_diff={mean_abs_diff:.4})"
     );
 
-    // 2. Verify 54/54 exact token_count + Stage-1/Stage-2 consistency across goldens.jsonl.
+    // 2. Verify 54/54 exact token_count + Stage-1/Stage-2 + decide() invariants across goldens.jsonl
+    //    and across all 51 real ARC-1.0 Stage-2 actions in arc-runtime.json.
+    let runtime_json: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(dir.join("runtime/arc-runtime.json"))
+            .expect("runtime/arc-runtime.json"),
+    )
+    .expect("parse arc-runtime.json");
+    let raw_actions = runtime_json
+        .pointer("/actions")
+        .and_then(|v| v.as_array())
+        .expect("runtime/arc-runtime.json actions");
+    assert_eq!(raw_actions.len(), heads.catalog.actions.len());
+    assert_eq!(raw_actions.len(), 51, "ARC-1.0 defines 51 Stage-2 actions");
+    for (idx, act) in heads.catalog.actions.iter().enumerate() {
+        assert!(
+            matches!(act.effort.as_str(), "default" | "low" | "medium" | "high"),
+            "ARC-1.0 action[{idx}] unexpected base effort {:?}",
+            act.effort
+        );
+        if let Some(lv) = act.level.as_deref() {
+            assert!(
+                matches!(lv, "down" | "none" | "up"),
+                "ARC-1.0 action[{idx}] unexpected steering level {lv:?}"
+            );
+        }
+    }
+    // Verify native slot matching against the real 56-slot ARC-1.0 catalog handles dash-versioned IDs.
+    for (alias, expected_slot) in [
+        ("claude-haiku-5-5", 0usize),
+        ("claude-opus-5-5", 1),
+        ("claude-sonnet-5-5", 2),
+    ] {
+        assert_eq!(
+            warp34_host::arc_router::policy::find_native_arc_slot(&heads.catalog, alias),
+            Some(expected_slot),
+            "expected {alias} to match native ARC-1.0 slot {expected_slot}"
+        );
+    }
+
     let gold_txt = std::fs::read_to_string(dir.join("goldens.jsonl")).expect("goldens.jsonl");
     let mut gold_checked = 0usize;
     let mut exact_tok_matches = 0usize;
@@ -315,6 +353,7 @@ fn arc_encoder_and_heads_match_goldens() {
         .into_iter()
         .filter_map(|m| heads.catalog.stage_one_candidate_for_model(m))
         .collect();
+    let empty_pins = HashSet::new();
     for line in gold_txt.lines().filter(|l| !l.trim().is_empty()) {
         let row: serde_json::Value = serde_json::from_str(line).expect("parse decision golden");
         let Some(req_body) = row.pointer("/request/request") else {
@@ -364,13 +403,45 @@ fn arc_encoder_and_heads_match_goldens() {
                 assert_eq!(sparse[cand_idx].usage, preds[cand_idx].usage);
             }
         }
-        // Verify Stage-2 multi-block pooled prediction succeeds cleanly on every golden case.
+        // Verify Stage-2 multi-block pooled prediction succeeds cleanly on every golden case
+        // and that real `decide()` on Ternary-Bonsai-2.5-27B (slot 55) & Apex-35B (slot 54)
+        // never collapses thinking effort onto `"none"`.
         let all_arms: Vec<usize> = (0..8).collect();
         let s2 = heads
             .stage_two
             .predict_arms(&rows, &roles, &[], &all_arms)
             .expect("stage_two");
         assert!(!s2.is_empty());
+        for local_slot in [54usize, 55usize] {
+            let dec = decide(
+                &heads,
+                &DecideInput {
+                    block_readouts: &rows,
+                    block_roles: &roles,
+                    prompt_tokens: flat.len(),
+                    has_tools: turn.has_tools,
+                    has_images: turn.has_images,
+                    warm_local_kv: false,
+                    local_slot,
+                    cloud_candidates: &[],
+                    policy: RoutingPolicy::PreferLocal {
+                        min_p_pass:
+                            warp34_host::arc_router::policy::DEFAULT_PREFER_LOCAL_MIN_P_PASS,
+                        value_usd: 1.0,
+                    },
+                    pin_pii_classes: &empty_pins,
+                },
+            )
+            .expect("decide");
+            assert!(
+                matches!(
+                    dec.reasoning_effort.as_str(),
+                    "low" | "medium" | "high" | "xhigh"
+                ),
+                "golden[{gold_checked}] slot={local_slot} unexpectedly collapsed effort to {:?}",
+                dec.reasoning_effort
+            );
+        }
         gold_checked += 1;
     }
     eprintln!(
@@ -476,7 +547,7 @@ fn dp1_warm_kv_and_stateful_responses_routing() {
             local_model_name: "Qwen3.5-0.8B".to_string(),
             cloud_model_filter: Vec::new(),
             policy: RoutingPolicy::PreferLocal {
-                min_p_pass: 0.55,
+                min_p_pass: warp34_host::arc_router::policy::DEFAULT_PREFER_LOCAL_MIN_P_PASS,
                 value_usd: 1.0,
             },
             pin_pii_classes: HashSet::new(),
@@ -559,6 +630,15 @@ fn dp1_warm_kv_and_stateful_responses_routing() {
                     .and_then(|v| v.to_str().ok()),
                 Some("local_only_effort"),
                 "cold Turn 0 on local-only router must report local_only_effort"
+            );
+            let t0_effort = t0_resp
+                .headers()
+                .get("x-warp34-route-effort")
+                .and_then(|v| v.to_str().ok())
+                .expect("x-warp34-route-effort header");
+            assert!(
+                matches!(t0_effort, "low" | "medium" | "high" | "xhigh"),
+                "ARC-1.0 Stage-2 route effort must keep thinking enabled, got {t0_effort:?}"
             );
             let t0_json: serde_json::Value = t0_resp.json().await.unwrap();
             let asst_reply = t0_json["choices"][0]["message"]["content"]

@@ -1732,7 +1732,9 @@ pub(crate) fn run_serve(
         )
         .map_err(|e| format!("resolve ARC router model `{spec}`: {e}"))?;
         let policy_label = serve.router_policy.as_deref().unwrap_or("prefer-local");
-        let min_p = serve.router_min_p_pass.unwrap_or(0.55);
+        let min_p = serve
+            .router_min_p_pass
+            .unwrap_or(crate::arc_router::policy::DEFAULT_PREFER_LOCAL_MIN_P_PASS);
         let policy = crate::arc_router::policy::RoutingPolicy::from_args(
             policy_label,
             min_p,

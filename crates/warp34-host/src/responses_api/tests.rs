@@ -814,3 +814,45 @@ fn streaming_reasoning_uses_content_part_events_matching_vllm_034() {
         .expect("reasoning content_part.done");
     assert_eq!(done.1["part"]["text"], "thinking");
 }
+
+#[test]
+fn mandatory_thinking_responses_translation_clamps_disabled_reasoning_to_low() {
+    let store = ResponseStore::default();
+    for payload in [
+        json!({
+            "input": "solve",
+            "reasoning": {"effort": "none"}
+        }),
+        json!({
+            "input": "solve",
+            "reasoning": {"max_tokens": 0}
+        }),
+    ] {
+        let (chat, _) = super::translate_responses_to_chat_with_thinking(
+            &payload, "bonsai", &store, None, 1, true,
+        )
+        .unwrap();
+        assert_eq!(chat["chat_template_kwargs"]["enable_thinking"], true);
+        assert_eq!(chat["reasoning_effort"], "low");
+        assert!(
+            chat.get("thinking_token_budget").is_none(),
+            "zero reasoning.max_tokens must clear 0-token budget when clamped to low: {chat}"
+        );
+    }
+
+    // Raw escape hatch (`chat_template_kwargs.enable_thinking = false`) stays honored.
+    let (escaped, _) = super::translate_responses_to_chat_with_thinking(
+        &json!({
+            "input": "solve",
+            "reasoning": {"effort": "none"},
+            "chat_template_kwargs": {"enable_thinking": false}
+        }),
+        "bonsai",
+        &store,
+        None,
+        2,
+        true,
+    )
+    .unwrap();
+    assert_eq!(escaped["chat_template_kwargs"]["enable_thinking"], false);
+}

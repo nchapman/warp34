@@ -239,10 +239,37 @@ fn prepare_upstream_body(
     }
 
     // Forward ARC's Stage-2 reasoning effort when the caller omitted explicit reasoning controls
-    // and the target cloud model supports reasoning.
-    let caller_set_reasoning = obj.contains_key("reasoning_effort")
-        || obj.contains_key("reasoning")
-        || obj.contains_key("thinking");
+    // and the target cloud model supports reasoning. Note that OpenAI Responses callers often pass
+    // `"reasoning": {"summary": "auto"}` without an `"effort"`, so inspect concrete control keys
+    // rather than treating any `"reasoning"` object as an explicit effort override.
+    let is_adaptive_anthropic = protocol == ApiProtocol::AnthropicMessages
+        && obj
+            .get("thinking")
+            .and_then(|v| v.get("type"))
+            .and_then(Value::as_str)
+            == Some("adaptive")
+        && obj
+            .get("output_config")
+            .and_then(|v| v.get("effort"))
+            .is_none_or(Value::is_null);
+    let caller_set_reasoning = obj.get("reasoning_effort").is_some_and(|v| !v.is_null())
+        || obj
+            .get("reasoning")
+            .and_then(|r| r.get("effort"))
+            .is_some_and(|v| !v.is_null())
+        || obj
+            .get("reasoning")
+            .and_then(|r| r.get("enabled"))
+            .is_some_and(|v| !v.is_null())
+        || obj
+            .get("reasoning")
+            .and_then(|r| r.get("max_tokens"))
+            .is_some_and(|v| !v.is_null())
+        || obj
+            .get("output_config")
+            .and_then(|o| o.get("effort"))
+            .is_some_and(|v| !v.is_null())
+        || (obj.get("thinking").is_some_and(|v| !v.is_null()) && !is_adaptive_anthropic);
     let supports_reasoning = capabilities.is_none_or(|c| c.supports_reasoning);
     if !caller_set_reasoning
         && supports_reasoning
@@ -253,26 +280,29 @@ fn prepare_upstream_body(
         let toggle_off = effort == "none"
             && capabilities
                 .is_some_and(|c| c.supports_toggle && !c.effort_values.iter().any(|v| v == "none"));
+        let merge_reasoning_field =
+            |obj: &mut serde_json::Map<String, Value>, key: &str, val: Value| {
+                let entry = obj
+                    .entry("reasoning".to_string())
+                    .or_insert_with(|| serde_json::json!({}));
+                if !entry.is_object() {
+                    *entry = serde_json::json!({});
+                }
+                if let Some(r_obj) = entry.as_object_mut() {
+                    r_obj.insert(key.to_string(), val);
+                }
+            };
         match (dialect, protocol) {
             (WireDialect::OpenRouter, ApiProtocol::OpenAiChat | ApiProtocol::OpenAiResponses) => {
                 if toggle_off {
-                    obj.insert(
-                        "reasoning".to_string(),
-                        serde_json::json!({ "enabled": false }),
-                    );
+                    merge_reasoning_field(obj, "enabled", Value::Bool(false));
                 } else {
-                    obj.insert(
-                        "reasoning".to_string(),
-                        serde_json::json!({ "effort": effort }),
-                    );
+                    merge_reasoning_field(obj, "effort", Value::String(effort));
                 }
             }
             (WireDialect::OpenAiNative, ApiProtocol::OpenAiResponses) => {
                 if !toggle_off {
-                    obj.insert(
-                        "reasoning".to_string(),
-                        serde_json::json!({ "effort": effort }),
-                    );
+                    merge_reasoning_field(obj, "effort", Value::String(effort));
                 }
             }
             (WireDialect::OpenAiNative, ApiProtocol::OpenAiChat) => {
@@ -289,9 +319,34 @@ fn prepare_upstream_body(
                     obj.insert("reasoning_effort".to_string(), Value::String(effort));
                 }
             }
+            (WireDialect::AnthropicNative, ApiProtocol::AnthropicMessages)
+                if is_adaptive_anthropic =>
+            {
+                if effort == "none" {
+                    obj.insert(
+                        "thinking".to_string(),
+                        serde_json::json!({ "type": "disabled" }),
+                    );
+                } else {
+                    let anthropic_eff = match effort.as_str() {
+                        "low" | "medium" | "high" | "max" => effort,
+                        "xhigh" => "max".to_string(),
+                        _ => "low".to_string(),
+                    };
+                    let out_cfg = obj
+                        .entry("output_config".to_string())
+                        .or_insert_with(|| serde_json::json!({}));
+                    if !out_cfg.is_object() {
+                        *out_cfg = serde_json::json!({});
+                    }
+                    if let Some(o_obj) = out_cfg.as_object_mut() {
+                        o_obj.insert("effort".to_string(), Value::String(anthropic_eff));
+                    }
+                }
+            }
             (WireDialect::AnthropicNative, _) => {
-                // Anthropic Messages uses `thinking: {type, budget_tokens}` rather than
-                // string effort levels; omit to avoid schema rejection on non-thinking models.
+                // Anthropic Messages without `thinking: {"type": "adaptive"}` uses explicit
+                // `thinking: {type, budget_tokens}` or omits thinking per Anthropic's spec.
             }
             _ => {}
         }
@@ -667,5 +722,41 @@ mod tests {
             Some(&toggle_caps),
         );
         assert_eq!(compat_high["reasoning_effort"], "high");
+
+        // OpenAI Responses `"reasoning": {"summary": "auto"}` without `"effort"` must preserve
+        // `"summary"` while merging ARC's Stage-2 `"effort"`.
+        let mut resp_summary = serde_json::json!({
+            "model": "router",
+            "input": "solve",
+            "reasoning": {"summary": "auto"}
+        });
+        prepare_upstream_body(
+            &mut resp_summary,
+            "gpt-5.4",
+            WireDialect::OpenAiNative,
+            ApiProtocol::OpenAiResponses,
+            Some("medium"),
+            None,
+        );
+        assert_eq!(resp_summary["reasoning"]["summary"], "auto");
+        assert_eq!(resp_summary["reasoning"]["effort"], "medium");
+
+        // Anthropic adaptive thinking without `output_config.effort` receives Stage-2 effort.
+        let mut anthropic_adaptive = serde_json::json!({
+            "model": "router",
+            "max_tokens": 8192,
+            "thinking": {"type": "adaptive"},
+            "messages": [{"role": "user", "content": "solve"}]
+        });
+        prepare_upstream_body(
+            &mut anthropic_adaptive,
+            "claude-opus-5-5",
+            WireDialect::AnthropicNative,
+            ApiProtocol::AnthropicMessages,
+            Some("xhigh"),
+            Some(&ModelCapabilities::default()),
+        );
+        assert_eq!(anthropic_adaptive["thinking"]["type"], "adaptive");
+        assert_eq!(anthropic_adaptive["output_config"]["effort"], "high");
     }
 }

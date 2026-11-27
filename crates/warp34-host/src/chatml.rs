@@ -285,6 +285,23 @@ impl ChatTemplate {
         &self.source_name
     }
 
+    /// Returns `true` when the model's chat template mandates `<think>` reasoning on chat turns
+    /// (e.g. `Ternary-Bonsai-2.5`, whose Jinja template rejects efforts outside `('xhigh', 'medium', 'low')`).
+    pub fn requires_thinking(&self) -> bool {
+        self.strict_xhigh_effort
+    }
+
+    /// Maps an arbitrary canonical `reasoning_effort` onto the `('low', 'medium', 'xhigh')` levels
+    /// accepted by mandatory-thinking `strict_xhigh_effort` templates.
+    pub fn clamp_mandatory_effort(effort: &str) -> &'static str {
+        match effort.to_ascii_lowercase().as_str() {
+            "none" | "off" | "minimal" | "low" => "low",
+            "medium" => "medium",
+            "high" | "xhigh" | "max" => "xhigh",
+            _ => "xhigh",
+        }
+    }
+
     /// Renders `messages` and optional `tools` with arbitrary `chat_template_kwargs`.
     pub fn render(
         &self,
@@ -297,11 +314,7 @@ impl ChatTemplate {
         if self.strict_xhigh_effort
             && let Some(Value::String(eff)) = ctx.get_mut("reasoning_effort")
         {
-            match eff.to_ascii_lowercase().as_str() {
-                "high" | "max" => *eff = "xhigh".to_string(),
-                "minimal" | "none" | "off" => *eff = "low".to_string(),
-                _ => {}
-            }
+            *eff = Self::clamp_mandatory_effort(eff).to_string();
         }
         ctx.insert(
             "messages".into(),
@@ -858,6 +871,88 @@ mod tests {
         assert!(rendered.contains("<think>\nThinking...\n</think>"));
         assert!(rendered.contains("# Tools"));
         assert!(rendered.ends_with("<|im_start|>assistant\n<think>\n"));
+    }
+
+    #[test]
+    fn mandatory_thinking_template_clamps_efforts_and_preserves_open_think_block() {
+        let bonsai_source = concat!(
+            "{%- set reasoning_instructions = '' %}\n",
+            "{%- if enable_thinking is undefined or enable_thinking is true %}\n",
+            "    {%- set resolved_reasoning_effort = reasoning_effort|default('xhigh') %}\n",
+            "    {%- if resolved_reasoning_effort not in ('xhigh', 'medium', 'low') %}\n",
+            "        {{- raise_exception('Unexpected reasoning effort ' ~ reasoning_effort) }}\n",
+            "    {%- endif %}\n",
+            "    {%- if resolved_reasoning_effort == 'xhigh' %}\n",
+            "        {%- set reasoning_instructions = 'Reasoning effort is set to xhigh.' %}\n",
+            "    {%- elif resolved_reasoning_effort == 'low' %}\n",
+            "        {%- set reasoning_instructions = 'Reasoning effort is set to low.' %}\n",
+            "    {%- endif %}\n",
+            "{%- endif %}\n",
+            "{%- if reasoning_instructions %}<|im_start|>system\n{{ reasoning_instructions }}<|im_end|>\n{%- endif %}",
+            "{%- for m in messages %}<|im_start|>{{ m.role }}\n{{ m.content }}<|im_end|>\n{%- endfor %}",
+            "{%- if add_generation_prompt %}<|im_start|>assistant\n{% if enable_thinking is defined and enable_thinking is false %}<think>\n\n</think>\n\n{% else %}<think>\n{% endif %}{%- endif %}"
+        );
+        let bonsai = ChatTemplate::from_source(bonsai_source, "bonsai-test").unwrap();
+        assert!(bonsai.requires_thinking());
+        assert!(!ChatTemplate::default_qwen().requires_thinking());
+
+        let msgs = vec![ChatMessage {
+            role: "user".into(),
+            content: Some("Solve 2+2".into()),
+            reasoning_content: None,
+            tool_calls: vec![],
+        }];
+
+        for (raw, expected_instr) in [
+            ("none", Some("Reasoning effort is set to low.")),
+            ("off", Some("Reasoning effort is set to low.")),
+            ("minimal", Some("Reasoning effort is set to low.")),
+            ("low", Some("Reasoning effort is set to low.")),
+            ("medium", None),
+            ("high", Some("Reasoning effort is set to xhigh.")),
+            ("xhigh", Some("Reasoning effort is set to xhigh.")),
+            ("max", Some("Reasoning effort is set to xhigh.")),
+        ] {
+            let mut kw = Map::new();
+            kw.insert("enable_thinking".into(), Value::Bool(true));
+            kw.insert("reasoning_effort".into(), Value::String(raw.into()));
+            let out = bonsai.render(&msgs, None, true, &kw).unwrap();
+            assert!(
+                out.ends_with("<|im_start|>assistant\n<think>\n"),
+                "raw={raw} must keep open <think>, got: {out}"
+            );
+            assert!(!out.contains("<think>\n\n</think>"));
+            match expected_instr {
+                Some(instr) => assert!(out.contains(instr), "raw={raw} missing {instr}: {out}"),
+                None => assert!(
+                    !out.contains("Reasoning effort is set to"),
+                    "raw=medium must be unsteered, got: {out}"
+                ),
+            }
+        }
+
+        // Real cached Ternary-Bonsai-2.5-27B template if present on disk
+        if let Some(home) = std::env::var_os("HOME") {
+            let snaps = std::path::PathBuf::from(home).join(
+                ".cache/huggingface/hub/models--nchapman--Ternary-Bonsai-2.5-27B-warp34/snapshots",
+            );
+            if let Some(dir) = std::fs::read_dir(snaps)
+                .ok()
+                .and_then(|mut it| it.next())
+                .and_then(Result::ok)
+                .map(|e| e.path())
+                && dir.join("chat_template.jinja").is_file()
+            {
+                let real = ChatTemplate::from_model_dir(&dir);
+                assert!(real.requires_thinking());
+                let mut kw = Map::new();
+                kw.insert("enable_thinking".into(), Value::Bool(true));
+                kw.insert("reasoning_effort".into(), Value::String("medium".into()));
+                let rendered = real.render(&msgs, None, true, &kw).unwrap();
+                assert!(rendered.ends_with("<|im_start|>assistant\n<think>\n"));
+                assert!(!rendered.contains("Reasoning effort is set to"));
+            }
+        }
     }
 
     #[test]

@@ -1046,6 +1046,72 @@ pub fn translate_responses_to_chat(
     caller_scope: Option<&str>,
     request_seq_id: u64,
 ) -> Result<(Value, ResponsesPreparedMeta), ResponsesApiError> {
+    translate_responses_to_chat_with_thinking(
+        req,
+        default_model,
+        store,
+        caller_scope,
+        request_seq_id,
+        false,
+    )
+}
+
+fn apply_responses_reasoning_controls(
+    chat_req: &mut Map<String, Value>,
+    obj: &Map<String, Value>,
+    mut enable_thinking: Option<bool>,
+    mut reasoning_effort: Option<String>,
+    mut reasoning_budget: Option<i64>,
+    requires_thinking: bool,
+) -> Result<(), ResponsesApiError> {
+    let mut template_kwargs = match obj.get("chat_template_kwargs").filter(|v| !v.is_null()) {
+        None => Map::new(),
+        Some(v) => v.as_object().cloned().ok_or_else(|| {
+            ResponsesApiError::bad_request("'chat_template_kwargs' must be an object")
+        })?,
+    };
+    let caller_forced_no_think = template_kwargs
+        .get("enable_thinking")
+        .and_then(Value::as_bool)
+        == Some(false);
+    if requires_thinking && !caller_forced_no_think && enable_thinking == Some(false) {
+        enable_thinking = Some(true);
+        reasoning_effort = Some("low".to_string());
+        if reasoning_budget == Some(0) {
+            reasoning_budget = None;
+        }
+    }
+    if let Some(eff) = reasoning_effort {
+        chat_req.insert("reasoning_effort".into(), json!(eff));
+    }
+    if let Some(budget) = reasoning_budget {
+        chat_req.insert("thinking_token_budget".into(), json!(budget));
+    }
+    forward_optional_reasoning_budget_fields(chat_req, obj);
+    if let Some(thinking) = enable_thinking {
+        template_kwargs
+            .entry("enable_thinking")
+            .or_insert_with(|| json!(thinking));
+    }
+    if !template_kwargs.is_empty() {
+        chat_req.insert(
+            "chat_template_kwargs".into(),
+            Value::Object(template_kwargs),
+        );
+    }
+    Ok(())
+}
+
+/// Template-aware variant of [`translate_responses_to_chat`] that clamps disabled thinking onto
+/// `"low"` when the served local model's template mandates `<think>` reasoning.
+pub fn translate_responses_to_chat_with_thinking(
+    req: &Value,
+    default_model: &str,
+    store: &ResponseStore,
+    caller_scope: Option<&str>,
+    request_seq_id: u64,
+    requires_thinking: bool,
+) -> Result<(Value, ResponsesPreparedMeta), ResponsesApiError> {
     let obj = req
         .as_object()
         .ok_or_else(|| ResponsesApiError::bad_request("request body must be a JSON object"))?;
@@ -1270,30 +1336,14 @@ pub fn translate_responses_to_chat(
     if let Some(rf) = response_format {
         chat_req.insert("response_format".into(), rf);
     }
-    if let Some(eff) = reasoning_effort {
-        chat_req.insert("reasoning_effort".into(), json!(eff));
-    }
-    if let Some(budget) = reasoning_budget {
-        chat_req.insert("thinking_token_budget".into(), json!(budget));
-    }
-    forward_optional_reasoning_budget_fields(&mut chat_req, obj);
-    let mut template_kwargs = match obj.get("chat_template_kwargs").filter(|v| !v.is_null()) {
-        None => Map::new(),
-        Some(v) => v.as_object().cloned().ok_or_else(|| {
-            ResponsesApiError::bad_request("'chat_template_kwargs' must be an object")
-        })?,
-    };
-    if let Some(thinking) = enable_thinking {
-        template_kwargs
-            .entry("enable_thinking")
-            .or_insert_with(|| json!(thinking));
-    }
-    if !template_kwargs.is_empty() {
-        chat_req.insert(
-            "chat_template_kwargs".into(),
-            Value::Object(template_kwargs),
-        );
-    }
+    apply_responses_reasoning_controls(
+        &mut chat_req,
+        obj,
+        enable_thinking,
+        reasoning_effort,
+        reasoning_budget,
+        requires_thinking,
+    )?;
 
     let meta = ResponsesPreparedMeta {
         response_id: generate_unguessable_response_id(request_seq_id),

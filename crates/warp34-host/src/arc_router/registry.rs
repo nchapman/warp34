@@ -84,7 +84,10 @@ impl ModelCapabilities {
             return "none".to_string();
         }
         if self.effort_values.is_empty() {
-            return effort.to_string();
+            return match effort {
+                "xhigh" | "max" => "high".to_string(),
+                _ => effort.to_string(),
+            };
         }
         if self.effort_values.iter().any(|v| v == effort) {
             return effort.to_string();
@@ -877,6 +880,12 @@ mod tests {
         assert_eq!(gm.endpoint.provider_id, "google");
         assert!(!gm.capabilities.supports_toggle);
         assert_eq!(gm.capabilities.clamp_effort("none"), "low");
+        // Unlisted cloud models (`effort_values.is_empty()`) clamp `"xhigh"`/`"max"` to `"high"`
+        // so OpenAI/OpenRouter wire payloads never send an unlisted `"xhigh"` effort.
+        let unlisted = ModelCapabilities::default();
+        assert_eq!(unlisted.clamp_effort("xhigh"), "high");
+        assert_eq!(unlisted.clamp_effort("max"), "high");
+        assert_eq!(unlisted.clamp_effort("medium"), "medium");
 
         // Reject empty model suffix on explicit provider prefixes or tier= prefixes.
         assert!(reg.resolve_spec("google/", |_| None).is_err());

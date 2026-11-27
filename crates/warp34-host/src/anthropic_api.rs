@@ -631,6 +631,25 @@ pub fn translate_anthropic_to_chat(
     request_seq_id: u64,
     require_max_tokens: bool,
 ) -> Result<(Value, AnthropicPreparedMeta), AnthropicApiError> {
+    translate_anthropic_to_chat_with_thinking(
+        req,
+        default_model,
+        request_seq_id,
+        require_max_tokens,
+        false,
+    )
+}
+
+/// Template-aware variant of [`translate_anthropic_to_chat`] that clamps omitted/disabled thinking
+/// onto `"low"` when the served local model's template mandates `<think>` reasoning (except when
+/// `tool_choice` forces immediate tool use, where Anthropic's wire contract forbids thinking blocks).
+pub fn translate_anthropic_to_chat_with_thinking(
+    req: &Value,
+    default_model: &str,
+    request_seq_id: u64,
+    require_max_tokens: bool,
+    requires_thinking: bool,
+) -> Result<(Value, AnthropicPreparedMeta), AnthropicApiError> {
     let obj = req
         .as_object()
         .ok_or_else(|| AnthropicApiError::bad_request("request body must be a JSON object"))?;
@@ -756,7 +775,7 @@ pub fn translate_anthropic_to_chat(
     };
 
     // Thinking & output_config
-    let (enable_thinking, thinking_budget, reasoning_effort, response_format) =
+    let (mut enable_thinking, thinking_budget, mut reasoning_effort, response_format) =
         parse_anthropic_thinking_config(
             obj,
             is_forced_tool_choice,
@@ -816,18 +835,33 @@ pub fn translate_anthropic_to_chat(
     if let Some(rf) = response_format {
         chat_req.insert("response_format".into(), rf);
     }
-    if let Some(eff) = reasoning_effort {
-        chat_req.insert("reasoning_effort".into(), json!(eff));
-    }
-    if let Some(budget) = thinking_budget {
-        chat_req.insert("thinking_token_budget".into(), json!(budget));
-    }
     let mut template_kwargs = match obj.get("chat_template_kwargs").filter(|v| !v.is_null()) {
         None => Map::new(),
         Some(v) => v.as_object().cloned().ok_or_else(|| {
             AnthropicApiError::bad_request("'chat_template_kwargs' must be an object")
         })?,
     };
+    let caller_forced_no_think = template_kwargs
+        .get("enable_thinking")
+        .and_then(Value::as_bool)
+        == Some(false);
+    if requires_thinking
+        && !is_forced_tool_choice
+        && !caller_forced_no_think
+        && enable_thinking != Some(true)
+    {
+        enable_thinking = Some(true);
+        let eff = reasoning_effort
+            .as_deref()
+            .map_or("low", crate::chatml::ChatTemplate::clamp_mandatory_effort);
+        reasoning_effort = Some(eff.to_string());
+    }
+    if let Some(eff) = reasoning_effort {
+        chat_req.insert("reasoning_effort".into(), json!(eff));
+    }
+    if let Some(budget) = thinking_budget {
+        chat_req.insert("thinking_token_budget".into(), json!(budget));
+    }
     if let Some(thinking) = enable_thinking {
         template_kwargs.insert("enable_thinking".into(), json!(thinking));
     } else if !template_kwargs.contains_key("enable_thinking") {
@@ -1881,6 +1915,67 @@ mod tests {
         assert_eq!(
             explicit_kw_chat["chat_template_kwargs"]["enable_thinking"],
             true
+        );
+
+        // Mandatory-thinking local models (`requires_thinking == true`) clamp omitted/disabled
+        // Anthropic `thinking` onto `enable_thinking = true` + `reasoning_effort = "low"`, except
+        // when `tool_choice` forces immediate tool use (`"any"` / `"tool"`) or the caller passes
+        // `chat_template_kwargs.enable_thinking = false`.
+        for payload in [
+            json!({
+                "model": "bonsai",
+                "max_tokens": 2048,
+                "messages": [{"role": "user", "content": "solve"}]
+            }),
+            json!({
+                "model": "bonsai",
+                "max_tokens": 2048,
+                "thinking": {"type": "disabled"},
+                "messages": [{"role": "user", "content": "solve"}]
+            }),
+        ] {
+            let (clamped, _) =
+                translate_anthropic_to_chat_with_thinking(&payload, "bonsai", 5, true, true)
+                    .unwrap();
+            assert_eq!(clamped["chat_template_kwargs"]["enable_thinking"], true);
+            assert_eq!(clamped["reasoning_effort"], "low");
+        }
+
+        let (forced_tool_chat, _) = translate_anthropic_to_chat_with_thinking(
+            &json!({
+                "model": "bonsai",
+                "max_tokens": 2048,
+                "tools": [{"name": "ping", "input_schema": {"type": "object", "properties": {}}}],
+                "tool_choice": {"type": "any"},
+                "messages": [{"role": "user", "content": "call ping"}]
+            }),
+            "bonsai",
+            6,
+            true,
+            true,
+        )
+        .unwrap();
+        assert_eq!(
+            forced_tool_chat["chat_template_kwargs"]["enable_thinking"],
+            false
+        );
+
+        let (escaped_chat, _) = translate_anthropic_to_chat_with_thinking(
+            &json!({
+                "model": "bonsai",
+                "max_tokens": 2048,
+                "chat_template_kwargs": {"enable_thinking": false},
+                "messages": [{"role": "user", "content": "raw"}]
+            }),
+            "bonsai",
+            7,
+            true,
+            true,
+        )
+        .unwrap();
+        assert_eq!(
+            escaped_chat["chat_template_kwargs"]["enable_thinking"],
+            false
         );
     }
 }
