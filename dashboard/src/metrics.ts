@@ -16,6 +16,31 @@ export interface CheckpointPoolStats {
   host_capacity: number;
   host_used: number;
 }
+export interface ArcRouterModelStats {
+  model: string;
+  is_local: boolean;
+  requests: number;
+  prompt_tokens: number;
+  completion_tokens: number;
+  cached_tokens: number;
+  spend_usd: number;
+}
+export interface ArcRouterMetrics {
+  total_requests: number;
+  local_requests: number;
+  cloud_requests: number;
+  pii_pinned_requests: number;
+  warm_kv_stayed_local: number;
+  effort_none: number;
+  effort_low: number;
+  effort_medium: number;
+  effort_high: number;
+  router_fallbacks: number;
+  cloud_upstream_errors: number;
+  mean_router_latency_ms: number;
+  total_spend_usd: number;
+  models: ArcRouterModelStats[];
+}
 export interface Snapshot {
   schema_version: 1;
   instance_id: string;
@@ -60,6 +85,7 @@ export interface Snapshot {
     client_error: number;
     server_error: number;
   };
+  arc_router?: ArcRouterMetrics;
 }
 
 const isRecord = (value: unknown): value is Record<string, unknown> =>
@@ -84,6 +110,42 @@ function isCheckpointPoolStats(value: unknown): boolean {
     "host_capacity",
     "host_used",
   ]);
+}
+function isArcRouterModelStats(value: unknown): boolean {
+  return (
+    isRecord(value) &&
+    typeof value.model === "string" &&
+    typeof value.is_local === "boolean" &&
+    hasNumbers(value, [
+      "requests",
+      "prompt_tokens",
+      "completion_tokens",
+      "cached_tokens",
+      "spend_usd",
+    ])
+  );
+}
+function isArcRouterMetrics(value: unknown): boolean {
+  return (
+    isRecord(value) &&
+    hasNumbers(value, [
+      "total_requests",
+      "local_requests",
+      "cloud_requests",
+      "pii_pinned_requests",
+      "warm_kv_stayed_local",
+      "effort_none",
+      "effort_low",
+      "effort_medium",
+      "effort_high",
+      "router_fallbacks",
+      "cloud_upstream_errors",
+      "mean_router_latency_ms",
+      "total_spend_usd",
+    ]) &&
+    Array.isArray(value.models) &&
+    value.models.every(isArcRouterModelStats)
+  );
 }
 function isHistogram(value: unknown): boolean {
   if (!isRecord(value) || !hasNumbers(value, ["count", "sum"])) return false;
@@ -149,7 +211,8 @@ export function parseSnapshot(value: unknown): Snapshot {
     hasNumbers(speculation, ["rounds", "accepted_tokens"]) &&
     isRecord(speculation) &&
     (speculation.draft_tokens === null || isNumber(speculation.draft_tokens)) &&
-    hasNumbers(http_responses, ["success", "client_error", "server_error"]);
+    hasNumbers(http_responses, ["success", "client_error", "server_error"]) &&
+    (value.arc_router === undefined || isArcRouterMetrics(value.arc_router));
   if (!valid)
     throw new Error(
       "Unsupported metrics response; refresh after upgrading the server",
@@ -287,4 +350,21 @@ export function uptime(seconds: number): string {
   if (seconds < 86400)
     return `${Math.floor(seconds / 3600)}h ${Math.floor((seconds % 3600) / 60)}m`;
   return `${Math.floor(seconds / 86400)}d ${Math.floor((seconds % 86400) / 3600)}h`;
+}
+export function usd(amount: number | null | undefined): string {
+  if (amount === null || amount === undefined || !Number.isFinite(amount)) {
+    return "—";
+  }
+  if (amount === 0) return "$0.00";
+  if (amount < 0.01) return `$${amount.toFixed(4)}`;
+  return `$${amount.toFixed(2)}`;
+}
+export function compactTokens(value: number | null | undefined): string {
+  if (value === null || value === undefined || !Number.isFinite(value)) {
+    return "—";
+  }
+  if (value >= 1_000_000) return `${(value / 1_000_000).toFixed(2)}M`;
+  if (value >= 10_000) return `${(value / 1_000).toFixed(1)}k`;
+  if (value >= 1_000) return `${(value / 1_000).toFixed(2)}k`;
+  return String(Math.round(value));
 }

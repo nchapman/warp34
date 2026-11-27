@@ -302,4 +302,71 @@ describe("dashboard states", () => {
     expect(screen.getByText("2 LoRAs")).toBeVisible();
     expect(screen.getByText("LoRA: sql-expert, code-review")).toBeVisible();
   });
+  it("renders ARC Router per-model split and cloud spend when enabled", () => {
+    render(
+      <Dashboard
+        state={{
+          history: [
+            snapshot({
+              model: "Ternary-Bonsai-2.5-27B",
+              arc_router: {
+                total_requests: 100,
+                local_requests: 30,
+                cloud_requests: 70,
+                pii_pinned_requests: 3,
+                warm_kv_stayed_local: 12,
+                effort_none: 10,
+                effort_low: 25,
+                effort_medium: 45,
+                effort_high: 20,
+                router_fallbacks: 0,
+                cloud_upstream_errors: 0,
+                mean_router_latency_ms: 14.2,
+                total_spend_usd: 1.54,
+                models: [
+                  {
+                    model: "anthropic/claude-sonnet-4.6",
+                    is_local: false,
+                    requests: 45,
+                    prompt_tokens: 210000,
+                    completion_tokens: 18500,
+                    cached_tokens: 100000,
+                    spend_usd: 0.62,
+                  },
+                  {
+                    model: "local",
+                    is_local: true,
+                    requests: 30,
+                    prompt_tokens: 0,
+                    completion_tokens: 0,
+                    cached_tokens: 0,
+                    spend_usd: 0,
+                  },
+                  {
+                    model: "anthropic/claude-opus-4.6",
+                    is_local: false,
+                    requests: 25,
+                    prompt_tokens: 140000,
+                    completion_tokens: 9400,
+                    cached_tokens: 60000,
+                    spend_usd: 0.92,
+                  },
+                ],
+              },
+            }),
+          ],
+          connection: "live",
+          error: null,
+        }}
+      />,
+    );
+    expect(screen.getByRole("heading", { name: "ARC Router" })).toBeVisible();
+    expect(screen.getByText("14.2 ms avg · 100 routed")).toBeVisible();
+    expect(screen.getByText("$1.54")).toBeVisible();
+    expect(screen.getByText("anthropic/claude-sonnet-4.6")).toBeVisible();
+    expect(screen.getByText("anthropic/claude-opus-4.6")).toBeVisible();
+    expect(screen.getByText("210.0k / 18.5k")).toBeVisible();
+    expect(screen.getByText("$0.62")).toBeVisible();
+    expect(screen.getByText("$0.92")).toBeVisible();
+  });
 });

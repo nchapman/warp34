@@ -14,7 +14,8 @@ pub mod policy;
 pub mod proxy;
 pub mod registry;
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 
 use axum::http::{HeaderMap, HeaderName, HeaderValue};
 use encoder::ArcEncoderWorker;
@@ -48,6 +49,27 @@ pub struct ArcRouterConfig {
     pub pin_pii_classes: HashSet<String>,
 }
 
+#[derive(Debug, Default, Clone)]
+struct ModelRouteStats {
+    is_local: bool,
+    requests: u64,
+    prompt_tokens: u64,
+    completion_tokens: u64,
+    cached_tokens: u64,
+    spend_usd: f64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct RouterModelStatsSnapshot {
+    pub model: String,
+    pub is_local: bool,
+    pub requests: u64,
+    pub prompt_tokens: u64,
+    pub completion_tokens: u64,
+    pub cached_tokens: u64,
+    pub spend_usd: f64,
+}
+
 #[derive(Debug, Default)]
 pub struct RouterMetrics {
     pub total_requests: AtomicU64,
@@ -62,6 +84,7 @@ pub struct RouterMetrics {
     pub router_fallbacks: AtomicU64,
     pub cloud_upstream_errors: AtomicU64,
     pub total_router_latency_us: AtomicU64,
+    per_model: Mutex<HashMap<String, ModelRouteStats>>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -78,18 +101,29 @@ pub struct RouterMetricsSnapshot {
     pub router_fallbacks: u64,
     pub cloud_upstream_errors: u64,
     pub mean_router_latency_ms: f64,
+    pub total_spend_usd: f64,
+    pub models: Vec<RouterModelStatsSnapshot>,
 }
 
 impl RouterMetrics {
     pub fn record(&self, d: &RoutingDecision) {
         self.total_requests.fetch_add(1, Ordering::Relaxed);
-        match d.target {
+        let (model_key, is_local) = match &d.target {
             RouteTarget::Local => {
                 self.local_requests.fetch_add(1, Ordering::Relaxed);
+                ("local".to_string(), true)
             }
-            RouteTarget::Cloud { .. } => {
+            RouteTarget::Cloud { name, .. } => {
                 self.cloud_requests.fetch_add(1, Ordering::Relaxed);
+                (name.clone(), false)
             }
+        };
+        if let Ok(mut map) = self.per_model.lock() {
+            let entry = map.entry(model_key).or_insert_with(|| ModelRouteStats {
+                is_local,
+                ..Default::default()
+            });
+            entry.requests = entry.requests.saturating_add(1);
         }
         match d.basis {
             RoutingBasis::PiiPinnedLocal => {
@@ -118,6 +152,39 @@ impl RouterMetrics {
             .fetch_add((d.latency_ms * 1000.0) as u64, Ordering::Relaxed);
     }
 
+    /// Records actual token usage & USD spend reported by an upstream cloud response.
+    /// `prices` is `[input, cache_read, cache_write, output]` in USD per million tokens.
+    pub fn record_cloud_usage(
+        &self,
+        model_name: &str,
+        prices: [f64; 4],
+        prompt_tokens: u64,
+        cached_tokens: u64,
+        cache_write_tokens: u64,
+        completion_tokens: u64,
+    ) {
+        let non_cached_in = prompt_tokens.saturating_sub(cached_tokens + cache_write_tokens);
+        let spend = (non_cached_in as f64 * prices[0]
+            + cached_tokens as f64 * prices[1]
+            + cache_write_tokens as f64 * prices[2]
+            + completion_tokens as f64 * prices[3])
+            * 1e-6;
+        if let Ok(mut map) = self.per_model.lock() {
+            let entry = map
+                .entry(model_name.to_string())
+                .or_insert_with(|| ModelRouteStats {
+                    is_local: false,
+                    ..Default::default()
+                });
+            entry.prompt_tokens = entry.prompt_tokens.saturating_add(prompt_tokens);
+            entry.completion_tokens = entry.completion_tokens.saturating_add(completion_tokens);
+            entry.cached_tokens = entry.cached_tokens.saturating_add(cached_tokens);
+            if spend.is_finite() && spend > 0.0 {
+                entry.spend_usd += spend;
+            }
+        }
+    }
+
     pub fn record_fallback(&self) {
         self.router_fallbacks.fetch_add(1, Ordering::Relaxed);
     }
@@ -129,6 +196,29 @@ impl RouterMetrics {
     pub fn snapshot(&self) -> RouterMetricsSnapshot {
         let total = self.total_requests.load(Ordering::Relaxed);
         let total_us = self.total_router_latency_us.load(Ordering::Relaxed);
+        let mut models: Vec<RouterModelStatsSnapshot> = self
+            .per_model
+            .lock()
+            .map(|map| {
+                map.iter()
+                    .map(|(model, st)| RouterModelStatsSnapshot {
+                        model: model.clone(),
+                        is_local: st.is_local,
+                        requests: st.requests,
+                        prompt_tokens: st.prompt_tokens,
+                        completion_tokens: st.completion_tokens,
+                        cached_tokens: st.cached_tokens,
+                        spend_usd: st.spend_usd,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        models.sort_by(|a, b| {
+            b.requests
+                .cmp(&a.requests)
+                .then_with(|| a.model.cmp(&b.model))
+        });
+        let total_spend_usd = models.iter().map(|m| m.spend_usd).sum();
         RouterMetricsSnapshot {
             total_requests: total,
             local_requests: self.local_requests.load(Ordering::Relaxed),
@@ -146,6 +236,8 @@ impl RouterMetrics {
             } else {
                 0.0
             },
+            total_spend_usd,
+            models,
         }
     }
 }
@@ -158,7 +250,7 @@ pub struct ArcRouter {
     policy: RoutingPolicy,
     pin_pii_classes: HashSet<String>,
     proxy: Option<UpstreamProxy>,
-    metrics: RouterMetrics,
+    metrics: Arc<RouterMetrics>,
 }
 
 impl ArcRouter {
@@ -199,8 +291,29 @@ impl ArcRouter {
             policy: cfg.policy,
             pin_pii_classes: cfg.pin_pii_classes,
             proxy,
-            metrics: RouterMetrics::default(),
+            metrics: Arc::new(RouterMetrics::default()),
         })
+    }
+
+    pub fn metrics_arc(&self) -> Arc<RouterMetrics> {
+        Arc::clone(&self.metrics)
+    }
+
+    /// Returns the 4-tuple USD/Mtok pricing `[input, cache_read, cache_write, output]` for a
+    /// routed cloud candidate (`models.dev` override first, then ARC catalog fallback).
+    pub fn prices_for_cloud_model(&self, name: &str, slot: usize) -> [f64; 4] {
+        if let Some(cand) = self.cloud_candidates.iter().find(|c| c.name == name)
+            && let Some(p) = cand.price_override
+        {
+            return p;
+        }
+        self.heads
+            .catalog
+            .model_prices
+            .get(slot)
+            .copied()
+            .flatten()
+            .unwrap_or([0.0; 4])
     }
 
     pub fn local_slot_name(&self) -> &str {
