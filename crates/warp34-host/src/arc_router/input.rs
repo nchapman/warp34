@@ -28,6 +28,18 @@ impl ArcRoleBlock {
     }
 }
 
+/// Turn boundary classification matching `rayline-arc-decide`:
+/// - `TaskStart`: opening request (no prior assistant turn).
+/// - `ToolResult`: continuation where the latest message is a tool result (`role: "tool"`,
+///   Responses `function_call_output`, or Anthropic `tool_result` blocks).
+/// - `UserMessage`: a new human user turn after at least one assistant turn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TurnEvent {
+    TaskStart,
+    UserMessage,
+    ToolResult,
+}
+
 /// Serialized ARC-1.0 encoder input plus lightweight metadata extracted from the request.
 #[derive(Debug, Clone)]
 pub struct SerializedArcInput {
@@ -36,6 +48,7 @@ pub struct SerializedArcInput {
     pub has_tools: bool,
     pub has_images: bool,
     pub turn_count: usize,
+    pub event: TurnEvent,
 }
 
 impl SerializedArcInput {
@@ -627,6 +640,22 @@ pub fn serialize_request(protocol: ApiProtocol, raw: &Value) -> SerializedArcInp
             )
         })
     });
+    let has_assistant = canonical.iter().any(|m| m.role == "assistant");
+    let last_is_tool_result = canonical.last().is_some_and(|m| {
+        m.role == "user"
+            && !m.parts.is_empty()
+            && m.parts
+                .iter()
+                .all(|p| p.get("type").and_then(Value::as_str) == Some("tool_result"))
+    });
+    let event = if !has_assistant {
+        TurnEvent::TaskStart
+    } else if last_is_tool_result {
+        TurnEvent::ToolResult
+    } else {
+        TurnEvent::UserMessage
+    };
+
     let mut blocks: Vec<ArcRoleBlock> = canonical
         .into_iter()
         .map(|m| ArcRoleBlock {
@@ -653,6 +682,7 @@ pub fn serialize_request(protocol: ApiProtocol, raw: &Value) -> SerializedArcInp
         has_tools,
         has_images,
         turn_count,
+        event,
     }
 }
 
@@ -745,5 +775,44 @@ mod tests {
         assert_ne!(k0, k_other, "distinct tasks must produce distinct keys");
         assert!(!has_asst0, "turn 0 must not be marked as a continuation");
         assert!(has_asst1, "turn 1+ must be marked as a continuation");
+    }
+
+    #[test]
+    fn turn_event_classifies_task_start_tool_result_and_user_message() {
+        let start = serialize_request(
+            ApiProtocol::OpenAiChat,
+            &json!({"messages": [{"role": "user", "content": "Fix bug"}]}),
+        );
+        assert_eq!(start.event, TurnEvent::TaskStart);
+
+        let tool_chat = serialize_request(
+            ApiProtocol::OpenAiChat,
+            &json!({"messages": [
+                {"role": "user", "content": "Fix bug"},
+                {"role": "assistant", "tool_calls": [{"id": "c1", "type": "function", "function": {"name": "bash", "arguments": "{\"cmd\":\"ls\"}"}}]},
+                {"role": "tool", "tool_call_id": "c1", "content": "ok"}
+            ]}),
+        );
+        assert_eq!(tool_chat.event, TurnEvent::ToolResult);
+
+        let tool_anth = serialize_request(
+            ApiProtocol::AnthropicMessages,
+            &json!({"messages": [
+                {"role": "user", "content": "Fix bug"},
+                {"role": "assistant", "content": [{"type": "tool_use", "id": "c1", "name": "bash", "input": {}}]},
+                {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "c1", "content": "ok"}]}
+            ]}),
+        );
+        assert_eq!(tool_anth.event, TurnEvent::ToolResult);
+
+        let user_followup = serialize_request(
+            ApiProtocol::OpenAiChat,
+            &json!({"messages": [
+                {"role": "user", "content": "Fix bug"},
+                {"role": "assistant", "content": "Done."},
+                {"role": "user", "content": "Now write a test."}
+            ]}),
+        );
+        assert_eq!(user_followup.event, TurnEvent::UserMessage);
     }
 }

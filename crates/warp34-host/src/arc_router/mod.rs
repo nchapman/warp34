@@ -20,10 +20,13 @@ use std::sync::{Arc, Mutex};
 use axum::http::{HeaderMap, HeaderName, HeaderValue};
 use encoder::ArcEncoderWorker;
 use heads::ArcHeads;
-use input::{ApiProtocol, SerializedArcInput, serialize_request};
+use input::{
+    ApiProtocol, SerializedArcInput, derive_prefix_session_key_from_serialized, serialize_request,
+};
 use policy::{
-    CloudCandidate, DecideInput, RouteTarget, RoutingBasis, RoutingDecision, RoutingPolicy, decide,
-    infer_local_profile, is_local_only_cloud_filter, resolve_cloud_candidates_from_registry,
+    CloudCandidate, DecideInput, HeldTarget, RouteTarget, RoutingBasis, RoutingDecision,
+    RoutingPolicy, decide, infer_local_profile, is_local_only_cloud_filter,
+    resolve_cloud_candidates_from_registry,
 };
 use proxy::UpstreamProxy;
 use registry::ModelsDevRegistry;
@@ -252,6 +255,7 @@ pub struct ArcRouter {
     empty_candidates: Arc<[CloudCandidate]>,
     policy: RoutingPolicy,
     pin_pii_classes: Arc<HashSet<String>>,
+    session_holds: Mutex<HashMap<String, HeldTarget>>,
     proxy: Option<UpstreamProxy>,
     metrics: Arc<RouterMetrics>,
 }
@@ -319,6 +323,7 @@ impl ArcRouter {
             empty_candidates,
             policy: cfg.policy,
             pin_pii_classes: Arc::new(cfg.pin_pii_classes),
+            session_holds: Mutex::new(HashMap::new()),
             proxy,
             metrics: Arc::new(RouterMetrics::default()),
         })
@@ -388,8 +393,19 @@ impl ArcRouter {
         canonical: SerializedArcInput,
         warm_local_kv: bool,
         allow_cloud: bool,
+        session_key: Option<&str>,
         t0: std::time::Instant,
     ) -> Result<RoutingDecision, String> {
+        let resolved_session_key = session_key
+            .map(ToString::to_string)
+            .or_else(|| derive_prefix_session_key_from_serialized(&canonical).map(|(k, _)| k));
+        let held_target = resolved_session_key.as_deref().and_then(|key| {
+            self.session_holds
+                .lock()
+                .ok()
+                .and_then(|map| map.get(key).cloned())
+        });
+        let event = canonical.event;
         let enc = self.encoder.encode_blocks(canonical.blocks).await?;
         let heads = Arc::clone(&self.heads);
         let local_slot = self.local_slot;
@@ -413,6 +429,8 @@ impl ArcRouter {
                     has_tools,
                     has_images,
                     warm_local_kv,
+                    event,
+                    held_target: held_target.as_ref(),
                     local_slot,
                     local_logit_bias,
                     cloud_candidates: &cloud_candidates,
@@ -424,6 +442,20 @@ impl ArcRouter {
         .await
         .map_err(|e| format!("ARC decide join error: {e}"))??;
         decision.latency_ms = t0.elapsed().as_secs_f64() * 1000.0;
+        if decision.basis != RoutingBasis::PiiPinnedLocal
+            && let Some(key) = resolved_session_key
+            && let Ok(mut map) = self.session_holds.lock()
+        {
+            const MAX_SESSION_HOLDS: usize = 4096;
+            if map.len() >= MAX_SESSION_HOLDS && !map.contains_key(&key) {
+                map.clear();
+            }
+            let target = match &decision.target {
+                RouteTarget::Local => HeldTarget::Local,
+                RouteTarget::Cloud(c) => HeldTarget::Cloud(c.wire.clone()),
+            };
+            map.insert(key, target);
+        }
         self.metrics.record(&decision);
         Ok(decision)
     }
@@ -441,7 +473,7 @@ impl ArcRouter {
             tokio::task::spawn_blocking(move || serialize_request(protocol, &body_clone))
                 .await
                 .map_err(|e| format!("ARC serialize join error: {e}"))?;
-        self.route_serialized(protocol, canonical, warm_local_kv, true, t0)
+        self.route_serialized(protocol, canonical, warm_local_kv, true, None, t0)
             .await
     }
 }

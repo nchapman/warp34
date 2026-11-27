@@ -1505,8 +1505,19 @@ impl OpenAiServerState {
             (false, RequestSessionAffinity::default())
         };
 
+        let session_key = affinity
+            .pin_session_key
+            .as_deref()
+            .or(affinity.record_after_select_key.as_deref());
         let decision = match router
-            .route_serialized(protocol, canonical, warm_local_kv, !force_local, t0)
+            .route_serialized(
+                protocol,
+                canonical,
+                warm_local_kv,
+                !force_local,
+                session_key,
+                t0,
+            )
             .await
         {
             Ok(d) => d,

@@ -3,9 +3,9 @@
 use std::{collections::HashSet, path::PathBuf};
 use warp34_host::arc_router::{
     heads::ArcHeads,
-    input::{ApiProtocol, serialize_request},
+    input::{ApiProtocol, TurnEvent, serialize_request},
     policy::{
-        DecideInput, LocalProfile, RouteTarget, RoutingBasis, RoutingPolicy, decide,
+        DecideInput, HeldTarget, LocalProfile, RouteTarget, RoutingBasis, RoutingPolicy, decide,
         infer_local_profile, resolve_cloud_candidates_from_registry,
     },
     registry::ModelsDevRegistry,
@@ -233,7 +233,8 @@ fn heads_catalog_slot_inference_and_policy_invariants() {
     assert_eq!(filtered[1].wire, "google/gemini-4-neon");
     assert_eq!(filtered[1].slot, 1);
 
-    // Warm local KV must stay local even with cloud slots available.
+    // Warm local KV on a continuing user message stays local while local_p >= warm_floor,
+    // and symmetric tool-loop holding keeps an active cloud model across ToolResult turns.
     let zero_readouts = vec![vec![0.0f32; 1024]];
     let roles = vec!["user".to_string()];
     let d = decide(
@@ -245,6 +246,8 @@ fn heads_catalog_slot_inference_and_policy_invariants() {
             has_tools: false,
             has_images: false,
             warm_local_kv: true,
+            event: TurnEvent::UserMessage,
+            held_target: Some(&HeldTarget::Local),
             local_slot: 54,
             local_logit_bias: 0.0,
             cloud_candidates: &auto_slots,
@@ -255,6 +258,83 @@ fn heads_catalog_slot_inference_and_policy_invariants() {
     .expect("decide");
     assert!(matches!(d.target, RouteTarget::Local));
     assert_eq!(d.basis, RoutingBasis::WarmKvStayLocal);
+}
+
+#[test]
+fn symmetric_tool_loop_hold_and_warm_kv_escape() {
+    let Some(dir) = cached_arc_dir() else {
+        eprintln!("skipping symmetric_tool_loop_hold_and_warm_kv_escape: ARC-1.0 not cached");
+        return;
+    };
+    let heads = ArcHeads::load(&dir).expect("load ARC heads");
+    let registry = ModelsDevRegistry::builtin_fallback();
+    let auto_slots = resolve_cloud_candidates_from_registry(
+        &registry,
+        &heads.catalog,
+        &["auto".to_string()],
+        |k| (k == "OPENROUTER_API_KEY").then(|| "test-key".to_string()),
+    )
+    .expect("auto openrouter");
+    let zero_readouts = vec![vec![0.0f32; 1024]];
+    let roles = vec!["user".to_string()];
+
+    // Symmetric tool-loop hold: when the session's held target is a cloud model (e.g. Opus),
+    // a ToolResult turn holds that exact cloud model instead of flipping mid-task to local.
+    let held_opus = HeldTarget::Cloud(auto_slots[1].wire.clone());
+    let d_held_cloud = decide(
+        &heads,
+        &DecideInput {
+            block_readouts: &zero_readouts,
+            block_roles: &roles,
+            prompt_tokens: 128,
+            has_tools: true,
+            has_images: false,
+            warm_local_kv: false,
+            event: TurnEvent::ToolResult,
+            held_target: Some(&held_opus),
+            local_slot: 54,
+            local_logit_bias: 4.0,
+            cloud_candidates: &auto_slots,
+            policy: RoutingPolicy::PreferLocal {
+                min_p_pass: 0.65,
+                value_usd: 1.5,
+            },
+            pin_pii_classes: &HashSet::new(),
+        },
+    )
+    .expect("decide held cloud");
+    assert_eq!(d_held_cloud.basis, RoutingBasis::SessionHeld);
+    match d_held_cloud.target {
+        RouteTarget::Cloud(c) => assert_eq!(c.wire, auto_slots[1].wire),
+        RouteTarget::Local => panic!("expected ToolResult to hold active cloud model"),
+    }
+
+    // Warm local KV escape hatch: on a new UserMessage where local_p collapses well below
+    // warm_floor (via negative bias), Stage 1 is allowed to escalate to cloud.
+    let d_escape = decide(
+        &heads,
+        &DecideInput {
+            block_readouts: &zero_readouts,
+            block_roles: &roles,
+            prompt_tokens: 128,
+            has_tools: false,
+            has_images: false,
+            warm_local_kv: true,
+            event: TurnEvent::UserMessage,
+            held_target: Some(&HeldTarget::Local),
+            local_slot: 54,
+            local_logit_bias: -4.0,
+            cloud_candidates: &auto_slots,
+            policy: RoutingPolicy::PreferLocal {
+                min_p_pass: 0.65,
+                value_usd: 1.5,
+            },
+            pin_pii_classes: &HashSet::new(),
+        },
+    )
+    .expect("decide escape");
+    assert_eq!(d_escape.basis, RoutingBasis::CloudSpillover);
+    assert!(matches!(d_escape.target, RouteTarget::Cloud(_)));
 }
 
 #[cfg(feature = "cuda")]
@@ -494,6 +574,8 @@ fn arc_encoder_and_heads_match_goldens() {
                     has_tools: turn.has_tools,
                     has_images: turn.has_images,
                     warm_local_kv: false,
+                    event: TurnEvent::TaskStart,
+                    held_target: None,
                     local_slot,
                     local_logit_bias: 0.0,
                     cloud_candidates: &[],

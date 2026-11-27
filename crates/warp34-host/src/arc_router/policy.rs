@@ -2,6 +2,7 @@
 
 use super::{
     heads::{ArcHeads, ArcRuntimeCatalog, LEGS, PiiSignalPrediction, StageOnePrediction},
+    input::TurnEvent,
     registry::{ModelCapabilities, ModelsDevRegistry, ProviderEndpoint, infer_tier_from_prices},
 };
 use std::collections::HashSet;
@@ -77,7 +78,9 @@ fn has_ascii_token(haystack: &str, needle: &str) -> bool {
 /// Maps a served local `warp34` model ID/path onto its empirically calibrated ARC-1.0 anchor
 /// slot and logit bias:
 /// - `Flash-Next` (`flash-next` / `flash_next`): `[53]` `qwen3.8-flash-next`, `bias = 0.0`
+/// - `Ornith-1.5-35B`: `[54]` `qwen3.5-9b`, `bias = +0.45` (`82.5%` vs `75.0%` screen)
 /// - `Apex-35B` (`apex-35b` / `apex_35b`): `[54]` `qwen3.5-9b`, `bias = +0.20` (`78.5%` vs `75.0%` screen)
+/// - `Ornith-1.5-9B`: `[54]` `qwen3.5-9b`, `bias = +0.20` (`78.7%` vs `75.0%` screen)
 /// - `Ternary-Bonsai-2.5-27B`: `[55]` `qwen3.8-27b`, `bias = +0.40` (`93.5%` vs `90.7%` screen)
 /// - Small `<= 9B` models (`9b`, `4b`, `2b`, `0.8b`): `[54]` `qwen3.5-9b`, `bias = 0.0`
 /// - Default (including `27B` and arbitrary/third-party local models): `[55]` `qwen3.8-27b`, `bias = 0.0`
@@ -85,7 +88,12 @@ pub fn infer_local_profile(model_name: &str, catalog: &ArcRuntimeCatalog) -> Loc
     let lower = model_name.to_ascii_lowercase();
     let (raw_slot, logit_bias) = if lower.contains("flash-next") || lower.contains("flash_next") {
         (LOCAL_FLASH_NEXT_SLOT, 0.0)
-    } else if lower.contains("apex-35b") || lower.contains("apex_35b") {
+    } else if lower.contains("ornith") && has_ascii_token(&lower, "35b") {
+        (LOCAL_9B_SLOT, 0.45)
+    } else if (lower.contains("ornith") && has_ascii_token(&lower, "9b"))
+        || lower.contains("apex-35b")
+        || lower.contains("apex_35b")
+    {
         (LOCAL_9B_SLOT, 0.20)
     } else if lower.contains("bonsai") && has_ascii_token(&lower, "27b") {
         (DEFAULT_LOCAL_SLOT, 0.40)
@@ -267,6 +275,14 @@ where
     Ok(out)
 }
 
+/// Last served routing target for a session, held symmetrically across `TurnEvent::ToolResult`
+/// loops to match `rayline-arc-decide` (`Local` or a specific cloud model's `wire` ID).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HeldTarget {
+    Local,
+    Cloud(String),
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RoutingBasis {
     /// Local-only mode (no cloud upstream configured); Stage 2 selects reasoning effort.
@@ -275,6 +291,8 @@ pub enum RoutingBasis {
     PiiPinnedLocal,
     /// Local radix KV prefix cache is warm on a continuing session; stayed local to preserve KV.
     WarmKvStayLocal,
+    /// Held the session's current model (local or cloud) across a `tool_result` loop.
+    SessionHeld,
     /// Local model cleared `prefer-local` `min_p_pass` threshold.
     PreferLocal,
     /// Local model won utility maximization `V * P(pass) - expected_cost`.
@@ -289,6 +307,7 @@ impl RoutingBasis {
             Self::LocalOnlyEffort => "local_only_effort",
             Self::PiiPinnedLocal => "pii_pinned_local",
             Self::WarmKvStayLocal => "warm_kv_stay_local",
+            Self::SessionHeld => "session_held",
             Self::PreferLocal => "prefer_local",
             Self::UtilityLocal => "utility_local",
             Self::CloudSpillover => "cloud_spillover",
@@ -446,6 +465,8 @@ pub struct DecideInput<'a> {
     pub has_tools: bool,
     pub has_images: bool,
     pub warm_local_kv: bool,
+    pub event: TurnEvent,
+    pub held_target: Option<&'a HeldTarget>,
     pub local_slot: usize,
     pub local_logit_bias: f64,
     pub cloud_candidates: &'a [CloudCandidate],
@@ -504,11 +525,10 @@ pub fn decide(heads: &ArcHeads, input: &DecideInput<'_>) -> Result<RoutingDecisi
         }
     };
 
-    // 1–3. Local pinning guards in semantic priority order:
+    // 1–2. Unconditional local guards:
     //      (a) PII / credential guard (`pii_pinned_local`),
-    //      (b) live warm radix + GDN KV continuation (`warm_kv_stay_local`),
-    //      (c) local-only mode / stateful local-pinned request (`local_only_effort`).
-    if pii_pin || input.warm_local_kv || input.cloud_candidates.is_empty() {
+    //      (b) local-only mode / stateful local-pinned request (`local_only_effort`).
+    if pii_pin || input.cloud_candidates.is_empty() {
         let basis = if pii_pin {
             RoutingBasis::PiiPinnedLocal
         } else if input.warm_local_kv {
@@ -534,7 +554,134 @@ pub fn decide(heads: &ArcHeads, input: &DecideInput<'_>) -> Result<RoutingDecisi
         });
     }
 
-    // 4. Policy decision: PreferLocal vs Utility.
+    let cloud_eligible = |cand: &CloudCandidate| -> bool {
+        (!input.has_tools || cand.capabilities.tool_call)
+            && (!input.has_images || cand.capabilities.supports_image)
+            && cand
+                .capabilities
+                .context_limit
+                .is_none_or(|lim| input.prompt_tokens <= lim)
+    };
+
+    // 3. Symmetric tool-loop hold (matching `rayline-arc-decide`): on `TurnEvent::ToolResult`,
+    //    hold whichever model (local OR cloud) was last served for this session and run Stage 2
+    //    for effort steering, preserving prompt/KV caches and avoiding mid-task split-brain flips.
+    //    If the in-memory hold was evicted but local radix KV is warm, preserve local KV.
+    if input.event == TurnEvent::ToolResult {
+        if let Some(held) = input.held_target {
+            match held {
+                HeldTarget::Local => {
+                    let effort = choose_effort_for_slot(
+                        heads,
+                        input.block_readouts,
+                        input.block_roles,
+                        input.local_slot,
+                        None,
+                    );
+                    return Ok(RoutingDecision {
+                        target: RouteTarget::Local,
+                        p_pass: local_p,
+                        local_p_pass: local_p,
+                        reasoning_effort: effort,
+                        basis: if input.warm_local_kv {
+                            RoutingBasis::WarmKvStayLocal
+                        } else {
+                            RoutingBasis::SessionHeld
+                        },
+                        pii_triggered: pii.triggered_classes,
+                        latency_ms: t0.elapsed().as_secs_f64() * 1000.0,
+                    });
+                }
+                HeldTarget::Cloud(held_wire) => {
+                    if let Some(cand) = input
+                        .cloud_candidates
+                        .iter()
+                        .find(|c| c.wire == *held_wire && cloud_eligible(c))
+                    {
+                        let prices = cand
+                            .price_override
+                            .or(heads.catalog.model_prices[cand.slot])
+                            .unwrap_or([0.0; LEGS]);
+                        let cloud_p = heads
+                            .catalog
+                            .stage_one_candidate_for_model(cand.slot)
+                            .and_then(|idx| preds.get(idx))
+                            .map(|p| p.p_pass)
+                            .filter(|p| p.is_finite())
+                            .unwrap_or(local_p);
+                        let effort = choose_effort_for_slot(
+                            heads,
+                            input.block_readouts,
+                            input.block_roles,
+                            cand.slot,
+                            Some(prices),
+                        );
+                        return Ok(RoutingDecision {
+                            target: RouteTarget::Cloud(Box::new(CloudRouteTarget {
+                                slot: cand.slot,
+                                name: cand.name.clone(),
+                                wire: cand.wire.clone(),
+                                endpoint: cand.endpoint.clone(),
+                                prices,
+                                capabilities: cand.capabilities.clone(),
+                            })),
+                            p_pass: cloud_p,
+                            local_p_pass: local_p,
+                            reasoning_effort: effort,
+                            basis: RoutingBasis::SessionHeld,
+                            pii_triggered: pii.triggered_classes,
+                            latency_ms: t0.elapsed().as_secs_f64() * 1000.0,
+                        });
+                    }
+                }
+            }
+        } else if input.warm_local_kv {
+            let effort = choose_effort_for_slot(
+                heads,
+                input.block_readouts,
+                input.block_roles,
+                input.local_slot,
+                None,
+            );
+            return Ok(RoutingDecision {
+                target: RouteTarget::Local,
+                p_pass: local_p,
+                local_p_pass: local_p,
+                reasoning_effort: effort,
+                basis: RoutingBasis::WarmKvStayLocal,
+                pii_triggered: pii.triggered_classes,
+                latency_ms: t0.elapsed().as_secs_f64() * 1000.0,
+            });
+        }
+    }
+
+    // 4. Warm local KV continuation on a new `UserMessage` (cache-boundary hysteresis):
+    //    stay local while `local_p` remains viable (`>= warm_floor`), but allow Stage 1 to
+    //    escalate to cloud if the new user turn collapses `local_p` below `warm_floor`.
+    let warm_floor = match input.policy {
+        RoutingPolicy::PreferLocal { min_p_pass, .. } => (min_p_pass - 0.15).clamp(0.35, 0.65),
+        RoutingPolicy::Utility { .. } => 0.45,
+    };
+    if input.warm_local_kv && input.event == TurnEvent::UserMessage && local_p >= warm_floor {
+        let effort = choose_effort_for_slot(
+            heads,
+            input.block_readouts,
+            input.block_roles,
+            input.local_slot,
+            None,
+        );
+        return Ok(RoutingDecision {
+            target: RouteTarget::Local,
+            p_pass: local_p,
+            local_p_pass: local_p,
+            reasoning_effort: effort,
+            basis: RoutingBasis::WarmKvStayLocal,
+            pii_triggered: pii.triggered_classes,
+            latency_ms: t0.elapsed().as_secs_f64() * 1000.0,
+        });
+    }
+
+    // 5. Boundary Stage-1 policy decision: PreferLocal vs Utility.
     if let RoutingPolicy::PreferLocal { min_p_pass, .. } = input.policy
         && local_p >= min_p_pass
     {
@@ -715,6 +862,20 @@ mod tests {
             LocalProfile {
                 slot: LOCAL_FLASH_NEXT_SLOT,
                 logit_bias: 0.0,
+            }
+        );
+        assert_eq!(
+            infer_local_profile("nchapman/Ornith-1.5-35B-A3B-W4A16-HGPTQ", &catalog),
+            LocalProfile {
+                slot: LOCAL_9B_SLOT,
+                logit_bias: 0.45,
+            }
+        );
+        assert_eq!(
+            infer_local_profile("nchapman/Ornith-1.5-9B-W4A16-HGPTQ", &catalog),
+            LocalProfile {
+                slot: LOCAL_9B_SLOT,
+                logit_bias: 0.20,
             }
         );
         assert_eq!(
