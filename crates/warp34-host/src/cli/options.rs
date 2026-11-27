@@ -174,6 +174,7 @@ Serving Options (warp34 serve):
   --router [repo|dir]                 Enable native ARC-1.0 router (default: nchapman/ARC-1.0-W4A16-HGPTQ)
   --router-policy <policy>            Routing policy: prefer-local (default), sage, or swift
   --router-min-p-pass <0..1>          Min local P(pass) for prefer-local (default: 0.65)
+  --router-local-bias <float>         Override logit-space local strength offset vs anchor slot (e.g. +0.4, -0.5; default: auto)
   --router-value <usd>                Override utility task value V in USD (default: 1.5 prefer-local, 4.5 sage, 0.1 swift)
   --router-cloud-models <csv|auto|none> Cloud models as provider/model, openrouter/vendor/model, https://host/v1#model, or standard=/frontier= (aliases: sonnet=/opus=) prefix (default: none = local-only; auto = detect from env keys)
   --router-pin-pii <csv|none>         PII classes pinned locally (default: credential,government_id,financial_account,payment_card)
@@ -300,6 +301,7 @@ pub(crate) struct ServeCliConfig {
     pub(crate) router_model: Option<String>,
     pub(crate) router_policy: Option<String>,
     pub(crate) router_min_p_pass: Option<f64>,
+    pub(crate) router_local_bias: Option<f64>,
     pub(crate) router_value_usd: Option<f64>,
     pub(crate) router_cloud_models: Vec<String>,
     pub(crate) router_pin_pii: Option<String>,
@@ -422,6 +424,23 @@ impl ServeCliConfig {
                 .parse()
                 .map_err(|_| format!("invalid --router-min-p-pass `{raw}`"))?;
             self.router_min_p_pass = Some(val);
+            return Ok(true);
+        }
+        if flag == "--router-local-bias" {
+            self.used = true;
+            *i += 1;
+            let raw = args
+                .get(*i)
+                .ok_or_else(|| "missing --router-local-bias value".to_string())?;
+            let val: f64 = raw
+                .parse()
+                .map_err(|_| format!("invalid --router-local-bias `{raw}`"))?;
+            if !val.is_finite() || !(-4.0..=4.0).contains(&val) {
+                return Err(format!(
+                    "--router-local-bias `{raw}` must be a finite number in -4.0..=4.0"
+                ));
+            }
+            self.router_local_bias = Some(val);
             return Ok(true);
         }
         if flag == "--router-value" {

@@ -47,18 +47,79 @@ impl RoutingPolicy {
     }
 }
 
-/// Canonical ARC-1.0 reference slot for the local model target (`qwen3.8-27b`, ~27B class,
-/// with full 4-action Stage-2 steering: `down` / `none` / `up` / unsteered).
+/// Trained ARC-1.0 local anchor for 80B-A3B MoE (`qwen3.8-flash-next`, 2 Stage-2 actions).
+pub const LOCAL_FLASH_NEXT_SLOT: usize = 53;
+/// Trained ARC-1.0 local anchor for small/9B-class models (`qwen3.5-9b`, 4 Stage-2 actions).
+pub const LOCAL_9B_SLOT: usize = 54;
+/// Canonical ARC-1.0 reference slot for the ~27B local model target (`qwen3.8-27b`, 4 Stage-2
+/// actions: `down` / `none` / `up` / unsteered).
 pub const DEFAULT_LOCAL_SLOT: usize = 55;
 /// Canonical ARC-1.0 reference slot for the mid/workhorse remote tier (`claude-sonnet-5.5`).
 pub const REMOTE_SONNET_SLOT: usize = 2;
 /// Canonical ARC-1.0 reference slot for the frontier/heavy remote tier (`claude-opus-5.5`).
 pub const REMOTE_OPUS_SLOT: usize = 1;
 
-/// Maps any served local `warp34` model to the canonical `~27B` ARC-1.0 local target slot
-/// (`[55]` `qwen3.8-27b`, clamped for synthetic test catalogs).
-pub fn infer_local_slot(_model_name: &str, catalog: &ArcRuntimeCatalog) -> usize {
-    DEFAULT_LOCAL_SLOT.min(catalog.models.len().saturating_sub(1))
+/// Calibrated local routing profile pairing one of ARC-1.0's three trained local anchors
+/// (`[54] qwen3.5-9b`, `[55] qwen3.8-27b`, `[53] qwen3.8-flash-next`) with a monotone
+/// logit-space ability offset (`local_p' = sigmoid(logit(local_p) + logit_bias)`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct LocalProfile {
+    pub slot: usize,
+    pub logit_bias: f64,
+}
+
+fn has_ascii_token(haystack: &str, needle: &str) -> bool {
+    haystack
+        .split(|c: char| !c.is_ascii_alphanumeric() && c != '.')
+        .any(|tok| tok.eq_ignore_ascii_case(needle))
+}
+
+/// Maps a served local `warp34` model ID/path onto its empirically calibrated ARC-1.0 anchor
+/// slot and logit bias:
+/// - `Flash-Next` (`flash-next` / `flash_next`): `[53]` `qwen3.8-flash-next`, `bias = 0.0`
+/// - `Apex-35B` (`apex-35b` / `apex_35b`): `[54]` `qwen3.5-9b`, `bias = +0.20` (`78.5%` vs `75.0%` screen)
+/// - `Ternary-Bonsai-2.5-27B`: `[55]` `qwen3.8-27b`, `bias = +0.40` (`93.5%` vs `90.7%` screen)
+/// - Small `<= 9B` models (`9b`, `4b`, `2b`, `0.8b`): `[54]` `qwen3.5-9b`, `bias = 0.0`
+/// - Default (including `27B` and arbitrary/third-party local models): `[55]` `qwen3.8-27b`, `bias = 0.0`
+pub fn infer_local_profile(model_name: &str, catalog: &ArcRuntimeCatalog) -> LocalProfile {
+    let lower = model_name.to_ascii_lowercase();
+    let (raw_slot, logit_bias) = if lower.contains("flash-next") || lower.contains("flash_next") {
+        (LOCAL_FLASH_NEXT_SLOT, 0.0)
+    } else if lower.contains("apex-35b") || lower.contains("apex_35b") {
+        (LOCAL_9B_SLOT, 0.20)
+    } else if lower.contains("bonsai") && has_ascii_token(&lower, "27b") {
+        (DEFAULT_LOCAL_SLOT, 0.40)
+    } else if has_ascii_token(&lower, "9b")
+        || has_ascii_token(&lower, "4b")
+        || has_ascii_token(&lower, "2b")
+        || has_ascii_token(&lower, "0.8b")
+    {
+        (LOCAL_9B_SLOT, 0.0)
+    } else {
+        (DEFAULT_LOCAL_SLOT, 0.0)
+    };
+    LocalProfile {
+        slot: raw_slot.min(catalog.models.len().saturating_sub(1)),
+        logit_bias,
+    }
+}
+
+/// Convenience wrapper returning just the resolved local anchor slot.
+pub fn infer_local_slot(model_name: &str, catalog: &ArcRuntimeCatalog) -> usize {
+    infer_local_profile(model_name, catalog).slot
+}
+
+/// Applies a monotone logit-space calibration offset (`sigmoid(logit(p) + bias)`) to a Stage-1
+/// pass probability `p`. Returns `p` clamped to `[0, 1]` when `bias == 0.0` or non-finite.
+pub fn apply_logit_bias(p: f64, bias: f64) -> f64 {
+    let clamped = p.clamp(0.0, 1.0);
+    if bias == 0.0 || !bias.is_finite() {
+        return clamped;
+    }
+    let eps = 1e-6;
+    let p_safe = clamped.clamp(eps, 1.0 - eps);
+    let logit = (p_safe / (1.0 - p_safe)).ln();
+    1.0 / (1.0 + (-(logit + bias)).exp())
 }
 
 /// Human-readable archetype label for a resolved remote cloud slot.
@@ -386,6 +447,7 @@ pub struct DecideInput<'a> {
     pub has_images: bool,
     pub warm_local_kv: bool,
     pub local_slot: usize,
+    pub local_logit_bias: f64,
     pub cloud_candidates: &'a [CloudCandidate],
     pub policy: RoutingPolicy,
     pub pin_pii_classes: &'a HashSet<String>,
@@ -417,11 +479,12 @@ pub fn decide(heads: &ArcHeads, input: &DecideInput<'_>) -> Result<RoutingDecisi
         heads.catalog.stage_one_regime,
         &active_cands,
     )?;
-    let local_p = local_cand
+    let raw_local_p = local_cand
         .and_then(|c| preds.get(c))
         .map(|p| p.p_pass)
         .filter(|p| p.is_finite())
         .unwrap_or(0.5);
+    let local_p = apply_logit_bias(raw_local_p, input.local_logit_bias);
 
     let pii_thresh = heads.catalog.pii_threshold_for_tokens(input.prompt_tokens);
     let pii: PiiSignalPrediction = heads.pii.predict(
@@ -617,8 +680,7 @@ mod tests {
         assert_eq!(map_arc_effort_to_warp34("none", None), "none");
     }
 
-    #[test]
-    fn generalized_three_archetype_slot_mapping_covers_local_sonnet_and_opus() {
+    fn synthetic_catalog() -> super::super::heads::ArcRuntimeCatalog {
         use super::super::heads::{ArcModelEntry, ArcRuntimeCatalog};
         let models: Vec<ArcModelEntry> = (0..56)
             .map(|i| ArcModelEntry {
@@ -626,7 +688,7 @@ mod tests {
                 wire: None,
             })
             .collect();
-        let catalog = ArcRuntimeCatalog {
+        ArcRuntimeCatalog {
             models,
             actions: Vec::new(),
             fallback_action: 0,
@@ -642,19 +704,74 @@ mod tests {
             pii_presence_threshold: 0.5,
             pii_type_threshold: 0.5,
             pii_length_buckets: Vec::new(),
-        };
-
-        // Any local model maps to the canonical ~27B local archetype (`DEFAULT_LOCAL_SLOT = 55`).
-        for local_name in [
-            "nchapman/Ternary-Bonsai-2.5-27B-warp34",
-            "nchapman/Apex-35B-V1.0-W4A16-HGPTQ",
-            "nchapman/Qwen3.8-Flash-Next-W4A16-HGPTQ",
-            "nchapman/Qwen3.5-9B-W4A16-HGPTQ",
-            "custom-local-model",
-        ] {
-            assert_eq!(infer_local_slot(local_name, &catalog), DEFAULT_LOCAL_SLOT);
         }
+    }
 
+    #[test]
+    fn local_profile_calibration_and_logit_bias_are_monotone() {
+        let catalog = synthetic_catalog();
+        assert_eq!(
+            infer_local_profile("nchapman/Qwen3.8-Flash-Next-W4A16-HGPTQ", &catalog),
+            LocalProfile {
+                slot: LOCAL_FLASH_NEXT_SLOT,
+                logit_bias: 0.0,
+            }
+        );
+        assert_eq!(
+            infer_local_profile("nchapman/Apex-35B-V1.0-W4A16-HGPTQ", &catalog),
+            LocalProfile {
+                slot: LOCAL_9B_SLOT,
+                logit_bias: 0.20,
+            }
+        );
+        assert_eq!(
+            infer_local_profile("nchapman/Ternary-Bonsai-2.5-27B-warp34", &catalog),
+            LocalProfile {
+                slot: DEFAULT_LOCAL_SLOT,
+                logit_bias: 0.40,
+            }
+        );
+        assert_eq!(
+            infer_local_profile("nchapman/Qwen3.5-9B-W4A16-HGPTQ", &catalog),
+            LocalProfile {
+                slot: LOCAL_9B_SLOT,
+                logit_bias: 0.0,
+            }
+        );
+        assert_eq!(
+            infer_local_profile("nchapman/Qwen3.5-4B-W4A16-HGPTQ", &catalog),
+            LocalProfile {
+                slot: LOCAL_9B_SLOT,
+                logit_bias: 0.0,
+            }
+        );
+        assert_eq!(
+            infer_local_profile("nchapman/Qwen3.8-27B-W4A16-HGPTQ", &catalog),
+            LocalProfile {
+                slot: DEFAULT_LOCAL_SLOT,
+                logit_bias: 0.0,
+            }
+        );
+        assert_eq!(
+            infer_local_profile("custom-local-model", &catalog),
+            LocalProfile {
+                slot: DEFAULT_LOCAL_SLOT,
+                logit_bias: 0.0,
+            }
+        );
+
+        // Logit-space bias is identity at 0 and strictly monotone.
+        assert!((apply_logit_bias(0.75, 0.0) - 0.75).abs() < 1e-12);
+        let p_up = apply_logit_bias(0.75, 0.20);
+        let p_down = apply_logit_bias(0.75, -0.50);
+        assert!(p_up > 0.75 && p_up < 1.0);
+        assert!(p_down < 0.75 && p_down > 0.0);
+        assert!((p_up - 0.7856).abs() < 0.002);
+    }
+
+    #[test]
+    fn remote_archetype_slot_mapping_covers_standard_and_frontier() {
+        let catalog = synthetic_catalog();
         // Explicit tier prefixes: vendor-neutral (`standard`/`frontier`) + Claude (`sonnet`/`opus`).
         for tok in ["standard", "sonnet"] {
             assert_eq!(

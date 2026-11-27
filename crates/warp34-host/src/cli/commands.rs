@@ -1765,6 +1765,7 @@ pub(crate) fn run_serve(
             model_dir: router_dir,
             device_id: 0,
             local_model_name: model.clone(),
+            local_logit_bias: serve.router_local_bias,
             cloud_model_filter: serve.router_cloud_models.clone(),
             policy,
             pin_pii_classes,
@@ -1775,8 +1776,13 @@ pub(crate) fn run_serve(
         } else {
             format!("{pii_count} classes")
         };
+        let local_bias_label = if router.local_logit_bias().abs() > 1e-6 {
+            format!(" (bias={:+.2})", router.local_logit_bias())
+        } else {
+            String::new()
+        };
         router_banner = Some(format!(
-            "model=\"router\", policy={policy_label}, local_slot={}, cloud={}, pin_pii={pii_label}",
+            "model=\"router\", policy={policy_label}, local_slot={}{local_bias_label}, cloud={}, pin_pii={pii_label}",
             router.local_slot_name(),
             router.cloud_summary(),
         ));

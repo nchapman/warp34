@@ -23,7 +23,7 @@ use heads::ArcHeads;
 use input::{ApiProtocol, SerializedArcInput, serialize_request};
 use policy::{
     CloudCandidate, DecideInput, RouteTarget, RoutingBasis, RoutingDecision, RoutingPolicy, decide,
-    infer_local_slot, is_local_only_cloud_filter, resolve_cloud_candidates_from_registry,
+    infer_local_profile, is_local_only_cloud_filter, resolve_cloud_candidates_from_registry,
 };
 use proxy::UpstreamProxy;
 use registry::ModelsDevRegistry;
@@ -42,6 +42,7 @@ pub struct ArcRouterConfig {
     pub model_dir: PathBuf,
     pub device_id: i32,
     pub local_model_name: String,
+    pub local_logit_bias: Option<f64>,
     pub cloud_model_filter: Vec<String>,
     pub policy: RoutingPolicy,
     pub pin_pii_classes: HashSet<String>,
@@ -245,6 +246,7 @@ pub struct ArcRouter {
     encoder: ArcEncoderWorker,
     heads: Arc<ArcHeads>,
     local_slot: usize,
+    local_logit_bias: f64,
     cloud_candidates: Vec<CloudCandidate>,
     cloud_candidates_by_proto: [Arc<[CloudCandidate]>; 3],
     empty_candidates: Arc<[CloudCandidate]>,
@@ -265,7 +267,9 @@ fn proto_index(protocol: ApiProtocol) -> usize {
 impl ArcRouter {
     pub fn load(cfg: ArcRouterConfig) -> Result<Self, String> {
         let heads = ArcHeads::load(&cfg.model_dir)?;
-        let local_slot = infer_local_slot(&cfg.local_model_name, &heads.catalog);
+        let local_profile = infer_local_profile(&cfg.local_model_name, &heads.catalog);
+        let local_slot = local_profile.slot;
+        let local_logit_bias = cfg.local_logit_bias.unwrap_or(local_profile.logit_bias);
         let cloud_candidates = if is_local_only_cloud_filter(&cfg.cloud_model_filter) {
             Vec::new()
         } else {
@@ -309,6 +313,7 @@ impl ArcRouter {
             encoder,
             heads: Arc::new(heads),
             local_slot,
+            local_logit_bias,
             cloud_candidates,
             cloud_candidates_by_proto,
             empty_candidates,
@@ -325,6 +330,10 @@ impl ArcRouter {
 
     pub fn local_slot_name(&self) -> &str {
         &self.heads.catalog.models[self.local_slot].name
+    }
+
+    pub fn local_logit_bias(&self) -> f64 {
+        self.local_logit_bias
     }
 
     pub fn cloud_model_names(&self) -> Vec<String> {
@@ -384,6 +393,7 @@ impl ArcRouter {
         let enc = self.encoder.encode_blocks(canonical.blocks).await?;
         let heads = Arc::clone(&self.heads);
         let local_slot = self.local_slot;
+        let local_logit_bias = self.local_logit_bias;
         let cloud_candidates = if allow_cloud {
             Arc::clone(&self.cloud_candidates_by_proto[proto_index(protocol)])
         } else {
@@ -404,6 +414,7 @@ impl ArcRouter {
                     has_images,
                     warm_local_kv,
                     local_slot,
+                    local_logit_bias,
                     cloud_candidates: &cloud_candidates,
                     policy,
                     pin_pii_classes: &pin_pii_classes,

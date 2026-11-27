@@ -643,6 +643,7 @@ async fn models(State(s): State<Arc<OpenAiServerState>>) -> Json<Value> {
             "object": "model",
             "owned_by": "warp34",
             "local_slot": router.local_slot_name(),
+            "local_logit_bias": router.local_logit_bias(),
             "cloud_models": router.cloud_model_names(),
             "max_model_len": max_model_len,
         }));

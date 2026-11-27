@@ -5,8 +5,8 @@ use warp34_host::arc_router::{
     heads::ArcHeads,
     input::{ApiProtocol, serialize_request},
     policy::{
-        DecideInput, RouteTarget, RoutingBasis, RoutingPolicy, decide, infer_local_slot,
-        resolve_cloud_candidates_from_registry,
+        DecideInput, LocalProfile, RouteTarget, RoutingBasis, RoutingPolicy, decide,
+        infer_local_profile, resolve_cloud_candidates_from_registry,
     },
     registry::ModelsDevRegistry,
 };
@@ -150,20 +150,51 @@ fn heads_catalog_slot_inference_and_policy_invariants() {
     assert_eq!(heads.catalog.stage_one_candidate_for_model(53), Some(53)); // qwen3.8-flash-next
     assert_eq!(heads.catalog.stage_one_candidate_for_model(54), Some(54)); // qwen3.5-9b
     assert_eq!(heads.catalog.stage_one_candidate_for_model(55), Some(55)); // qwen3.8-27b
-    // Generalized 3-archetype slot system: every local model maps to the canonical ~27B target
-    // (`DEFAULT_LOCAL_SLOT = 55`, `qwen3.8-27b`), and remote cloud models map to `sonnet` (`2`)
-    // or `opus` (`1`).
+    // Local anchor & empirical logit-bias calibration across all three trained ARC-1.0 anchors
+    // (`[54] 9B`, `[55] 27B`, `[53] Flash-Next`), and remote cloud models map to `standard`/`sonnet`
+    // (`[2]`) or `frontier`/`opus` (`[1]`).
     assert_eq!(
-        infer_local_slot("Apex-35B-V1.0-W4A16-HGPTQ", &heads.catalog),
-        55
+        infer_local_profile("Apex-35B-V1.0-W4A16-HGPTQ", &heads.catalog),
+        LocalProfile {
+            slot: 54,
+            logit_bias: 0.20,
+        }
     );
-    assert_eq!(infer_local_slot("Qwen3.8-Flash-Next", &heads.catalog), 55);
     assert_eq!(
-        infer_local_slot("Ternary-Bonsai-2.5-27B", &heads.catalog),
-        55
+        infer_local_profile("Qwen3.8-Flash-Next", &heads.catalog),
+        LocalProfile {
+            slot: 53,
+            logit_bias: 0.0,
+        }
     );
-    assert_eq!(infer_local_slot("Qwen3.5-9B", &heads.catalog), 55);
-    assert_eq!(infer_local_slot("Qwen3.5-4B", &heads.catalog), 55);
+    assert_eq!(
+        infer_local_profile("Ternary-Bonsai-2.5-27B", &heads.catalog),
+        LocalProfile {
+            slot: 55,
+            logit_bias: 0.40,
+        }
+    );
+    assert_eq!(
+        infer_local_profile("Qwen3.5-9B", &heads.catalog),
+        LocalProfile {
+            slot: 54,
+            logit_bias: 0.0,
+        }
+    );
+    assert_eq!(
+        infer_local_profile("Qwen3.5-4B", &heads.catalog),
+        LocalProfile {
+            slot: 54,
+            logit_bias: 0.0,
+        }
+    );
+    assert_eq!(
+        infer_local_profile("custom-local-model", &heads.catalog),
+        LocalProfile {
+            slot: 55,
+            logit_bias: 0.0,
+        }
+    );
 
     let registry = ModelsDevRegistry::builtin_fallback();
     // Default (empty filter) resolves to local-only (no surprise cloud spend).
@@ -215,6 +246,7 @@ fn heads_catalog_slot_inference_and_policy_invariants() {
             has_images: false,
             warm_local_kv: true,
             local_slot: 54,
+            local_logit_bias: 0.0,
             cloud_candidates: &auto_slots,
             policy: RoutingPolicy::Utility { value_usd: 4.5 },
             pin_pii_classes: &HashSet::new(),
@@ -463,6 +495,7 @@ fn arc_encoder_and_heads_match_goldens() {
                     has_images: turn.has_images,
                     warm_local_kv: false,
                     local_slot,
+                    local_logit_bias: 0.0,
                     cloud_candidates: &[],
                     policy: RoutingPolicy::PreferLocal {
                         min_p_pass:
@@ -585,6 +618,7 @@ fn dp1_warm_kv_and_stateful_responses_routing() {
             model_dir: arc_dir,
             device_id: 0,
             local_model_name: "Qwen3.5-0.8B".to_string(),
+            local_logit_bias: None,
             cloud_model_filter: Vec::new(),
             policy: RoutingPolicy::PreferLocal {
                 min_p_pass: warp34_host::arc_router::policy::DEFAULT_PREFER_LOCAL_MIN_P_PASS,
