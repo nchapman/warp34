@@ -1327,7 +1327,7 @@ impl OpenAiServerState {
         &self,
         protocol: crate::arc_router::input::ApiProtocol,
         bypass_header: bool,
-        session_key: Option<&str>,
+        warm_session_key: Option<&str>,
         anthropic_beta: Option<&str>,
         force_local: bool,
         body: &mut Value,
@@ -1347,7 +1347,7 @@ impl OpenAiServerState {
         // KV-cache boundary awareness: stay local when caller carries a warm session key bound
         // to a local worker, or when continuing a local `previous_response_id` chain.
         let warm_local_kv = force_local
-            || session_key
+            || warm_session_key
                 .and_then(|k| self.dp_router.lookup_session(k))
                 .is_some();
 
@@ -1484,19 +1484,34 @@ async fn generate(
         .get("x-warp34-bypass-router")
         .and_then(|v| v.to_str().ok())
         .is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true"));
-    let session_key = request
+    let header_session = request
         .headers()
         .get("x-session-id")
         .and_then(|v| v.to_str().ok())
         .filter(|s| !s.is_empty())
         .map(|s| format!("sess:{s}"));
     let (mut json, body_len) = read_json_with_len(&s, request).await?;
+    let (session_key, allow_session_warm_kv) = if let Some(k) = header_session {
+        (Some(k), true)
+    } else if chat && (s.arc_router.is_some() || !s.extra_workers.is_empty()) {
+        match crate::arc_router::input::derive_prefix_session_key(
+            crate::arc_router::input::ApiProtocol::OpenAiChat,
+            &json,
+        ) {
+            Some((k, has_asst)) => (Some(k), has_asst),
+            None => (None, false),
+        }
+    } else {
+        (None, false)
+    };
     let arc_decision = if chat {
         match s
             .maybe_arc_route(
                 crate::arc_router::input::ApiProtocol::OpenAiChat,
                 bypass_router,
-                session_key.as_deref(),
+                allow_session_warm_kv
+                    .then_some(session_key.as_deref())
+                    .flatten(),
                 None,
                 false,
                 &mut json,
@@ -2227,14 +2242,29 @@ async fn responses_create(
             .get_response(id, caller_scope.as_deref().unwrap_or(""))
             .is_some()
     });
-    let session_key = prev_resp_id
+    let (session_key, allow_session_warm_kv) = if let Some(k) = prev_resp_id
         .map(|id| format!("resp:{id}"))
-        .or(header_session);
+        .or(header_session)
+    {
+        (Some(k), true)
+    } else if s.arc_router.is_some() || !s.extra_workers.is_empty() {
+        match crate::arc_router::input::derive_prefix_session_key(
+            crate::arc_router::input::ApiProtocol::OpenAiResponses,
+            &body,
+        ) {
+            Some((k, has_asst)) => (Some(k), has_asst),
+            None => (None, false),
+        }
+    } else {
+        (None, false)
+    };
     let arc_decision = match s
         .maybe_arc_route(
             crate::arc_router::input::ApiProtocol::OpenAiResponses,
             bypass_router,
-            session_key.as_deref(),
+            allow_session_warm_kv
+                .then_some(session_key.as_deref())
+                .flatten(),
             None,
             has_local_prev_resp,
             &mut body,
@@ -2595,18 +2625,33 @@ async fn anthropic_messages(
         .get("anthropic-beta")
         .and_then(|v| v.to_str().ok())
         .map(ToString::to_string);
-    let session_key = request
+    let header_session = request
         .headers()
         .get("x-session-id")
         .and_then(|v| v.to_str().ok())
         .filter(|s| !s.is_empty())
         .map(|s| format!("sess:{s}"));
     let mut body = read_json(&s, request).await.map_err(to_anthropic_err)?;
+    let (session_key, allow_session_warm_kv) = if let Some(k) = header_session {
+        (Some(k), true)
+    } else if s.arc_router.is_some() || !s.extra_workers.is_empty() {
+        match crate::arc_router::input::derive_prefix_session_key(
+            crate::arc_router::input::ApiProtocol::AnthropicMessages,
+            &body,
+        ) {
+            Some((k, has_asst)) => (Some(k), has_asst),
+            None => (None, false),
+        }
+    } else {
+        (None, false)
+    };
     let arc_decision = match s
         .maybe_arc_route(
             crate::arc_router::input::ApiProtocol::AnthropicMessages,
             bypass_router,
-            session_key.as_deref(),
+            allow_session_warm_kv
+                .then_some(session_key.as_deref())
+                .flatten(),
             anthropic_beta.as_deref(),
             false,
             &mut body,

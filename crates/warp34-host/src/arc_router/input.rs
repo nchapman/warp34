@@ -4,6 +4,7 @@
 use std::collections::{BTreeMap, HashMap};
 
 use serde_json::{Map, Value, json};
+use sha2::{Digest, Sha256};
 
 /// Incoming HTTP API dialect for request normalization.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -649,5 +650,88 @@ pub fn serialize_request(protocol: ApiProtocol, raw: &Value) -> SerializedArcInp
         has_tools,
         has_images,
         turn_count,
+    }
+}
+
+/// Derives a collision-resistant 128-bit fallback session key (`pfx:<32-hex>`) from the
+/// conversation's opening prefix (leading `system` + first `user` block) for clients that do not
+/// send an explicit `X-Session-ID` header.
+///
+/// Also returns `has_assistant_turn` so callers only treat the derived key as a warm local KV
+/// continuation on multi-turn follow-ups (never on turn 0 of an independent identical prompt).
+pub fn derive_prefix_session_key(protocol: ApiProtocol, raw: &Value) -> Option<(String, bool)> {
+    let serialized = serialize_request(protocol, raw);
+    let mut hasher = Sha256::new();
+    let mut hashed_any = false;
+    for block in &serialized.blocks {
+        if block.role == "system" {
+            hasher.update(b"sys\0");
+            hasher.update(block.content.as_bytes());
+            hasher.update(b"\0");
+            hashed_any = true;
+        } else if block.role == "user" {
+            hasher.update(b"usr\0");
+            hasher.update(block.content.as_bytes());
+            hasher.update(b"\0");
+            hashed_any = true;
+            break;
+        } else {
+            break;
+        }
+    }
+    if !hashed_any {
+        return None;
+    }
+    let digest = hasher.finalize();
+    let mut key = String::with_capacity(4 + 32);
+    key.push_str("pfx:");
+    for b in &digest[..16] {
+        use std::fmt::Write as _;
+        let _ = write!(&mut key, "{b:02x}");
+    }
+    let has_assistant_turn = serialized.blocks.iter().any(|b| b.role == "assistant");
+    Some((key, has_assistant_turn))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn prefix_session_key_persists_across_turns_and_guards_turn_zero() {
+        let t0 = json!({
+            "messages": [
+                {"role": "system", "content": "You are a coding agent."},
+                {"role": "user", "content": "Fix astropy #12907"}
+            ]
+        });
+        let t1 = json!({
+            "messages": [
+                {"role": "system", "content": "You are a coding agent."},
+                {"role": "user", "content": "Fix astropy #12907"},
+                {"role": "assistant", "content": "Let me inspect the file."},
+                {"role": "user", "content": "Here is the file contents."}
+            ]
+        });
+        let other = json!({
+            "messages": [
+                {"role": "system", "content": "You are a coding agent."},
+                {"role": "user", "content": "Fix astropy #13033"}
+            ]
+        });
+
+        let (k0, has_asst0) =
+            derive_prefix_session_key(ApiProtocol::OpenAiChat, &t0).expect("t0 key");
+        let (k1, has_asst1) =
+            derive_prefix_session_key(ApiProtocol::OpenAiChat, &t1).expect("t1 key");
+        let (k_other, _) =
+            derive_prefix_session_key(ApiProtocol::OpenAiChat, &other).expect("other key");
+
+        assert!(k0.starts_with("pfx:"));
+        assert_eq!(k0.len(), 36);
+        assert_eq!(k0, k1, "multi-turn continuation must keep the same key");
+        assert_ne!(k0, k_other, "distinct tasks must produce distinct keys");
+        assert!(!has_asst0, "turn 0 must not be marked as a continuation");
+        assert!(has_asst1, "turn 1+ must be marked as a continuation");
     }
 }
