@@ -82,10 +82,18 @@ fn has_ascii_token(haystack: &str, needle: &str) -> bool {
 /// - `Apex-35B` (`apex-35b` / `apex_35b`): `[54]` `qwen3.5-9b`, `bias = +0.20` (`78.5%` vs `75.0%` screen)
 /// - `Ornith-1.5-9B`: `[54]` `qwen3.5-9b`, `bias = +0.20` (`78.7%` vs `75.0%` screen)
 /// - `Ternary-Bonsai-2.5-27B`: `[55]` `qwen3.8-27b`, `bias = +0.40` (`93.5%` vs `90.7%` screen)
-/// - Small `<= 9B` models (`9b`, `4b`, `2b`, `0.8b`): `[54]` `qwen3.5-9b`, `bias = 0.0`
+/// - Small `<= 14B` models (`0.5b`..`14b`): `[54]` `qwen3.5-9b`, `bias = 0.0`
 /// - Default (including `27B` and arbitrary/third-party local models): `[55]` `qwen3.8-27b`, `bias = 0.0`
 pub fn infer_local_profile(model_name: &str, catalog: &ArcRuntimeCatalog) -> LocalProfile {
-    let lower = model_name.to_ascii_lowercase();
+    // Match only the model basename/leaf segment so parent directory names never skew matching.
+    let trimmed = model_name.trim().trim_end_matches(['/', '\\']);
+    let leaf = trimmed.rsplit(['/', '\\']).next().unwrap_or(trimmed);
+    let lower = leaf.to_ascii_lowercase();
+    let is_small = [
+        "0.5b", "0.8b", "1b", "1.5b", "1.7b", "2b", "3b", "4b", "7b", "8b", "9b", "12b", "14b",
+    ]
+    .iter()
+    .any(|sz| has_ascii_token(&lower, sz));
     let (raw_slot, logit_bias) = if lower.contains("flash-next") || lower.contains("flash_next") {
         (LOCAL_FLASH_NEXT_SLOT, 0.0)
     } else if lower.contains("ornith") && has_ascii_token(&lower, "35b") {
@@ -97,11 +105,7 @@ pub fn infer_local_profile(model_name: &str, catalog: &ArcRuntimeCatalog) -> Loc
         (LOCAL_9B_SLOT, 0.20)
     } else if lower.contains("bonsai") && has_ascii_token(&lower, "27b") {
         (DEFAULT_LOCAL_SLOT, 0.40)
-    } else if has_ascii_token(&lower, "9b")
-        || has_ascii_token(&lower, "4b")
-        || has_ascii_token(&lower, "2b")
-        || has_ascii_token(&lower, "0.8b")
-    {
+    } else if is_small {
         (LOCAL_9B_SLOT, 0.0)
     } else {
         (DEFAULT_LOCAL_SLOT, 0.0)
@@ -387,6 +391,7 @@ fn choose_effort_for_slot(
     block_roles: &[String],
     model_slot: usize,
     rates_override: Option<[f64; LEGS]>,
+    cost_weight_override: Option<f32>,
 ) -> String {
     let actions: Vec<&super::heads::ArcActionEntry> = heads
         .catalog
@@ -429,7 +434,9 @@ fn choose_effort_for_slot(
     let rates = rates_override
         .or(heads.catalog.model_prices[model_slot])
         .unwrap_or([0.0; LEGS]);
-    let cost_weight = heads.catalog.stage_two_cost_weight as f32;
+    let cost_weight = cost_weight_override
+        .filter(|w| w.is_finite() && *w >= 0.0)
+        .unwrap_or(heads.catalog.stage_two_cost_weight as f32);
 
     let mut best_effort = "medium";
     let mut best_score = f32::NEG_INFINITY;
@@ -524,6 +531,8 @@ pub fn decide(heads: &ArcHeads, input: &DecideInput<'_>) -> Result<RoutingDecisi
             value_usd
         }
     };
+    let cloud_stage_two_cost_weight =
+        (value_usd.is_finite() && value_usd > 0.0).then_some((1.0 / value_usd) as f32);
 
     // 1–2. Unconditional local guards:
     //      (a) PII / credential guard (`pii_pinned_local`),
@@ -541,6 +550,7 @@ pub fn decide(heads: &ArcHeads, input: &DecideInput<'_>) -> Result<RoutingDecisi
             input.block_readouts,
             input.block_roles,
             input.local_slot,
+            None,
             None,
         );
         return Ok(RoutingDecision {
@@ -577,6 +587,7 @@ pub fn decide(heads: &ArcHeads, input: &DecideInput<'_>) -> Result<RoutingDecisi
                         input.block_roles,
                         input.local_slot,
                         None,
+                        None,
                     );
                     return Ok(RoutingDecision {
                         target: RouteTarget::Local,
@@ -609,13 +620,15 @@ pub fn decide(heads: &ArcHeads, input: &DecideInput<'_>) -> Result<RoutingDecisi
                             .map(|p| p.p_pass)
                             .filter(|p| p.is_finite())
                             .unwrap_or(local_p);
-                        let effort = choose_effort_for_slot(
+                        let raw_effort = choose_effort_for_slot(
                             heads,
                             input.block_readouts,
                             input.block_roles,
                             cand.slot,
                             Some(prices),
+                            cloud_stage_two_cost_weight,
                         );
+                        let effort = cand.capabilities.clamp_effort(&raw_effort);
                         return Ok(RoutingDecision {
                             target: RouteTarget::Cloud(Box::new(CloudRouteTarget {
                                 slot: cand.slot,
@@ -642,6 +655,7 @@ pub fn decide(heads: &ArcHeads, input: &DecideInput<'_>) -> Result<RoutingDecisi
                 input.block_roles,
                 input.local_slot,
                 None,
+                None,
             );
             return Ok(RoutingDecision {
                 target: RouteTarget::Local,
@@ -656,29 +670,35 @@ pub fn decide(heads: &ArcHeads, input: &DecideInput<'_>) -> Result<RoutingDecisi
     }
 
     // 4. Warm local KV continuation on a new `UserMessage` (cache-boundary hysteresis):
-    //    stay local while `local_p` remains viable (`>= warm_floor`), but allow Stage 1 to
-    //    escalate to cloud if the new user turn collapses `local_p` below `warm_floor`.
-    let warm_floor = match input.policy {
-        RoutingPolicy::PreferLocal { min_p_pass, .. } => (min_p_pass - 0.15).clamp(0.35, 0.65),
-        RoutingPolicy::Utility { .. } => 0.45,
-    };
-    if input.warm_local_kv && input.event == TurnEvent::UserMessage && local_p >= warm_floor {
-        let effort = choose_effort_for_slot(
-            heads,
-            input.block_readouts,
-            input.block_roles,
-            input.local_slot,
-            None,
-        );
-        return Ok(RoutingDecision {
-            target: RouteTarget::Local,
-            p_pass: local_p,
-            local_p_pass: local_p,
-            reasoning_effort: effort,
-            basis: RoutingBasis::WarmKvStayLocal,
-            pii_triggered: pii.triggered_classes,
-            latency_ms: t0.elapsed().as_secs_f64() * 1000.0,
-        });
+    //    only applies when the session is NOT currently held on cloud (preventing stale Turn-0
+    //    local KV from hijacking an escalated cloud session). Under `PreferLocal`, stay local
+    //    while `local_p >= (min_p_pass - 0.15).clamp(0.0, min_p_pass)`. Under `Utility`, warm KV
+    //    is modeled in Step 5 as a small prefill-savings utility bonus rather than a value-blind
+    //    probability floor.
+    let eligible_warm_local = input.warm_local_kv
+        && input.event == TurnEvent::UserMessage
+        && !matches!(input.held_target, Some(HeldTarget::Cloud(_)));
+    if eligible_warm_local && let RoutingPolicy::PreferLocal { min_p_pass, .. } = input.policy {
+        let warm_floor = (min_p_pass - 0.15).clamp(0.0, min_p_pass);
+        if local_p >= warm_floor {
+            let effort = choose_effort_for_slot(
+                heads,
+                input.block_readouts,
+                input.block_roles,
+                input.local_slot,
+                None,
+                None,
+            );
+            return Ok(RoutingDecision {
+                target: RouteTarget::Local,
+                p_pass: local_p,
+                local_p_pass: local_p,
+                reasoning_effort: effort,
+                basis: RoutingBasis::WarmKvStayLocal,
+                pii_triggered: pii.triggered_classes,
+                latency_ms: t0.elapsed().as_secs_f64() * 1000.0,
+            });
+        }
     }
 
     // 5. Boundary Stage-1 policy decision: PreferLocal vs Utility.
@@ -690,6 +710,7 @@ pub fn decide(heads: &ArcHeads, input: &DecideInput<'_>) -> Result<RoutingDecisi
             input.block_readouts,
             input.block_roles,
             input.local_slot,
+            None,
             None,
         );
         return Ok(RoutingDecision {
@@ -708,21 +729,17 @@ pub fn decide(heads: &ArcHeads, input: &DecideInput<'_>) -> Result<RoutingDecisi
     // `models.dev` capabilities (`tool_call`, `supports_image`, `context_limit`), and using
     // live prices if present. Under `PreferLocal`, only consider cloud models that strictly
     // beat `local_p` so a weaker cheap model cannot block a stronger frontier model.
-    let local_utility = value_usd * local_p;
+    const WARM_LOCAL_KV_BONUS_USD: f64 = 0.01;
+    let local_utility = value_usd * local_p
+        + if eligible_warm_local {
+            WARM_LOCAL_KV_BONUS_USD
+        } else {
+            0.0
+        };
     let require_better_p_pass = matches!(input.policy, RoutingPolicy::PreferLocal { .. });
     let mut best_cloud: Option<(&CloudCandidate, f64, f64)> = None;
     for cand in input.cloud_candidates {
-        if input.has_tools && !cand.capabilities.tool_call {
-            continue;
-        }
-        if input.has_images && !cand.capabilities.supports_image {
-            continue;
-        }
-        if cand
-            .capabilities
-            .context_limit
-            .is_some_and(|lim| input.prompt_tokens > lim)
-        {
+        if !cloud_eligible(cand) {
             continue;
         }
         let Some(cand_idx) = heads.catalog.stage_one_candidate_for_model(cand.slot) else {
@@ -758,10 +775,19 @@ pub fn decide(heads: &ArcHeads, input: &DecideInput<'_>) -> Result<RoutingDecisi
             input.block_roles,
             input.local_slot,
             None,
+            None,
         );
         let basis = match input.policy {
             RoutingPolicy::PreferLocal { .. } => RoutingBasis::PreferLocal,
-            RoutingPolicy::Utility { .. } => RoutingBasis::UtilityLocal,
+            RoutingPolicy::Utility { .. } => {
+                if eligible_warm_local
+                    && best_cloud.is_some_and(|(_, best_u, _)| best_u > value_usd * local_p)
+                {
+                    RoutingBasis::WarmKvStayLocal
+                } else {
+                    RoutingBasis::UtilityLocal
+                }
+            }
         };
         return Ok(RoutingDecision {
             target: RouteTarget::Local,
@@ -780,6 +806,7 @@ pub fn decide(heads: &ArcHeads, input: &DecideInput<'_>) -> Result<RoutingDecisi
         input.block_roles,
         cand.slot,
         cand.price_override,
+        cloud_stage_two_cost_weight,
     );
     let effort = cand.capabilities.clamp_effort(&raw_effort);
     let prices = cand
@@ -923,6 +950,22 @@ mod tests {
 
         // Logit-space bias is identity at 0 and strictly monotone.
         assert!((apply_logit_bias(0.75, 0.0) - 0.75).abs() < 1e-12);
+        // Parent directory names must not skew basename matching; 7B/14B map to 9B anchor.
+        assert_eq!(
+            infer_local_profile("/models/9b-experiments/Qwen3.8-27B-W4A16", &catalog),
+            LocalProfile {
+                slot: DEFAULT_LOCAL_SLOT,
+                logit_bias: 0.0,
+            }
+        );
+        assert_eq!(
+            infer_local_profile("Qwen/Qwen2.5-14B-Instruct", &catalog),
+            LocalProfile {
+                slot: LOCAL_9B_SLOT,
+                logit_bias: 0.0,
+            }
+        );
+
         let p_up = apply_logit_bias(0.75, 0.20);
         let p_down = apply_logit_bias(0.75, -0.50);
         assert!(p_up > 0.75 && p_up < 1.0);

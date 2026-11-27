@@ -485,18 +485,26 @@ impl ModelsDevRegistry {
             .cloned()
             .unwrap_or_else(|| "WARP34_ROUTER_API_KEY".to_string());
 
+        let direct_model = self.find_in_provider(&provider_id, &wire_model);
+        let wire_model = if let Some(m) = direct_model {
+            m.id.clone()
+        } else {
+            wire_model
+        };
         let canonical_id = if provider_id == "openrouter" {
             wire_model.clone()
         } else {
             format!("{provider_id}/{wire_model}")
         };
 
-        let raw_model = self.lookup_model(
-            &provider_id,
-            &wire_model,
-            prefix_prov.as_deref(),
-            suffix_model,
-        );
+        let raw_model = direct_model.or_else(|| {
+            self.lookup_model(
+                &provider_id,
+                &wire_model,
+                prefix_prov.as_deref(),
+                suffix_model,
+            )
+        });
         let prices = raw_model.and_then(extract_prices);
         let capabilities = raw_model.map(extract_capabilities).unwrap_or_default();
 
@@ -535,8 +543,8 @@ impl ModelsDevRegistry {
             return specs;
         }
         if has_key("anthropic") {
-            specs.push("anthropic/claude-sonnet-5.5".to_string());
-            specs.push("anthropic/claude-opus-5.5".to_string());
+            specs.push("anthropic/claude-sonnet-5-5".to_string());
+            specs.push("anthropic/claude-opus-5-5".to_string());
         }
         if has_key("google") {
             specs.push("standard=google/gemini-4-hydrogen".to_string());
@@ -568,6 +576,24 @@ impl ModelsDevRegistry {
         None
     }
 
+    fn find_in_provider(&self, pid: &str, mid: &str) -> Option<&RawModel> {
+        let prov = self.providers.get(pid)?;
+        if let Some(m) = prov.models.get(mid) {
+            return Some(m);
+        }
+        // Handle minor dot/dash differences (e.g. `claude-sonnet-5.5` vs `claude-sonnet-5-5`).
+        let dashed = mid.replace('.', "-");
+        if let Some(m) = prov.models.get(&dashed) {
+            return Some(m);
+        }
+        let dotted = mid.replace('-', ".");
+        prov.models.get(&dotted).or_else(|| {
+            prov.models
+                .values()
+                .find(|m| m.id.eq_ignore_ascii_case(mid))
+        })
+    }
+
     fn lookup_model(
         &self,
         provider_id: &str,
@@ -575,27 +601,9 @@ impl ModelsDevRegistry {
         prefix_prov: Option<&str>,
         suffix_model: &str,
     ) -> Option<&RawModel> {
-        let find_in = |pid: &str, mid: &str| -> Option<&RawModel> {
-            let prov = self.providers.get(pid)?;
-            if let Some(m) = prov.models.get(mid) {
-                return Some(m);
-            }
-            // Handle minor dot/dash differences (e.g. `claude-sonnet-5.5` vs `claude-sonnet-5-5`).
-            let dashed = mid.replace('.', "-");
-            if let Some(m) = prov.models.get(&dashed) {
-                return Some(m);
-            }
-            let dotted = mid.replace('-', ".");
-            prov.models.get(&dotted).or_else(|| {
-                prov.models
-                    .values()
-                    .find(|m| m.id.eq_ignore_ascii_case(mid))
-            })
-        };
-
-        find_in(provider_id, wire_model)
-            .or_else(|| prefix_prov.and_then(|p| find_in(p, suffix_model)))
-            .or_else(|| find_in("openrouter", wire_model))
+        self.find_in_provider(provider_id, wire_model)
+            .or_else(|| prefix_prov.and_then(|p| self.find_in_provider(p, suffix_model)))
+            .or_else(|| self.find_in_provider("openrouter", wire_model))
     }
 }
 
@@ -886,6 +894,14 @@ mod tests {
         assert!(reg.resolve_spec("deepseek:", |_| None).is_err());
         assert!(reg.resolve_spec("standard=", |_| None).is_err());
 
+        assert_eq!(
+            ModelsDevRegistry::builtin_fallback()
+                .default_models_for_env(|k| (k == "ANTHROPIC_API_KEY").then(|| "k".to_string())),
+            vec![
+                "anthropic/claude-sonnet-5-5".to_string(),
+                "anthropic/claude-opus-5-5".to_string(),
+            ]
+        );
         assert_eq!(
             reg.default_models_for_env(|k| (k == "OPENROUTER_API_KEY").then(|| "k".to_string())),
             vec![

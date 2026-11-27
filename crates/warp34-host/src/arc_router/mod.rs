@@ -33,7 +33,7 @@ use registry::ModelsDevRegistry;
 use serde::Serialize;
 use serde_json::Value;
 use std::{
-    collections::HashSet,
+    collections::{HashSet, VecDeque},
     path::PathBuf,
     sync::atomic::{AtomicU64, Ordering},
 };
@@ -245,6 +245,36 @@ impl RouterMetrics {
     }
 }
 
+const MAX_SESSION_HOLDS: usize = 4096;
+
+#[derive(Debug, Default)]
+struct SessionHoldMap {
+    map: HashMap<String, HeldTarget>,
+    order: VecDeque<String>,
+}
+
+impl SessionHoldMap {
+    fn get(&self, key: &str) -> Option<&HeldTarget> {
+        self.map.get(key)
+    }
+
+    fn insert(&mut self, key: String, target: HeldTarget) {
+        if self.map.insert(key.clone(), target).is_some() {
+            if let Some(pos) = self.order.iter().position(|k| k == &key) {
+                self.order.remove(pos);
+            }
+            self.order.push_back(key);
+        } else {
+            self.order.push_back(key);
+            while self.order.len() > MAX_SESSION_HOLDS {
+                if let Some(evicted) = self.order.pop_front() {
+                    self.map.remove(&evicted);
+                }
+            }
+        }
+    }
+}
+
 pub struct ArcRouter {
     encoder: ArcEncoderWorker,
     heads: Arc<ArcHeads>,
@@ -255,7 +285,7 @@ pub struct ArcRouter {
     empty_candidates: Arc<[CloudCandidate]>,
     policy: RoutingPolicy,
     pin_pii_classes: Arc<HashSet<String>>,
-    session_holds: Mutex<HashMap<String, HeldTarget>>,
+    session_holds: Mutex<SessionHoldMap>,
     proxy: Option<UpstreamProxy>,
     metrics: Arc<RouterMetrics>,
 }
@@ -323,7 +353,7 @@ impl ArcRouter {
             empty_candidates,
             policy: cfg.policy,
             pin_pii_classes: Arc::new(cfg.pin_pii_classes),
-            session_holds: Mutex::new(HashMap::new()),
+            session_holds: Mutex::new(SessionHoldMap::default()),
             proxy,
             metrics: Arc::new(RouterMetrics::default()),
         })
@@ -442,22 +472,26 @@ impl ArcRouter {
         .await
         .map_err(|e| format!("ARC decide join error: {e}"))??;
         decision.latency_ms = t0.elapsed().as_secs_f64() * 1000.0;
-        if decision.basis != RoutingBasis::PiiPinnedLocal
-            && let Some(key) = resolved_session_key
-            && let Ok(mut map) = self.session_holds.lock()
-        {
-            const MAX_SESSION_HOLDS: usize = 4096;
-            if map.len() >= MAX_SESSION_HOLDS && !map.contains_key(&key) {
-                map.clear();
-            }
+        self.metrics.record(&decision);
+        Ok(decision)
+    }
+
+    /// Commits the served routing target for `session_key` into the bounded LRU session-hold
+    /// cache so subsequent `TurnEvent::ToolResult` turns stay on the same model. Must only be
+    /// called after the chosen target has succeeded (HTTP 2xx for cloud, or local dispatch), so
+    /// failed cloud calls never poison a session's hold. Skips `PiiPinnedLocal` turns so a single
+    /// PII-pinned turn does not overwrite an active cloud hold.
+    pub fn commit_session_hold(&self, session_key: &str, decision: &RoutingDecision) {
+        if decision.basis == RoutingBasis::PiiPinnedLocal || session_key.is_empty() {
+            return;
+        }
+        if let Ok(mut holds) = self.session_holds.lock() {
             let target = match &decision.target {
                 RouteTarget::Local => HeldTarget::Local,
                 RouteTarget::Cloud(c) => HeldTarget::Cloud(c.wire.clone()),
             };
-            map.insert(key, target);
+            holds.insert(session_key.to_string(), target);
         }
-        self.metrics.record(&decision);
-        Ok(decision)
     }
 
     /// Run ARC-1.0 encoding + Stage 1/2/PII heads and return a `RoutingDecision`.

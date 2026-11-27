@@ -57,6 +57,8 @@ fn extract_usage_from_json(v: &Value, is_anthropic_dialect: bool) -> Option<Pars
         .unwrap_or(0);
     let cache_write = usage
         .get("cache_creation_input_tokens")
+        .or_else(|| usage.pointer("/prompt_tokens_details/cache_write_tokens"))
+        .or_else(|| usage.pointer("/input_tokens_details/cache_write_tokens"))
         .and_then(Value::as_u64)
         .unwrap_or(0);
     let anthropic_schema = is_anthropic_dialect
@@ -99,7 +101,7 @@ struct UsageStreamTracker {
     merged: ParsedUsage,
 }
 
-const MAX_SSE_LINE_BYTES: usize = 64 * 1024;
+const MAX_SSE_LINE_BYTES: usize = 2 * 1024 * 1024;
 const MAX_JSON_USAGE_BYTES: usize = 2 * 1024 * 1024;
 
 impl UsageStreamTracker {
@@ -231,18 +233,42 @@ fn prepare_upstream_body(
     for local_ext in [
         "chat_template_kwargs",
         "thinking_budget",
-        "top_k",
+        "thinking_token_budget",
+        "reasoning_budget_tokens",
+        "thinking_budget_tokens",
+        "reasoning_budget_message",
+        "thinking_budget_message",
         "min_p",
         "repetition_penalty",
+        "min_tokens",
+        "ignore_eos",
     ] {
         obj.remove(local_ext);
+    }
+    if dialect == WireDialect::OpenAiNative {
+        obj.remove("top_k");
+    }
+    // `warp34` treats omitted `store` on `/v1/responses` as `false` (stateless), whereas native
+    // OpenAI defaults omitted `store` to `true`. Make statelessness explicit upstream.
+    if protocol == ApiProtocol::OpenAiResponses
+        && matches!(dialect, WireDialect::OpenAiNative | WireDialect::OpenRouter)
+        && !obj.contains_key("store")
+    {
+        obj.insert("store".to_string(), Value::Bool(false));
     }
 
     // Forward ARC's Stage-2 reasoning effort when the caller omitted explicit reasoning controls
     // and the target cloud model supports reasoning. Note that OpenAI Responses callers often pass
     // `"reasoning": {"summary": "auto"}` without an `"effort"`, so inspect concrete control keys
     // rather than treating any `"reasoning"` object as an explicit effort override.
+    let is_forced_anthropic_tool = protocol == ApiProtocol::AnthropicMessages
+        && obj
+            .get("tool_choice")
+            .and_then(|v| v.get("type"))
+            .and_then(Value::as_str)
+            .is_some_and(|t| matches!(t, "any" | "tool"));
     let is_adaptive_anthropic = protocol == ApiProtocol::AnthropicMessages
+        && !is_forced_anthropic_tool
         && obj
             .get("thinking")
             .and_then(|v| v.get("type"))
@@ -270,6 +296,24 @@ fn prepare_upstream_body(
             .and_then(|o| o.get("effort"))
             .is_some_and(|v| !v.is_null())
         || (obj.get("thinking").is_some_and(|v| !v.is_null()) && !is_adaptive_anthropic);
+    // Native OpenAI `/v1/chat/completions` rejects OpenRouter's nested `"reasoning"` object;
+    // translate `"reasoning": {"effort": ...}` to `"reasoning_effort"` after checking
+    // `caller_set_reasoning`, so `{"enabled": false}` isn't overwritten by Stage 2.
+    if dialect == WireDialect::OpenAiNative
+        && protocol == ApiProtocol::OpenAiChat
+        && obj.get("reasoning").is_some_and(Value::is_object)
+        && let Some(reasoning_val) = obj.remove("reasoning")
+        && obj.get("reasoning_effort").is_none_or(Value::is_null)
+        && let Some(eff) = reasoning_val
+            .get("effort")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+    {
+        obj.insert(
+            "reasoning_effort".to_string(),
+            Value::String(eff.to_string()),
+        );
+    }
     let supports_reasoning = capabilities.is_none_or(|c| c.supports_reasoning);
     if !caller_set_reasoning
         && supports_reasoning
@@ -328,8 +372,11 @@ fn prepare_upstream_body(
                         serde_json::json!({ "type": "disabled" }),
                     );
                 } else {
+                    let supports_xhigh =
+                        capabilities.is_some_and(|c| c.effort_values.iter().any(|v| v == "xhigh"));
                     let anthropic_eff = match effort.as_str() {
                         "low" | "medium" | "high" | "max" => effort,
+                        "xhigh" if supports_xhigh => effort,
                         "xhigh" => "max".to_string(),
                         _ => "low".to_string(),
                     };
@@ -498,6 +545,11 @@ impl UpstreamProxy {
             .get(reqwest::header::CONTENT_TYPE)
             .and_then(|v| v.to_str().ok())
             .map(ToString::to_string);
+        let retry_after = upstream_resp
+            .headers()
+            .get(reqwest::header::RETRY_AFTER)
+            .and_then(|v| v.to_str().ok())
+            .map(ToString::to_string);
 
         let is_sse = content_type
             .as_deref()
@@ -529,6 +581,12 @@ impl UpstreamProxy {
         {
             resp.headers_mut()
                 .insert(axum::http::header::CONTENT_TYPE, val);
+        }
+        if let Some(ra) = retry_after
+            && let Ok(val) = HeaderValue::from_str(&ra)
+        {
+            resp.headers_mut()
+                .insert(axum::http::header::RETRY_AFTER, val);
         }
         if status.is_success() {
             resp.headers_mut().insert(
@@ -618,6 +676,9 @@ mod tests {
             "model": "auto",
             "stream": true,
             "chat_template_kwargs": {"enable_thinking": true},
+            "thinking_token_budget": 1024,
+            "min_tokens": 16,
+            "ignore_eos": true,
             "top_k": 20,
             "messages": [{"role": "user", "content": "hi"}]
         });
@@ -631,7 +692,10 @@ mod tests {
         );
         assert_eq!(chat_stream["model"], "anthropic/claude-sonnet-4.6");
         assert!(chat_stream.get("chat_template_kwargs").is_none());
-        assert!(chat_stream.get("top_k").is_none());
+        assert!(chat_stream.get("thinking_token_budget").is_none());
+        assert!(chat_stream.get("min_tokens").is_none());
+        assert!(chat_stream.get("ignore_eos").is_none());
+        assert_eq!(chat_stream["top_k"], 20);
         assert_eq!(chat_stream["stream_options"]["include_usage"], true);
         assert_eq!(chat_stream["reasoning"]["effort"], "high");
 
@@ -758,5 +822,84 @@ mod tests {
         );
         assert_eq!(anthropic_adaptive["thinking"]["type"], "adaptive");
         assert_eq!(anthropic_adaptive["output_config"]["effort"], "high");
+    }
+
+    #[test]
+    fn prepares_upstream_body_dialect_protocol_guards() {
+        // OpenAiNative Chat strips top_k and translates OpenRouter-style `reasoning.effort`.
+        let mut openai_chat = serde_json::json!({
+            "model": "auto",
+            "top_k": 20,
+            "reasoning": {"effort": "medium"},
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+        prepare_upstream_body(
+            &mut openai_chat,
+            "gpt-5.4",
+            WireDialect::OpenAiNative,
+            ApiProtocol::OpenAiChat,
+            Some("high"),
+            None,
+        );
+        assert!(openai_chat.get("top_k").is_none());
+        assert!(openai_chat.get("reasoning").is_none());
+        assert_eq!(openai_chat["reasoning_effort"], "medium");
+
+        // OpenAiResponses injects `"store": false` when omitted.
+        let mut resp_body = serde_json::json!({
+            "model": "auto",
+            "input": "hello"
+        });
+        prepare_upstream_body(
+            &mut resp_body,
+            "gpt-5.4",
+            WireDialect::OpenAiNative,
+            ApiProtocol::OpenAiResponses,
+            Some("medium"),
+            None,
+        );
+        assert_eq!(resp_body["store"], false);
+
+        // AnthropicNative preserves `top_k`, respects forced `tool_choice`, and preserves `xhigh`.
+        let mut anth_forced = serde_json::json!({
+            "model": "auto",
+            "top_k": 20,
+            "thinking": {"type": "adaptive"},
+            "tool_choice": {"type": "any"},
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+        let anth_caps = ModelCapabilities {
+            supports_reasoning: true,
+            effort_values: vec!["low", "medium", "high", "xhigh", "max"]
+                .into_iter()
+                .map(ToString::to_string)
+                .collect(),
+            ..ModelCapabilities::default()
+        };
+        prepare_upstream_body(
+            &mut anth_forced,
+            "claude-sonnet-5-5",
+            WireDialect::AnthropicNative,
+            ApiProtocol::AnthropicMessages,
+            Some("xhigh"),
+            Some(&anth_caps),
+        );
+        assert_eq!(anth_forced["top_k"], 20);
+        assert!(anth_forced.get("output_config").is_none());
+
+        let mut anth_xhigh = serde_json::json!({
+            "model": "auto",
+            "thinking": {"type": "adaptive"},
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+        prepare_upstream_body(
+            &mut anth_xhigh,
+            "claude-opus-5-5",
+            WireDialect::AnthropicNative,
+            ApiProtocol::AnthropicMessages,
+            Some("xhigh"),
+            Some(&anth_caps),
+        );
+        assert_eq!(anth_xhigh["output_config"]["effort"], "xhigh");
     }
 }

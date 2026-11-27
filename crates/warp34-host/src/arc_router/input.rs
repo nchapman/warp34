@@ -517,9 +517,93 @@ fn collect_responses_messages(raw: &Value, canonical: &mut Vec<CanonicalMessage>
     }
 }
 
+fn collect_openai_chat_messages(messages: &[Value], canonical: &mut Vec<CanonicalMessage>) {
+    let mut seen_non_system = false;
+    for msg in messages {
+        let raw_role = msg.get("role").and_then(Value::as_str).unwrap_or("user");
+        if raw_role == "tool" || raw_role == "function" {
+            seen_non_system = true;
+            let call_id = msg
+                .get("tool_call_id")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            let content = wrap_tool_result_content(msg.get("content"));
+            push_or_merge(
+                canonical,
+                "user",
+                vec![json!({
+                    "type": "tool_result",
+                    "tool_use_id": call_id,
+                    "content": content,
+                })],
+            );
+            continue;
+        }
+        let role = match raw_role {
+            "system" | "developer" => "system",
+            "assistant" => "assistant",
+            _ => "user",
+        };
+        if role != "system" {
+            seen_non_system = true;
+        }
+        let mut parts = Vec::new();
+        if let Some(reasoning) = msg
+            .get("reasoning_content")
+            .or_else(|| msg.get("reasoning"))
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+        {
+            parts.push(json!({ "type": "thinking", "thinking": reasoning }));
+        }
+        parts.extend(extract_parts_from_content(
+            msg.get("content"),
+            role == "system" && !seen_non_system,
+        ));
+        if let Some(refusal) = msg
+            .get("refusal")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+        {
+            parts.push(json!({ "type": "text", "text": refusal }));
+        }
+        if let Some(tool_calls) = msg.get("tool_calls").and_then(Value::as_array) {
+            for tc in tool_calls {
+                let id = tc.get("id").and_then(Value::as_str).unwrap_or("");
+                let func = tc.get("function").unwrap_or(tc);
+                let name = func.get("name").and_then(Value::as_str).unwrap_or("");
+                let input = match func.get("arguments") {
+                    Some(Value::String(s)) => serde_json::from_str::<Value>(s)
+                        .unwrap_or_else(|_| Value::String(s.clone())),
+                    Some(v) => v.clone(),
+                    None => Value::Object(Map::new()),
+                };
+                parts.push(json!({
+                    "type": "tool_use",
+                    "id": id,
+                    "name": name,
+                    "input": input,
+                }));
+            }
+        }
+        push_or_merge(canonical, role, parts);
+    }
+}
+
 /// Serializes an incoming OpenAI / Responses / Anthropic JSON request into canonical
 /// `arc-role-blocks-v2` role blocks matching `rayline-arc-input`.
 pub fn serialize_request(protocol: ApiProtocol, raw: &Value) -> SerializedArcInput {
+    serialize_request_with_prior_history(protocol, raw, None)
+}
+
+/// Like [`serialize_request`], but optionally prepends hydrated OpenAI Chat `prior_chat_messages`
+/// (e.g. from `ResponseStore::get_history` on `previous_response_id` continuations) so Stage-2
+/// effort, PII detection, token count, and `TurnEvent` see the full conversation.
+pub fn serialize_request_with_prior_history(
+    protocol: ApiProtocol,
+    raw: &Value,
+    prior_chat_messages: Option<&[Value]>,
+) -> SerializedArcInput {
     let tool_defs = extract_tool_definitions(raw);
     let has_tools = !tool_defs.is_empty();
     let mut canonical: Vec<CanonicalMessage> = Vec::new();
@@ -532,6 +616,12 @@ pub fn serialize_request(protocol: ApiProtocol, raw: &Value) -> SerializedArcInp
                 "tools": tool_defs,
             })],
         });
+    }
+
+    if let Some(prior) = prior_chat_messages
+        && !prior.is_empty()
+    {
+        collect_openai_chat_messages(prior, &mut canonical);
     }
 
     match protocol {
@@ -556,76 +646,7 @@ pub fn serialize_request(protocol: ApiProtocol, raw: &Value) -> SerializedArcInp
         ApiProtocol::OpenAiResponses => collect_responses_messages(raw, &mut canonical),
         ApiProtocol::OpenAiChat => {
             if let Some(messages) = raw.get("messages").and_then(Value::as_array) {
-                let mut seen_non_system = false;
-                for msg in messages {
-                    let raw_role = msg.get("role").and_then(Value::as_str).unwrap_or("user");
-                    if raw_role == "tool" || raw_role == "function" {
-                        seen_non_system = true;
-                        let call_id = msg
-                            .get("tool_call_id")
-                            .and_then(Value::as_str)
-                            .unwrap_or("");
-                        let content = wrap_tool_result_content(msg.get("content"));
-                        push_or_merge(
-                            &mut canonical,
-                            "user",
-                            vec![json!({
-                                "type": "tool_result",
-                                "tool_use_id": call_id,
-                                "content": content,
-                            })],
-                        );
-                        continue;
-                    }
-                    let role = match raw_role {
-                        "system" | "developer" => "system",
-                        "assistant" => "assistant",
-                        _ => "user",
-                    };
-                    if role != "system" {
-                        seen_non_system = true;
-                    }
-                    let mut parts = Vec::new();
-                    if let Some(reasoning) = msg
-                        .get("reasoning_content")
-                        .or_else(|| msg.get("reasoning"))
-                        .and_then(Value::as_str)
-                        .filter(|s| !s.is_empty())
-                    {
-                        parts.push(json!({ "type": "thinking", "thinking": reasoning }));
-                    }
-                    parts.extend(extract_parts_from_content(
-                        msg.get("content"),
-                        role == "system" && !seen_non_system,
-                    ));
-                    if let Some(refusal) = msg
-                        .get("refusal")
-                        .and_then(Value::as_str)
-                        .filter(|s| !s.is_empty())
-                    {
-                        parts.push(json!({ "type": "text", "text": refusal }));
-                    }
-                    if let Some(tool_calls) = msg.get("tool_calls").and_then(Value::as_array) {
-                        for tc in tool_calls {
-                            let id = tc.get("id").and_then(Value::as_str).unwrap_or("");
-                            let func = tc.get("function").unwrap_or(tc);
-                            let name = func.get("name").and_then(Value::as_str).unwrap_or("");
-                            let input = match func.get("arguments") {
-                                Some(Value::String(s)) => serde_json::from_str::<Value>(s)
-                                    .unwrap_or_else(|_| Value::String(s.clone())),
-                                Some(v) => v.clone(),
-                                None => Value::Object(Map::new()),
-                            };
-                            parts.push(json!({
-                                "type": "tool_use",
-                                "id": id,
-                                "name": name,
-                                "input": input,
-                            }));
-                        }
-                    }
-                    push_or_merge(&mut canonical, role, parts);
-                }
+                collect_openai_chat_messages(messages, &mut canonical);
             }
         }
     }
@@ -640,15 +661,18 @@ pub fn serialize_request(protocol: ApiProtocol, raw: &Value) -> SerializedArcInp
             )
         })
     });
-    let has_assistant = canonical.iter().any(|m| m.role == "assistant");
+    let last_is_assistant = canonical.last().is_some_and(|m| m.role == "assistant");
+    let prior_len = canonical
+        .len()
+        .saturating_sub(usize::from(last_is_assistant));
+    let has_prior_assistant = canonical[..prior_len].iter().any(|m| m.role == "assistant");
     let last_is_tool_result = canonical.last().is_some_and(|m| {
         m.role == "user"
-            && !m.parts.is_empty()
             && m.parts
                 .iter()
-                .all(|p| p.get("type").and_then(Value::as_str) == Some("tool_result"))
+                .any(|p| p.get("type").and_then(Value::as_str) == Some("tool_result"))
     });
-    let event = if !has_assistant {
+    let event = if !has_prior_assistant {
         TurnEvent::TaskStart
     } else if last_is_tool_result {
         TurnEvent::ToolResult
@@ -794,6 +818,34 @@ mod tests {
             ]}),
         );
         assert_eq!(tool_chat.event, TurnEvent::ToolResult);
+
+        // Mixed tool_result + harness <system-reminder> text must still classify as ToolResult.
+        let mixed_anth = serialize_request(
+            ApiProtocol::AnthropicMessages,
+            &json!({"messages": [
+                {"role": "user", "content": "Fix bug"},
+                {"role": "assistant", "content": [{"type": "tool_use", "id": "u1", "name": "bash", "input": {}}]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "u1", "content": "ok"},
+                    {"type": "text", "text": "<system-reminder>keep going</system-reminder>"}
+                ]}
+            ]}),
+        );
+        assert_eq!(mixed_anth.event, TurnEvent::ToolResult);
+
+        // Hydrating prior chat history for Responses previous_response_id yields UserMessage + full turns.
+        let prior = vec![
+            json!({"role": "system", "content": "You are helpful."}),
+            json!({"role": "user", "content": "First question"}),
+            json!({"role": "assistant", "content": "First answer"}),
+        ];
+        let hydrated = serialize_request_with_prior_history(
+            ApiProtocol::OpenAiResponses,
+            &json!({"input": "Follow-up question"}),
+            Some(&prior),
+        );
+        assert_eq!(hydrated.event, TurnEvent::UserMessage);
+        assert_eq!(hydrated.turn_count, 2);
 
         let tool_anth = serialize_request(
             ApiProtocol::AnthropicMessages,

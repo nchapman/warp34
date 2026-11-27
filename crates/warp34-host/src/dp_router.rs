@@ -762,6 +762,14 @@ impl SessionAffinityMap {
             }
         }
     }
+
+    pub fn remove(&mut self, key: &str) {
+        if self.map.remove(key).is_some()
+            && let Some(pos) = self.order.iter().position(|k| k == key)
+        {
+            self.order.remove(pos);
+        }
+    }
 }
 
 /// Shared router state tracking per-worker in-flight requests, session affinity,
@@ -906,6 +914,15 @@ impl DpRouterCore {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .bind_with_prefix(session_key, dp_rank, prefix_hash);
+    }
+
+    /// Removes any recorded local worker / prefix binding for `session_key` (e.g. when the
+    /// session escalates to cloud so stale Turn-0 local KV does not pull later turns back).
+    pub fn unbind_session(&self, session_key: &str) {
+        self.sessions
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(session_key);
     }
 
     /// Returns true only when `session_key` has a bound worker whose last recorded prefix block

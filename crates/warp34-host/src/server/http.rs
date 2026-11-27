@@ -1409,6 +1409,7 @@ struct RequestSessionAffinity {
 }
 
 impl OpenAiServerState {
+    #[allow(clippy::too_many_arguments)]
     async fn maybe_arc_route(
         &self,
         protocol: crate::arc_router::input::ApiProtocol,
@@ -1416,6 +1417,7 @@ impl OpenAiServerState {
         explicit_session_key: Option<String>,
         anthropic_beta: Option<&str>,
         force_local: bool,
+        prior_chat_messages: Option<Vec<Value>>,
         body: &mut Value,
     ) -> Result<(Option<ArcRouteOutcome>, RequestSessionAffinity), ApiError> {
         let passthrough = |pin_session_key| {
@@ -1456,7 +1458,11 @@ impl OpenAiServerState {
         let taken_body = std::mem::take(body);
         let need_derived_session = explicit_session_key.is_none();
         let (restored_body, canonical, derived) = tokio::task::spawn_blocking(move || {
-            let canonical = crate::arc_router::input::serialize_request(protocol, &taken_body);
+            let canonical = crate::arc_router::input::serialize_request_with_prior_history(
+                protocol,
+                &taken_body,
+                prior_chat_messages.as_deref(),
+            );
             let derived = need_derived_session
                 .then(|| {
                     crate::arc_router::input::derive_prefix_session_key_from_serialized(&canonical)
@@ -1559,12 +1565,20 @@ impl OpenAiServerState {
                 .await;
             if is_err {
                 router.metrics().record_cloud_error();
+            } else if let Some(key) = session_key {
+                // Commit cloud hold only after HTTP 2xx, and unbind any stale Turn-0 local KV
+                // affinity so subsequent UserMessage turns aren't falsely pulled back to local.
+                router.commit_session_hold(key, &decision);
+                self.dp_router.unbind_session(key);
             }
             return Ok((Some(ArcRouteOutcome::Proxied(resp)), affinity));
         }
 
-        // Local target: rewrite virtual `"router"` / `"auto"` model aliases to the served local
-        // model and apply Stage-2 reasoning effort when the caller didn't specify one explicitly.
+        // Local target: commit hold, rewrite virtual `"router"` / `"auto"` model aliases to the
+        // served local model, and apply Stage-2 reasoning effort when the caller didn't specify one.
+        if let Some(key) = session_key {
+            router.commit_session_hold(key, &decision);
+        }
         self.apply_local_arc_decision_to_body(protocol, body, &decision);
         Ok((Some(ArcRouteOutcome::Local(decision)), affinity))
     }
@@ -1580,12 +1594,24 @@ impl OpenAiServerState {
                 .pointer("/reasoning/effort")
                 .is_some_and(|v| !v.is_null())
             || body
+                .pointer("/reasoning/enabled")
+                .is_some_and(|v| !v.is_null())
+            || body
                 .pointer("/reasoning/max_tokens")
                 .is_some_and(|v| !v.is_null())
             || body
                 .pointer("/output_config/effort")
                 .is_some_and(|v| !v.is_null())
             || body.get("thinking").is_some_and(|v| !v.is_null())
+            || body
+                .get("thinking_token_budget")
+                .is_some_and(|v| !v.is_null())
+            || body
+                .get("reasoning_budget_tokens")
+                .is_some_and(|v| !v.is_null())
+            || body
+                .get("thinking_budget_tokens")
+                .is_some_and(|v| !v.is_null())
             || body
                 .pointer("/chat_template_kwargs/reasoning_effort")
                 .is_some_and(|v| !v.is_null())
@@ -1707,6 +1733,7 @@ async fn generate(
                 header_session,
                 None,
                 false,
+                None,
                 &mut json,
             )
             .await?;
@@ -2443,10 +2470,11 @@ async fn responses_create(
         .and_then(Value::as_str)
         .filter(|s| !s.is_empty())
         .map(ToString::to_string);
-    let has_local_prev_resp = prev_resp_id
+    let prev_resp_history = prev_resp_id
         .as_deref()
         .zip(caller_scope.as_deref())
-        .is_some_and(|(id, scope)| s.response_store.get_response(id, scope).is_some());
+        .and_then(|(id, scope)| s.response_store.get_history(id, scope));
+    let has_local_prev_resp = prev_resp_history.is_some();
     let explicit_session = prev_resp_id
         .as_ref()
         .filter(|_| has_local_prev_resp)
@@ -2469,6 +2497,7 @@ async fn responses_create(
                 explicit_session,
                 None,
                 prev_resp_id.is_some() || store_enabled,
+                prev_resp_history,
                 &mut body,
             )
             .await?;
@@ -2850,6 +2879,7 @@ async fn anthropic_messages(
             header_session,
             anthropic_beta.as_deref(),
             false,
+            None,
             &mut body,
         )
         .await

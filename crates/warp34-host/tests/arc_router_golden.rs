@@ -233,8 +233,8 @@ fn heads_catalog_slot_inference_and_policy_invariants() {
     assert_eq!(filtered[1].wire, "google/gemini-4-neon");
     assert_eq!(filtered[1].slot, 1);
 
-    // Warm local KV on a continuing user message stays local while local_p >= warm_floor,
-    // and symmetric tool-loop holding keeps an active cloud model across ToolResult turns.
+    // Warm local KV on a continuing user message stays local under PreferLocal while
+    // `local_p >= warm_floor` (`(min_p_pass - 0.15).clamp(0.0, min_p_pass)`).
     let zero_readouts = vec![vec![0.0f32; 1024]];
     let roles = vec!["user".to_string()];
     let d = decide(
@@ -251,7 +251,10 @@ fn heads_catalog_slot_inference_and_policy_invariants() {
             local_slot: 54,
             local_logit_bias: 0.0,
             cloud_candidates: &auto_slots,
-            policy: RoutingPolicy::Utility { value_usd: 4.5 },
+            policy: RoutingPolicy::PreferLocal {
+                min_p_pass: 0.65,
+                value_usd: 1.5,
+            },
             pin_pii_classes: &HashSet::new(),
         },
     )
@@ -335,6 +338,32 @@ fn symmetric_tool_loop_hold_and_warm_kv_escape() {
     .expect("decide escape");
     assert_eq!(d_escape.basis, RoutingBasis::CloudSpillover);
     assert!(matches!(d_escape.target, RouteTarget::Cloud(_)));
+
+    // Stale Turn-0 warm_local_kv must NOT pull a cloud-held session back to local at warm_floor
+    // on a subsequent UserMessage when local_p is below min_p_pass.
+    let d_no_stale_pullback = decide(
+        &heads,
+        &DecideInput {
+            block_readouts: &zero_readouts,
+            block_roles: &roles,
+            prompt_tokens: 128,
+            has_tools: false,
+            has_images: false,
+            warm_local_kv: true,
+            event: TurnEvent::UserMessage,
+            held_target: Some(&held_opus),
+            local_slot: 54,
+            local_logit_bias: -4.0,
+            cloud_candidates: &auto_slots,
+            policy: RoutingPolicy::PreferLocal {
+                min_p_pass: 0.99,
+                value_usd: 1.5,
+            },
+            pin_pii_classes: &HashSet::new(),
+        },
+    )
+    .expect("decide no stale pullback");
+    assert_ne!(d_no_stale_pullback.basis, RoutingBasis::WarmKvStayLocal);
 }
 
 #[cfg(feature = "cuda")]
