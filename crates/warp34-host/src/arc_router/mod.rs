@@ -316,6 +316,14 @@ impl ArcRouter {
             .unwrap_or([0.0; 4])
     }
 
+    /// Returns the `models.dev` capability descriptor for a routed cloud candidate, if present.
+    pub fn capabilities_for_cloud_model(&self, name: &str) -> Option<&registry::ModelCapabilities> {
+        self.cloud_candidates
+            .iter()
+            .find(|c| c.name == name)
+            .map(|c| &c.capabilities)
+    }
+
     pub fn local_slot_name(&self) -> &str {
         &self.heads.catalog.models[self.local_slot].name
     }

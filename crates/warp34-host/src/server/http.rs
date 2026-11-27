@@ -348,9 +348,32 @@ impl OpenAiServerState {
         ),
         WorkerError,
     > {
+        let mm_key = if !images.is_empty()
+            && let Some(vcfg) = self.worker.vision_config.as_ref()
+        {
+            Some(crate::vision::compute_multimodal_radix_key(
+                prompt_tokens,
+                images,
+                vcfg.image_token_id,
+                vcfg.spatial_merge_size,
+            ))
+        } else {
+            None
+        };
+        let routing_tokens = mm_key.as_deref().unwrap_or(prompt_tokens);
+        let last_prefix_hash = if session_key.is_some()
+            && (!self.extra_workers.is_empty() || self.arc_router.is_some())
+        {
+            crate::dp_router::compute_chained_prefix_hashes(lora_id, routing_tokens)
+                .last()
+                .copied()
+        } else {
+            None
+        };
         if self.extra_workers.is_empty() {
             if let Some(k) = session_key {
-                self.bind_session_to_worker(k.to_string(), 0);
+                self.dp_router
+                    .bind_session_with_prefix(k.to_string(), 0, last_prefix_hash);
             }
             return Ok((0, &self.worker, None));
         }
@@ -380,19 +403,6 @@ impl OpenAiServerState {
                 }
             })
             .collect();
-        let mm_key = if !images.is_empty()
-            && let Some(vcfg) = self.worker.vision_config.as_ref()
-        {
-            Some(crate::vision::compute_multimodal_radix_key(
-                prompt_tokens,
-                images,
-                vcfg.image_token_id,
-                vcfg.spatial_merge_size,
-            ))
-        } else {
-            None
-        };
-        let routing_tokens = mm_key.as_deref().unwrap_or(prompt_tokens);
         let Some((rank, guard)) =
             self.dp_router
                 .select_and_acquire(samples, lora_id, routing_tokens, session_key)
@@ -401,6 +411,12 @@ impl OpenAiServerState {
                 "all data-parallel workers are unavailable",
             ));
         };
+        if let Some(k) = session_key
+            && last_prefix_hash.is_some()
+        {
+            self.dp_router
+                .bind_session_with_prefix(k.to_string(), rank, last_prefix_hash);
+        }
         Ok((rank, self.worker_at(rank), Some(guard)))
     }
 
@@ -1338,18 +1354,25 @@ impl OpenAiServerState {
         if bypass_header {
             return Ok(None);
         }
-        // Skip routing when caller explicitly targets a registered LoRA adapter.
+        // Skip routing when caller explicitly targets a local LoRA adapter (either via `model`
+        // or via an explicit `adapter` / `lora` field).
         if let Some(req_model) = body.get("model").and_then(Value::as_str)
             && self.worker.lora_registry.resolve_name(req_model).is_some()
         {
             return Ok(None);
         }
-        // KV-cache boundary awareness: stay local when caller carries a warm session key bound
-        // to a local worker, or when continuing a local `previous_response_id` chain.
-        let warm_local_kv = force_local
-            || warm_session_key
-                .and_then(|k| self.dp_router.lookup_session(k))
-                .is_some();
+        if body
+            .get("adapter")
+            .or_else(|| body.get("lora"))
+            .and_then(Value::as_str)
+            .is_some_and(|s| !s.trim().is_empty())
+        {
+            return Ok(None);
+        }
+        // KV-cache boundary awareness: stay local only when the bound worker actually has a live
+        // KV+GDN checkpoint for this session's last local prefix, or when `force_local` is set.
+        let warm_local_kv =
+            force_local || warm_session_key.is_some_and(|k| self.dp_router.has_warm_local_kv(k));
 
         let decision = match router.route(protocol, body, warm_local_kv).await {
             Ok(d) => d,
@@ -1382,6 +1405,7 @@ impl OpenAiServerState {
                 {
                     let taken_body = std::mem::take(body);
                     let prices = router.prices_for_cloud_model(name, *slot);
+                    let caps = router.capabilities_for_cloud_model(name);
                     let (resp, is_err) = proxy
                         .forward(
                             ep,
@@ -1390,6 +1414,7 @@ impl OpenAiServerState {
                             wire,
                             name,
                             prices,
+                            caps,
                             router.metrics_arc(),
                             &decision,
                             anthropic_beta,
@@ -2270,6 +2295,10 @@ async fn responses_create(
     } else {
         (None, false)
     };
+    // Keep stateful Responses (`store != false`, the default) and `previous_response_id`
+    // continuations local so GET/DELETE/cancel and continuation lookups stay consistent with
+    // `warp34`'s local `ResponseStore`. Stateless Responses (`store: false`) may spill to cloud.
+    let store_enabled = body.get("store").and_then(Value::as_bool).unwrap_or(true);
     let arc_decision = match s
         .maybe_arc_route(
             crate::arc_router::input::ApiProtocol::OpenAiResponses,
@@ -2278,7 +2307,7 @@ async fn responses_create(
                 .then_some(session_key.as_deref())
                 .flatten(),
             None,
-            has_local_prev_resp,
+            has_local_prev_resp || store_enabled,
             &mut body,
         )
         .await?

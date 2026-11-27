@@ -6,7 +6,7 @@ use super::{
     RouterMetrics,
     input::ApiProtocol,
     policy::RoutingDecision,
-    registry::{ProviderEndpoint, WireDialect},
+    registry::{ModelCapabilities, ProviderEndpoint, WireDialect},
 };
 use axum::{
     body::Body,
@@ -213,13 +213,16 @@ impl Drop for UsageStreamTracker {
     }
 }
 
-/// Rewrites `"model"`, strips warp34-local extension fields, and enables
+/// Rewrites `"model"`, strips warp34-local extension fields, forwards ARC's Stage-2
+/// `reasoning_effort` when the caller did not specify an explicit reasoning control, and enables
 /// `stream_options.include_usage` for streaming OpenAI-compatible Chat requests.
 fn prepare_upstream_body(
     body: &mut Value,
     wire_model: &str,
     dialect: WireDialect,
     protocol: ApiProtocol,
+    selected_effort: Option<&str>,
+    capabilities: Option<&ModelCapabilities>,
 ) {
     let Some(obj) = body.as_object_mut() else {
         return;
@@ -234,6 +237,42 @@ fn prepare_upstream_body(
     ] {
         obj.remove(local_ext);
     }
+
+    // Forward ARC's Stage-2 reasoning effort when the caller omitted explicit reasoning controls
+    // and the target cloud model supports reasoning.
+    let caller_set_reasoning = obj.contains_key("reasoning_effort")
+        || obj.contains_key("reasoning")
+        || obj.contains_key("thinking");
+    let supports_reasoning = capabilities.is_none_or(|c| c.supports_reasoning);
+    if !caller_set_reasoning
+        && supports_reasoning
+        && let Some(raw_effort) = selected_effort.filter(|s| !s.is_empty())
+    {
+        let effort =
+            capabilities.map_or_else(|| raw_effort.to_string(), |c| c.clamp_effort(raw_effort));
+        match (dialect, protocol) {
+            (WireDialect::OpenRouter, ApiProtocol::OpenAiChat)
+            | (WireDialect::OpenRouter | WireDialect::OpenAiNative, ApiProtocol::OpenAiResponses) =>
+            {
+                obj.insert(
+                    "reasoning".to_string(),
+                    serde_json::json!({ "effort": effort }),
+                );
+            }
+            (
+                WireDialect::OpenAiNative | WireDialect::OpenAiChatCompat,
+                ApiProtocol::OpenAiChat,
+            ) => {
+                obj.insert("reasoning_effort".to_string(), Value::String(effort));
+            }
+            (WireDialect::AnthropicNative, _) => {
+                // Anthropic Messages uses `thinking: {type, budget_tokens}` rather than
+                // string effort levels; omit to avoid schema rejection on non-thinking models.
+            }
+            _ => {}
+        }
+    }
+
     if protocol == ApiProtocol::OpenAiChat
         && dialect != WireDialect::AnthropicNative
         && obj.get("stream").and_then(Value::as_bool) == Some(true)
@@ -289,6 +328,7 @@ impl UpstreamProxy {
         wire_model: &str,
         model_display_name: &str,
         prices: [f64; 4],
+        capabilities: Option<&ModelCapabilities>,
         metrics: Arc<RouterMetrics>,
         decision: &RoutingDecision,
         anthropic_beta: Option<&str>,
@@ -314,7 +354,14 @@ impl UpstreamProxy {
             }
         };
 
-        prepare_upstream_body(&mut body, wire_model, endpoint.dialect, protocol);
+        prepare_upstream_body(
+            &mut body,
+            wire_model,
+            endpoint.dialect,
+            protocol,
+            Some(decision.reasoning_effort.as_str()),
+            capabilities,
+        );
 
         let mut req = self.client.post(&url).json(&body);
         if endpoint.dialect == WireDialect::AnthropicNative {
@@ -500,13 +547,32 @@ mod tests {
             "anthropic/claude-sonnet-4.6",
             WireDialect::OpenRouter,
             ApiProtocol::OpenAiChat,
+            Some("high"),
+            None,
         );
         assert_eq!(chat_stream["model"], "anthropic/claude-sonnet-4.6");
         assert!(chat_stream.get("chat_template_kwargs").is_none());
         assert!(chat_stream.get("top_k").is_none());
         assert_eq!(chat_stream["stream_options"]["include_usage"], true);
+        assert_eq!(chat_stream["reasoning"]["effort"], "high");
 
-        // Anthropic Messages must NOT receive `stream_options`.
+        // Explicit caller reasoning_effort must be respected (not overwritten).
+        let mut explicit_effort = serde_json::json!({
+            "model": "auto",
+            "reasoning_effort": "low",
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+        prepare_upstream_body(
+            &mut explicit_effort,
+            "gpt-5.4",
+            WireDialect::OpenAiNative,
+            ApiProtocol::OpenAiChat,
+            Some("high"),
+            None,
+        );
+        assert_eq!(explicit_effort["reasoning_effort"], "low");
+
+        // Anthropic Messages must NOT receive `stream_options` or `reasoning_effort`.
         let mut anthropic_stream = serde_json::json!({
             "model": "auto",
             "stream": true,
@@ -518,8 +584,11 @@ mod tests {
             "claude-sonnet-4-6",
             WireDialect::AnthropicNative,
             ApiProtocol::AnthropicMessages,
+            Some("medium"),
+            None,
         );
         assert!(anthropic_stream.get("thinking_budget").is_none());
         assert!(anthropic_stream.get("stream_options").is_none());
+        assert!(anthropic_stream.get("reasoning_effort").is_none());
     }
 }

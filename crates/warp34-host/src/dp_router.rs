@@ -208,6 +208,16 @@ impl DpPrefixDirectory {
         (dp_rank < MAX_DP_WORKERS).then_some(1u64 << dp_rank)
     }
 
+    /// Returns true if `hash` is currently both KV-resident and backed by a live Mamba/GDN
+    /// checkpoint on `dp_rank` (returns false after eviction, tombstoning, or worker reset).
+    pub fn is_checkpoint_live(&self, dp_rank: usize, hash: u64) -> bool {
+        let Some(bit) = Self::rank_bit(dp_rank) else {
+            return false;
+        };
+        let entry = self.lookup_entry(hash);
+        (entry.kv_mask & bit) != 0 && (entry.ckpt_mask & bit) != 0
+    }
+
     /// Marks every complete 64-token block in `tokens` (for `lora_id`) as resident and
     /// checkpoint-usable on `dp_rank` (convenience helper for tests and pure-attention models).
     pub fn record_insert(&self, dp_rank: usize, lora_id: i32, tokens: &[i32]) {
@@ -668,26 +678,39 @@ fn pick_lowest_score(
     best_idx
 }
 
-/// Bounded LRU session-affinity map (`session_key -> dp_rank`).
+/// Bounded LRU session-affinity map (`session_key -> (dp_rank, last_prefix_block_hash)`).
 #[derive(Debug, Default)]
 pub struct SessionAffinityMap {
-    map: HashMap<String, usize>,
+    map: HashMap<String, (usize, Option<u64>)>,
     order: VecDeque<String>,
 }
 
 impl SessionAffinityMap {
     pub fn get(&mut self, key: &str) -> Option<usize> {
-        let rank = self.map.get(key).copied()?;
+        self.get_with_prefix(key).map(|(rank, _)| rank)
+    }
+
+    pub fn get_with_prefix(&mut self, key: &str) -> Option<(usize, Option<u64>)> {
+        let entry = self.map.get(key).copied()?;
         if let Some(pos) = self.order.iter().position(|k| k == key)
             && let Some(item) = self.order.remove(pos)
         {
             self.order.push_back(item);
         }
-        Some(rank)
+        Some(entry)
     }
 
     pub fn bind(&mut self, key: String, dp_rank: usize) {
-        if self.map.insert(key.clone(), dp_rank).is_some() {
+        let prev_hash = self.map.get(&key).and_then(|&(_, h)| h);
+        self.bind_with_prefix(key, dp_rank, prev_hash);
+    }
+
+    pub fn bind_with_prefix(&mut self, key: String, dp_rank: usize, prefix_hash: Option<u64>) {
+        if self
+            .map
+            .insert(key.clone(), (dp_rank, prefix_hash))
+            .is_some()
+        {
             if let Some(pos) = self.order.iter().position(|k| k == &key) {
                 self.order.remove(pos);
             }
@@ -833,6 +856,32 @@ impl DpRouterCore {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .bind(session_key, dp_rank);
+    }
+
+    pub fn bind_session_with_prefix(
+        &self,
+        session_key: String,
+        dp_rank: usize,
+        prefix_hash: Option<u64>,
+    ) {
+        self.sessions
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .bind_with_prefix(session_key, dp_rank, prefix_hash);
+    }
+
+    /// Returns true only when `session_key` has a bound worker whose last recorded prefix block
+    /// is still KV-resident and backed by a live Mamba/GDN checkpoint in `prefix_dir`.
+    pub fn has_warm_local_kv(&self, session_key: &str) -> bool {
+        let entry = self
+            .sessions
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get_with_prefix(session_key);
+        let Some((rank, Some(prefix_hash))) = entry else {
+            return false;
+        };
+        self.prefix_dir.is_checkpoint_live(rank, prefix_hash)
     }
 
     /// Selects a worker and atomically acquires an [`InflightGuard`] on it.
@@ -1491,5 +1540,31 @@ mod tests {
             )
             .expect("worker");
         assert_eq!(chosen_fifth, 1);
+    }
+
+    #[test]
+    fn has_warm_local_kv_tracks_live_kv_and_gdn_checkpoint_residency() {
+        let router = DpRouterCore::new(2, DpRoutingPolicy::Prefix);
+        let prompt: Vec<i32> = (100..228).collect(); // 2 full 64-token blocks
+        let hashes = compute_chained_prefix_hashes(0, &prompt);
+        let last_hash = *hashes.last().unwrap();
+
+        // Bound session without resident radix block is NOT warm.
+        router.bind_session_with_prefix("sess-1".to_string(), 0, Some(last_hash));
+        assert!(!router.has_warm_local_kv("sess-1"));
+
+        // Inserting KV + GDN checkpoint on rank 0 makes it warm.
+        router.prefix_dir.record_insert(0, 0, &prompt);
+        assert!(router.has_warm_local_kv("sess-1"));
+
+        // Tombstoning the GDN checkpoint immediately clears warm status even if KV remains.
+        router.prefix_dir.record_tombstone_hash(0, last_hash);
+        assert!(!router.has_warm_local_kv("sess-1"));
+
+        // Re-inserting then clearing the worker (reset) also clears warm status.
+        router.prefix_dir.record_insert(0, 0, &prompt);
+        assert!(router.has_warm_local_kv("sess-1"));
+        router.prefix_dir.clear_worker(0);
+        assert!(!router.has_warm_local_kv("sess-1"));
     }
 }

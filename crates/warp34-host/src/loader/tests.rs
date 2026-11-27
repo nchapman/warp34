@@ -809,13 +809,20 @@ fn test_model_config_rejects_unsupported_rope_scaling_and_biases() {
     ok_rope["rope_scaling"] = serde_json::json!({ "type": "default" });
     ModelConfig::from_json(&ok_rope).unwrap();
 
-    // rope_scaling: yarn / dynamic fails fast
+    // rope_scaling: yarn is supported and populates YaRN parameters
+    let mut yarn_rope = base_json.clone();
+    yarn_rope["rope_scaling"] = serde_json::json!({ "type": "yarn", "factor": 4.0 });
+    let yarn_cfg = ModelConfig::from_json(&yarn_rope).unwrap();
+    assert!((yarn_cfg.yarn_factor - 4.0).abs() < 1e-6);
+    assert!(yarn_cfg.yarn_mscale > 1.0);
+
+    // rope_scaling: dynamic fails fast
     let mut bad_rope = base_json.clone();
-    bad_rope["rope_scaling"] = serde_json::json!({ "type": "yarn" });
+    bad_rope["rope_scaling"] = serde_json::json!({ "type": "dynamic" });
     let err = ModelConfig::from_json(&bad_rope).unwrap_err();
     assert!(
         err.to_string()
-            .contains("unsupported rope_scaling type='yarn'")
+            .contains("unsupported rope_scaling type='dynamic'")
     );
 
     // attention_bias=true fails fast

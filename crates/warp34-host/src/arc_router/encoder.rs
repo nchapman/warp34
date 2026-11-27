@@ -238,7 +238,7 @@ impl SessionPool {
 /// Applies head+tail block selection when tokenized blocks exceed `max_ctx`:
 /// preserves leading system + first user task block (up to `max_ctx / 3`), then packs
 /// as many most-recent blocks from the tail as fit.
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", test))]
 fn select_head_tail_blocks(
     block_tokens: Vec<(String, Vec<i32>)>,
     max_ctx: usize,
@@ -279,16 +279,31 @@ fn select_head_tail_blocks(
 
     let mut head_blocks: Vec<(String, Vec<i32>)> = Vec::new();
     let mut head_len = 0usize;
-    for (role, mut toks) in block_tokens.iter().take(head_count).cloned() {
+    let mut oversized_final_tail: Option<Vec<i32>> = None;
+    for (idx, (role, mut toks)) in block_tokens.iter().take(head_count).cloned().enumerate() {
         let avail = head_budget.saturating_sub(head_len);
         if avail == 0 {
             break;
         }
+        let is_final_overall = idx + 1 == block_tokens.len();
         if toks.len() > avail {
+            if is_final_overall {
+                // Keep the unconsumed suffix so oversized single-turn / final user blocks still
+                // expose their ending instructions and any trailing PII to Stage 1 and PII heads.
+                let tail_avail = max_ctx.saturating_sub(head_len + avail);
+                let suffix_start = toks.len().saturating_sub(tail_avail).max(avail);
+                if suffix_start < toks.len() {
+                    oversized_final_tail = Some(toks[suffix_start..].to_vec());
+                }
+            }
             toks.truncate(avail);
         }
         head_len += toks.len();
         head_blocks.push((role, toks));
+    }
+    if let (Some(suffix), Some((_, last_toks))) = (oversized_final_tail, head_blocks.last_mut()) {
+        head_len += suffix.len();
+        last_toks.extend_from_slice(&suffix);
     }
 
     let tail_budget = max_ctx.saturating_sub(head_len);
@@ -715,5 +730,18 @@ mod tests {
         assert!(pool.evict_lru());
         assert_eq!(pool.free_slots.len(), 1);
         assert_eq!(pool.sessions.len(), 15);
+    }
+
+    #[test]
+    fn oversized_single_user_block_preserves_head_and_trailing_suffix() {
+        let big_user: Vec<i32> = (0..40_000).collect();
+        let blocks = vec![("user".to_string(), big_user)];
+        let (toks, ends, roles) = select_head_tail_blocks(blocks, 32_768);
+        assert_eq!(roles, vec!["user"]);
+        assert_eq!(ends.len(), 1);
+        assert_eq!(toks.len(), 32_768);
+        // First token preserved (head) AND last token preserved (trailing suffix/PII).
+        assert_eq!(toks[0], 0);
+        assert_eq!(*toks.last().unwrap(), 39_999);
     }
 }

@@ -760,11 +760,11 @@ impl ModelConfig {
                 .or_else(|| rs.get("rope_type"))
                 .and_then(|v| v.as_str())
                 .unwrap_or("unknown");
-            if !rtype.eq_ignore_ascii_case("default") {
+            if !rtype.eq_ignore_ascii_case("default") && !rtype.eq_ignore_ascii_case("yarn") {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     format!(
-                        "unsupported rope_scaling type='{}' (only standard unscaled RoPE is supported)",
+                        "unsupported rope_scaling type='{}' (only default and yarn RoPE are supported)",
                         sanitize_diag(rtype)
                     ),
                 ));
