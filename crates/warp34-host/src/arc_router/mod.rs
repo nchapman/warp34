@@ -20,10 +20,10 @@ use std::sync::{Arc, Mutex};
 use axum::http::{HeaderMap, HeaderName, HeaderValue};
 use encoder::ArcEncoderWorker;
 use heads::ArcHeads;
-use input::{ApiProtocol, serialize_request};
+use input::{ApiProtocol, SerializedArcInput, serialize_request};
 use policy::{
     CloudCandidate, DecideInput, RouteTarget, RoutingBasis, RoutingDecision, RoutingPolicy, decide,
-    infer_local_slot, resolve_cloud_candidates_from_registry,
+    infer_local_slot, is_local_only_cloud_filter, resolve_cloud_candidates_from_registry,
 };
 use proxy::UpstreamProxy;
 use registry::ModelsDevRegistry;
@@ -45,6 +45,7 @@ pub struct ArcRouterConfig {
     pub cloud_model_filter: Vec<String>,
     pub policy: RoutingPolicy,
     pub pin_pii_classes: HashSet<String>,
+    pub offline: bool,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -111,9 +112,9 @@ impl RouterMetrics {
                 self.local_requests.fetch_add(1, Ordering::Relaxed);
                 ("local".to_string(), true)
             }
-            RouteTarget::Cloud { name, .. } => {
+            RouteTarget::Cloud(cloud) => {
                 self.cloud_requests.fetch_add(1, Ordering::Relaxed);
-                (name.clone(), false)
+                (cloud.name.clone(), false)
             }
         };
         if let Ok(mut map) = self.per_model.lock() {
@@ -136,10 +137,10 @@ impl RouterMetrics {
             "none" => {
                 self.effort_none.fetch_add(1, Ordering::Relaxed);
             }
-            "low" => {
+            "minimal" | "low" => {
                 self.effort_low.fetch_add(1, Ordering::Relaxed);
             }
-            "high" => {
+            "high" | "xhigh" | "max" => {
                 self.effort_high.fetch_add(1, Ordering::Relaxed);
             }
             _ => {
@@ -245,27 +246,63 @@ pub struct ArcRouter {
     heads: Arc<ArcHeads>,
     local_slot: usize,
     cloud_candidates: Vec<CloudCandidate>,
+    cloud_candidates_by_proto: [Arc<[CloudCandidate]>; 3],
+    empty_candidates: Arc<[CloudCandidate]>,
     policy: RoutingPolicy,
-    pin_pii_classes: HashSet<String>,
+    pin_pii_classes: Arc<HashSet<String>>,
     proxy: Option<UpstreamProxy>,
     metrics: Arc<RouterMetrics>,
+}
+
+fn proto_index(protocol: ApiProtocol) -> usize {
+    match protocol {
+        ApiProtocol::OpenAiChat => 0,
+        ApiProtocol::OpenAiResponses => 1,
+        ApiProtocol::AnthropicMessages => 2,
+    }
 }
 
 impl ArcRouter {
     pub fn load(cfg: ArcRouterConfig) -> Result<Self, String> {
         let heads = ArcHeads::load(&cfg.model_dir)?;
         let local_slot = infer_local_slot(&cfg.local_model_name, &heads.catalog);
-        let registry = ModelsDevRegistry::load_cached_or_fetch();
-        let cloud_candidates = resolve_cloud_candidates_from_registry(
-            &registry,
-            &heads.catalog,
-            &cfg.cloud_model_filter,
-            |var| std::env::var(var).ok(),
-        )?;
+        let cloud_candidates = if is_local_only_cloud_filter(&cfg.cloud_model_filter) {
+            Vec::new()
+        } else {
+            let registry = ModelsDevRegistry::load_cached_or_fetch_with_options(cfg.offline);
+            resolve_cloud_candidates_from_registry(
+                &registry,
+                &heads.catalog,
+                &cfg.cloud_model_filter,
+                |var| std::env::var(var).ok(),
+            )?
+        };
         let proxy = if cloud_candidates.is_empty() {
             None
         } else {
             Some(UpstreamProxy::new()?)
+        };
+        let empty_candidates: Arc<[CloudCandidate]> = Arc::from(Vec::new());
+        let cloud_candidates_by_proto = if proxy.is_some() {
+            [
+                ApiProtocol::OpenAiChat,
+                ApiProtocol::OpenAiResponses,
+                ApiProtocol::AnthropicMessages,
+            ]
+            .map(|proto| {
+                let filtered: Vec<CloudCandidate> = cloud_candidates
+                    .iter()
+                    .filter(|c| UpstreamProxy::supports_protocol(&c.endpoint, proto))
+                    .cloned()
+                    .collect();
+                Arc::from(filtered)
+            })
+        } else {
+            [
+                Arc::clone(&empty_candidates),
+                Arc::clone(&empty_candidates),
+                Arc::clone(&empty_candidates),
+            ]
         };
         let encoder = ArcEncoderWorker::spawn(&cfg.model_dir, cfg.device_id)?;
         Ok(Self {
@@ -273,8 +310,10 @@ impl ArcRouter {
             heads: Arc::new(heads),
             local_slot,
             cloud_candidates,
+            cloud_candidates_by_proto,
+            empty_candidates,
             policy: cfg.policy,
-            pin_pii_classes: cfg.pin_pii_classes,
+            pin_pii_classes: Arc::new(cfg.pin_pii_classes),
             proxy,
             metrics: Arc::new(RouterMetrics::default()),
         })
@@ -282,31 +321,6 @@ impl ArcRouter {
 
     pub fn metrics_arc(&self) -> Arc<RouterMetrics> {
         Arc::clone(&self.metrics)
-    }
-
-    /// Returns the 4-tuple USD/Mtok pricing `[input, cache_read, cache_write, output]` for a
-    /// routed cloud candidate (`models.dev` override first, then ARC catalog fallback).
-    pub fn prices_for_cloud_model(&self, name: &str, slot: usize) -> [f64; 4] {
-        if let Some(cand) = self.cloud_candidates.iter().find(|c| c.name == name)
-            && let Some(p) = cand.price_override
-        {
-            return p;
-        }
-        self.heads
-            .catalog
-            .model_prices
-            .get(slot)
-            .copied()
-            .flatten()
-            .unwrap_or([0.0; 4])
-    }
-
-    /// Returns the `models.dev` capability descriptor for a routed cloud candidate, if present.
-    pub fn capabilities_for_cloud_model(&self, name: &str) -> Option<&registry::ModelCapabilities> {
-        self.cloud_candidates
-            .iter()
-            .find(|c| c.name == name)
-            .map(|c| &c.capabilities)
     }
 
     pub fn local_slot_name(&self) -> &str {
@@ -348,33 +362,34 @@ impl ArcRouter {
         self.proxy.as_ref()
     }
 
-    /// Run ARC-1.0 encoding + Stage 1/2/PII heads and return a `RoutingDecision`.
-    pub async fn route(
+    /// Cleanly shuts down the background ARC-1.0 GPU encoder worker before process exit.
+    pub async fn shutdown(&self) {
+        self.encoder.shutdown().await;
+    }
+
+    /// Run ARC-1.0 encoding + Stage 1/2/PII heads over an already-serialized request.
+    ///
+    /// `allow_cloud` disables cloud candidates (e.g. stateful `/v1/responses` that must stay in
+    /// the local `ResponseStore`) independently from `warm_local_kv`, so cold stateful requests
+    /// report `RoutingBasis::LocalOnlyEffort` rather than `RoutingBasis::WarmKvStayLocal`.
+    pub async fn route_serialized(
         &self,
         protocol: ApiProtocol,
-        body: &Value,
+        canonical: SerializedArcInput,
         warm_local_kv: bool,
+        allow_cloud: bool,
+        t0: std::time::Instant,
     ) -> Result<RoutingDecision, String> {
-        let t0 = std::time::Instant::now();
-        let body_clone = body.clone();
-        let canonical =
-            tokio::task::spawn_blocking(move || serialize_request(protocol, &body_clone))
-                .await
-                .map_err(|e| format!("ARC serialize join error: {e}"))?;
         let enc = self.encoder.encode_blocks(canonical.blocks).await?;
         let heads = Arc::clone(&self.heads);
         let local_slot = self.local_slot;
-        let cloud_candidates: Vec<CloudCandidate> = if self.proxy.is_some() {
-            self.cloud_candidates
-                .iter()
-                .filter(|c| UpstreamProxy::supports_protocol(&c.endpoint, protocol))
-                .cloned()
-                .collect()
+        let cloud_candidates = if allow_cloud {
+            Arc::clone(&self.cloud_candidates_by_proto[proto_index(protocol)])
         } else {
-            Vec::new()
+            Arc::clone(&self.empty_candidates)
         };
         let policy = self.policy;
-        let pin_pii_classes = self.pin_pii_classes.clone();
+        let pin_pii_classes = Arc::clone(&self.pin_pii_classes);
         let has_tools = canonical.has_tools;
         let has_images = canonical.has_images;
         let mut decision = tokio::task::spawn_blocking(move || {
@@ -400,13 +415,30 @@ impl ArcRouter {
         self.metrics.record(&decision);
         Ok(decision)
     }
+
+    /// Run ARC-1.0 encoding + Stage 1/2/PII heads and return a `RoutingDecision`.
+    pub async fn route(
+        &self,
+        protocol: ApiProtocol,
+        body: &Value,
+        warm_local_kv: bool,
+    ) -> Result<RoutingDecision, String> {
+        let t0 = std::time::Instant::now();
+        let body_clone = body.clone();
+        let canonical =
+            tokio::task::spawn_blocking(move || serialize_request(protocol, &body_clone))
+                .await
+                .map_err(|e| format!("ARC serialize join error: {e}"))?;
+        self.route_serialized(protocol, canonical, warm_local_kv, true, t0)
+            .await
+    }
 }
 
 /// Attach standardized `x-warp34-route*` transparency headers to any HTTP response.
 pub fn apply_routing_headers(headers: &mut HeaderMap, decision: &RoutingDecision) {
     let target_str = match &decision.target {
         RouteTarget::Local => "local".to_string(),
-        RouteTarget::Cloud { wire, .. } => format!("cloud:{wire}"),
+        RouteTarget::Cloud(cloud) => format!("cloud:{}", cloud.wire),
     };
     let pairs = [
         ("x-warp34-route", target_str),
@@ -437,5 +469,38 @@ pub fn apply_routing_headers(headers: &mut HeaderMap, decision: &RoutingDecision
         && let Ok(val) = HeaderValue::from_str(&decision.pii_triggered.join(","))
     {
         headers.insert(HeaderName::from_static("x-warp34-route-pii"), val);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn router_metrics_buckets_minimal_and_xhigh_max_efforts_accurately() {
+        let metrics = RouterMetrics::default();
+        let make = |effort: &str| RoutingDecision {
+            target: RouteTarget::Local,
+            p_pass: 0.8,
+            local_p_pass: 0.8,
+            reasoning_effort: effort.to_string(),
+            basis: RoutingBasis::LocalOnlyEffort,
+            pii_triggered: Vec::new(),
+            latency_ms: 1.5,
+        };
+        metrics.record(&make("none"));
+        metrics.record(&make("minimal"));
+        metrics.record(&make("low"));
+        metrics.record(&make("medium"));
+        metrics.record(&make("high"));
+        metrics.record(&make("xhigh"));
+        metrics.record(&make("max"));
+
+        let snap = metrics.snapshot();
+        assert_eq!(snap.effort_none, 1);
+        assert_eq!(snap.effort_low, 2);
+        assert_eq!(snap.effort_medium, 1);
+        assert_eq!(snap.effort_high, 3);
+        assert_eq!(snap.warm_kv_stayed_local, 0);
     }
 }

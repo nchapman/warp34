@@ -51,6 +51,8 @@ pub struct ModelCapabilities {
     pub context_limit: Option<usize>,
     /// Allowed `reasoning.effort` values (empty means no explicit effort list / unrestricted).
     pub effort_values: Vec<String>,
+    /// Whether the model exposes a `toggle` reasoning option (can disable thinking explicitly).
+    pub supports_toggle: bool,
     pub supports_reasoning: bool,
 }
 
@@ -61,6 +63,7 @@ impl Default for ModelCapabilities {
             supports_image: true,
             context_limit: None,
             effort_values: Vec::new(),
+            supports_toggle: false,
             supports_reasoning: true,
         }
     }
@@ -70,7 +73,16 @@ impl ModelCapabilities {
     /// Clamps an ARC-selected effort (`none`, `low`, `medium`, `high`, `xhigh`, `max`) to the
     /// nearest supported effort value declared in `models.dev`, or returns `effort` unchanged when
     /// the model does not publish an explicit effort list.
+    ///
+    /// Toggle-capable models (`supports_toggle == true`) preserve `"none"` so `proxy.rs` can
+    /// explicitly disable thinking (`{"enabled": false}`), whereas non-toggle always-reasoning
+    /// models (e.g. `gpt-5.4-pro`, `gemini-4-argon`) clamp `"none"` to their minimum supported
+    /// effort rather than sending an unsupported `"none"` (HTTP 400) or omitting `reasoning`
+    /// (which falls back to a higher provider default like `"medium"`/`"high"`).
     pub fn clamp_effort(&self, effort: &str) -> String {
+        if effort == "none" && self.supports_toggle {
+            return "none".to_string();
+        }
         if self.effort_values.is_empty() {
             return effort.to_string();
         }
@@ -183,9 +195,15 @@ pub struct ModelsDevRegistry {
 
 impl ModelsDevRegistry {
     /// Loads `models.dev` from `~/.cache/warp34/models.dev.json`, refreshing from
-    /// `https://models.dev/api.json` if missing or older than 24h. Never fails hard:
-    /// falls back to stale cache or built-in defaults if offline.
+    /// `https://models.dev/api.json` if missing or older than 24h (unless `offline` is set).
+    /// Never fails hard: falls back to stale cache or built-in defaults if offline.
     pub fn load_cached_or_fetch() -> Self {
+        Self::load_cached_or_fetch_with_options(false)
+    }
+
+    /// Loads `models.dev` honoring an explicit `offline` flag (never performs network I/O when
+    /// `offline == true`).
+    pub fn load_cached_or_fetch_with_options(offline: bool) -> Self {
         let cache_path = cache_file_path();
         let cached_bytes = cache_path.as_ref().and_then(|p| std::fs::read(p).ok());
         let is_fresh = cache_path
@@ -195,14 +213,15 @@ impl ModelsDevRegistry {
             .and_then(|t| SystemTime::now().duration_since(t).ok())
             .is_some_and(|age| age < CACHE_TTL);
 
-        if is_fresh
+        if (is_fresh || offline)
             && let Some(bytes) = &cached_bytes
             && let Ok(reg) = Self::from_json_bytes(bytes)
         {
             return reg;
         }
 
-        if let Some(bytes) = fetch_models_dev_blocking()
+        if !offline
+            && let Some(bytes) = fetch_models_dev_blocking()
             && let Ok(reg) = Self::from_json_bytes(&bytes)
         {
             if let Some(path) = &cache_path {
@@ -363,6 +382,11 @@ impl ModelsDevRegistry {
         } else {
             (None, trimmed)
         };
+        if rest.is_empty() {
+            return Err(format!(
+                "cloud model spec `{raw_spec}` has an empty model id"
+            ));
+        }
 
         let pick_key = |env_vars: &[String]| -> Option<String> {
             for var in env_vars {
@@ -393,22 +417,30 @@ impl ModelsDevRegistry {
                     model,
                 )
             } else {
-                // Parse optional explicit `provider:model` or `provider/model`.
-                let (prefix_prov, suffix_model) = if let Some((p, m)) = rest.split_once(':') {
-                    if self.has_provider(p) {
-                        (Some(p), m)
+                // Parse optional explicit `provider:model` or `provider/model` (case-insensitive provider prefix).
+                let (prefix_prov, suffix_model): (Option<String>, &str) =
+                    if let Some((p, m)) = rest.split_once(':') {
+                        let p_lc = p.trim().to_ascii_lowercase();
+                        if self.has_provider(&p_lc) {
+                            (Some(p_lc), m.trim())
+                        } else {
+                            (None, rest)
+                        }
+                    } else if let Some((p, m)) = rest.split_once('/') {
+                        let p_lc = p.trim().to_ascii_lowercase();
+                        if self.has_provider(&p_lc) {
+                            (Some(p_lc), m.trim())
+                        } else {
+                            (None, rest)
+                        }
                     } else {
                         (None, rest)
-                    }
-                } else if let Some((p, m)) = rest.split_once('/') {
-                    if self.has_provider(p) {
-                        (Some(p), m)
-                    } else {
-                        (None, rest)
-                    }
-                } else {
-                    (None, rest)
-                };
+                    };
+                if prefix_prov.is_some() && suffix_model.is_empty() {
+                    return Err(format!(
+                        "cloud model spec `{raw_spec}` has an empty model id"
+                    ));
+                }
 
                 // Prefer direct provider when its env key is present, otherwise fall back to
                 // OpenRouter if OPENROUTER_API_KEY is present. Explicit `openrouter/<vendor>/<model>`
@@ -417,19 +449,19 @@ impl ModelsDevRegistry {
                     .resolve_provider_meta("openrouter")
                     .and_then(|(_, _, envs)| pick_key(&envs));
 
-                let (prov, wire) = if let Some(p) = prefix_prov {
-                    if p.eq_ignore_ascii_case("openrouter") {
+                let (prov, wire) = if let Some(ref p) = prefix_prov {
+                    if p == "openrouter" {
                         ("openrouter".to_string(), suffix_model.to_string())
                     } else {
                         let direct_key = self
                             .resolve_provider_meta(p)
                             .and_then(|(_, _, envs)| pick_key(&envs));
                         if direct_key.is_some() {
-                            (p.to_string(), suffix_model.to_string())
+                            (p.clone(), suffix_model.to_string())
                         } else if openrouter_key.is_some() {
                             ("openrouter".to_string(), format!("{p}/{suffix_model}"))
                         } else {
-                            (p.to_string(), suffix_model.to_string())
+                            (p.clone(), suffix_model.to_string())
                         }
                     }
                 } else if openrouter_key.is_some() {
@@ -458,7 +490,12 @@ impl ModelsDevRegistry {
             format!("{provider_id}/{wire_model}")
         };
 
-        let raw_model = self.lookup_model(&provider_id, &wire_model, prefix_prov, suffix_model);
+        let raw_model = self.lookup_model(
+            &provider_id,
+            &wire_model,
+            prefix_prov.as_deref(),
+            suffix_model,
+        );
         let prices = raw_model.and_then(extract_prices);
         let capabilities = raw_model.map(extract_capabilities).unwrap_or_default();
 
@@ -478,7 +515,7 @@ impl ModelsDevRegistry {
         })
     }
 
-    /// Auto-detects default cloud models when `--router` is enabled without `--router-cloud-models`.
+    /// Auto-detects default cloud models when `--router-cloud-models auto` is passed.
     pub fn default_models_for_env<F>(&self, env_lookup: F) -> Vec<String>
     where
         F: Fn(&str) -> Option<String>,
@@ -649,11 +686,13 @@ fn extract_capabilities(m: &RawModel) -> ModelCapabilities {
         .find(|o| o.kind == "effort")
         .map(|o| o.values.clone())
         .unwrap_or_default();
+    let supports_toggle = m.reasoning_options.iter().any(|o| o.kind == "toggle");
     ModelCapabilities {
         tool_call: m.tool_call,
         supports_image,
         context_limit: m.limit.as_ref().and_then(|l| l.context),
         effort_values,
+        supports_toggle,
         supports_reasoning: m.reasoning,
     }
 }
@@ -756,7 +795,7 @@ mod tests {
                         "id": "deepseek-v4-pro",
                         "tool_call": true,
                         "reasoning": true,
-                        "reasoning_options": [{"type": "effort", "values": ["low", "high", "max"]}],
+                        "reasoning_options": [{"type": "toggle"}, {"type": "effort", "values": ["low", "high", "max"]}],
                         "modalities": {"input": ["text"]},
                         "cost": {"input": 0.3, "output": 1.2, "cache_read": 0.03},
                         "limit": {"context": 1000000}
@@ -823,8 +862,26 @@ mod tests {
         assert_eq!(ds.endpoint.provider_id, "deepseek");
         assert_eq!(ds.endpoint.base_url, "https://api.deepseek.com");
         assert!(!ds.capabilities.supports_image);
+        assert!(ds.capabilities.supports_toggle);
         assert_eq!(ds.capabilities.clamp_effort("medium"), "low");
+        // Toggle-capable models preserve `"none"` instead of clamping to `"low"`.
+        assert_eq!(ds.capabilities.clamp_effort("none"), "none");
         assert_eq!(infer_tier_from_prices(ds.prices.unwrap()), "fast");
+
+        // Non-toggle models without `"none"` in `effort_values` clamp `"none"` to `"low"`.
+        let gm = reg
+            .resolve_spec("Google/gemini-4-argon", |k| {
+                (k == "GEMINI_API_KEY").then(|| "gm-key".to_string())
+            })
+            .expect("case-insensitive provider prefix");
+        assert_eq!(gm.endpoint.provider_id, "google");
+        assert!(!gm.capabilities.supports_toggle);
+        assert_eq!(gm.capabilities.clamp_effort("none"), "low");
+
+        // Reject empty model suffix on explicit provider prefixes or tier= prefixes.
+        assert!(reg.resolve_spec("google/", |_| None).is_err());
+        assert!(reg.resolve_spec("deepseek:", |_| None).is_err());
+        assert!(reg.resolve_spec("fast=", |_| None).is_err());
 
         assert_eq!(
             reg.default_models_for_env(|k| (k == "OPENROUTER_API_KEY").then(|| "k".to_string())),

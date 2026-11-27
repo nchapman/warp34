@@ -98,6 +98,19 @@ fn find_native_arc_slot(catalog: &ArcRuntimeCatalog, id: &str) -> Option<usize> 
     })
 }
 
+/// Returns true when `--router-cloud-models` requests local-only routing (`[]`, `none`, or `local`),
+/// allowing startup to skip loading or refreshing `models.dev`.
+pub fn is_local_only_cloud_filter(filter: &[String]) -> bool {
+    let non_empty: Vec<&str> = filter
+        .iter()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .collect();
+    non_empty.is_empty()
+        || (non_empty.len() == 1
+            && matches!(non_empty[0].to_ascii_lowercase().as_str(), "none" | "local"))
+}
+
 /// Resolves cloud candidates through the `models.dev` registry, auto-detecting provider base URLs,
 /// API keys from environment variables, live USD/Mtok pricing, and model capabilities.
 pub fn resolve_cloud_candidates_from_registry<F>(
@@ -109,13 +122,7 @@ pub fn resolve_cloud_candidates_from_registry<F>(
 where
     F: Fn(&str) -> Option<String>,
 {
-    if filter.is_empty()
-        || (filter.len() == 1
-            && matches!(
-                filter[0].trim().to_ascii_lowercase().as_str(),
-                "none" | "local"
-            ))
-    {
+    if is_local_only_cloud_filter(filter) {
         return Ok(Vec::new());
     }
     let specs: Vec<String> = if filter.len() == 1 && filter[0].trim().eq_ignore_ascii_case("auto") {
@@ -212,14 +219,19 @@ impl RoutingBasis {
 }
 
 #[derive(Debug, Clone)]
+pub struct CloudRouteTarget {
+    pub slot: usize,
+    pub name: String,
+    pub wire: String,
+    pub endpoint: ProviderEndpoint,
+    pub prices: [f64; LEGS],
+    pub capabilities: ModelCapabilities,
+}
+
+#[derive(Debug, Clone)]
 pub enum RouteTarget {
     Local,
-    Cloud {
-        slot: usize,
-        name: String,
-        wire: String,
-        endpoint: ProviderEndpoint,
-    },
+    Cloud(Box<CloudRouteTarget>),
 }
 
 #[derive(Debug, Clone)]
@@ -402,8 +414,18 @@ pub fn decide(heads: &ArcHeads, input: &DecideInput<'_>) -> Result<RoutingDecisi
         }
     };
 
-    // 1. Local-only mode (no cloud upstream configured).
-    if input.cloud_candidates.is_empty() {
+    // 1–3. Local pinning guards in semantic priority order:
+    //      (a) PII / credential guard (`pii_pinned_local`),
+    //      (b) live warm radix + GDN KV continuation (`warm_kv_stay_local`),
+    //      (c) local-only mode / stateful local-pinned request (`local_only_effort`).
+    if pii_pin || input.warm_local_kv || input.cloud_candidates.is_empty() {
+        let basis = if pii_pin {
+            RoutingBasis::PiiPinnedLocal
+        } else if input.warm_local_kv {
+            RoutingBasis::WarmKvStayLocal
+        } else {
+            RoutingBasis::LocalOnlyEffort
+        };
         let effort = choose_effort_for_slot(
             heads,
             input.block_readouts,
@@ -416,47 +438,7 @@ pub fn decide(heads: &ArcHeads, input: &DecideInput<'_>) -> Result<RoutingDecisi
             p_pass: local_p,
             local_p_pass: local_p,
             reasoning_effort: effort,
-            basis: RoutingBasis::LocalOnlyEffort,
-            pii_triggered: pii.triggered_classes,
-            latency_ms: t0.elapsed().as_secs_f64() * 1000.0,
-        });
-    }
-
-    // 2. Automatic PII / credential local pinning.
-    if pii_pin {
-        let effort = choose_effort_for_slot(
-            heads,
-            input.block_readouts,
-            input.block_roles,
-            input.local_slot,
-            None,
-        );
-        return Ok(RoutingDecision {
-            target: RouteTarget::Local,
-            p_pass: local_p,
-            local_p_pass: local_p,
-            reasoning_effort: effort,
-            basis: RoutingBasis::PiiPinnedLocal,
-            pii_triggered: pii.triggered_classes,
-            latency_ms: t0.elapsed().as_secs_f64() * 1000.0,
-        });
-    }
-
-    // 3. KV-cache boundary awareness: stay local when prefix cache is warm on a continuing session.
-    if input.warm_local_kv {
-        let effort = choose_effort_for_slot(
-            heads,
-            input.block_readouts,
-            input.block_roles,
-            input.local_slot,
-            None,
-        );
-        return Ok(RoutingDecision {
-            target: RouteTarget::Local,
-            p_pass: local_p,
-            local_p_pass: local_p,
-            reasoning_effort: effort,
-            basis: RoutingBasis::WarmKvStayLocal,
+            basis,
             pii_triggered: pii.triggered_classes,
             latency_ms: t0.elapsed().as_secs_f64() * 1000.0,
         });
@@ -529,13 +511,10 @@ pub fn decide(heads: &ArcHeads, input: &DecideInput<'_>) -> Result<RoutingDecisi
         }
     }
 
-    let stay_local = match (input.policy, best_cloud) {
-        (_, None) => true,
-        (RoutingPolicy::Utility { .. }, Some((_, best_u, _))) => local_utility >= best_u,
-        (RoutingPolicy::PreferLocal { .. }, Some(_)) => false,
-    };
-
-    if stay_local {
+    let Some((cand, _, cloud_p)) = best_cloud.filter(|&(_, best_u, _)| match input.policy {
+        RoutingPolicy::Utility { .. } => best_u > local_utility,
+        RoutingPolicy::PreferLocal { .. } => true,
+    }) else {
         let effort = choose_effort_for_slot(
             heads,
             input.block_readouts,
@@ -556,9 +535,8 @@ pub fn decide(heads: &ArcHeads, input: &DecideInput<'_>) -> Result<RoutingDecisi
             pii_triggered: pii.triggered_classes,
             latency_ms: t0.elapsed().as_secs_f64() * 1000.0,
         });
-    }
+    };
 
-    let (cand, _, cloud_p) = best_cloud.unwrap();
     let raw_effort = choose_effort_for_slot(
         heads,
         input.block_readouts,
@@ -567,13 +545,19 @@ pub fn decide(heads: &ArcHeads, input: &DecideInput<'_>) -> Result<RoutingDecisi
         cand.price_override,
     );
     let effort = cand.capabilities.clamp_effort(&raw_effort);
+    let prices = cand
+        .price_override
+        .or_else(|| heads.catalog.model_prices.get(cand.slot).copied().flatten())
+        .unwrap_or([0.0; LEGS]);
     Ok(RoutingDecision {
-        target: RouteTarget::Cloud {
+        target: RouteTarget::Cloud(Box::new(CloudRouteTarget {
             slot: cand.slot,
             name: cand.name.clone(),
             wire: cand.wire.clone(),
             endpoint: cand.endpoint.clone(),
-        },
+            prices,
+            capabilities: cand.capabilities.clone(),
+        })),
         p_pass: cloud_p,
         local_p_pass: local_p,
         reasoning_effort: effort,
@@ -596,5 +580,17 @@ mod tests {
         assert_eq!(map_arc_effort_to_warp34("default", Some("up")), "high");
         assert_eq!(map_arc_effort_to_warp34("high", Some("down")), "low");
         assert_eq!(map_arc_effort_to_warp34("medium", None), "medium");
+    }
+
+    #[test]
+    fn local_only_cloud_filter_detects_empty_and_none_aliases() {
+        assert!(is_local_only_cloud_filter(&[]));
+        assert!(is_local_only_cloud_filter(&["  ".to_string()]));
+        assert!(is_local_only_cloud_filter(&["none".to_string()]));
+        assert!(is_local_only_cloud_filter(&["LOCAL".to_string()]));
+        assert!(!is_local_only_cloud_filter(&["auto".to_string()]));
+        assert!(!is_local_only_cloud_filter(&[
+            "deepseek/deepseek-v4-pro".to_string()
+        ]));
     }
 }

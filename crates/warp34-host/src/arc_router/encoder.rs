@@ -53,15 +53,16 @@ struct EncodeJob {
 
 /// Thread-safe handle to the background ARC-1.0 GPU encoder worker.
 pub struct ArcEncoderWorker {
-    tx: mpsc::SyncSender<EncodeJob>,
+    tx: std::sync::Mutex<Option<mpsc::SyncSender<EncodeJob>>>,
+    handle: std::sync::Mutex<Option<std::thread::JoinHandle<()>>>,
 }
 
 /// Splits literal reserved vision tokens inside block content (`<|vision_start|>` etc.) so
 /// source code mentioning them tokenizes as ordinary text rather than special vision IDs.
 #[cfg(feature = "cuda")]
-fn tokenize_block_safe(
+fn tokenize_serialized_safe(
     engine: &crate::model::Qwen3_5Engine,
-    block: &ArcRoleBlock,
+    serialized: &str,
 ) -> Result<Vec<i32>, String> {
     const VISION_LITERALS: [&str; 5] = [
         "<|vision_start|>",
@@ -70,15 +71,14 @@ fn tokenize_block_safe(
         "<|vision_pad|>",
         "<|video_pad|>",
     ];
-    let serialized = block.serialized();
     if !VISION_LITERALS.iter().any(|pat| serialized.contains(pat)) {
         return engine
-            .encode(&serialized)
+            .encode(serialized)
             .map_err(|e| format!("ARC tokenize failed: {e}"));
     }
     // Cut right after `<|` whenever a vision literal appears so each half tokenizes as text.
     let mut out = Vec::new();
-    let mut rest = serialized.as_str();
+    let mut rest = serialized;
     while !rest.is_empty() {
         let next_hit = VISION_LITERALS
             .iter()
@@ -125,12 +125,12 @@ impl BlockTokenMemo {
     ) -> Result<Vec<i32>, String> {
         let key = block.serialized();
         if key.len() < BLOCK_MEMO_MIN_TEXT_BYTES {
-            return tokenize_block_safe(engine, block);
+            return tokenize_serialized_safe(engine, &key);
         }
         if let Some(cached) = self.entries.get(&key) {
             return Ok(cached.clone());
         }
-        let toks = tokenize_block_safe(engine, block)?;
+        let toks = tokenize_serialized_safe(engine, &key)?;
         let entry_bytes = key.len() + toks.len() * 4;
         if entry_bytes <= BLOCK_MEMO_MAX_BYTES / 4 {
             if self.approx_bytes + entry_bytes > BLOCK_MEMO_MAX_BYTES {
@@ -260,7 +260,7 @@ fn select_head_tail_blocks(
     }
 
     // Reserve up to 1/3 of max_ctx for the head (system + first user prompt).
-    let head_budget = (max_ctx / 3).max(256);
+    let head_budget = (max_ctx / 3).max(256).min(max_ctx);
     let mut head_count = 0usize;
     let mut head_used = 0usize;
     for (role, toks) in &block_tokens {
@@ -460,13 +460,11 @@ fn run_encoder_microbatch(
             let extra_pages = pages_needed.saturating_sub(sess.kv_pages.len());
             if extra_pages > 0 {
                 if !pool.ensure_free_pages(extra_pages) {
+                    pool.sessions.push(sess);
                     if !claimed.is_empty() {
-                        pool.sessions.push(sess);
                         deferred.push(job);
                         continue;
                     }
-                    pool.free_slots.push(sess.state_slot);
-                    pool.free_pages.extend(sess.kv_pages);
                     let _ = job
                         .reply
                         .send(Err("ARC encoder KV pool exhausted".to_string()));
@@ -610,9 +608,9 @@ impl ArcEncoderWorker {
     pub fn spawn(model_dir: &std::path::Path, device_id: i32) -> Result<Self, String> {
         let model_dir = model_dir.to_path_buf();
         let (ready_tx, ready_rx) = mpsc::sync_channel::<Result<(), String>>(1);
-        let (tx, rx) = mpsc::sync_channel::<EncodeJob>(64);
+        let (tx, rx) = mpsc::sync_channel::<EncodeJob>(256);
 
-        std::thread::Builder::new()
+        let handle = std::thread::Builder::new()
             .name("warp34-arc-encoder".to_string())
             .spawn(move || {
                 let mut engine = match crate::model::Qwen3_5Engine::load_for_encoder_on_device(
@@ -657,10 +655,19 @@ impl ArcEncoderWorker {
             })
             .map_err(|e| format!("failed to spawn ARC encoder thread: {e}"))?;
 
-        ready_rx
+        if let Err(e) = ready_rx
             .recv()
-            .map_err(|_| "ARC encoder thread exited before ready".to_string())??;
-        Ok(Self { tx })
+            .map_err(|_| "ARC encoder thread exited before ready".to_string())
+            .and_then(|r| r)
+        {
+            drop(tx);
+            let _ = handle.join();
+            return Err(e);
+        }
+        Ok(Self {
+            tx: std::sync::Mutex::new(Some(tx)),
+            handle: std::sync::Mutex::new(Some(handle)),
+        })
     }
 
     /// CPU-only build stub.
@@ -669,10 +676,30 @@ impl ArcEncoderWorker {
         Err("ARC-1.0 router requires a CUDA build (--features cuda)".to_string())
     }
 
+    /// Signals the encoder thread to exit and awaits CUDA engine teardown cleanly before
+    /// process exit (preventing `atexit` `libcudart`/`libcublasLt` destruction races).
+    pub async fn shutdown(&self) {
+        let _ = self.tx.lock().unwrap_or_else(|e| e.into_inner()).take();
+        let handle = self.handle.lock().unwrap_or_else(|e| e.into_inner()).take();
+        if let Some(h) = handle {
+            let _ = tokio::task::spawn_blocking(move || {
+                let _ = h.join();
+            })
+            .await;
+        }
+    }
+
     /// Runs the ARC-1.0 encoder asynchronously over canonical role blocks.
     pub async fn encode_blocks(&self, blocks: Vec<ArcRoleBlock>) -> Result<EncodeResponse, String> {
+        let sender = self
+            .tx
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .cloned()
+            .ok_or_else(|| "ARC encoder is shut down".to_string())?;
         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
-        self.tx
+        sender
             .try_send(EncodeJob {
                 blocks,
                 reply: reply_tx,
@@ -682,6 +709,17 @@ impl ArcEncoderWorker {
             .await
             .map_err(|_| "ARC encoder timed out".to_string())?
             .map_err(|_| "ARC encoder dropped response".to_string())?
+    }
+}
+
+impl Drop for ArcEncoderWorker {
+    fn drop(&mut self) {
+        let _ = self.tx.lock().unwrap_or_else(|e| e.into_inner()).take();
+        if tokio::runtime::Handle::try_current().is_err()
+            && let Some(h) = self.handle.lock().unwrap_or_else(|e| e.into_inner()).take()
+        {
+            let _ = h.join();
+        }
     }
 }
 
@@ -743,5 +781,14 @@ mod tests {
         // First token preserved (head) AND last token preserved (trailing suffix/PII).
         assert_eq!(toks[0], 0);
         assert_eq!(*toks.last().unwrap(), 39_999);
+
+        // Even when `max_ctx < 256`, `head_budget` clamps to `max_ctx` without overflow.
+        let small_blocks = vec![
+            ("system".to_string(), (0..100).collect()),
+            ("user".to_string(), (100..300).collect()),
+        ];
+        let (small_toks, small_ends, small_roles) = select_head_tail_blocks(small_blocks, 128);
+        assert!(small_toks.len() <= 128);
+        assert_eq!(small_ends.len(), small_roles.len());
     }
 }

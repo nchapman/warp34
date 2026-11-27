@@ -440,3 +440,224 @@ fn arc_encoder_and_heads_match_goldens() {
         "incremental prefix extension diverged from fresh prefill: {max_inc_diff}"
     );
 }
+
+#[cfg(feature = "cuda")]
+#[test]
+fn dp1_warm_kv_and_stateful_responses_routing() {
+    use std::sync::Arc;
+    use std::time::Duration;
+    use warp34_host::{
+        arc_router::{ArcRouter, ArcRouterConfig},
+        cache::KvFormatPolicy,
+        model::Qwen3_5Engine,
+        server::{OpenAiServerState, ServeOptions, serve},
+    };
+
+    let Some(arc_dir) = cached_arc_dir() else {
+        eprintln!("skipping: nchapman/ARC-1.0-W4A16-HGPTQ not cached");
+        return;
+    };
+    let Some(local_dir) = std::env::var("HOME")
+        .ok()
+        .map(|h| {
+            PathBuf::from(h)
+                .join(".cache/huggingface/hub/models--nchapman--Qwen3.5-0.8B-W4A16-HGPTQ/snapshots")
+        })
+        .and_then(|p| std::fs::read_dir(p).ok()?.next()?.ok().map(|e| e.path()))
+    else {
+        eprintln!("skipping: nchapman/Qwen3.5-0.8B-W4A16-HGPTQ not cached");
+        return;
+    };
+
+    let arc_router = Arc::new(
+        ArcRouter::load(ArcRouterConfig {
+            model_dir: arc_dir,
+            device_id: 0,
+            local_model_name: "Qwen3.5-0.8B".to_string(),
+            cloud_model_filter: Vec::new(),
+            policy: RoutingPolicy::PreferLocal {
+                min_p_pass: 0.55,
+                value_usd: 1.0,
+            },
+            pin_pii_classes: HashSet::new(),
+            offline: true,
+        })
+        .expect("load ArcRouter"),
+    );
+
+    let local_dir_str = local_dir.to_string_lossy().into_owned();
+    let state = OpenAiServerState::from_loader_with_options(
+        "Qwen3.5-0.8B".into(),
+        false,
+        ServeOptions {
+            webui: false,
+            max_num_seqs: 2,
+            arc_router: Some(arc_router),
+            ..Default::default()
+        },
+        move || {
+            Qwen3_5Engine::load_for_serving(
+                &local_dir_str,
+                1,
+                KvFormatPolicy::Fp16,
+                Some(256),
+                false,
+                2,
+            )
+            .map_err(|e| e.to_string())
+        },
+    )
+    .expect("boot DP=1 server with ArcRouter");
+
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(async {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let base = format!("http://{}", listener.local_addr().unwrap());
+            let (stop_tx, stop_rx) = tokio::sync::oneshot::channel();
+            let server_state = Arc::clone(&state);
+            let server = tokio::spawn(async move {
+                serve(listener, server_state, async {
+                    let _ = stop_rx.await;
+                })
+                .await
+            });
+            let client = reqwest::Client::builder()
+                .timeout(Duration::from_secs(60))
+                .build()
+                .unwrap();
+
+            // >= 64 tokens so Turn 0 donates at least one complete 64-token radix + GDN block.
+            let long_sys = "You are a systems programming assistant specializing in Rust, CUDA, \
+                memory allocators, lock-free data structures, radix prefix caching, and clean \
+                deterministic verification. Always answer concisely with exact facts. "
+                .repeat(4);
+
+            // 1. Headerless DP=1 `/v1/chat/completions`: Turn 0 cold -> Turn 1 warm_kv_stay_local.
+            let t0_resp = client
+                .post(format!("{base}/v1/chat/completions"))
+                .json(&serde_json::json!({
+                    "model": "router",
+                    "max_tokens": 8,
+                    "temperature": 0.0,
+                    "messages": [
+                        {"role": "system", "content": long_sys},
+                        {"role": "user", "content": "Reply with OK."}
+                    ]
+                }))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(t0_resp.status(), 200);
+            assert_eq!(
+                t0_resp
+                    .headers()
+                    .get("x-warp34-route-basis")
+                    .and_then(|v| v.to_str().ok()),
+                Some("local_only_effort"),
+                "cold Turn 0 on local-only router must report local_only_effort"
+            );
+            let t0_json: serde_json::Value = t0_resp.json().await.unwrap();
+            let asst_reply = t0_json["choices"][0]["message"]["content"]
+                .as_str()
+                .unwrap_or("OK");
+
+            let t1_resp = client
+                .post(format!("{base}/v1/chat/completions"))
+                .json(&serde_json::json!({
+                    "model": "router",
+                    "max_tokens": 8,
+                    "temperature": 0.0,
+                    "messages": [
+                        {"role": "system", "content": long_sys},
+                        {"role": "user", "content": "Reply with OK."},
+                        {"role": "assistant", "content": asst_reply},
+                        {"role": "user", "content": "Now reply with DONE."}
+                    ]
+                }))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(t1_resp.status(), 200);
+            assert_eq!(
+                t1_resp
+                    .headers()
+                    .get("x-warp34-route-basis")
+                    .and_then(|v| v.to_str().ok()),
+                Some("warm_kv_stay_local"),
+                "Turn 1 headerless continuation on DP=1 must detect live radix+GDN KV"
+            );
+
+            // 2. Stateful `/v1/responses` (`"store": true` + Bearer scope): cold Turn 0 must NOT
+            //    claim warm_kv_stay_local; follow-up via `previous_response_id` MUST detect warm_kv_stay_local.
+            let r0_resp = client
+                .post(format!("{base}/v1/responses"))
+                .bearer_auth("test-session-scope")
+                .json(&serde_json::json!({
+                    "model": "router",
+                    "store": true,
+                    "max_output_tokens": 8,
+                    "temperature": 0.0,
+                    "instructions": long_sys,
+                    "input": "Reply with ALPHA."
+                }))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(r0_resp.status(), 200);
+            assert_eq!(
+                r0_resp
+                    .headers()
+                    .get("x-warp34-route-basis")
+                    .and_then(|v| v.to_str().ok()),
+                Some("local_only_effort"),
+                "cold stateful /v1/responses Turn 0 must report local_only_effort, not warm_kv_stay_local"
+            );
+            let r0_json: serde_json::Value = r0_resp.json().await.unwrap();
+            let prev_id = r0_json["id"].as_str().expect("response id");
+
+            let r1_resp = client
+                .post(format!("{base}/v1/responses"))
+                .bearer_auth("test-session-scope")
+                .json(&serde_json::json!({
+                    "model": "router",
+                    "previous_response_id": prev_id,
+                    "max_output_tokens": 8,
+                    "temperature": 0.0,
+                    "input": "Reply with BETA."
+                }))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(r1_resp.status(), 200);
+            assert_eq!(
+                r1_resp
+                    .headers()
+                    .get("x-warp34-route-basis")
+                    .and_then(|v| v.to_str().ok()),
+                Some("warm_kv_stay_local"),
+                "previous_response_id continuation must detect live radix+GDN KV"
+            );
+
+            let metrics: serde_json::Value = client
+                .get(format!("{base}/api/metrics"))
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            assert_eq!(metrics["arc_router"]["total_requests"], 4);
+            assert_eq!(
+                metrics["arc_router"]["warm_kv_stayed_local"], 2,
+                "only the 2 genuine warm-KV continuations should increment warm_kv_stayed_local"
+            );
+
+            stop_tx.send(()).unwrap();
+            server.await.unwrap().unwrap();
+            state.shutdown_all().await.unwrap();
+        });
+}

@@ -130,10 +130,20 @@ impl OpenAiServerState {
             max_num_seqs: options.max_num_seqs,
             ..SchedulerConfig::default()
         };
+        let track_dp1_prefixes = options.arc_router.is_some();
         let mut workers = if dp_size == 1 {
             let loader = loaders.into_iter().next().unwrap();
             let dir = Arc::clone(&dp_router.prefix_dir);
-            let mut w = EngineWorker::from_loader(move || loader(0, dir), config)?;
+            let mut w = EngineWorker::from_loader(
+                move || {
+                    let mut engine = loader(0, Arc::clone(&dir))?;
+                    if track_dp1_prefixes {
+                        engine.radix.set_dp_prefix_observer(0, dir);
+                    }
+                    Ok(engine)
+                },
+                config,
+            )?;
             w.set_max_model_len(options.max_model_len)?;
             vec![w]
         } else {
@@ -348,6 +358,24 @@ impl OpenAiServerState {
         ),
         WorkerError,
     > {
+        self.select_worker_with_affinity(lora_id, prompt_tokens, images, session_key, None)
+    }
+
+    fn select_worker_with_affinity(
+        &self,
+        lora_id: i32,
+        prompt_tokens: &[i32],
+        images: &[crate::vision::PreprocessedImage],
+        pin_session_key: Option<&str>,
+        record_after_select_key: Option<&str>,
+    ) -> Result<
+        (
+            usize,
+            &EngineWorker,
+            Option<crate::dp_router::InflightGuard>,
+        ),
+        WorkerError,
+    > {
         let mm_key = if !images.is_empty()
             && let Some(vcfg) = self.worker.vision_config.as_ref()
         {
@@ -361,19 +389,14 @@ impl OpenAiServerState {
             None
         };
         let routing_tokens = mm_key.as_deref().unwrap_or(prompt_tokens);
-        let last_prefix_hash = if session_key.is_some()
-            && (!self.extra_workers.is_empty() || self.arc_router.is_some())
-        {
-            crate::dp_router::compute_chained_prefix_hashes(lora_id, routing_tokens)
-                .last()
-                .copied()
-        } else {
-            None
-        };
         if self.extra_workers.is_empty() {
-            if let Some(k) = session_key {
+            if self.arc_router.is_some()
+                && let Some(k) = pin_session_key.or(record_after_select_key)
+            {
+                let prefix_hash =
+                    crate::dp_router::compute_last_prefix_hash(lora_id, routing_tokens);
                 self.dp_router
-                    .bind_session_with_prefix(k.to_string(), 0, last_prefix_hash);
+                    .bind_session_with_prefix(k.to_string(), 0, prefix_hash);
             }
             return Ok((0, &self.worker, None));
         }
@@ -405,28 +428,54 @@ impl OpenAiServerState {
             .collect();
         let Some((rank, guard)) =
             self.dp_router
-                .select_and_acquire(samples, lora_id, routing_tokens, session_key)
+                .select_and_acquire(samples, lora_id, routing_tokens, pin_session_key)
         else {
             return Err(WorkerError::worker_stopped(
                 "all data-parallel workers are unavailable",
             ));
         };
-        if let Some(k) = session_key
-            && last_prefix_hash.is_some()
+        if pin_session_key.is_none()
+            && let Some(k) = record_after_select_key
         {
+            let prefix_hash = crate::dp_router::compute_last_prefix_hash(lora_id, routing_tokens);
             self.dp_router
-                .bind_session_with_prefix(k.to_string(), rank, last_prefix_hash);
+                .bind_session_with_prefix(k.to_string(), rank, prefix_hash);
         }
         Ok((rank, self.worker_at(rank), Some(guard)))
     }
 
-    pub(super) fn bind_session_to_worker(&self, session_key: String, dp_rank: usize) {
+    pub(super) fn bind_session_to_worker_with_prompt(
+        &self,
+        session_key: String,
+        dp_rank: usize,
+        lora_id: i32,
+        prompt_tokens: &[i32],
+        images: &[crate::vision::PreprocessedImage],
+    ) {
         if !self.extra_workers.is_empty() || self.arc_router.is_some() {
-            self.dp_router.bind_session(session_key, dp_rank);
+            let mm_key = if !images.is_empty()
+                && let Some(vcfg) = self.worker.vision_config.as_ref()
+            {
+                Some(crate::vision::compute_multimodal_radix_key(
+                    prompt_tokens,
+                    images,
+                    vcfg.image_token_id,
+                    vcfg.spatial_merge_size,
+                ))
+            } else {
+                None
+            };
+            let routing_tokens = mm_key.as_deref().unwrap_or(prompt_tokens);
+            let prefix_hash = crate::dp_router::compute_last_prefix_hash(lora_id, routing_tokens);
+            self.dp_router
+                .bind_session_with_prefix(session_key, dp_rank, prefix_hash);
         }
     }
 
     pub async fn shutdown_all(&self) -> Result<(), String> {
+        if let Some(router) = &self.arc_router {
+            router.shutdown().await;
+        }
         let mut first_err: Option<String> = None;
         for w in self.all_workers() {
             if let Err(e) = w.shutdown().await
@@ -1338,28 +1387,47 @@ fn attach_arc_headers(
     resp
 }
 
+#[derive(Default)]
+struct RequestSessionAffinity {
+    /// Session key passed as `pinned_worker` affinity into `select_worker` (`None` on Turn-0
+    /// derived `pfx:` keys so independent Turn-0 requests load-balance across DP replicas).
+    pin_session_key: Option<String>,
+    /// Derived Turn-0 `pfx:` key bound AFTER worker selection so Turn 1+ continuations can check
+    /// `has_warm_local_kv` and route back to the worker holding Turn 0's KV+GDN checkpoint.
+    record_after_select_key: Option<String>,
+}
+
 impl OpenAiServerState {
     async fn maybe_arc_route(
         &self,
         protocol: crate::arc_router::input::ApiProtocol,
         bypass_header: bool,
-        warm_session_key: Option<&str>,
+        explicit_session_key: Option<String>,
         anthropic_beta: Option<&str>,
         force_local: bool,
         body: &mut Value,
-    ) -> Result<Option<ArcRouteOutcome>, ApiError> {
+    ) -> Result<(Option<ArcRouteOutcome>, RequestSessionAffinity), ApiError> {
+        let passthrough = |pin_session_key| {
+            Ok((
+                None,
+                RequestSessionAffinity {
+                    pin_session_key,
+                    record_after_select_key: None,
+                },
+            ))
+        };
         let Some(router) = &self.arc_router else {
-            return Ok(None);
+            return passthrough(explicit_session_key);
         };
         if bypass_header {
-            return Ok(None);
+            return passthrough(explicit_session_key);
         }
         // Skip routing when caller explicitly targets a local LoRA adapter (either via `model`
         // or via an explicit `adapter` / `lora` field).
         if let Some(req_model) = body.get("model").and_then(Value::as_str)
             && self.worker.lora_registry.resolve_name(req_model).is_some()
         {
-            return Ok(None);
+            return passthrough(explicit_session_key);
         }
         if body
             .get("adapter")
@@ -1367,14 +1435,69 @@ impl OpenAiServerState {
             .and_then(Value::as_str)
             .is_some_and(|s| !s.trim().is_empty())
         {
-            return Ok(None);
+            return passthrough(explicit_session_key);
         }
-        // KV-cache boundary awareness: stay local only when the bound worker actually has a live
-        // KV+GDN checkpoint for this session's last local prefix, or when `force_local` is set.
-        let warm_local_kv =
-            force_local || warm_session_key.is_some_and(|k| self.dp_router.has_warm_local_kv(k));
 
-        let decision = match router.route(protocol, body, warm_local_kv).await {
+        // Serialize `body` once on the blocking pool (moving `body` in and back out with zero
+        // `serde_json::Value::clone()`) and derive any fallback `pfx:` session key from the
+        // already-serialized blocks.
+        let t0 = std::time::Instant::now();
+        let taken_body = std::mem::take(body);
+        let need_derived_session = explicit_session_key.is_none();
+        let (restored_body, canonical, derived) = tokio::task::spawn_blocking(move || {
+            let canonical = crate::arc_router::input::serialize_request(protocol, &taken_body);
+            let derived = need_derived_session
+                .then(|| {
+                    crate::arc_router::input::derive_prefix_session_key_from_serialized(&canonical)
+                })
+                .flatten();
+            (taken_body, canonical, derived)
+        })
+        .await
+        .map_err(|e| {
+            error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("ARC serialize join error: {e}"),
+            )
+        })?;
+        *body = restored_body;
+
+        let (warm_local_kv, affinity) = if let Some(k) = explicit_session_key {
+            let warm = self.dp_router.has_warm_local_kv(&k);
+            (
+                warm,
+                RequestSessionAffinity {
+                    pin_session_key: Some(k),
+                    record_after_select_key: None,
+                },
+            )
+        } else if let Some((pfx_key, has_asst)) = derived {
+            if has_asst {
+                let warm = self.dp_router.has_warm_local_kv(&pfx_key);
+                (
+                    warm,
+                    RequestSessionAffinity {
+                        pin_session_key: Some(pfx_key),
+                        record_after_select_key: None,
+                    },
+                )
+            } else {
+                (
+                    false,
+                    RequestSessionAffinity {
+                        pin_session_key: None,
+                        record_after_select_key: Some(pfx_key),
+                    },
+                )
+            }
+        } else {
+            (false, RequestSessionAffinity::default())
+        };
+
+        let decision = match router
+            .route_serialized(protocol, canonical, warm_local_kv, !force_local, t0)
+            .await
+        {
             Ok(d) => d,
             Err(e) => {
                 // Fail open to local inference on transient router errors so serving never breaks.
@@ -1389,31 +1512,24 @@ impl OpenAiServerState {
                 {
                     obj.insert("model".to_string(), Value::String(self.model_name.clone()));
                 }
-                return Ok(None);
+                return Ok((None, affinity));
             }
         };
 
-        if let crate::arc_router::policy::RouteTarget::Cloud {
-            slot,
-            name,
-            wire,
-            endpoint: ep,
-        } = &decision.target
+        if let crate::arc_router::policy::RouteTarget::Cloud(cloud) = &decision.target
             && let Some(proxy) = router.proxy()
-            && crate::arc_router::proxy::UpstreamProxy::supports_protocol(ep, protocol)
+            && crate::arc_router::proxy::UpstreamProxy::supports_protocol(&cloud.endpoint, protocol)
         {
             let taken_body = std::mem::take(body);
-            let prices = router.prices_for_cloud_model(name, *slot);
-            let caps = router.capabilities_for_cloud_model(name);
             let (resp, is_err) = proxy
                 .forward(
-                    ep,
+                    &cloud.endpoint,
                     protocol,
                     taken_body,
-                    wire,
-                    name,
-                    prices,
-                    caps,
+                    &cloud.wire,
+                    &cloud.name,
+                    cloud.prices,
+                    Some(&cloud.capabilities),
                     router.metrics_arc(),
                     &decision,
                     anthropic_beta,
@@ -1422,7 +1538,7 @@ impl OpenAiServerState {
             if is_err {
                 router.metrics().record_cloud_error();
             }
-            return Ok(Some(ArcRouteOutcome::Proxied(resp)));
+            return Ok((Some(ArcRouteOutcome::Proxied(resp)), affinity));
         }
 
         // Local target: rewrite virtual `"router"` / `"auto"` model aliases to the served local
@@ -1502,7 +1618,7 @@ impl OpenAiServerState {
                 }
             }
         }
-        Ok(Some(ArcRouteOutcome::Local(decision)))
+        Ok((Some(ArcRouteOutcome::Local(decision)), affinity))
     }
 }
 
@@ -1523,39 +1639,30 @@ async fn generate(
         .filter(|s| !s.is_empty())
         .map(|s| format!("sess:{s}"));
     let (mut json, body_len) = read_json_with_len(&s, request).await?;
-    let (session_key, allow_session_warm_kv) = if let Some(k) = header_session {
-        (Some(k), true)
-    } else if chat && (s.arc_router.is_some() || !s.extra_workers.is_empty()) {
-        match crate::arc_router::input::derive_prefix_session_key(
-            crate::arc_router::input::ApiProtocol::OpenAiChat,
-            &json,
-        ) {
-            Some((k, has_asst)) => (Some(k), has_asst),
-            None => (None, false),
-        }
-    } else {
-        (None, false)
-    };
-    let arc_decision = if chat {
-        match s
+    let (arc_decision, affinity) = if chat {
+        let (outcome, aff) = s
             .maybe_arc_route(
                 crate::arc_router::input::ApiProtocol::OpenAiChat,
                 bypass_router,
-                allow_session_warm_kv
-                    .then_some(session_key.as_deref())
-                    .flatten(),
+                header_session,
                 None,
                 false,
                 &mut json,
             )
-            .await?
-        {
+            .await?;
+        match outcome {
             Some(ArcRouteOutcome::Proxied(resp)) => return Ok(resp),
-            Some(ArcRouteOutcome::Local(d)) => Some(d),
-            None => None,
+            Some(ArcRouteOutcome::Local(d)) => (Some(d), aff),
+            None => (None, aff),
         }
     } else {
-        None
+        (
+            None,
+            RequestSessionAffinity {
+                pin_session_key: header_session,
+                record_after_select_key: None,
+            },
+        )
     };
     // Acquire local GPU admission only after cloud spillover is ruled out so slow cloud TTFB
     // cannot starve local GPU requests.
@@ -1598,11 +1705,12 @@ async fn generate(
     );
     let prompt_len = prepared.prompt.len();
     let (_dp_rank, target_worker, inflight_guard) = s
-        .select_worker(
+        .select_worker_with_affinity(
             prepared.lora_id,
             &prepared.prompt,
             &prepared.images,
-            session_key.as_deref(),
+            affinity.pin_session_key.as_deref(),
+            affinity.record_after_select_key.as_deref(),
         )
         .inspect_err(|_| log.finish("error", false))
         .map_err(worker_api_err)?;
@@ -2269,47 +2377,40 @@ async fn responses_create(
         .and_then(Value::as_str)
         .filter(|s| !s.is_empty())
         .map(ToString::to_string);
-    let has_local_prev_resp = prev_resp_id.as_deref().is_some_and(|id| {
-        s.response_store
-            .get_response(id, caller_scope.as_deref().unwrap_or(""))
-            .is_some()
-    });
-    let (session_key, allow_session_warm_kv) = if let Some(k) = prev_resp_id
+    let has_local_prev_resp = prev_resp_id
+        .as_deref()
+        .zip(caller_scope.as_deref())
+        .is_some_and(|(id, scope)| s.response_store.get_response(id, scope).is_some());
+    let explicit_session = prev_resp_id
+        .as_ref()
+        .filter(|_| has_local_prev_resp)
         .map(|id| format!("resp:{id}"))
-        .or(header_session)
-    {
-        (Some(k), true)
-    } else if s.arc_router.is_some() || !s.extra_workers.is_empty() {
-        match crate::arc_router::input::derive_prefix_session_key(
-            crate::arc_router::input::ApiProtocol::OpenAiResponses,
-            &body,
-        ) {
-            Some((k, has_asst)) => (Some(k), has_asst),
-            None => (None, false),
-        }
+        .or(header_session);
+    // Keep stateful Responses (`"store": true` opt-in, matching `responses_api.rs`) and
+    // `previous_response_id` continuations local so GET/DELETE/cancel and continuation lookups
+    // stay consistent with `warp34`'s local `ResponseStore`. Stateless Responses (omitted `store`
+    // or `"store": false`) may spill to cloud.
+    let store_enabled = body.get("store").and_then(Value::as_bool).unwrap_or(false);
+    let invalid_local_state = (prev_resp_id.is_some() && !has_local_prev_resp)
+        || (store_enabled && caller_scope.is_none());
+    let (arc_decision, affinity) = if invalid_local_state {
+        (None, RequestSessionAffinity::default())
     } else {
-        (None, false)
-    };
-    // Keep stateful Responses (`store != false`, the default) and `previous_response_id`
-    // continuations local so GET/DELETE/cancel and continuation lookups stay consistent with
-    // `warp34`'s local `ResponseStore`. Stateless Responses (`store: false`) may spill to cloud.
-    let store_enabled = body.get("store").and_then(Value::as_bool).unwrap_or(true);
-    let arc_decision = match s
-        .maybe_arc_route(
-            crate::arc_router::input::ApiProtocol::OpenAiResponses,
-            bypass_router,
-            allow_session_warm_kv
-                .then_some(session_key.as_deref())
-                .flatten(),
-            None,
-            has_local_prev_resp || store_enabled,
-            &mut body,
-        )
-        .await?
-    {
-        Some(ArcRouteOutcome::Proxied(resp)) => return Ok(resp),
-        Some(ArcRouteOutcome::Local(d)) => Some(d),
-        None => None,
+        let (outcome, aff) = s
+            .maybe_arc_route(
+                crate::arc_router::input::ApiProtocol::OpenAiResponses,
+                bypass_router,
+                explicit_session,
+                None,
+                prev_resp_id.is_some() || store_enabled,
+                &mut body,
+            )
+            .await?;
+        match outcome {
+            Some(ArcRouteOutcome::Proxied(resp)) => return Ok(resp),
+            Some(ArcRouteOutcome::Local(d)) => (Some(d), aff),
+            None => (None, aff),
+        }
     };
     let admission = s
         .admission
@@ -2343,11 +2444,12 @@ async fn responses_create(
     );
     let prompt_len = prepared.prompt.len();
     let (dp_rank, target_worker, inflight_guard) = s
-        .select_worker(
+        .select_worker_with_affinity(
             prepared.lora_id,
             &prepared.prompt,
             &prepared.images,
-            session_key.as_deref(),
+            affinity.pin_session_key.as_deref(),
+            affinity.record_after_select_key.as_deref(),
         )
         .inspect_err(|_| log.finish("error", false))
         .map_err(worker_api_err)?;
@@ -2359,7 +2461,13 @@ async fn responses_create(
     )
     .inspect_err(|_| log.finish("error", false))
     .map_err(prepare_responses_err)?;
-    s.bind_session_to_worker(format!("resp:{}", meta.response_id), dp_rank);
+    s.bind_session_to_worker_with_prompt(
+        format!("resp:{}", meta.response_id),
+        dp_rank,
+        prepared.lora_id,
+        &prepared.prompt,
+        &prepared.images,
+    );
     let mut generation = target_worker
         .submit_with_images_lora_and_budget_mode(
             prepared.prompt,
@@ -2668,33 +2776,18 @@ async fn anthropic_messages(
         .filter(|s| !s.is_empty())
         .map(|s| format!("sess:{s}"));
     let mut body = read_json(&s, request).await.map_err(to_anthropic_err)?;
-    let (session_key, allow_session_warm_kv) = if let Some(k) = header_session {
-        (Some(k), true)
-    } else if s.arc_router.is_some() || !s.extra_workers.is_empty() {
-        match crate::arc_router::input::derive_prefix_session_key(
-            crate::arc_router::input::ApiProtocol::AnthropicMessages,
-            &body,
-        ) {
-            Some((k, has_asst)) => (Some(k), has_asst),
-            None => (None, false),
-        }
-    } else {
-        (None, false)
-    };
-    let arc_decision = match s
+    let (outcome, affinity) = s
         .maybe_arc_route(
             crate::arc_router::input::ApiProtocol::AnthropicMessages,
             bypass_router,
-            allow_session_warm_kv
-                .then_some(session_key.as_deref())
-                .flatten(),
+            header_session,
             anthropic_beta.as_deref(),
             false,
             &mut body,
         )
         .await
-        .map_err(to_anthropic_err)?
-    {
+        .map_err(to_anthropic_err)?;
+    let arc_decision = match outcome {
         Some(ArcRouteOutcome::Proxied(resp)) => return Ok(resp),
         Some(ArcRouteOutcome::Local(d)) => Some(d),
         None => None,
@@ -2723,11 +2816,12 @@ async fn anthropic_messages(
     );
     let prompt_len = prepared.prompt.len();
     let (_dp_rank, target_worker, inflight_guard) = s
-        .select_worker(
+        .select_worker_with_affinity(
             prepared.lora_id,
             &prepared.prompt,
             &prepared.images,
-            session_key.as_deref(),
+            affinity.pin_session_key.as_deref(),
+            affinity.record_after_select_key.as_deref(),
         )
         .inspect_err(|_| log.finish("error", false))
         .map_err(worker_anthropic_err)?;

@@ -1363,6 +1363,7 @@ pub(crate) fn run_serve(
         use_cuda_graph,
         lora_modules,
         speculative_choice,
+        offline,
         ..
     } = options;
     let checkpoint_label = raw_model.clone();
@@ -1723,7 +1724,10 @@ pub(crate) fn run_serve(
     if let Some(ref spec) = router_spec {
         let router_dir = crate::hub::resolve_model(
             spec,
-            &crate::hub::HubOptions::default(),
+            &crate::hub::HubOptions {
+                revision: None,
+                offline,
+            },
             crate::hub::ModelRole::Target,
         )
         .map_err(|e| format!("resolve ARC router model `{spec}`: {e}"))?;
@@ -1762,6 +1766,7 @@ pub(crate) fn run_serve(
             cloud_model_filter: serve.router_cloud_models.clone(),
             policy,
             pin_pii_classes,
+            offline,
         })?;
         let pii_label = if pii_count == 0 {
             "off".to_string()

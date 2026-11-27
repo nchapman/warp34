@@ -656,14 +656,12 @@ pub fn serialize_request(protocol: ApiProtocol, raw: &Value) -> SerializedArcInp
     }
 }
 
-/// Derives a collision-resistant 128-bit fallback session key (`pfx:<32-hex>`) from the
-/// conversation's opening prefix (leading `system` + first `user` block) for clients that do not
-/// send an explicit `X-Session-ID` header.
-///
-/// Also returns `has_assistant_turn` so callers only treat the derived key as a warm local KV
-/// continuation on multi-turn follow-ups (never on turn 0 of an independent identical prompt).
-pub fn derive_prefix_session_key(protocol: ApiProtocol, raw: &Value) -> Option<(String, bool)> {
-    let serialized = serialize_request(protocol, raw);
+/// Derives a collision-resistant 128-bit fallback session key (`pfx:<32-hex>`) from an already
+/// serialized [`SerializedArcInput`] (leading `system` + first `user` block) so callers never run
+/// [`serialize_request`] twice on the same request.
+pub fn derive_prefix_session_key_from_serialized(
+    serialized: &SerializedArcInput,
+) -> Option<(String, bool)> {
     let mut hasher = Sha256::new();
     let mut hashed_any = false;
     for block in &serialized.blocks {
@@ -694,6 +692,17 @@ pub fn derive_prefix_session_key(protocol: ApiProtocol, raw: &Value) -> Option<(
     }
     let has_assistant_turn = serialized.blocks.iter().any(|b| b.role == "assistant");
     Some((key, has_assistant_turn))
+}
+
+/// Derives a collision-resistant 128-bit fallback session key (`pfx:<32-hex>`) from the
+/// conversation's opening prefix (leading `system` + first `user` block) for clients that do not
+/// send an explicit `X-Session-ID` header.
+///
+/// Also returns `has_assistant_turn` so callers only treat the derived key as a warm local KV
+/// continuation on multi-turn follow-ups (never on turn 0 of an independent identical prompt).
+pub fn derive_prefix_session_key(protocol: ApiProtocol, raw: &Value) -> Option<(String, bool)> {
+    let serialized = serialize_request(protocol, raw);
+    derive_prefix_session_key_from_serialized(&serialized)
 }
 
 #[cfg(test)]

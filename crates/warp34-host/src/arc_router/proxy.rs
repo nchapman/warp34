@@ -250,20 +250,44 @@ fn prepare_upstream_body(
     {
         let effort =
             capabilities.map_or_else(|| raw_effort.to_string(), |c| c.clamp_effort(raw_effort));
+        let toggle_off = effort == "none"
+            && capabilities
+                .is_some_and(|c| c.supports_toggle && !c.effort_values.iter().any(|v| v == "none"));
         match (dialect, protocol) {
-            (WireDialect::OpenRouter, ApiProtocol::OpenAiChat)
-            | (WireDialect::OpenRouter | WireDialect::OpenAiNative, ApiProtocol::OpenAiResponses) =>
-            {
-                obj.insert(
-                    "reasoning".to_string(),
-                    serde_json::json!({ "effort": effort }),
-                );
+            (WireDialect::OpenRouter, ApiProtocol::OpenAiChat | ApiProtocol::OpenAiResponses) => {
+                if toggle_off {
+                    obj.insert(
+                        "reasoning".to_string(),
+                        serde_json::json!({ "enabled": false }),
+                    );
+                } else {
+                    obj.insert(
+                        "reasoning".to_string(),
+                        serde_json::json!({ "effort": effort }),
+                    );
+                }
             }
-            (
-                WireDialect::OpenAiNative | WireDialect::OpenAiChatCompat,
-                ApiProtocol::OpenAiChat,
-            ) => {
-                obj.insert("reasoning_effort".to_string(), Value::String(effort));
+            (WireDialect::OpenAiNative, ApiProtocol::OpenAiResponses) => {
+                if !toggle_off {
+                    obj.insert(
+                        "reasoning".to_string(),
+                        serde_json::json!({ "effort": effort }),
+                    );
+                }
+            }
+            (WireDialect::OpenAiNative, ApiProtocol::OpenAiChat) => {
+                if !toggle_off {
+                    obj.insert("reasoning_effort".to_string(), Value::String(effort));
+                }
+            }
+            (WireDialect::OpenAiChatCompat, ApiProtocol::OpenAiChat) => {
+                // Only inject `reasoning_effort` on OpenAiChatCompat providers when the target
+                // model explicitly declares `effort` values in `models.dev` (avoiding 400s on
+                // toggle-only models or custom OpenAI-compatible gateways).
+                let declares_effort = capabilities.is_some_and(|c| !c.effort_values.is_empty());
+                if declares_effort && !toggle_off {
+                    obj.insert("reasoning_effort".to_string(), Value::String(effort));
+                }
             }
             (WireDialect::AnthropicNative, _) => {
                 // Anthropic Messages uses `thinking: {type, budget_tokens}` rather than
@@ -296,7 +320,7 @@ impl UpstreamProxy {
     pub fn new() -> Result<Self, String> {
         let client = reqwest::Client::builder()
             .connect_timeout(std::time::Duration::from_secs(15))
-            .read_timeout(std::time::Duration::from_secs(120))
+            .read_timeout(std::time::Duration::from_secs(300))
             .build()
             .map_err(|e| format!("build upstream HTTP client: {e}"))?;
         Ok(Self { client })
@@ -590,5 +614,58 @@ mod tests {
         assert!(anthropic_stream.get("thinking_budget").is_none());
         assert!(anthropic_stream.get("stream_options").is_none());
         assert!(anthropic_stream.get("reasoning_effort").is_none());
+
+        // Toggle-capable models without `"none"` in `effort_values` emit `enabled: false` on
+        // OpenRouter and omit `reasoning_effort` on OpenAiChatCompat instead of forcing `"low"`.
+        let toggle_caps = ModelCapabilities {
+            tool_call: true,
+            supports_image: false,
+            context_limit: Some(128_000),
+            effort_values: vec!["low".into(), "high".into(), "max".into()],
+            supports_toggle: true,
+            supports_reasoning: true,
+        };
+        let mut or_toggle_off = serde_json::json!({
+            "model": "router",
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+        prepare_upstream_body(
+            &mut or_toggle_off,
+            "deepseek/deepseek-v4-pro",
+            WireDialect::OpenRouter,
+            ApiProtocol::OpenAiChat,
+            Some("none"),
+            Some(&toggle_caps),
+        );
+        assert_eq!(or_toggle_off["reasoning"]["enabled"], false);
+        assert!(or_toggle_off["reasoning"].get("effort").is_none());
+
+        let mut compat_toggle_off = serde_json::json!({
+            "model": "router",
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+        prepare_upstream_body(
+            &mut compat_toggle_off,
+            "deepseek-v4-pro",
+            WireDialect::OpenAiChatCompat,
+            ApiProtocol::OpenAiChat,
+            Some("none"),
+            Some(&toggle_caps),
+        );
+        assert!(compat_toggle_off.get("reasoning_effort").is_none());
+
+        let mut compat_high = serde_json::json!({
+            "model": "router",
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+        prepare_upstream_body(
+            &mut compat_high,
+            "deepseek-v4-pro",
+            WireDialect::OpenAiChatCompat,
+            ApiProtocol::OpenAiChat,
+            Some("high"),
+            Some(&toggle_caps),
+        );
+        assert_eq!(compat_high["reasoning_effort"], "high");
     }
 }

@@ -636,7 +636,7 @@ impl StageOneHead {
             .zip(&self.scale)
             .map(|((x, mean), scale)| (f64::from(*x) - mean) * scale)
             .collect();
-        let net = self.orderer_net(&z);
+        let net = self.orderer_net(&z, &active);
 
         let mut p = vec![f64::NAN; m_count * c_count];
         let mut usage = vec![f64::NAN; m_count * c_count * LEGS];
@@ -701,6 +701,12 @@ impl StageOneHead {
 
         Ok((0..c_count)
             .map(|c| {
+                if !active[c] {
+                    return StageOnePrediction {
+                        p_pass: f64::NAN,
+                        usage: [f64::NAN; LEGS],
+                    };
+                }
                 let (mut total, mut count) = (0.0, 0usize);
                 let mut legs = [0.0; LEGS];
                 let mut leg_counts = [0usize; LEGS];
@@ -741,7 +747,7 @@ impl StageOneHead {
             .collect())
     }
 
-    fn orderer_net(&self, z: &[f64]) -> Vec<f64> {
+    fn orderer_net(&self, z: &[f64], active: &[bool]) -> Vec<f64> {
         let o = &self.orderer;
         let (c_count, d) = (self.candidates, self.dim);
         let centered: Vec<f64> = z.iter().zip(&o.mean).map(|(z, mean)| z - mean).collect();
@@ -761,9 +767,9 @@ impl StageOneHead {
                 }
             }
             let w2 = &o.w2[leg * o.hidden..(leg + 1) * o.hidden];
-            for c in 0..c_count {
+            for (c, &is_active) in active.iter().enumerate() {
                 let lc = leg * c_count + c;
-                if !o.seen[lc] {
+                if !is_active || !o.seen[lc] {
                     continue;
                 }
                 let e1 = &o.e1[lc * o.hidden..(lc + 1) * o.hidden];
@@ -881,13 +887,18 @@ impl StageTwoHead {
             };
             let index = read_i64(archive, &p(&format!("arms.{part}_index")), &[*rows])?;
             let table = read_f32(archive, &w_name, &[*count, *width])?;
-            parts.push((index, table, *width));
+            parts.push((part, index, table, *count, *width));
             arm_dim += *width;
         }
         let mut arm_vectors = Vec::with_capacity(arms * arm_dim);
         for arm in 1..*rows {
-            for (index, table, width) in &parts {
-                let r = index[arm] as usize;
+            for (part, index, table, count, width) in &parts {
+                let raw_idx = index[arm];
+                let r = usize::try_from(raw_idx).ok().filter(|&r| r < *count).ok_or_else(|| {
+                    format!(
+                        "stage_two arms.{part}_index[{arm}]={raw_idx} out of range (count={count})"
+                    )
+                })?;
                 arm_vectors.extend_from_slice(&table[r * width..(r + 1) * width]);
             }
         }
