@@ -376,7 +376,16 @@ impl ModelsDevRegistry {
             let tier = lhs.trim().to_ascii_lowercase();
             if matches!(
                 tier.as_str(),
-                "fast" | "cheap" | "small" | "medium" | "mid" | "strong" | "big" | "frontier"
+                "sonnet"
+                    | "opus"
+                    | "fast"
+                    | "cheap"
+                    | "small"
+                    | "medium"
+                    | "mid"
+                    | "strong"
+                    | "big"
+                    | "frontier"
             ) {
                 (Some(tier), rhs.trim())
             } else {
@@ -541,14 +550,14 @@ impl ModelsDevRegistry {
             specs.push("anthropic/claude-opus-5.5".to_string());
         }
         if has_key("google") {
-            specs.push("medium=google/gemini-4-hydrogen".to_string());
-            specs.push("frontier=google/gemini-4-argon".to_string());
+            specs.push("sonnet=google/gemini-4-hydrogen".to_string());
+            specs.push("opus=google/gemini-4-argon".to_string());
         }
         if has_key("openai") {
-            specs.push("openai/gpt-5.6-terra".to_string());
+            specs.push("sonnet=openai/gpt-5.6-terra".to_string());
         }
         if has_key("deepseek") {
-            specs.push("fast=deepseek/deepseek-v4-pro".to_string());
+            specs.push("sonnet=deepseek/deepseek-v4-pro".to_string());
         }
         specs
     }
@@ -601,20 +610,11 @@ impl ModelsDevRegistry {
     }
 }
 
-/// Infers an ARC-1.0 proxy tier (`fast`, `medium`, `strong`, `frontier`) from live `models.dev`
-/// USD/Mtok pricing when a cloud model is not a native ARC-1.0 catalog slot and no explicit
-/// `tier=` prefix was supplied.
+/// Infers the generalized remote ARC-1.0 archetype (`"sonnet"` or `"opus"`) from live
+/// `models.dev` USD/Mtok output pricing when no explicit `sonnet=` / `opus=` prefix or name cue
+/// was supplied.
 pub fn infer_tier_from_prices(prices: [f64; 4]) -> &'static str {
-    let out = prices[3];
-    if out <= 2.5 {
-        "fast"
-    } else if out <= 10.5 {
-        "medium"
-    } else if out <= 16.0 {
-        "strong"
-    } else {
-        "frontier"
-    }
+    if prices[3] > 15.0 { "opus" } else { "sonnet" }
 }
 
 fn provider_defaults(provider_id: &str, npm: Option<&str>) -> (Option<&'static str>, WireDialect) {
@@ -869,7 +869,8 @@ mod tests {
         assert_eq!(ds.capabilities.clamp_effort("medium"), "low");
         // Toggle-capable models preserve `"none"` instead of clamping to `"low"`.
         assert_eq!(ds.capabilities.clamp_effort("none"), "none");
-        assert_eq!(infer_tier_from_prices(ds.prices.unwrap()), "fast");
+        assert_eq!(infer_tier_from_prices(ds.prices.unwrap()), "sonnet");
+        assert_eq!(infer_tier_from_prices([4.0, 0.2, 5.0, 20.0]), "opus");
 
         // Non-toggle models without `"none"` in `effort_values` clamp `"none"` to `"low"`.
         let gm = reg

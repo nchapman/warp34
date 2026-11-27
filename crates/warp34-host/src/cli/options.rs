@@ -175,7 +175,7 @@ Serving Options (warp34 serve):
   --router-policy <policy>            Routing policy: prefer-local (default), sage, or swift
   --router-min-p-pass <0..1>          Min local P(pass) for prefer-local (default: 0.65)
   --router-value <usd>                Override utility task value V in USD (default: 1.5 prefer-local, 4.5 sage, 0.1 swift)
-  --router-cloud-models <csv|auto|none> Cloud models as provider/model, openrouter/vendor/model, https://host/v1#model, or tier=... (default: none = local-only; auto = detect from env keys)
+  --router-cloud-models <csv|auto|none> Cloud models as provider/model, openrouter/vendor/model, https://host/v1#model, or sonnet=/opus= prefix (default: none = local-only; auto = detect from env keys)
   --router-pin-pii <csv|none>         PII classes pinned locally (default: credential,government_id,financial_account,payment_card)
 
 Generation & Chat Options (warp34 chat / generate):

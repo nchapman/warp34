@@ -343,12 +343,13 @@ impl ArcRouter {
             .iter()
             .map(|c| {
                 let prov = c.endpoint.provider_id.as_str();
+                let tier = policy::remote_tier_label(c.slot);
                 let price = c
                     .price_override
                     .or(self.heads.catalog.model_prices[c.slot])
                     .map(|p| format!(" ${:.2}/${:.2}", p[0], p[3]))
                     .unwrap_or_default();
-                format!("{prov}:{}{price}", c.wire)
+                format!("{prov}:{} [{tier}{price}]", c.wire)
             })
             .collect();
         format!("[{}]", items.join(", "))

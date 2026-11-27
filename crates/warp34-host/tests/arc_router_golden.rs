@@ -150,11 +150,20 @@ fn heads_catalog_slot_inference_and_policy_invariants() {
     assert_eq!(heads.catalog.stage_one_candidate_for_model(53), Some(53)); // qwen3.8-flash-next
     assert_eq!(heads.catalog.stage_one_candidate_for_model(54), Some(54)); // qwen3.5-9b
     assert_eq!(heads.catalog.stage_one_candidate_for_model(55), Some(55)); // qwen3.8-27b
-    assert_eq!(infer_local_slot("Qwen3.5-35B-A3B", &heads.catalog), 53);
-    assert_eq!(infer_local_slot("Qwen3.8-Flash-Next", &heads.catalog), 53);
-    assert_eq!(infer_local_slot("Qwen3.5-27B", &heads.catalog), 55);
-    assert_eq!(infer_local_slot("Qwen3.5-9B", &heads.catalog), 54);
-    assert_eq!(infer_local_slot("Qwen3.5-4B", &heads.catalog), 54);
+    // Generalized 3-archetype slot system: every local model maps to the canonical ~27B target
+    // (`DEFAULT_LOCAL_SLOT = 55`, `qwen3.8-27b`), and remote cloud models map to `sonnet` (`2`)
+    // or `opus` (`1`).
+    assert_eq!(
+        infer_local_slot("Apex-35B-V1.0-W4A16-HGPTQ", &heads.catalog),
+        55
+    );
+    assert_eq!(infer_local_slot("Qwen3.8-Flash-Next", &heads.catalog), 55);
+    assert_eq!(
+        infer_local_slot("Ternary-Bonsai-2.5-27B", &heads.catalog),
+        55
+    );
+    assert_eq!(infer_local_slot("Qwen3.5-9B", &heads.catalog), 55);
+    assert_eq!(infer_local_slot("Qwen3.5-4B", &heads.catalog), 55);
 
     let registry = ModelsDevRegistry::builtin_fallback();
     // Default (empty filter) resolves to local-only (no surprise cloud spend).
@@ -165,7 +174,7 @@ fn heads_catalog_slot_inference_and_policy_invariants() {
         .expect("default local-only");
     assert!(default_slots.is_empty());
 
-    // Explicit `auto` detects env keys; explicit specs with tier overrides resolve cleanly.
+    // Explicit `auto` detects env keys and maps to Sonnet (`2`) + Opus (`1`).
     let auto_slots = resolve_cloud_candidates_from_registry(
         &registry,
         &heads.catalog,
@@ -173,21 +182,25 @@ fn heads_catalog_slot_inference_and_policy_invariants() {
         |k| (k == "OPENROUTER_API_KEY").then(|| "test-key".to_string()),
     )
     .expect("auto openrouter");
-    assert!(!auto_slots.is_empty());
+    assert_eq!(auto_slots.len(), 2);
+    assert_eq!(auto_slots[0].slot, 2);
+    assert_eq!(auto_slots[1].slot, 1);
 
     let filtered = resolve_cloud_candidates_from_registry(
         &registry,
         &heads.catalog,
         &[
-            "medium=openrouter/meta/muse-spark-1.3-contributor".to_string(),
-            "strong=openrouter/google/gemini-4-neon".to_string(),
+            "sonnet=openrouter/meta/muse-spark-1.3-contributor".to_string(),
+            "opus=openrouter/google/gemini-4-neon".to_string(),
         ],
         |k| (k == "OPENROUTER_API_KEY").then(|| "test-key".to_string()),
     )
     .expect("filtered");
     assert_eq!(filtered.len(), 2);
     assert_eq!(filtered[0].wire, "meta/muse-spark-1.3-contributor");
+    assert_eq!(filtered[0].slot, 2);
     assert_eq!(filtered[1].wire, "google/gemini-4-neon");
+    assert_eq!(filtered[1].slot, 1);
 
     // Warm local KV must stay local even with cloud slots available.
     let zero_readouts = vec![vec![0.0f32; 1024]];
@@ -333,16 +346,41 @@ fn arc_encoder_and_heads_match_goldens() {
             );
         }
     }
-    // Verify native slot matching against the real 56-slot ARC-1.0 catalog handles dash-versioned IDs.
-    for (alias, expected_slot) in [
-        ("claude-haiku-5-5", 0usize),
-        ("claude-opus-5-5", 1),
-        ("claude-sonnet-5-5", 2),
+    // Verify generalized 3-archetype remote slot resolution against the real 56-slot ARC-1.0 catalog.
+    for (tier, id, prices, expected_slot) in [
+        (
+            None,
+            "opencode/claude-sonnet-5-5",
+            Some([2.0, 0.2, 2.5, 10.0]),
+            2usize,
+        ),
+        (
+            None,
+            "opencode/claude-opus-5-5",
+            Some([4.0, 0.4, 5.0, 20.0]),
+            1usize,
+        ),
+        (None, "openai/gpt-5.4", Some([2.5, 0.25, 0.0, 15.0]), 2usize),
+        (
+            None,
+            "openai/gpt-5.4-pro",
+            Some([30.0, 3.0, 0.0, 180.0]),
+            1usize,
+        ),
+        (Some("sonnet"), "custom/model-a", None, 2usize),
+        (Some("opus"), "custom/model-b", None, 1usize),
     ] {
         assert_eq!(
-            warp34_host::arc_router::policy::find_native_arc_slot(&heads.catalog, alias),
-            Some(expected_slot),
-            "expected {alias} to match native ARC-1.0 slot {expected_slot}"
+            warp34_host::arc_router::policy::infer_remote_slot(
+                tier,
+                id,
+                id,
+                prices,
+                &heads.catalog,
+            )
+            .expect("infer_remote_slot"),
+            expected_slot,
+            "expected ({tier:?}, {id}) to map to remote archetype slot {expected_slot}"
         );
     }
 

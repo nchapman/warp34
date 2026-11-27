@@ -47,27 +47,26 @@ impl RoutingPolicy {
     }
 }
 
-/// Automatically maps a served local `warp34` model ID/path to the best unmasked ARC-1.0 slot:
-/// - `[53]` (`qwen3.8-flash-next`): `Flash-Next` / `35B-A3B` / `80B`
-/// - `[55]` (`qwen3.8-27b`): `27B` / `32B`
-/// - `[54]` (`qwen3.5-9b`): `9B` / `4B` / `2B` / `0.8B` (fallback)
-pub fn infer_local_slot(model_name: &str, catalog: &ArcRuntimeCatalog) -> usize {
-    let lower = model_name.to_ascii_lowercase();
-    let preferred = if lower.contains("flash-next")
-        || lower.contains("flash_next")
-        || lower.contains("35b")
-        || lower.contains("80b")
-    {
-        53
-    } else if lower.contains("27b") || lower.contains("32b") {
-        55
+/// Canonical ARC-1.0 reference slot for the local model target (`qwen3.8-27b`, ~27B class,
+/// with full 4-action Stage-2 steering: `down` / `none` / `up` / unsteered).
+pub const DEFAULT_LOCAL_SLOT: usize = 55;
+/// Canonical ARC-1.0 reference slot for the mid/workhorse remote tier (`claude-sonnet-5.5`).
+pub const REMOTE_SONNET_SLOT: usize = 2;
+/// Canonical ARC-1.0 reference slot for the frontier/heavy remote tier (`claude-opus-5.5`).
+pub const REMOTE_OPUS_SLOT: usize = 1;
+
+/// Maps any served local `warp34` model to the canonical `~27B` ARC-1.0 local target slot
+/// (`[55]` `qwen3.8-27b`, clamped for synthetic test catalogs).
+pub fn infer_local_slot(_model_name: &str, catalog: &ArcRuntimeCatalog) -> usize {
+    DEFAULT_LOCAL_SLOT.min(catalog.models.len().saturating_sub(1))
+}
+
+/// Human-readable archetype label for a resolved remote cloud slot.
+pub fn remote_tier_label(slot: usize) -> &'static str {
+    if slot == REMOTE_OPUS_SLOT {
+        "opus"
     } else {
-        54
-    };
-    if preferred < catalog.models.len() {
-        preferred
-    } else {
-        catalog.models.len().saturating_sub(1)
+        "sonnet"
     }
 }
 
@@ -84,20 +83,51 @@ pub struct CloudCandidate {
     pub capabilities: ModelCapabilities,
 }
 
-pub fn find_native_arc_slot(catalog: &ArcRuntimeCatalog, id: &str) -> Option<usize> {
-    let wanted = id.trim().to_ascii_lowercase();
-    let wanted_canon = wanted.replace('.', "-");
-    catalog.models.iter().enumerate().find_map(|(idx, m)| {
-        let name_lc = m.name.to_ascii_lowercase();
-        let name_canon = name_lc.replace('.', "-");
-        let wire_lc = m.wire.as_deref().map(str::to_ascii_lowercase);
-        let matches = name_lc == wanted
-            || name_canon == wanted_canon
-            || wire_lc
-                .as_deref()
-                .is_some_and(|w| w == wanted || w.replace('.', "-") == wanted_canon);
-        matches.then_some(idx)
-    })
+/// Resolves an explicit remote tier prefix (`sonnet=`, `opus=`, or legacy aliases) to one of the
+/// two canonical remote ARC-1.0 archetypes (`REMOTE_SONNET_SLOT` or `REMOTE_OPUS_SLOT`).
+pub fn resolve_remote_tier_slot(token: &str, catalog: &ArcRuntimeCatalog) -> Option<usize> {
+    let idx = match token.trim().to_ascii_lowercase().as_str() {
+        "sonnet" | "medium" | "mid" | "fast" | "cheap" | "small" => REMOTE_SONNET_SLOT,
+        "opus" | "frontier" | "strong" | "big" => REMOTE_OPUS_SLOT,
+        _ => return None,
+    };
+    (idx < catalog.models.len()).then_some(idx)
+}
+
+/// Maps any swappable cloud model to the generalized two-tier remote ARC-1.0 archetypes:
+/// `REMOTE_SONNET_SLOT` (`claude-sonnet-5.5`) or `REMOTE_OPUS_SLOT` (`claude-opus-5.5`).
+///
+/// Precedence:
+/// 1. Explicit tier prefix (`sonnet=...`, `opus=...`, or legacy aliases).
+/// 2. Explicit archetype cue in the model ID (`"opus"` vs `"sonnet"`).
+/// 3. Live `models.dev` output pricing (`> $15/M` -> `opus`, `<= $15/M` -> `sonnet`).
+/// 4. Default fallback: `sonnet`.
+pub fn infer_remote_slot(
+    explicit_tier: Option<&str>,
+    canonical_id: &str,
+    wire_model: &str,
+    prices: Option<[f64; LEGS]>,
+    catalog: &ArcRuntimeCatalog,
+) -> Result<usize, String> {
+    if let Some(tier) = explicit_tier {
+        return resolve_remote_tier_slot(tier, catalog)
+            .ok_or_else(|| format!("unknown remote tier `{tier}`"));
+    }
+    let has_token = |s: &str, needle: &str| {
+        s.split(|c: char| !c.is_ascii_alphanumeric())
+            .any(|tok| tok.eq_ignore_ascii_case(needle))
+    };
+    let tier = if has_token(canonical_id, "opus") || has_token(wire_model, "opus") {
+        "opus"
+    } else if has_token(canonical_id, "sonnet") || has_token(wire_model, "sonnet") {
+        "sonnet"
+    } else if let Some(p) = prices {
+        infer_tier_from_prices(p)
+    } else {
+        "sonnet"
+    };
+    Ok(resolve_remote_tier_slot(tier, catalog)
+        .unwrap_or_else(|| REMOTE_SONNET_SLOT.min(catalog.models.len().saturating_sub(1))))
 }
 
 /// Returns true when `--router-cloud-models` requests local-only routing (`[]`, `none`, or `local`),
@@ -154,19 +184,14 @@ where
             ));
         }
 
-        let slot = if let Some(tier) = resolved.explicit_tier.as_deref() {
-            resolve_tier_slot(tier, catalog)
-                .ok_or_else(|| format!("unknown tier `{tier}` in --router-cloud-models `{raw}`"))?
-        } else if let Some(native) = find_native_arc_slot(catalog, &resolved.canonical_id)
-            .or_else(|| find_native_arc_slot(catalog, &resolved.wire_model))
-        {
-            native
-        } else if let Some(prices) = resolved.prices {
-            let inferred = infer_tier_from_prices(prices);
-            resolve_tier_slot(inferred, catalog).unwrap_or(2)
-        } else {
-            resolve_tier_slot("medium", catalog).unwrap_or(2)
-        };
+        let slot = infer_remote_slot(
+            resolved.explicit_tier.as_deref(),
+            &resolved.canonical_id,
+            &resolved.wire_model,
+            resolved.prices,
+            catalog,
+        )
+        .map_err(|e| format!("{e} in --router-cloud-models `{raw}`"))?;
 
         out.push(CloudCandidate {
             slot,
@@ -178,17 +203,6 @@ where
         });
     }
     Ok(out)
-}
-
-fn resolve_tier_slot(token: &str, catalog: &ArcRuntimeCatalog) -> Option<usize> {
-    let idx = match token {
-        "fast" | "cheap" | "small" => 3, // deepseek/deepseek-v4.1-flash
-        "medium" | "mid" => 2,           // anthropic/claude-sonnet-5.5
-        "strong" | "big" => 10,          // moonshotai/kimi-k3 ($3/$15 frontier reasoning)
-        "frontier" => 1,                 // anthropic/claude-opus-5.5
-        _ => return None,
-    };
-    (idx < catalog.models.len()).then_some(idx)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -603,55 +617,110 @@ mod tests {
     }
 
     #[test]
-    fn find_native_arc_slot_matches_mixed_dash_and_dot_version_ids() {
+    fn generalized_three_archetype_slot_mapping_covers_local_sonnet_and_opus() {
         use super::super::heads::{ArcModelEntry, ArcRuntimeCatalog};
+        let models: Vec<ArcModelEntry> = (0..56)
+            .map(|i| ArcModelEntry {
+                name: format!("slot-{i}"),
+                wire: None,
+            })
+            .collect();
         let catalog = ArcRuntimeCatalog {
-            models: vec![
-                ArcModelEntry {
-                    name: "claude-haiku-5.5".to_string(),
-                    wire: Some("anthropic/claude-haiku-5.5".to_string()),
-                },
-                ArcModelEntry {
-                    name: "claude-opus-5.5".to_string(),
-                    wire: Some("anthropic/claude-opus-5.5".to_string()),
-                },
-                ArcModelEntry {
-                    name: "claude-sonnet-5.5".to_string(),
-                    wire: Some("anthropic/claude-sonnet-5.5".to_string()),
-                },
-                ArcModelEntry {
-                    name: "deepseek-v4.1-flash".to_string(),
-                    wire: Some("deepseek/deepseek-v4.1-flash".to_string()),
-                },
-            ],
+            models,
             actions: Vec::new(),
             fallback_action: 0,
-            model_to_candidate: vec![Some(0), Some(1), Some(2), Some(3)],
-            candidate_latency_factor: vec![None; 4],
+            model_to_candidate: (0..56).map(Some).collect(),
+            candidate_latency_factor: vec![None; 56],
             stage_one_regime: 0,
             stage_one_cost_weight: 0.3,
             stage_one_latency_weight: 0.0,
             stage_two_cost_weight: 0.3,
             stage_two_support_columns: Vec::new(),
-            model_prices: vec![None; 4],
+            model_prices: vec![None; 56],
             pii_classes: Vec::new(),
             pii_presence_threshold: 0.5,
             pii_type_threshold: 0.5,
             pii_length_buckets: Vec::new(),
         };
-        assert_eq!(find_native_arc_slot(&catalog, "claude-haiku-5-5"), Some(0));
-        assert_eq!(find_native_arc_slot(&catalog, "claude-opus-5-5"), Some(1));
-        assert_eq!(find_native_arc_slot(&catalog, "claude-sonnet-5-5"), Some(2));
+
+        // Any local model maps to the canonical ~27B local archetype (`DEFAULT_LOCAL_SLOT = 55`).
+        for local_name in [
+            "nchapman/Ternary-Bonsai-2.5-27B-warp34",
+            "nchapman/Apex-35B-V1.0-W4A16-HGPTQ",
+            "nchapman/Qwen3.8-Flash-Next-W4A16-HGPTQ",
+            "nchapman/Qwen3.5-9B-W4A16-HGPTQ",
+            "custom-local-model",
+        ] {
+            assert_eq!(infer_local_slot(local_name, &catalog), DEFAULT_LOCAL_SLOT);
+        }
+
+        // Explicit tier prefixes (canonical `sonnet`/`opus` + legacy aliases).
+        for tok in ["sonnet", "medium", "mid", "fast", "cheap", "small"] {
+            assert_eq!(
+                infer_remote_slot(Some(tok), "x/y", "y", None, &catalog).unwrap(),
+                REMOTE_SONNET_SLOT
+            );
+        }
+        for tok in ["opus", "frontier", "strong", "big"] {
+            assert_eq!(
+                infer_remote_slot(Some(tok), "x/y", "y", None, &catalog).unwrap(),
+                REMOTE_OPUS_SLOT
+            );
+        }
+        assert!(infer_remote_slot(Some("bogus"), "x/y", "y", None, &catalog).is_err());
+
+        // Name cues for swappable Sonnet/Opus models (including dash/dot variants).
         assert_eq!(
-            find_native_arc_slot(&catalog, "anthropic/claude-sonnet-5-5"),
-            Some(2)
+            infer_remote_slot(
+                None,
+                "opencode/claude-sonnet-5-5",
+                "claude-sonnet-5-5",
+                Some([2.0, 0.2, 2.5, 10.0]),
+                &catalog
+            )
+            .unwrap(),
+            REMOTE_SONNET_SLOT
         );
         assert_eq!(
-            find_native_arc_slot(&catalog, "deepseek-v4-1-flash"),
-            Some(3)
+            infer_remote_slot(
+                None,
+                "opencode/claude-opus-5-5",
+                "claude-opus-5-5",
+                Some([4.0, 0.4, 5.0, 20.0]),
+                &catalog
+            )
+            .unwrap(),
+            REMOTE_OPUS_SLOT
         );
-        assert_eq!(find_native_arc_slot(&catalog, "Claude-Opus-5-5"), Some(1));
-        assert_eq!(find_native_arc_slot(&catalog, "unknown-model-99"), None);
+        // Price-based tiering for non-Claude swappable cloud models.
+        assert_eq!(
+            infer_remote_slot(
+                None,
+                "openai/gpt-5.4",
+                "gpt-5.4",
+                Some([2.5, 0.25, 0.0, 15.0]),
+                &catalog
+            )
+            .unwrap(),
+            REMOTE_SONNET_SLOT
+        );
+        assert_eq!(
+            infer_remote_slot(
+                None,
+                "openai/gpt-5.4-pro",
+                "gpt-5.4-pro",
+                Some([30.0, 3.0, 0.0, 180.0]),
+                &catalog
+            )
+            .unwrap(),
+            REMOTE_OPUS_SLOT
+        );
+        assert_eq!(
+            infer_remote_slot(None, "custom/unknown", "unknown", None, &catalog).unwrap(),
+            REMOTE_SONNET_SLOT
+        );
+        assert_eq!(remote_tier_label(REMOTE_SONNET_SLOT), "sonnet");
+        assert_eq!(remote_tier_label(REMOTE_OPUS_SLOT), "opus");
         assert!((DEFAULT_PREFER_LOCAL_MIN_P_PASS - 0.65).abs() < 1e-12);
     }
 
