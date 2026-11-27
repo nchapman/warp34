@@ -183,15 +183,16 @@ pub fn resolve_cloud_candidates_from_registry<F>(
 where
     F: Fn(&str) -> Option<String>,
 {
-    if filter.len() == 1
-        && matches!(
-            filter[0].trim().to_ascii_lowercase().as_str(),
-            "none" | "local"
-        )
+    if filter.is_empty()
+        || (filter.len() == 1
+            && matches!(
+                filter[0].trim().to_ascii_lowercase().as_str(),
+                "none" | "local"
+            ))
     {
         return Ok(Vec::new());
     }
-    let specs: Vec<String> = if filter.is_empty() {
+    let specs: Vec<String> = if filter.len() == 1 && filter[0].trim().eq_ignore_ascii_case("auto") {
         registry.default_models_for_env(&env_lookup)
     } else {
         filter

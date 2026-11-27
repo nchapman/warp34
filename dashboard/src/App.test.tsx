@@ -360,7 +360,7 @@ describe("dashboard states", () => {
         }}
       />,
     );
-    expect(screen.getByRole("heading", { name: "ARC Router" })).toBeVisible();
+    expect(screen.getByRole("heading", { name: "Router" })).toBeVisible();
     expect(screen.getByText("14.2 ms avg · 100 routed")).toBeVisible();
     expect(screen.getByText("$1.54")).toBeVisible();
     expect(screen.getByText("anthropic/claude-sonnet-4.6")).toBeVisible();

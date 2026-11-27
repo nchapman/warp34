@@ -108,7 +108,7 @@ function ArcRouterCard({
     >
       <CardHeader className="flex flex-row items-center justify-between gap-2">
         <CardTitle>
-          <h2 id="router-title">ARC Router</h2>
+          <h2 id="router-title">Router</h2>
         </CardTitle>
         <span className="muted numeric">
           {total > 0
@@ -231,7 +231,8 @@ function ArcRouterCard({
           </table>
         ) : (
           <p className="metric-caption">
-            Waiting for routed traffic on <code>model: &quot;auto&quot;</code>.
+            Waiting for routed traffic on <code>model: &quot;router&quot;</code>
+            .
           </p>
         )}
 

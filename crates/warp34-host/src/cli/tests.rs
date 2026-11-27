@@ -1597,6 +1597,9 @@ fn bench_and_profile_diff_cli_validation_and_forwarding() {
         vision_banner: Some(
             "preprocessor_config.json (patch=16, merge=2, pixels=65536..16777216)".to_string(),
         ),
+        router_banner: Some(
+            "model=\"router\", policy=prefer-local, local_slot=qwen3.5-27b, cloud=none (local adaptive effort), pin_pii=4 classes".to_string(),
+        ),
         lora_adapters: Vec::new(),
     };
     let banner = super::commands::format_serve_boot_banner(&summary);
@@ -1610,6 +1613,9 @@ fn bench_and_profile_diff_cli_validation_and_forwarding() {
     assert!(banner.contains("Thinking     : effort-budget=on (ceil=32768), budget=auto, cutoff="));
     assert!(banner.contains(
         "Vision       : preprocessor_config.json (patch=16, merge=2, pixels=65536..16777216)"
+    ));
+    assert!(banner.contains(
+        "Router       : model=\"router\", policy=prefer-local, local_slot=qwen3.5-27b, cloud=none (local adaptive effort), pin_pii=4 classes"
     ));
     assert!(banner.contains("tq4_all (3.88x, 132B/row TQ4 all attention layers) [auto: stepped down from tq4 to fit full context]"));
     assert!(banner.contains("262144 tokens (16384 pages"));
@@ -1667,6 +1673,7 @@ fn serve_boot_banner_formats_lora_and_tq4_tail_variants() {
         default_reasoning_budget: None,
         default_reasoning_budget_message: None,
         vision_banner: None,
+        router_banner: None,
         lora_adapters: vec!["sql-expert".to_string()],
     };
     let banner_sm86 = super::commands::format_serve_boot_banner(&summary);

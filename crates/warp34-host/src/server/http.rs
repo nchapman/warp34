@@ -590,9 +590,9 @@ async fn models(State(s): State<Arc<OpenAiServerState>>) -> Json<Value> {
     }));
     if let Some(router) = &s.arc_router {
         data.push(json!({
-            "id": "auto",
+            "id": "router",
             "object": "model",
-            "owned_by": "warp34-arc",
+            "owned_by": "warp34",
             "local_slot": router.local_slot_name(),
             "cloud_models": router.cloud_model_names(),
             "max_model_len": max_model_len,
@@ -1384,7 +1384,7 @@ impl OpenAiServerState {
                     && let Some(m) = obj.get("model").and_then(Value::as_str)
                     && matches!(
                         m.to_ascii_lowercase().as_str(),
-                        "auto" | "arc" | "arc-router"
+                        "router" | "auto" | "arc" | "arc-router"
                     )
                 {
                     obj.insert("model".to_string(), Value::String(self.model_name.clone()));
@@ -1430,8 +1430,8 @@ impl OpenAiServerState {
             | crate::arc_router::policy::RouteTarget::Local => {}
         }
 
-        // Local target: rewrite virtual `"auto"` / `"arc"` model aliases to the served local model
-        // and apply ARC Stage-2 reasoning effort when the caller didn't specify one explicitly.
+        // Local target: rewrite virtual `"router"` / `"auto"` model aliases to the served local
+        // model and apply Stage-2 reasoning effort when the caller didn't specify one explicitly.
         let has_explicit_effort = body.get("reasoning_effort").is_some_and(|v| !v.is_null())
             || body
                 .pointer("/reasoning/effort")
@@ -1450,7 +1450,7 @@ impl OpenAiServerState {
             if let Some(m) = obj.get("model").and_then(Value::as_str)
                 && matches!(
                     m.to_ascii_lowercase().as_str(),
-                    "auto" | "arc" | "arc-router"
+                    "router" | "auto" | "arc" | "arc-router"
                 )
             {
                 obj.insert("model".to_string(), Value::String(self.model_name.clone()));
